@@ -1,0 +1,47 @@
+// bobrwm config — place at ~/.config/bobrwm/config.zon
+// or pass via: bobrwm -c /path/to/config.zon
+.{
+    // Gaps between windows (pixels). Omit or set to 0 for no gaps.
+    // .gaps = .{
+    //     .inner = 4,
+    //     .outer = .{ .left = 4, .right = 4, .top = 4, .bottom = 4 },
+    // },
+
+    .keybinds = .{
+        // alt+1..9 → focus workspace
+        .{ .key = "1", .mods = .{ .alt = true }, .action = .focus_workspace, .arg = 1 },
+        .{ .key = "2", .mods = .{ .alt = true }, .action = .focus_workspace, .arg = 2 },
+        .{ .key = "3", .mods = .{ .alt = true }, .action = .focus_workspace, .arg = 3 },
+        .{ .key = "4", .mods = .{ .alt = true }, .action = .focus_workspace, .arg = 4 },
+        .{ .key = "5", .mods = .{ .alt = true }, .action = .focus_workspace, .arg = 5 },
+        .{ .key = "6", .mods = .{ .alt = true }, .action = .focus_workspace, .arg = 6 },
+        .{ .key = "7", .mods = .{ .alt = true }, .action = .focus_workspace, .arg = 7 },
+        .{ .key = "8", .mods = .{ .alt = true }, .action = .focus_workspace, .arg = 8 },
+        .{ .key = "9", .mods = .{ .alt = true }, .action = .focus_workspace, .arg = 9 },
+
+        // alt+shift+1..9 → move window to workspace
+        .{ .key = "1", .mods = .{ .alt = true, .shift = true }, .action = .move_to_workspace, .arg = 1 },
+        .{ .key = "2", .mods = .{ .alt = true, .shift = true }, .action = .move_to_workspace, .arg = 2 },
+        .{ .key = "3", .mods = .{ .alt = true, .shift = true }, .action = .move_to_workspace, .arg = 3 },
+        .{ .key = "4", .mods = .{ .alt = true, .shift = true }, .action = .move_to_workspace, .arg = 4 },
+        .{ .key = "5", .mods = .{ .alt = true, .shift = true }, .action = .move_to_workspace, .arg = 5 },
+        .{ .key = "6", .mods = .{ .alt = true, .shift = true }, .action = .move_to_workspace, .arg = 6 },
+        .{ .key = "7", .mods = .{ .alt = true, .shift = true }, .action = .move_to_workspace, .arg = 7 },
+        .{ .key = "8", .mods = .{ .alt = true, .shift = true }, .action = .move_to_workspace, .arg = 8 },
+        .{ .key = "9", .mods = .{ .alt = true, .shift = true }, .action = .move_to_workspace, .arg = 9 },
+
+        // alt+hjkl → focus direction
+        .{ .key = "h", .mods = .{ .alt = true }, .action = .focus_left },
+        .{ .key = "j", .mods = .{ .alt = true }, .action = .focus_down },
+        .{ .key = "k", .mods = .{ .alt = true }, .action = .focus_up },
+        .{ .key = "l", .mods = .{ .alt = true }, .action = .focus_right },
+
+        // alt+return → toggle split direction
+        .{ .key = "return", .mods = .{ .alt = true }, .action = .toggle_split },
+    },
+
+    .workspace_assignments = .{
+        // .{ .app_id = "com.apple.Safari", .workspace = 2 },
+        // .{ .app_id = "com.apple.MobileSMS", .workspace = 3 },
+    },
+}
