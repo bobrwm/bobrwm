@@ -16,6 +16,7 @@ const log = std.log.scoped(.config);
 pub const Config = struct {
     keybinds: []const Keybind = &default_keybinds,
     workspace_assignments: []const WorkspaceAssignment = &.{},
+    gaps: Gaps = .{},
 
     /// Look up the assigned workspace for a given bundle identifier.
     pub fn workspaceForApp(self: *const Config, bundle_id: []const u8) ?u8 {
@@ -85,6 +86,18 @@ pub const Keybind = struct {
 pub const WorkspaceAssignment = struct {
     app_id: []const u8,
     workspace: u8,
+};
+
+pub const OuterGaps = struct {
+    left: u16 = 0,
+    right: u16 = 0,
+    top: u16 = 0,
+    bottom: u16 = 0,
+};
+
+pub const Gaps = struct {
+    inner: u16 = 0,
+    outer: OuterGaps = .{},
 };
 
 // ---------------------------------------------------------------------------

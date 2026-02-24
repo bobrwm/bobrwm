@@ -683,18 +683,19 @@ fn retile() void {
     const root = g_layout_roots[ws_idx] orelse return;
 
     const display = shim.bw_get_display_frame();
+    const outer = g_config.gaps.outer;
     const frame = window_mod.Window.Frame{
-        .x = display.x,
-        .y = display.y,
-        .width = display.w,
-        .height = display.h,
+        .x = display.x + @as(f64, @floatFromInt(outer.left)),
+        .y = display.y + @as(f64, @floatFromInt(outer.top)),
+        .width = display.w - @as(f64, @floatFromInt(@as(u32, outer.left) + @as(u32, outer.right))),
+        .height = display.h - @as(f64, @floatFromInt(@as(u32, outer.top) + @as(u32, outer.bottom))),
     };
 
     var buf: [256 * @sizeOf(layout.LayoutEntry)]u8 = undefined;
     var fba = std.heap.FixedBufferAllocator.init(&buf);
     var entries: std.ArrayList(layout.LayoutEntry) = .{};
 
-    layout.applyLayout(root, frame, &entries, fba.allocator()) catch return;
+    layout.applyLayout(root, frame, @floatFromInt(g_config.gaps.inner), &entries, fba.allocator()) catch return;
 
     for (entries.items) |entry| {
         const win = g_store.get(entry.wid) orelse continue;

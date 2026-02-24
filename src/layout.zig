@@ -103,33 +103,34 @@ fn removeFrom(node: Node, wid: WindowId, allocator: std.mem.Allocator) ?Node {
 }
 
 /// Walk the BSP tree and compute a frame for each leaf window within the given
-/// bounding frame. Appends results to the output list.
-pub fn applyLayout(node: Node, frame: Frame, output: *std.ArrayList(LayoutEntry), allocator: std.mem.Allocator) !void {
+/// bounding frame. `inner_gap` is the pixel spacing inserted between adjacent windows.
+pub fn applyLayout(node: Node, frame: Frame, inner_gap: f64, output: *std.ArrayList(LayoutEntry), allocator: std.mem.Allocator) !void {
     switch (node) {
         .leaf => |leaf| {
             try output.append(allocator, .{ .wid = leaf.wid, .frame = frame });
         },
         .split => |split| {
+            const half_gap = inner_gap / 2.0;
             var left_frame = frame;
             var right_frame = frame;
 
             switch (split.direction) {
                 .horizontal => {
                     const left_width = frame.width * split.ratio;
-                    left_frame.width = left_width;
-                    right_frame.x = frame.x + left_width;
-                    right_frame.width = frame.width - left_width;
+                    left_frame.width = left_width - half_gap;
+                    right_frame.x = frame.x + left_width + half_gap;
+                    right_frame.width = frame.width - left_width - half_gap;
                 },
                 .vertical => {
                     const top_height = frame.height * split.ratio;
-                    left_frame.height = top_height;
-                    right_frame.y = frame.y + top_height;
-                    right_frame.height = frame.height - top_height;
+                    left_frame.height = top_height - half_gap;
+                    right_frame.y = frame.y + top_height + half_gap;
+                    right_frame.height = frame.height - top_height - half_gap;
                 },
             }
 
-            try applyLayout(split.left, left_frame, output, allocator);
-            try applyLayout(split.right, right_frame, output, allocator);
+            try applyLayout(split.left, left_frame, inner_gap, output, allocator);
+            try applyLayout(split.right, right_frame, inner_gap, output, allocator);
         },
     }
 }
