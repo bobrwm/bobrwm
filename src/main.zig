@@ -617,10 +617,11 @@ fn retile() void {
         .height = display.h,
     };
 
+    var buf: [256 * @sizeOf(layout.LayoutEntry)]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&buf);
     var entries: std.ArrayList(layout.LayoutEntry) = .{};
-    defer entries.deinit(g_allocator);
 
-    layout.applyLayout(root, frame, &entries, g_allocator) catch return;
+    layout.applyLayout(root, frame, &entries, fba.allocator()) catch return;
 
     for (entries.items) |entry| {
         const win = g_store.get(entry.wid) orelse continue;
