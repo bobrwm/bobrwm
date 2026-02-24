@@ -30,6 +30,20 @@ enum bw_event_kind {
     BW_HK_TOGGLE_SPLIT            = 26,
 };
 
+// --- Modifier flags for configurable keybinds ---
+
+#define BW_MOD_ALT   (1 << 0)
+#define BW_MOD_SHIFT (1 << 1)
+#define BW_MOD_CMD   (1 << 2)
+#define BW_MOD_CTRL  (1 << 3)
+
+typedef struct {
+    uint16_t keycode;
+    uint8_t  mods;     // BW_MOD_* bitmask
+    uint8_t  action;   // bw_event_kind value
+    uint32_t arg;
+} bw_keybind;
+
 // --- Data types ---
 
 typedef struct {
@@ -107,5 +121,16 @@ void bw_unobserve_app(int32_t pid);
 /// Block until the observer thread's run loop is ready.
 /// Call once after bw_start_observer().
 void bw_wait_observer_ready(void);
+
+// --- Configurable keybinds ---
+
+/// Set the keybind table. The shim copies the data internally.
+void bw_set_keybinds(const bw_keybind *binds, uint32_t count);
+
+// --- App identity ---
+
+/// Get the bundle identifier for a given PID.
+/// Returns the number of bytes written to `out` (0 on failure).
+uint32_t bw_get_app_bundle_id(int32_t pid, char *out, uint32_t max_len);
 
 #endif

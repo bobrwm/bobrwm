@@ -67,19 +67,15 @@ static CFMachPortRef g_tap_port = NULL;
 static CFRunLoopRef g_observer_runloop = NULL;
 static dispatch_semaphore_t g_observer_ready_sem = NULL;
 
-static uint32_t keycode_to_number(CGKeyCode keycode) {
-    switch (keycode) {
-        case kVK_ANSI_1: return 1;
-        case kVK_ANSI_2: return 2;
-        case kVK_ANSI_3: return 3;
-        case kVK_ANSI_4: return 4;
-        case kVK_ANSI_5: return 5;
-        case kVK_ANSI_6: return 6;
-        case kVK_ANSI_7: return 7;
-        case kVK_ANSI_8: return 8;
-        case kVK_ANSI_9: return 9;
-        default: return 0;
-    }
+// Configurable keybind table (set from Zig via bw_set_keybinds)
+#define MAX_KEYBINDS 128
+static bw_keybind g_keybinds[MAX_KEYBINDS];
+static uint32_t   g_keybind_count = 0;
+
+void bw_set_keybinds(const bw_keybind *binds, uint32_t count) {
+    if (count > MAX_KEYBINDS) count = MAX_KEYBINDS;
+    memcpy(g_keybinds, binds, count * sizeof(bw_keybind));
+    g_keybind_count = count;
 }
 
 static CGEventRef hotkey_callback(CGEventTapProxy proxy, CGEventType type,
@@ -97,42 +93,17 @@ static CGEventRef hotkey_callback(CGEventTapProxy proxy, CGEventType type,
     CGKeyCode keycode = (CGKeyCode)CGEventGetIntegerValueField(
         event, kCGKeyboardEventKeycode);
 
-    bool has_alt   = (flags & kCGEventFlagMaskAlternate) != 0;
-    bool has_shift = (flags & kCGEventFlagMaskShift) != 0;
-    bool has_cmd   = (flags & kCGEventFlagMaskCommand) != 0;
+    uint8_t current_mods = 0;
+    if (flags & kCGEventFlagMaskAlternate) current_mods |= BW_MOD_ALT;
+    if (flags & kCGEventFlagMaskShift)     current_mods |= BW_MOD_SHIFT;
+    if (flags & kCGEventFlagMaskCommand)   current_mods |= BW_MOD_CMD;
+    if (flags & kCGEventFlagMaskControl)   current_mods |= BW_MOD_CTRL;
 
-    if (!has_alt || has_cmd) return event;
-
-    // alt+1..9 / alt+shift+1..9 → workspace
-    uint32_t ws_num = keycode_to_number(keycode);
-    if (ws_num != 0) {
-        if (has_shift) {
-            bw_emit_event(BW_HK_MOVE_TO_WORKSPACE, 0, ws_num);
-        } else {
-            bw_emit_event(BW_HK_FOCUS_WORKSPACE, 0, ws_num);
+    for (uint32_t i = 0; i < g_keybind_count; i++) {
+        if (g_keybinds[i].keycode == keycode && g_keybinds[i].mods == current_mods) {
+            bw_emit_event(g_keybinds[i].action, 0, g_keybinds[i].arg);
+            return NULL;
         }
-        return NULL;
-    }
-
-    // alt+h/j/k/l → focus direction
-    if (!has_shift) {
-        switch (keycode) {
-            case kVK_ANSI_H:
-                bw_emit_event(BW_HK_FOCUS_LEFT, 0, 0); return NULL;
-            case kVK_ANSI_J:
-                bw_emit_event(BW_HK_FOCUS_DOWN, 0, 0); return NULL;
-            case kVK_ANSI_K:
-                bw_emit_event(BW_HK_FOCUS_UP, 0, 0); return NULL;
-            case kVK_ANSI_L:
-                bw_emit_event(BW_HK_FOCUS_RIGHT, 0, 0); return NULL;
-            default: break;
-        }
-    }
-
-    // alt+return → toggle split direction
-    if (keycode == kVK_Return && !has_shift) {
-        bw_emit_event(BW_HK_TOGGLE_SPLIT, 0, 0);
-        return NULL;
     }
 
     return event;
@@ -694,5 +665,26 @@ void bw_unobserve_app(int32_t pid) {
         CFRelease(g_app_observers[i].observer);
         g_app_observers[i] = g_app_observers[--g_app_observer_count];
         return;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// App identity
+// ---------------------------------------------------------------------------
+
+uint32_t bw_get_app_bundle_id(int32_t pid, char *out, uint32_t max_len) {
+    @autoreleasepool {
+        NSRunningApplication *app =
+            [NSRunningApplication runningApplicationWithProcessIdentifier:(pid_t)pid];
+        if (!app || !app.bundleIdentifier) return 0;
+
+        const char *utf8 = [app.bundleIdentifier UTF8String];
+        if (!utf8) return 0;
+
+        uint32_t len = (uint32_t)strlen(utf8);
+        if (len >= max_len) len = max_len - 1;
+        memcpy(out, utf8, len);
+        out[len] = '\0';
+        return len;
     }
 }
