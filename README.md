@@ -2,16 +2,70 @@
 
 A tiling window manager for macOS, written in Zig.
 
-## Default Keys
+## Usage
 
-All keybindings use **Alt (⌥)** as the modifier.
+```
+bobrwm                    # start daemon
+bobrwm -c /path/to/config.zon  # start with explicit config
+bobrwm query windows      # IPC: list managed windows
+bobrwm query workspaces   # IPC: list workspaces
+bobrwm query apps         # IPC: list observed apps
+```
 
-| Key | Action |
-| --- | --- |
-| `Alt + 1-9` | Focus workspace 1–9 |
-| `Alt + Shift + 1-9` | Move focused window to workspace 1–9 |
-| `Alt + H` | Focus window left |
-| `Alt + J` | Focus window down |
-| `Alt + K` | Focus window up |
-| `Alt + L` | Focus window right |
-| `Alt + Return` | Toggle split direction (horizontal / vertical) |
+## Configuration
+
+Config is loaded from (in order):
+
+1. `-c` / `--config` CLI argument
+2. `$XDG_CONFIG_HOME/bobrwm/config.zon`
+3. `~/.config/bobrwm/config.zon`
+
+If no config file is found, built-in defaults are used. See [`examples/config.zon`](examples/config.zon) for a full example.
+
+### Keybinds
+
+Map a key + modifiers to an action:
+
+```zon
+.keybinds = .{
+    .{ .key = "1", .mods = .{ .alt = true }, .action = .focus_workspace, .arg = 1 },
+    .{ .key = "h", .mods = .{ .alt = true }, .action = .focus_left },
+    .{ .key = "return", .mods = .{ .alt = true }, .action = .toggle_split },
+},
+```
+
+**Available modifiers:** `alt`, `shift`, `cmd`, `ctrl`
+
+**Available actions:**
+
+| Action | Description | `arg` |
+| --- | --- | --- |
+| `focus_workspace` | Switch to workspace N | workspace number |
+| `move_to_workspace` | Move focused window to workspace N | workspace number |
+| `focus_left` | Focus window to the left | — |
+| `focus_right` | Focus window to the right | — |
+| `focus_up` | Focus window above | — |
+| `focus_down` | Focus window below | — |
+| `toggle_split` | Toggle next split direction | — |
+
+### Gaps
+
+Pixel spacing between and around windows:
+
+```zon
+.gaps = .{
+    .inner = 4,
+    .outer = .{ .left = 4, .right = 4, .top = 4, .bottom = 4 },
+},
+```
+
+### Workspace Assignments
+
+Pin apps to specific workspaces by bundle ID:
+
+```zon
+.workspace_assignments = .{
+    .{ .app_id = "com.mitchellh.ghostty", .workspace = 1 },
+    .{ .app_id = "com.brave.Browser", .workspace = 2 },
+},
+```
