@@ -12,6 +12,7 @@ const workspace_mod = @import("workspace.zig");
 const layout = @import("layout.zig");
 const ipc = @import("ipc.zig");
 const tabgroup = @import("tabgroup.zig");
+const config_mod = @import("config.zig");
 
 pub const std_options = std.Options{
     .log_level = if (build_options.log_level_int) |l|
@@ -76,6 +77,7 @@ var g_layout_roots: [workspace_mod.max_workspaces]?layout.Node =
 var g_next_split_dir: layout.Direction = .horizontal;
 var g_tab_groups: tabgroup.TabGroupManager = undefined;
 var g_ipc: ipc.Server = undefined;
+var g_config: config_mod.Config = .{};
 
 // ---------------------------------------------------------------------------
 // Event bridge (called from ObjC observer thread)
@@ -100,6 +102,11 @@ pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
     g_allocator = gpa.allocator();
+
+    // -- Config --
+    const config_path = config_mod.parseConfigPathArg();
+    g_config = config_mod.load(g_allocator, config_path);
+    g_config.applyKeybinds();
 
     // -- Accessibility check --
     if (!shim.bw_ax_is_trusted()) {
@@ -292,11 +299,11 @@ fn discoverWindows() void {
         }
     }.lessThan);
 
-    const ws = g_workspaces.active();
-    const ws_idx: usize = ws.id - 1;
-
     for (slice) |info| {
         if (g_store.get(info.wid) != null) continue;
+
+        const target_ws = resolveWorkspace(info.pid);
+        const target_idx: usize = target_ws.id - 1;
 
         const win = window_mod.Window{
             .wid = info.wid,
@@ -305,22 +312,30 @@ fn discoverWindows() void {
             .frame = .{ .x = info.x, .y = info.y, .width = info.w, .height = info.h },
             .is_minimized = false,
             .is_fullscreen = false,
-            .workspace_id = ws.id,
+            .workspace_id = target_ws.id,
         };
 
         g_store.put(win) catch continue;
-        ws.addWindow(info.wid) catch continue;
-        g_layout_roots[ws_idx] = layout.insertWindow(
-            g_layout_roots[ws_idx],
+        target_ws.addWindow(info.wid) catch continue;
+        g_layout_roots[target_idx] = layout.insertWindow(
+            g_layout_roots[target_idx],
             info.wid,
             g_next_split_dir,
             g_allocator,
         ) catch continue;
+
+        // If assigned to a non-visible workspace, hide immediately
+        if (!target_ws.is_visible) {
+            _ = shim.bw_ax_set_window_frame(
+                info.pid, info.wid, hide_x, hide_y, hide_w, hide_h,
+            );
+        }
     }
 
-    // Ensure a focused window is set (first discovery has no activeAppChanged event)
-    if (ws.focused_wid == null and ws.windows.items.len > 0) {
-        ws.focused_wid = ws.windows.items[0];
+    // Ensure a focused window is set on the active workspace
+    const active_ws = g_workspaces.active();
+    if (active_ws.focused_wid == null and active_ws.windows.items.len > 0) {
+        active_ws.focused_wid = active_ws.windows.items[0];
     }
 }
 
@@ -367,7 +382,7 @@ fn addNewWindow(pid: i32, wid: u32) void {
     // pushing the old tab to background). If so, form a tab group.
     if (tryFormTabGroupOnCreate(pid, wid)) return;
 
-    const ws = g_workspaces.active();
+    const ws = resolveWorkspace(pid);
     const ws_idx: usize = ws.id - 1;
 
     const win = window_mod.Window{
@@ -389,7 +404,13 @@ fn addNewWindow(pid: i32, wid: u32) void {
         g_allocator,
     ) catch return;
     ws.focused_wid = wid;
-    log.info("addNewWindow: tiled wid={d} as standalone", .{wid});
+
+    // If assigned to a non-visible workspace, hide immediately
+    if (!ws.is_visible) {
+        _ = shim.bw_ax_set_window_frame(pid, wid, hide_x, hide_y, hide_w, hide_h);
+    }
+
+    log.info("addNewWindow: tiled wid={d} on workspace {d}", .{ wid, ws.id });
 }
 
 /// When a new on-screen window appears, check if an existing managed window
@@ -956,6 +977,24 @@ fn checkTabDragOut(_: i32, wid: u32) void {
     }
 
     retile();
+}
+
+// ---------------------------------------------------------------------------
+// Workspace resolution (config-based app → workspace mapping)
+// ---------------------------------------------------------------------------
+
+/// Return the workspace a window should be placed on, checking
+/// config workspace_assignments by bundle ID before falling back
+/// to the active workspace.
+fn resolveWorkspace(pid: i32) *workspace_mod.Workspace {
+    if (g_config.workspace_assignments.len > 0) {
+        if (config_mod.getAppBundleId(pid)) |bundle_id| {
+            if (g_config.workspaceForApp(bundle_id)) |ws_id| {
+                if (g_workspaces.get(ws_id)) |ws| return ws;
+            }
+        }
+    }
+    return g_workspaces.active();
 }
 
 // ---------------------------------------------------------------------------
