@@ -55,6 +55,8 @@ Map a key + modifiers to an action:
 | `focus_up` | Focus window above | — |
 | `focus_down` | Focus window below | — |
 | `toggle_split` | Toggle next split direction | — |
+| `toggle_fullscreen` | Toggle focused window fullscreen | — |
+| `toggle_float` | Toggle focused window floating | — |
 
 ### Gaps
 

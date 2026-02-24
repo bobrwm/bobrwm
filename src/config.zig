@@ -74,6 +74,8 @@ pub const Action = enum(u8) {
     focus_up = 24,
     focus_down = 25,
     toggle_split = 26,
+    toggle_fullscreen = 27,
+    toggle_float = 28,
 };
 
 pub const Keybind = struct {

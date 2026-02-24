@@ -28,6 +28,8 @@ enum bw_event_kind {
     BW_HK_FOCUS_UP                = 24,
     BW_HK_FOCUS_DOWN              = 25,
     BW_HK_TOGGLE_SPLIT            = 26,
+    BW_HK_TOGGLE_FULLSCREEN       = 27,
+    BW_HK_TOGGLE_FLOAT            = 28,
 };
 
 // --- Modifier flags for configurable keybinds ---

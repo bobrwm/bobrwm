@@ -38,6 +38,9 @@
 
         // alt+return → toggle split direction
         .{ .key = "return", .mods = .{ .alt = true }, .action = .toggle_split },
+
+        // alt+f → toggle fullscreen
+        .{ .key = "f", .mods = .{ .alt = true }, .action = .toggle_fullscreen },
     },
 
     .workspace_assignments = .{

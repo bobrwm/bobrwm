@@ -305,6 +305,13 @@ fn handleEvent(ev: *const event_mod.Event) void {
                 if (ev.kind == .window_moved) "moved" else "resized",
                 ev.wid,
             });
+            // Snap fullscreen windows back to display frame
+            if (g_store.get(ev.wid)) |win| {
+                if (win.is_fullscreen) {
+                    retile();
+                    return;
+                }
+            }
             checkTabDragOut(ev.pid, ev.wid);
         },
 
@@ -330,7 +337,59 @@ fn handleEvent(ev: *const event_mod.Event) void {
             };
             log.info("split direction: {s}", .{@tagName(g_next_split_dir)});
         },
+        .hk_toggle_fullscreen => {
+            const ws = g_workspaces.active();
+            const focused = ws.focused_wid orelse return;
+            var win = g_store.get(focused) orelse return;
+            win.is_fullscreen = !win.is_fullscreen;
+            g_store.put(win) catch {};
+            log.info("fullscreen {s} wid={d}", .{
+                if (win.is_fullscreen) "on" else "off", focused,
+            });
+            retile();
+        },
+        .hk_toggle_float => {
+            const ws = g_workspaces.active();
+            const focused = ws.focused_wid orelse return;
+            const win = g_store.get(focused) orelse return;
+            const target: window_mod.WindowMode = if (win.mode != .tiled) .tiled else .floating;
+            setWindowMode(focused, target);
+        },
     }
+}
+
+// ---------------------------------------------------------------------------
+// Window mode (tiled / floating / fullscreen)
+// ---------------------------------------------------------------------------
+
+fn setWindowMode(wid: u32, target: window_mod.WindowMode) void {
+    var win = g_store.get(wid) orelse return;
+    const old = win.mode;
+    if (old == target) return;
+
+    const ws_idx: usize = win.workspace_id - 1;
+
+    // Leaving tiled → remove from BSP so remaining windows fill the space
+    if (old == .tiled) {
+        if (g_layout_roots[ws_idx]) |root| {
+            g_layout_roots[ws_idx] = layout.removeWindow(root, wid, g_allocator);
+        }
+    }
+
+    // Entering tiled → re-insert into BSP
+    if (target == .tiled) {
+        g_layout_roots[ws_idx] = layout.insertWindow(
+            g_layout_roots[ws_idx],
+            wid,
+            g_next_split_dir,
+            g_allocator,
+        ) catch return;
+    }
+
+    win.mode = target;
+    g_store.put(win) catch {};
+    log.info("window {d} mode: {s} → {s}", .{ wid, @tagName(old), @tagName(target) });
+    retile();
 }
 
 // ---------------------------------------------------------------------------
@@ -363,7 +422,7 @@ fn discoverWindows() void {
             .title = null,
             .frame = .{ .x = info.x, .y = info.y, .width = info.w, .height = info.h },
             .is_minimized = false,
-            .is_fullscreen = false,
+            .mode = .tiled,
             .workspace_id = target_ws.id,
         };
 
@@ -443,7 +502,7 @@ fn addNewWindow(pid: i32, wid: u32) void {
         .title = null,
         .frame = .{ .x = 0, .y = 0, .width = 0, .height = 0 },
         .is_minimized = false,
-        .is_fullscreen = false,
+        .mode = .tiled,
         .workspace_id = ws.id,
     };
 
@@ -545,7 +604,7 @@ fn tryFormTabGroupOnCreate(pid: i32, new_wid: u32) bool {
                 .title = null,
                 .frame = new_frame,
                 .is_minimized = false,
-                .is_fullscreen = false,
+                .mode = .tiled,
                 .workspace_id = ws.id,
             }) catch return false;
 
@@ -573,7 +632,7 @@ fn tryFormTabGroupOnCreate(pid: i32, new_wid: u32) bool {
                     .title = null,
                     .frame = f,
                     .is_minimized = false,
-                    .is_fullscreen = false,
+                    .mode = .tiled,
                     .workspace_id = ws.id,
                 }) catch continue;
             }
@@ -683,6 +742,7 @@ fn retile() void {
     const root = g_layout_roots[ws_idx] orelse return;
 
     const display = shim.bw_get_display_frame();
+
     const outer = g_config.gaps.outer;
     const frame = window_mod.Window.Frame{
         .x = display.x + @as(f64, @floatFromInt(outer.left)),
@@ -699,17 +759,28 @@ fn retile() void {
 
     for (entries.items) |entry| {
         const win = g_store.get(entry.wid) orelse continue;
+
+        // Fullscreen windows fill the outer-gap-inset frame, skipping BSP splits and inner gaps
+        const target_frame = if (win.is_fullscreen) frame else entry.frame;
+
         _ = shim.bw_ax_set_window_frame(
             win.pid,
             entry.wid,
-            entry.frame.x,
-            entry.frame.y,
-            entry.frame.width,
-            entry.frame.height,
+            target_frame.x,
+            target_frame.y,
+            target_frame.width,
+            target_frame.height,
         );
-        // Persist computed frame in store (needed for focus-direction)
+        // Two-pass for fullscreen to handle macOS size clamping
+        if (win.is_fullscreen) {
+            _ = shim.bw_ax_set_window_frame(
+                win.pid, entry.wid,
+                target_frame.x, target_frame.y,
+                target_frame.width, target_frame.height,
+            );
+        }
         var updated = win;
-        updated.frame = entry.frame;
+        updated.frame = target_frame;
         g_store.put(updated) catch {};
 
         // If this is a tab group leader, apply the same frame to all members
@@ -913,7 +984,7 @@ fn reconcileAppTabs(pid: i32) void {
             .title = null,
             .frame = focused_frame,
             .is_minimized = false,
-            .is_fullscreen = false,
+            .mode = .tiled,
             .workspace_id = matching_ws_id,
         }) catch return;
 
@@ -950,7 +1021,7 @@ fn reconcileAppTabs(pid: i32) void {
                 .title = null,
                 .frame = f,
                 .is_minimized = false,
-                .is_fullscreen = false,
+                .mode = .tiled,
                 .workspace_id = matching_ws_id,
             }) catch continue;
         }

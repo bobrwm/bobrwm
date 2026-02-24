@@ -2,13 +2,19 @@ const std = @import("std");
 
 pub const WindowId = u32;
 
+pub const WindowMode = enum {
+    tiled,
+    floating,
+};
+
 pub const Window = struct {
     wid: WindowId,
     pid: i32,
     title: ?[]const u8,
     frame: Frame,
     is_minimized: bool,
-    is_fullscreen: bool,
+    is_fullscreen: bool = false,
+    mode: WindowMode = .tiled,
     workspace_id: u8,
 
     pub const Frame = struct {
