@@ -492,12 +492,14 @@ static void bw_retry_resolve_wid(void *context) {
         register_window_ax_notifications(ctx->observer,
                                           ctx->element, ctx->pid);
         bw_emit_event(BW_EVENT_WINDOW_CREATED, ctx->pid, wid);
+        CFRelease(ctx->observer);
         CFRelease(ctx->element);
         free(ctx);
         return;
     }
 
     if (ctx->attempts_remaining == 0) {
+        CFRelease(ctx->observer);
         CFRelease(ctx->element);
         free(ctx);
         return;
@@ -529,7 +531,7 @@ static void ax_notification_handler(AXObserverRef observer,
         // CGWindowID not assigned yet — schedule retries
         bw_wid_retry_ctx *ctx = malloc(sizeof(bw_wid_retry_ctx));
         if (!ctx) return;
-        ctx->observer = observer;
+        ctx->observer = (AXObserverRef)CFRetain(observer);
         ctx->element = (AXUIElementRef)CFRetain(element);
         ctx->pid = pid;
         ctx->attempts_remaining = 5;
