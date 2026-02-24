@@ -84,6 +84,9 @@ bool bw_ax_focus_window(int32_t pid, uint32_t wid);
 /// Returns 0 on failure.
 uint32_t bw_ax_get_focused_window(int32_t pid);
 
+/// Check if a window should be managed (regular app, standard AX window role).
+bool bw_should_manage_window(int32_t pid, uint32_t wid);
+
 // --- Per-app AX observers ---
 
 /// Start watching a specific app for window events (move, resize, create, destroy).

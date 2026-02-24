@@ -291,6 +291,7 @@ fn discoverWindows() void {
 
 fn addNewWindow(pid: i32, wid: u32) void {
     if (g_store.get(wid) != null) return;
+    if (!shim.bw_should_manage_window(pid, wid)) return;
 
     const ws = g_workspaces.active();
     const ws_idx: usize = ws.id - 1;
@@ -313,36 +314,44 @@ fn addNewWindow(pid: i32, wid: u32) void {
         g_next_split_dir,
         g_allocator,
     ) catch return;
+    ws.focused_wid = wid;
 }
 
 fn removeWindow(wid: u32) void {
+    const win = g_store.get(wid) orelse return;
+    const ws_idx: usize = win.workspace_id - 1;
     g_store.remove(wid);
-    const ws = g_workspaces.active();
-    ws.removeWindow(wid);
-    const ws_idx: usize = ws.id - 1;
+    if (g_workspaces.get(win.workspace_id)) |ws| {
+        ws.removeWindow(wid);
+    }
     if (g_layout_roots[ws_idx]) |root| {
         g_layout_roots[ws_idx] = layout.removeWindow(root, wid, g_allocator);
     }
 }
 
 fn removeAppWindows(pid: i32) void {
-    const ws = g_workspaces.active();
-    const ws_idx: usize = ws.id - 1;
-
     var wids: [128]u32 = undefined;
+    var ws_ids: [128]u8 = undefined;
     var n: usize = 0;
-    for (ws.windows.items) |wid| {
-        if (g_store.get(wid)) |win| {
-            if (win.pid == pid and n < wids.len) {
-                wids[n] = wid;
-                n += 1;
+
+    for (&g_workspaces.workspaces) |*ws| {
+        for (ws.windows.items) |wid| {
+            if (g_store.get(wid)) |win| {
+                if (win.pid == pid and n < wids.len) {
+                    wids[n] = wid;
+                    ws_ids[n] = ws.id;
+                    n += 1;
+                }
             }
         }
     }
 
-    for (wids[0..n]) |wid| {
+    for (wids[0..n], ws_ids[0..n]) |wid, ws_id| {
         g_store.remove(wid);
-        ws.removeWindow(wid);
+        if (g_workspaces.get(ws_id)) |ws| {
+            ws.removeWindow(wid);
+        }
+        const ws_idx: usize = ws_id - 1;
         if (g_layout_roots[ws_idx]) |root| {
             g_layout_roots[ws_idx] = layout.removeWindow(root, wid, g_allocator);
         }

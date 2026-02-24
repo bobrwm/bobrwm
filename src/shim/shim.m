@@ -372,6 +372,35 @@ bool bw_ax_focus_window(int32_t pid, uint32_t wid) {
     return true;
 }
 
+bool bw_should_manage_window(int32_t pid, uint32_t wid) {
+    NSRunningApplication *app =
+        [NSRunningApplication runningApplicationWithProcessIdentifier:pid];
+    if (!app ||
+        app.activationPolicy != NSApplicationActivationPolicyRegular)
+        return false;
+
+    AXUIElementRef win = find_ax_window((pid_t)pid, wid);
+    if (!win) return false;
+
+    CFStringRef role = NULL;
+    AXUIElementCopyAttributeValue(win, kAXRoleAttribute, (CFTypeRef *)&role);
+    if (!role || !CFEqual(role, kAXWindowRole)) {
+        if (role) CFRelease(role);
+        CFRelease(win);
+        return false;
+    }
+    CFRelease(role);
+
+    CFStringRef subrole = NULL;
+    AXUIElementCopyAttributeValue(win, kAXSubroleAttribute,
+                                  (CFTypeRef *)&subrole);
+    bool is_standard = (subrole && CFEqual(subrole, kAXStandardWindowSubrole));
+    if (subrole) CFRelease(subrole);
+
+    CFRelease(win);
+    return is_standard;
+}
+
 uint32_t bw_ax_get_focused_window(int32_t pid) {
     AXUIElementRef app = AXUIElementCreateApplication((pid_t)pid);
     if (!app) return 0;
@@ -403,9 +432,28 @@ typedef struct {
 static bw_app_observer_entry g_app_observers[MAX_OBSERVED_APPS];
 static uint32_t g_app_observer_count = 0;
 
+// Pack pid (low 32) + wid (high 32) into a single pointer-sized refcon.
+// Per-window notifications store the wid at registration time so it's
+// available when the element is already invalid (e.g. destroyed).
+static inline void *pack_refcon(pid_t pid, uint32_t wid) {
+    return (void *)(((uint64_t)wid << 32) | (uint32_t)pid);
+}
+
+static inline pid_t refcon_pid(void *refcon) {
+    return (pid_t)(int32_t)((uint64_t)refcon & 0xFFFFFFFF);
+}
+
+static inline uint32_t refcon_wid(void *refcon) {
+    return (uint32_t)((uint64_t)refcon >> 32);
+}
+
 static void register_window_ax_notifications(AXObserverRef observer,
                                               AXUIElementRef window,
-                                              void *refcon) {
+                                              pid_t pid) {
+    uint32_t wid = 0;
+    _AXUIElementGetWindow(window, &wid);
+    void *refcon = pack_refcon(pid, wid);
+
     AXObserverAddNotification(observer, window, kAXMovedNotification, refcon);
     AXObserverAddNotification(observer, window, kAXResizedNotification, refcon);
     AXObserverAddNotification(observer, window,
@@ -420,14 +468,17 @@ static void ax_notification_handler(AXObserverRef observer,
                                     AXUIElementRef element,
                                     CFStringRef notification,
                                     void *refcon) {
-    pid_t pid = (pid_t)(intptr_t)refcon;
-    uint32_t wid = 0;
-    _AXUIElementGetWindow(element, &wid);
-    if (wid == 0) return;
+    pid_t pid = refcon_pid(refcon);
+    uint32_t wid = refcon_wid(refcon);
 
     if (CFEqual(notification, kAXWindowCreatedNotification)) {
-        register_window_ax_notifications(observer, element, refcon);
+        // App-level: wid is 0 in refcon, resolve from the new element
+        _AXUIElementGetWindow(element, &wid);
+        if (wid == 0) return;
+        register_window_ax_notifications(observer, element, pid);
         bw_emit_event(BW_EVENT_WINDOW_CREATED, pid, wid);
+    } else if (wid == 0) {
+        return; // Per-window notification but wid was unknown at registration
     } else if (CFEqual(notification, kAXUIElementDestroyedNotification)) {
         bw_emit_event(BW_EVENT_WINDOW_DESTROYED, pid, wid);
     } else if (CFEqual(notification, kAXMovedNotification)) {
@@ -459,22 +510,22 @@ void bw_observe_app(int32_t pid) {
         return;
     }
 
-    void *refcon = (void *)(intptr_t)pid;
+    void *app_refcon = pack_refcon((pid_t)pid, 0);
 
-    // App-level: detect new windows
+    // App-level: detect new windows (wid=0 in refcon)
     AXObserverAddNotification(observer, app,
-                              kAXWindowCreatedNotification, refcon);
+                              kAXWindowCreatedNotification, app_refcon);
 
     // Per-window: move, resize, destroy, minimize, deminimize
     CFArrayRef windows = NULL;
     err = AXUIElementCopyAttributeValue(app, kAXWindowsAttribute,
-                                        (CFTypeRef *)&windows);
+                                         (CFTypeRef *)&windows);
     if (err == kAXErrorSuccess && windows) {
         CFIndex count = CFArrayGetCount(windows);
         for (CFIndex i = 0; i < count; i++) {
             AXUIElementRef win =
                 (AXUIElementRef)CFArrayGetValueAtIndex(windows, i);
-            register_window_ax_notifications(observer, win, refcon);
+            register_window_ax_notifications(observer, win, (pid_t)pid);
         }
         CFRelease(windows);
     }
