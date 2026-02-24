@@ -93,10 +93,63 @@ export fn bw_emit_event(kind: u8, pid: i32, wid: u32) void {
 }
 
 // ---------------------------------------------------------------------------
+// CLI client (sends command to running daemon)
+// ---------------------------------------------------------------------------
+
+fn runClient(cmd: []const u8) void {
+    const stdout = std.fs.File.stdout();
+    const stderr = std.fs.File.stderr();
+
+    var path_buf: [128]u8 = undefined;
+    const path = std.fmt.bufPrintZ(&path_buf, "/tmp/bobrwm_{d}.sock", .{std.c.getuid()}) catch {
+        stderr.writeAll("error: socket path too long\n") catch {};
+        return;
+    };
+
+    const fd = posix.socket(posix.AF.UNIX, posix.SOCK.STREAM, 0) catch {
+        stderr.writeAll("error: could not create socket\n") catch {};
+        return;
+    };
+    defer posix.close(fd);
+
+    var addr: posix.sockaddr.un = .{ .path = undefined, .family = posix.AF.UNIX };
+    @memcpy(addr.path[0..path.len], path[0..path.len]);
+    if (path.len < addr.path.len) addr.path[path.len] = 0;
+
+    posix.connect(fd, @ptrCast(&addr), @sizeOf(posix.sockaddr.un)) catch {
+        stderr.writeAll("error: bobrwm is not running\n") catch {};
+        return;
+    };
+
+    _ = posix.write(fd, cmd) catch {
+        stderr.writeAll("error: write failed\n") catch {};
+        return;
+    };
+
+    while (true) {
+        var buf: [4096]u8 = undefined;
+        const n = posix.read(fd, &buf) catch break;
+        if (n == 0) break;
+        stdout.writeAll(buf[0..n]) catch break;
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------
 
 pub fn main() !void {
+    // -- Arg parsing (before anything else) --
+    var cmd_buf: [512]u8 = undefined;
+    const args = config_mod.parseArgs(&cmd_buf);
+
+    // Client mode: forward command to running daemon via IPC
+    if (args.command) |cmd| {
+        runClient(cmd);
+        return;
+    }
+
+    // -- Daemon mode --
     log.info("bobrwm starting...", .{});
 
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
@@ -104,8 +157,7 @@ pub fn main() !void {
     g_allocator = gpa.allocator();
 
     // -- Config --
-    const config_path = config_mod.parseConfigPathArg();
-    g_config = config_mod.load(g_allocator, config_path);
+    g_config = config_mod.load(g_allocator, args.config_path);
     g_config.applyKeybinds();
 
     // -- Accessibility check --
@@ -988,7 +1040,8 @@ fn checkTabDragOut(_: i32, wid: u32) void {
 /// to the active workspace.
 fn resolveWorkspace(pid: i32) *workspace_mod.Workspace {
     if (g_config.workspace_assignments.len > 0) {
-        if (config_mod.getAppBundleId(pid)) |bundle_id| {
+        var id_buf: [256]u8 = undefined;
+        if (config_mod.getAppBundleId(pid, &id_buf)) |bundle_id| {
             if (g_config.workspaceForApp(bundle_id)) |ws_id| {
                 if (g_workspaces.get(ws_id)) |ws| return ws;
             }
@@ -1174,6 +1227,8 @@ fn ipcDispatch(cmd: []const u8, client_fd: posix.socket_t) void {
         ipcQueryWindows(client_fd);
     } else if (std.mem.eql(u8, cmd, "query workspaces")) {
         ipcQueryWorkspaces(client_fd);
+    } else if (std.mem.eql(u8, cmd, "query apps")) {
+        ipcQueryApps(client_fd);
     } else {
         ipc.writeResponse(client_fd, "err: unknown command\n");
     }
@@ -1181,16 +1236,56 @@ fn ipcDispatch(cmd: []const u8, client_fd: posix.socket_t) void {
 
 fn ipcQueryWindows(fd: posix.socket_t) void {
     const ws = g_workspaces.active();
-    var buf: [4096]u8 = undefined;
+    var buf: [8192]u8 = undefined;
     var fbs = std.io.fixedBufferStream(&buf);
     const w = fbs.writer();
 
     for (ws.windows.items) |wid| {
         if (g_store.get(wid)) |win| {
-            w.print("{d} {d} {d} {d:.0} {d:.0} {d:.0} {d:.0}\n", .{
-                win.wid, win.pid, win.workspace_id,
+            var id_buf: [256]u8 = undefined;
+            const id_len = shim.bw_get_app_bundle_id(win.pid, &id_buf, 256);
+            const bundle_id: []const u8 = if (id_len > 0) id_buf[0..id_len] else "(unknown)";
+
+            w.print("{d} {d} {s} {d} {d:.0} {d:.0} {d:.0} {d:.0}\n", .{
+                win.wid, win.pid, bundle_id, win.workspace_id,
                 win.frame.x, win.frame.y, win.frame.width, win.frame.height,
             }) catch break;
+        }
+    }
+
+    ipc.writeResponse(fd, fbs.getWritten());
+}
+
+fn ipcQueryApps(fd: posix.socket_t) void {
+    var buf: [8192]u8 = undefined;
+    var fbs = std.io.fixedBufferStream(&buf);
+    const w = fbs.writer();
+
+    var seen_pids: [256]i32 = undefined;
+    var seen_count: usize = 0;
+
+    for (&g_workspaces.workspaces) |*ws| {
+        for (ws.windows.items) |wid| {
+            if (g_store.get(wid)) |win| {
+                // Deduplicate by PID
+                var already = false;
+                for (seen_pids[0..seen_count]) |p| {
+                    if (p == win.pid) {
+                        already = true;
+                        break;
+                    }
+                }
+                if (already) continue;
+                if (seen_count >= seen_pids.len) break;
+                seen_pids[seen_count] = win.pid;
+                seen_count += 1;
+
+                var id_buf: [256]u8 = undefined;
+                const id_len = shim.bw_get_app_bundle_id(win.pid, &id_buf, 256);
+                const bundle_id: []const u8 = if (id_len > 0) id_buf[0..id_len] else "(unknown)";
+
+                w.print("{s}\t{d}\n", .{ bundle_id, win.pid }) catch break;
+            }
         }
     }
 

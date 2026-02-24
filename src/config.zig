@@ -180,24 +180,48 @@ fn loadFromPath(allocator: std.mem.Allocator, path: []const u8) ?Config {
 // CLI argument parsing
 // ---------------------------------------------------------------------------
 
-pub fn parseConfigPathArg() ?[]const u8 {
+pub const Args = struct {
+    config_path: ?[]const u8 = null,
+    /// IPC command assembled from positional args (written into caller buffer).
+    command: ?[]const u8 = null,
+};
+
+/// Parse process arguments.
+/// Positional args (anything that isn't `-c`/`--config` and its value) are
+/// joined with spaces into `cmd_buf` and returned as `command`.
+pub fn parseArgs(cmd_buf: []u8) Args {
+    var result: Args = .{};
     var args = std.process.args();
     _ = args.skip(); // program name
+    var pos: usize = 0;
+
     while (args.next()) |arg| {
         if (std.mem.eql(u8, arg, "-c") or std.mem.eql(u8, arg, "--config")) {
-            return args.next();
+            result.config_path = args.next();
+            continue;
         }
+        // Positional arg → part of the IPC command
+        if (pos > 0 and pos < cmd_buf.len) {
+            cmd_buf[pos] = ' ';
+            pos += 1;
+        }
+        const copy_len = @min(arg.len, cmd_buf.len - pos);
+        @memcpy(cmd_buf[pos..][0..copy_len], arg[0..copy_len]);
+        pos += copy_len;
     }
-    return null;
+
+    if (pos > 0) {
+        result.command = cmd_buf[0..pos];
+    }
+    return result;
 }
 
 // ---------------------------------------------------------------------------
 // Bundle ID helper
 // ---------------------------------------------------------------------------
 
-pub fn getAppBundleId(pid: i32) ?[]const u8 {
-    var buf: [256]u8 = undefined;
-    const len = shim.bw_get_app_bundle_id(pid, &buf, 256);
+pub fn getAppBundleId(pid: i32, buf: *[256]u8) ?[]const u8 {
+    const len = shim.bw_get_app_bundle_id(pid, buf, 256);
     if (len == 0) return null;
     return buf[0..len];
 }
@@ -209,22 +233,21 @@ pub fn getAppBundleId(pid: i32) ?[]const u8 {
 fn keyNameToCode(name: []const u8) ?u16 {
     const Map = struct { []const u8, u16 };
     const table: []const Map = &.{
-        .{ "a", 0x00 },     .{ "s", 0x01 },     .{ "d", 0x02 },
-        .{ "f", 0x03 },     .{ "h", 0x04 },     .{ "g", 0x05 },
-        .{ "z", 0x06 },     .{ "x", 0x07 },     .{ "c", 0x08 },
-        .{ "v", 0x09 },     .{ "b", 0x0B },     .{ "q", 0x0C },
-        .{ "w", 0x0D },     .{ "e", 0x0E },     .{ "r", 0x0F },
-        .{ "y", 0x10 },     .{ "t", 0x11 },     .{ "1", 0x12 },
-        .{ "2", 0x13 },     .{ "3", 0x14 },     .{ "4", 0x15 },
-        .{ "6", 0x16 },     .{ "5", 0x17 },     .{ "9", 0x19 },
-        .{ "7", 0x1A },     .{ "8", 0x1C },     .{ "0", 0x1D },
-        .{ "o", 0x1F },     .{ "u", 0x20 },     .{ "i", 0x22 },
-        .{ "p", 0x23 },     .{ "l", 0x25 },     .{ "j", 0x26 },
-        .{ "k", 0x28 },     .{ "n", 0x2D },     .{ "m", 0x2E },
-        .{ "return", 0x24 }, .{ "tab", 0x30 },   .{ "space", 0x31 },
-        .{ "delete", 0x33 }, .{ "escape", 0x35 },
-        .{ "left", 0x7B },  .{ "right", 0x7C },
-        .{ "down", 0x7D },  .{ "up", 0x7E },
+        .{ "a", 0x00 },      .{ "s", 0x01 },      .{ "d", 0x02 },
+        .{ "f", 0x03 },      .{ "h", 0x04 },      .{ "g", 0x05 },
+        .{ "z", 0x06 },      .{ "x", 0x07 },      .{ "c", 0x08 },
+        .{ "v", 0x09 },      .{ "b", 0x0B },      .{ "q", 0x0C },
+        .{ "w", 0x0D },      .{ "e", 0x0E },      .{ "r", 0x0F },
+        .{ "y", 0x10 },      .{ "t", 0x11 },      .{ "1", 0x12 },
+        .{ "2", 0x13 },      .{ "3", 0x14 },      .{ "4", 0x15 },
+        .{ "6", 0x16 },      .{ "5", 0x17 },      .{ "9", 0x19 },
+        .{ "7", 0x1A },      .{ "8", 0x1C },      .{ "0", 0x1D },
+        .{ "o", 0x1F },      .{ "u", 0x20 },      .{ "i", 0x22 },
+        .{ "p", 0x23 },      .{ "l", 0x25 },      .{ "j", 0x26 },
+        .{ "k", 0x28 },      .{ "n", 0x2D },      .{ "m", 0x2E },
+        .{ "return", 0x24 }, .{ "tab", 0x30 },    .{ "space", 0x31 },
+        .{ "delete", 0x33 }, .{ "escape", 0x35 }, .{ "left", 0x7B },
+        .{ "right", 0x7C },  .{ "down", 0x7D },   .{ "up", 0x7E },
     };
     for (table) |entry| {
         if (std.mem.eql(u8, name, entry[0])) return entry[1];
