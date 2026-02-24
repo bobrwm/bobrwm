@@ -379,22 +379,28 @@ bool bw_should_manage_window(int32_t pid, uint32_t wid) {
         app.activationPolicy != NSApplicationActivationPolicyRegular)
         return false;
 
+    // AX element may not be queryable yet for a brand-new window.
+    // Accept the window rather than silently dropping it.
     AXUIElementRef win = find_ax_window((pid_t)pid, wid);
-    if (!win) return false;
+    if (!win) return true;
 
     CFStringRef role = NULL;
     AXUIElementCopyAttributeValue(win, kAXRoleAttribute, (CFTypeRef *)&role);
-    if (!role || !CFEqual(role, kAXWindowRole)) {
-        if (role) CFRelease(role);
-        CFRelease(win);
-        return false;
+    if (role) {
+        bool is_window = CFEqual(role, kAXWindowRole);
+        CFRelease(role);
+        if (!is_window) {
+            CFRelease(win);
+            return false;
+        }
     }
-    CFRelease(role);
+    // role == NULL → AX not ready, fall through and accept
 
     CFStringRef subrole = NULL;
     AXUIElementCopyAttributeValue(win, kAXSubroleAttribute,
                                   (CFTypeRef *)&subrole);
-    bool is_standard = (subrole && CFEqual(subrole, kAXStandardWindowSubrole));
+    // Accept when subrole is absent (timing / app doesn't set it)
+    bool is_standard = !subrole || CFEqual(subrole, kAXStandardWindowSubrole);
     if (subrole) CFRelease(subrole);
 
     CFRelease(win);
@@ -464,6 +470,45 @@ static void register_window_ax_notifications(AXObserverRef observer,
                               kAXWindowDeminiaturizedNotification, refcon);
 }
 
+// ---------------------------------------------------------------------------
+// Deferred wid resolution — retry when CGWindowID is not yet assigned
+// ---------------------------------------------------------------------------
+
+typedef struct {
+    AXObserverRef observer;
+    AXUIElementRef element;
+    pid_t pid;
+    uint8_t attempts_remaining;
+} bw_wid_retry_ctx;
+
+static void bw_retry_resolve_wid(void *context) {
+    bw_wid_retry_ctx *ctx = (bw_wid_retry_ctx *)context;
+    uint32_t wid = 0;
+    _AXUIElementGetWindow(ctx->element, &wid);
+
+    if (wid != 0) {
+        register_window_ax_notifications(ctx->observer,
+                                          ctx->element, ctx->pid);
+        bw_emit_event(BW_EVENT_WINDOW_CREATED, ctx->pid, wid);
+        CFRelease(ctx->element);
+        free(ctx);
+        return;
+    }
+
+    if (ctx->attempts_remaining == 0) {
+        CFRelease(ctx->element);
+        free(ctx);
+        return;
+    }
+
+    ctx->attempts_remaining--;
+    dispatch_after_f(dispatch_time(DISPATCH_TIME_NOW, 50 * NSEC_PER_MSEC),
+                     dispatch_get_global_queue(0, 0),
+                     ctx, bw_retry_resolve_wid);
+}
+
+// ---------------------------------------------------------------------------
+
 static void ax_notification_handler(AXObserverRef observer,
                                     AXUIElementRef element,
                                     CFStringRef notification,
@@ -474,9 +519,24 @@ static void ax_notification_handler(AXObserverRef observer,
     if (CFEqual(notification, kAXWindowCreatedNotification)) {
         // App-level: wid is 0 in refcon, resolve from the new element
         _AXUIElementGetWindow(element, &wid);
-        if (wid == 0) return;
-        register_window_ax_notifications(observer, element, pid);
-        bw_emit_event(BW_EVENT_WINDOW_CREATED, pid, wid);
+        if (wid != 0) {
+            register_window_ax_notifications(observer, element, pid);
+            bw_emit_event(BW_EVENT_WINDOW_CREATED, pid, wid);
+            return;
+        }
+        // CGWindowID not assigned yet — schedule retries
+        bw_wid_retry_ctx *ctx = malloc(sizeof(bw_wid_retry_ctx));
+        if (!ctx) return;
+        ctx->observer = observer;
+        ctx->element = (AXUIElementRef)CFRetain(element);
+        ctx->pid = pid;
+        ctx->attempts_remaining = 5;
+        dispatch_after_f(dispatch_time(DISPATCH_TIME_NOW, 50 * NSEC_PER_MSEC),
+                         dispatch_get_global_queue(0, 0),
+                         ctx, bw_retry_resolve_wid);
+    } else if (CFEqual(notification, kAXFocusedWindowChangedNotification)) {
+        // App-level (wid=0 in refcon): emit so Zig discovers unknown windows
+        bw_emit_event(BW_EVENT_WINDOW_FOCUSED, pid, 0);
     } else if (wid == 0) {
         return; // Per-window notification but wid was unknown at registration
     } else if (CFEqual(notification, kAXUIElementDestroyedNotification)) {
@@ -512,9 +572,11 @@ void bw_observe_app(int32_t pid) {
 
     void *app_refcon = pack_refcon((pid_t)pid, 0);
 
-    // App-level: detect new windows (wid=0 in refcon)
+    // App-level notifications (wid=0 in refcon)
     AXObserverAddNotification(observer, app,
                               kAXWindowCreatedNotification, app_refcon);
+    AXObserverAddNotification(observer, app,
+                              kAXFocusedWindowChangedNotification, app_refcon);
 
     // Per-window: move, resize, destroy, minimize, deminimize
     CFArrayRef windows = NULL;

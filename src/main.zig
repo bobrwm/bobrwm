@@ -190,6 +190,7 @@ fn handleEvent(ev: *const event_mod.Event) void {
             const wid = shim.bw_ax_get_focused_window(ev.pid);
             if (wid != 0) {
                 if (g_store.get(wid) == null) {
+                    shim.bw_observe_app(ev.pid);
                     discoverWindows();
                     retile();
                 }

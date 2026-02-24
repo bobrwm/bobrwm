@@ -19,6 +19,7 @@ enum bw_event_kind {
     BW_EVENT_APP_TERMINATED       = 9,
     BW_EVENT_SPACE_CHANGED        = 10,
     BW_EVENT_DISPLAY_CHANGED      = 11,
+    BW_EVENT_FOCUSED_WINDOW_CHANGED = 12,
 
     BW_HK_FOCUS_WORKSPACE        = 20,
     BW_HK_MOVE_TO_WORKSPACE      = 21,
