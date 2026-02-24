@@ -88,6 +88,14 @@ uint32_t bw_ax_get_focused_window(int32_t pid);
 /// Check if a window should be managed (regular app, standard AX window role).
 bool bw_should_manage_window(int32_t pid, uint32_t wid);
 
+/// Check if a window is currently on screen (CGWindowList cross-check).
+/// Background tabs in native macOS tab groups are NOT on screen.
+bool bw_is_window_on_screen(uint32_t wid);
+
+/// Get all AX window IDs for a given PID (includes background tabs).
+/// Returns the number of entries written to `out`.
+uint32_t bw_get_app_window_ids(int32_t pid, uint32_t *out, uint32_t max_count);
+
 // --- Per-app AX observers ---
 
 /// Start watching a specific app for window events (move, resize, create, destroy).

@@ -12,6 +12,7 @@ pub const EventKind = enum(u8) {
     app_terminated = 9,
     space_changed = 10,
     display_changed = 11,
+    focused_window_changed = 12,
 
     hk_focus_workspace = 20,
     hk_move_to_workspace = 21,

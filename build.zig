@@ -14,6 +14,22 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
 
+    // Log level: -Dlog_level=debug, or LOG_LEVEL=debug zig build
+    const log_level: ?std.log.Level = b.option(
+        std.log.Level,
+        "log_level",
+        "Log level (debug, info, warn, err)",
+    ) orelse if (std.posix.getenv("LOG_LEVEL")) |env|
+        std.meta.stringToEnum(std.log.Level, env)
+    else
+        null;
+
+    const build_options = b.addOptions();
+    // std.log.Level can't be serialized directly — pass as backing int
+    const log_level_int: ?u3 = if (log_level) |l| @intFromEnum(l) else null;
+    build_options.addOption(?u3, "log_level_int", log_level_int);
+    exe_mod.addImport("build_options", build_options.createModule());
+
     const xev_dep = b.dependency("libxev", .{ .target = target, .optimize = optimize });
     exe_mod.addImport("xev", xev_dep.module("xev"));
 

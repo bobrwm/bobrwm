@@ -28,7 +28,16 @@ void bw_ax_prompt(void) {
 
 - (void)appLaunched:(NSNotification *)note {
     NSRunningApplication *app = note.userInfo[NSWorkspaceApplicationKey];
-    bw_emit_event(BW_EVENT_APP_LAUNCHED, app.processIdentifier, 0);
+    pid_t pid = app.processIdentifier;
+    bw_emit_event(BW_EVENT_APP_LAUNCHED, pid, 0);
+
+    // Heavy apps (Electron/Discord) may not have a ready AX interface when
+    // the launch notification fires. Re-emit after a delay so bw_observe_app
+    // and discoverWindows get a second chance. The handler is idempotent.
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1 * NSEC_PER_SEC)),
+                   dispatch_get_global_queue(0, 0), ^{
+        bw_emit_event(BW_EVENT_APP_LAUNCHED, pid, 0);
+    });
 }
 
 - (void)appTerminated:(NSNotification *)note {
@@ -427,6 +436,63 @@ uint32_t bw_ax_get_focused_window(int32_t pid) {
 }
 
 // ---------------------------------------------------------------------------
+// On-screen check (tab detection)
+// ---------------------------------------------------------------------------
+
+bool bw_is_window_on_screen(uint32_t target_wid) {
+    CFArrayRef list = CGWindowListCopyWindowInfo(
+        kCGWindowListOptionOnScreenOnly | kCGWindowListExcludeDesktopElements,
+        kCGNullWindowID);
+    if (!list) return false;
+
+    bool found = false;
+    CFIndex count = CFArrayGetCount(list);
+    for (CFIndex i = 0; i < count; i++) {
+        CFDictionaryRef info =
+            (CFDictionaryRef)CFArrayGetValueAtIndex(list, i);
+        CFNumberRef wid_ref = CFDictionaryGetValue(info, kCGWindowNumber);
+        if (!wid_ref) continue;
+        uint32_t wid = 0;
+        CFNumberGetValue(wid_ref, kCFNumberSInt32Type, &wid);
+        if (wid == target_wid) { found = true; break; }
+    }
+
+    CFRelease(list);
+    return found;
+}
+
+// ---------------------------------------------------------------------------
+// AX window enumeration (includes background tabs)
+// ---------------------------------------------------------------------------
+
+uint32_t bw_get_app_window_ids(int32_t pid, uint32_t *out,
+                                uint32_t max_count) {
+    AXUIElementRef app = AXUIElementCreateApplication((pid_t)pid);
+    if (!app) return 0;
+
+    CFArrayRef windows = NULL;
+    AXError err = AXUIElementCopyAttributeValue(
+        app, kAXWindowsAttribute, (CFTypeRef *)&windows);
+    CFRelease(app);
+
+    if (err != kAXErrorSuccess || !windows) return 0;
+
+    uint32_t count = 0;
+    CFIndex total = CFArrayGetCount(windows);
+    for (CFIndex i = 0; i < total && count < max_count; i++) {
+        AXUIElementRef win =
+            (AXUIElementRef)CFArrayGetValueAtIndex(windows, i);
+        uint32_t wid = 0;
+        if (_AXUIElementGetWindow(win, &wid) == kAXErrorSuccess && wid != 0) {
+            out[count++] = wid;
+        }
+    }
+
+    CFRelease(windows);
+    return count;
+}
+
+// ---------------------------------------------------------------------------
 // Per-app AX observers
 // ---------------------------------------------------------------------------
 
@@ -539,8 +605,8 @@ static void ax_notification_handler(AXObserverRef observer,
                          dispatch_get_global_queue(0, 0),
                          ctx, bw_retry_resolve_wid);
     } else if (CFEqual(notification, kAXFocusedWindowChangedNotification)) {
-        // App-level (wid=0 in refcon): emit so Zig discovers unknown windows
-        bw_emit_event(BW_EVENT_WINDOW_FOCUSED, pid, 0);
+        // App-level (wid=0 in refcon): emit so Zig can reconcile tab groups
+        bw_emit_event(BW_EVENT_FOCUSED_WINDOW_CHANGED, pid, 0);
     } else if (wid == 0) {
         return; // Per-window notification but wid was unknown at registration
     } else if (CFEqual(notification, kAXUIElementDestroyedNotification)) {
@@ -576,9 +642,16 @@ void bw_observe_app(int32_t pid) {
 
     void *app_refcon = pack_refcon((pid_t)pid, 0);
 
-    // App-level notifications (wid=0 in refcon)
-    AXObserverAddNotification(observer, app,
-                              kAXWindowCreatedNotification, app_refcon);
+    // App-level notifications (wid=0 in refcon).
+    // If the critical notification fails, the app's AX interface isn't ready.
+    // Bail out WITHOUT adding to g_app_observers so a future retry can succeed.
+    AXError add_err = AXObserverAddNotification(
+        observer, app, kAXWindowCreatedNotification, app_refcon);
+    if (add_err != kAXErrorSuccess) {
+        CFRelease(app);
+        CFRelease(observer);
+        return;
+    }
     AXObserverAddNotification(observer, app,
                               kAXFocusedWindowChangedNotification, app_refcon);
 
