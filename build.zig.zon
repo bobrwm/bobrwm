@@ -1,0 +1,16 @@
+.{
+    .name = .bobrwm,
+    .version = "0.1.0",
+    .fingerprint = 0x7abb9e0caf1b4364,
+    .dependencies = .{
+        .libxev = .{
+            .url = "https://github.com/mitchellh/libxev/archive/main.tar.gz",
+            .hash = "libxev-0.0.0-86vtc3kbEwBykzpSo2s87dYDs1G0fPxn__T4tG5AipAN",
+        },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+    },
+}
