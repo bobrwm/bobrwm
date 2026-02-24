@@ -1,4 +1,0 @@
-module Private {
-	header "private.h"
-	export *
-}
