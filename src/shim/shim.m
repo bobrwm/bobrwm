@@ -341,17 +341,19 @@ bool bw_ax_set_window_frame(int32_t pid, uint32_t wid,
     AXUIElementRef win = find_ax_window((pid_t)pid, wid);
     if (!win) return false;
 
-    // Position first, then size (order matters for min-size constraints)
-    CGPoint pos = { x, y };
-    AXValueRef pos_val = AXValueCreate(kAXValueTypeCGPoint, &pos);
-    AXUIElementSetAttributeValue(win, kAXPositionAttribute, (CFTypeRef)pos_val);
-    CFRelease(pos_val);
-
+    // Shrink first so the window fits at its new position, then reposition.
+    // A second position pass handles the case where the window grew and the
+    // initial position was clamped by screen edges.
     CGSize size = { w, h };
     AXValueRef size_val = AXValueCreate(kAXValueTypeCGSize, &size);
-    AXError err = AXUIElementSetAttributeValue(
-        win, kAXSizeAttribute, (CFTypeRef)size_val);
+    AXUIElementSetAttributeValue(win, kAXSizeAttribute, (CFTypeRef)size_val);
     CFRelease(size_val);
+
+    CGPoint pos = { x, y };
+    AXValueRef pos_val = AXValueCreate(kAXValueTypeCGPoint, &pos);
+    AXError err = AXUIElementSetAttributeValue(
+        win, kAXPositionAttribute, (CFTypeRef)pos_val);
+    CFRelease(pos_val);
 
     CFRelease(win);
     return err == kAXErrorSuccess;
