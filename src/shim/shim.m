@@ -7,10 +7,6 @@
 // Accessibility
 // ---------------------------------------------------------------------------
 
-bool bw_ax_is_trusted(void) {
-    return AXIsProcessTrusted();
-}
-
 void bw_ax_prompt(void) {
     NSDictionary *opts = @{(__bridge NSString *)kAXTrustedCheckOptionPrompt: @YES};
     AXIsProcessTrustedWithOptions((__bridge CFDictionaryRef)opts);

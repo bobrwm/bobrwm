@@ -1,6 +1,9 @@
 const std = @import("std");
 const posix = std.posix;
 const build_options = @import("build_options");
+const c = @cImport({
+    @cInclude("ApplicationServices/ApplicationServices.h");
+});
 const objc = @import("objc");
 const shim = @cImport({
     @cInclude("shim.h");
@@ -144,6 +147,11 @@ export fn bw_get_display_frame() shim.bw_frame {
     std.debug.assert(frame.w >= 0);
     std.debug.assert(frame.h >= 0);
     return frame;
+}
+
+/// Accessibility trust check.
+export fn bw_ax_is_trusted() bool {
+    return c.AXIsProcessTrusted() != 0;
 }
 
 // ---------------------------------------------------------------------------
