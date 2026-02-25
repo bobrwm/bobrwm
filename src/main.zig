@@ -146,38 +146,6 @@ export fn bw_get_display_frame() shim.bw_frame {
     return frame;
 }
 
-/// Get the bundle identifier for a given PID.
-/// Returns bytes written to `out` (excluding terminator), or 0 on failure.
-export fn bw_get_app_bundle_id(pid: i32, out: [*c]u8, max_len: u32) u32 {
-    std.debug.assert(max_len == 0 or out != null);
-
-    if (pid <= 0) return 0;
-    if (max_len == 0 or out == null) return 0;
-
-    const NSRunningApplication = objc.getClass("NSRunningApplication") orelse return 0;
-    const app = NSRunningApplication.msgSend(objc.Object, "runningApplicationWithProcessIdentifier:", .{pid});
-    if (app.value == null) return 0;
-
-    const bundle_identifier = app.msgSend(objc.Object, "bundleIdentifier", .{});
-    if (bundle_identifier.value == null) return 0;
-
-    const utf8 = bundle_identifier.msgSend([*c]const u8, "UTF8String", .{});
-    if (utf8 == null) return 0;
-
-    const max_copy = max_len - 1;
-    var copy_len: u32 = 0;
-    while (copy_len < max_copy) : (copy_len += 1) {
-        const ch = utf8[copy_len];
-        if (ch == 0) break;
-        out[copy_len] = ch;
-    }
-    out[copy_len] = 0;
-
-    std.debug.assert(copy_len < max_len);
-    std.debug.assert(out[copy_len] == 0);
-    return copy_len;
-}
-
 // ---------------------------------------------------------------------------
 // Event bridge (called from ObjC shim)
 // ---------------------------------------------------------------------------
