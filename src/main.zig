@@ -277,6 +277,7 @@ pub fn main() !void {
     // -- Accessibility check --
     if (!shim.bw_ax_is_trusted()) {
         log.warn("accessibility not trusted — prompting user", .{});
+        log.warn("after granting access, restart with: bobrwm service restart", .{});
         shim.bw_ax_prompt();
     }
 
