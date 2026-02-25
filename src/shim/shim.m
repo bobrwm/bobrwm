@@ -640,7 +640,11 @@ void bw_observe_app(int32_t pid) {
     AXObserverAddNotification(observer, app,
                               kAXFocusedWindowChangedNotification, app_refcon);
 
-    // Per-window: move, resize, destroy, minimize, deminimize
+    // Per-window: move, resize, destroy, minimize, deminimize.
+    // Also emit WINDOW_CREATED for each pre-existing window so the Zig side
+    // can tile windows that were created before the observer was registered
+    // (common with Electron/Discord where AX readiness lags behind window
+    // creation).
     CFArrayRef windows = NULL;
     err = AXUIElementCopyAttributeValue(app, kAXWindowsAttribute,
                                          (CFTypeRef *)&windows);
@@ -650,6 +654,12 @@ void bw_observe_app(int32_t pid) {
             AXUIElementRef win =
                 (AXUIElementRef)CFArrayGetValueAtIndex(windows, i);
             register_window_ax_notifications(observer, win, (pid_t)pid);
+
+            uint32_t wid = 0;
+            _AXUIElementGetWindow(win, &wid);
+            if (wid != 0) {
+                bw_emit_event(BW_EVENT_WINDOW_CREATED, (int32_t)pid, wid);
+            }
         }
         CFRelease(windows);
     }
