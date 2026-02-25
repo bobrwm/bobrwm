@@ -139,12 +139,25 @@ fn writeFile(path: []const u8, data: []const u8) !void {
 }
 
 const plist_template = @embedFile("launchd_plist");
-const exe_path_placeholder = "{exe_path}";
 
 fn generatePlist(exe_path: []const u8) []const u8 {
     const alloc = std.heap.page_allocator;
-    const idx = std.mem.indexOf(u8, plist_template, exe_path_placeholder) orelse return plist_template;
-    const before = plist_template[0..idx];
-    const after = plist_template[idx + exe_path_placeholder.len ..];
-    return std.mem.concat(alloc, u8, &.{ before, exe_path, after }) catch plist_template;
+    const env_path = std.posix.getenv("PATH") orelse "/usr/local/bin:/usr/bin:/bin";
+    const user = std.posix.getenv("USER") orelse "unknown";
+
+    var result: []const u8 = plist_template;
+    result = replace(alloc, result, "{exe_path}", exe_path) orelse return plist_template;
+    result = replace(alloc, result, "{env_path}", env_path) orelse return result;
+    result = replace(alloc, result, "{user}", user) orelse return result;
+    return result;
+}
+
+fn replace(alloc: std.mem.Allocator, haystack: []const u8, needle: []const u8, replacement: []const u8) ?[]const u8 {
+    var result = haystack;
+    while (std.mem.indexOf(u8, result, needle)) |idx| {
+        const before = result[0..idx];
+        const after = result[idx + needle.len ..];
+        result = std.mem.concat(alloc, u8, &.{ before, replacement, after }) catch return null;
+    }
+    return result;
 }
