@@ -7,10 +7,6 @@
 // Accessibility
 // ---------------------------------------------------------------------------
 
-bool bw_ax_is_trusted(void) {
-    return AXIsProcessTrusted();
-}
-
 void bw_ax_prompt(void) {
     NSDictionary *opts = @{(__bridge NSString *)kAXTrustedCheckOptionPrompt: @YES};
     AXIsProcessTrustedWithOptions((__bridge CFDictionaryRef)opts);
@@ -64,6 +60,7 @@ void bw_ax_prompt(void) {
 
 static CFMachPortRef g_tap_port = NULL;
 static CFRunLoopRef g_observer_runloop = NULL;
+static dispatch_source_t g_ipc_source = NULL;
 
 // Configurable keybind table (set from Zig via bw_set_keybinds)
 #define MAX_KEYBINDS 128
@@ -207,13 +204,18 @@ void bw_setup_sources(int ipc_fd) {
                       kCFRunLoopCommonModes);
 
     // --- IPC dispatch source ---
-    dispatch_source_t ipc_source = dispatch_source_create(
+    if (g_ipc_source) {
+        dispatch_source_cancel(g_ipc_source);
+        g_ipc_source = NULL;
+    }
+
+    g_ipc_source = dispatch_source_create(
         DISPATCH_SOURCE_TYPE_READ, (uintptr_t)ipc_fd, 0,
         dispatch_get_main_queue());
-    dispatch_source_set_event_handler(ipc_source, ^{
+    dispatch_source_set_event_handler(g_ipc_source, ^{
         bw_handle_ipc_client(ipc_fd);
     });
-    dispatch_resume(ipc_source);
+    dispatch_resume(g_ipc_source);
 }
 
 // ---------------------------------------------------------------------------
@@ -322,24 +324,6 @@ uint32_t bw_discover_windows(bw_window_info *out, uint32_t max_count) {
 
     CFRelease(window_list);
     return count;
-}
-
-// ---------------------------------------------------------------------------
-// Display
-// ---------------------------------------------------------------------------
-
-bw_frame bw_get_display_frame(void) {
-    NSScreen *screen = [NSScreen mainScreen];
-    NSRect visible = screen.visibleFrame;
-    NSRect full    = screen.frame;
-    // AppKit uses bottom-left origin; CG uses top-left
-    double cg_y = full.size.height - visible.origin.y - visible.size.height;
-    return (bw_frame){
-        .x = visible.origin.x,
-        .y = cg_y,
-        .w = visible.size.width,
-        .h = visible.size.height,
-    };
 }
 
 // ---------------------------------------------------------------------------
@@ -656,7 +640,11 @@ void bw_observe_app(int32_t pid) {
     AXObserverAddNotification(observer, app,
                               kAXFocusedWindowChangedNotification, app_refcon);
 
-    // Per-window: move, resize, destroy, minimize, deminimize
+    // Per-window: move, resize, destroy, minimize, deminimize.
+    // Also emit WINDOW_CREATED for each pre-existing window so the Zig side
+    // can tile windows that were created before the observer was registered
+    // (common with Electron/Discord where AX readiness lags behind window
+    // creation).
     CFArrayRef windows = NULL;
     err = AXUIElementCopyAttributeValue(app, kAXWindowsAttribute,
                                          (CFTypeRef *)&windows);
@@ -666,6 +654,12 @@ void bw_observe_app(int32_t pid) {
             AXUIElementRef win =
                 (AXUIElementRef)CFArrayGetValueAtIndex(windows, i);
             register_window_ax_notifications(observer, win, (pid_t)pid);
+
+            uint32_t wid = 0;
+            _AXUIElementGetWindow(win, &wid);
+            if (wid != 0) {
+                bw_emit_event(BW_EVENT_WINDOW_CREATED, (int32_t)pid, wid);
+            }
         }
         CFRelease(windows);
     }

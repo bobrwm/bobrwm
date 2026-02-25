@@ -1,6 +1,9 @@
 const std = @import("std");
 const posix = std.posix;
 const build_options = @import("build_options");
+const c = @cImport({
+    @cInclude("ApplicationServices/ApplicationServices.h");
+});
 const objc = @import("objc");
 const shim = @cImport({
     @cInclude("shim.h");
@@ -14,6 +17,21 @@ const ipc = @import("ipc.zig");
 const tabgroup = @import("tabgroup.zig");
 const config_mod = @import("config.zig");
 const statusbar = @import("statusbar.zig");
+
+const NSPoint = extern struct {
+    x: f64,
+    y: f64,
+};
+
+const NSSize = extern struct {
+    width: f64,
+    height: f64,
+};
+
+const NSRect = extern struct {
+    origin: NSPoint,
+    size: NSSize,
+};
 
 pub const std_options = std.Options{
     .log_level = if (build_options.log_level_int) |l|
@@ -94,6 +112,48 @@ fn initApp() objc.Object {
     return app;
 }
 
+/// Get the usable display frame (menu bar / dock excluded), CG coordinates.
+/// Exported for C callers while implemented in Zig via zig-objc.
+export fn bw_get_display_frame() shim.bw_frame {
+    const NSScreen = objc.getClass("NSScreen") orelse return .{
+        .x = 0,
+        .y = 0,
+        .w = 0,
+        .h = 0,
+    };
+
+    const screen = NSScreen.msgSend(objc.Object, "mainScreen", .{});
+    if (screen.value == null) return .{
+        .x = 0,
+        .y = 0,
+        .w = 0,
+        .h = 0,
+    };
+
+    const visible = screen.msgSend(NSRect, "visibleFrame", .{});
+    const full = screen.msgSend(NSRect, "frame", .{});
+
+    std.debug.assert(visible.size.width >= 0);
+    std.debug.assert(visible.size.height >= 0);
+
+    // AppKit uses bottom-left origin; CG uses top-left.
+    const cg_y = full.size.height - visible.origin.y - visible.size.height;
+    const frame: shim.bw_frame = .{
+        .x = visible.origin.x,
+        .y = cg_y,
+        .w = visible.size.width,
+        .h = visible.size.height,
+    };
+    std.debug.assert(frame.w >= 0);
+    std.debug.assert(frame.h >= 0);
+    return frame;
+}
+
+/// Accessibility trust check.
+export fn bw_ax_is_trusted() bool {
+    return c.AXIsProcessTrusted() != 0;
+}
+
 // ---------------------------------------------------------------------------
 // Event bridge (called from ObjC shim)
 // ---------------------------------------------------------------------------
@@ -114,6 +174,8 @@ export fn bw_emit_event(kind: u8, pid: i32, wid: u32) void {
 fn runClient(cmd: []const u8) void {
     const stdout = std.fs.File.stdout();
     const stderr = std.fs.File.stderr();
+    const started_ns = std.time.nanoTimestamp();
+    var response_bytes: usize = 0;
 
     var path_buf: [128]u8 = undefined;
     const path = std.fmt.bufPrintZ(&path_buf, "/tmp/bobrwm_{d}.sock", .{std.c.getuid()}) catch {
@@ -131,6 +193,8 @@ fn runClient(cmd: []const u8) void {
     @memcpy(addr.path[0..path.len], path[0..path.len]);
     if (path.len < addr.path.len) addr.path[path.len] = 0;
 
+    log.debug("[trace] ipc client connecting path={s} cmd={s}", .{ path, cmd });
+
     posix.connect(fd, @ptrCast(&addr), @sizeOf(posix.sockaddr.un)) catch {
         stderr.writeAll("error: bobrwm is not running\n") catch {};
         return;
@@ -140,13 +204,33 @@ fn runClient(cmd: []const u8) void {
         stderr.writeAll("error: write failed\n") catch {};
         return;
     };
+    posix.shutdown(fd, .send) catch {};
 
     while (true) {
+        var poll_fds = [_]posix.pollfd{.{
+            .fd = fd,
+            .events = posix.POLL.IN,
+            .revents = 0,
+        }};
+        const ready = posix.poll(&poll_fds, 2000) catch {
+            stderr.writeAll("error: IPC poll failed\n") catch {};
+            break;
+        };
+        if (ready == 0) {
+            stderr.writeAll("error: IPC response timeout\n") catch {};
+            log.warn("ipc client timeout waiting for response cmd={s}", .{cmd});
+            break;
+        }
+
         var buf: [4096]u8 = undefined;
         const n = posix.read(fd, &buf) catch break;
         if (n == 0) break;
+        response_bytes += n;
         stdout.writeAll(buf[0..n]) catch break;
     }
+
+    const elapsed_ms = @divTrunc(std.time.nanoTimestamp() - started_ns, std.time.ns_per_ms);
+    log.debug("[trace] ipc client completed bytes={} elapsed_ms={}", .{ response_bytes, elapsed_ms });
 }
 
 // ---------------------------------------------------------------------------
@@ -165,7 +249,7 @@ pub fn main() !void {
     }
 
     // -- Daemon mode --
-    log.info("bobrwm starting...", .{});
+    log.info("bobrwm starting (log_level={s})...", .{@tagName(std_options.log_level)});
 
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
@@ -251,6 +335,7 @@ export fn bw_handle_ipc_client(server_fd: c_int) void {
         return;
     };
     defer posix.close(client_fd);
+    const started_ns = std.time.nanoTimestamp();
 
     var buf: [512]u8 = undefined;
     const n = posix.read(client_fd, &buf) catch |err| {
@@ -261,9 +346,14 @@ export fn bw_handle_ipc_client(server_fd: c_int) void {
 
     const cmd = std.mem.trimRight(u8, buf[0..n], &.{ '\n', '\r', ' ', 0 });
     if (cmd.len == 0) return;
+    log.debug("[trace] ipc recv fd={} bytes={} cmd={s}", .{ client_fd, n, cmd });
 
     if (ipc.g_dispatch) |dispatch| {
         dispatch(cmd, client_fd);
+        const elapsed_ms = @divTrunc(std.time.nanoTimestamp() - started_ns, std.time.ns_per_ms);
+        log.debug("[trace] ipc handled fd={} cmd={s} elapsed_ms={}", .{ client_fd, cmd, elapsed_ms });
+    } else {
+        log.warn("ipc dispatch callback missing", .{});
     }
 }
 
@@ -476,7 +566,12 @@ fn discoverWindows() void {
         // If assigned to a non-visible workspace, hide immediately
         if (!target_ws.is_visible) {
             _ = shim.bw_ax_set_window_frame(
-                info.pid, info.wid, hide_x, hide_y, hide_w, hide_h,
+                info.pid,
+                info.wid,
+                hide_x,
+                hide_y,
+                hide_w,
+                hide_h,
             );
         }
     }
@@ -592,8 +687,9 @@ fn tryFormTabGroupOnCreate(pid: i32, new_wid: u32) bool {
 
             const still_on_screen = shim.bw_is_window_on_screen(existing_wid);
             log.debug("tryFormTabGroup: existing wid={d} on_screen={} frame=({d:.0},{d:.0},{d:.0},{d:.0})", .{
-                existing_wid, still_on_screen,
-                existing.frame.x, existing.frame.y, existing.frame.width, existing.frame.height,
+                existing_wid,         still_on_screen,
+                existing.frame.x,     existing.frame.y,
+                existing.frame.width, existing.frame.height,
             });
 
             if (still_on_screen) continue;
@@ -614,8 +710,10 @@ fn tryFormTabGroupOnCreate(pid: i32, new_wid: u32) bool {
             };
             log.debug("tryFormTabGroup: existing wid={d} SkyLight bounds=({d:.0},{d:.0},{d:.0},{d:.0})", .{
                 existing_wid,
-                existing_sky_frame.x, existing_sky_frame.y,
-                existing_sky_frame.width, existing_sky_frame.height,
+                existing_sky_frame.x,
+                existing_sky_frame.y,
+                existing_sky_frame.width,
+                existing_sky_frame.height,
             });
 
             // Native tab members share the same frame. If bounds diverge
@@ -717,7 +815,10 @@ fn removeWindow(wid: u32) void {
                 log.info("removeWindow: restoring tab survivor wid={d} to workspace", .{solo_wid});
                 ws.addWindow(solo_wid) catch {};
                 g_layout_roots[ws_idx] = layout.insertWindow(
-                    g_layout_roots[ws_idx], solo_wid, g_next_split_dir, g_allocator,
+                    g_layout_roots[ws_idx],
+                    solo_wid,
+                    g_next_split_dir,
+                    g_allocator,
                 ) catch return;
             }
         }
@@ -812,9 +913,12 @@ fn retile() void {
         // Two-pass for fullscreen to handle macOS size clamping
         if (win.is_fullscreen) {
             _ = shim.bw_ax_set_window_frame(
-                win.pid, entry.wid,
-                target_frame.x, target_frame.y,
-                target_frame.width, target_frame.height,
+                win.pid,
+                entry.wid,
+                target_frame.x,
+                target_frame.y,
+                target_frame.width,
+                target_frame.height,
             );
         }
         var updated = win;
@@ -1117,7 +1221,10 @@ fn checkTabDragOut(_: i32, wid: u32) void {
     const ws_idx: usize = ws.id - 1;
     ws.addWindow(wid) catch return;
     g_layout_roots[ws_idx] = layout.insertWindow(
-        g_layout_roots[ws_idx], wid, g_next_split_dir, g_allocator,
+        g_layout_roots[ws_idx],
+        wid,
+        g_next_split_dir,
+        g_allocator,
     ) catch return;
     ws.focused_wid = wid;
 
@@ -1134,7 +1241,10 @@ fn checkTabDragOut(_: i32, wid: u32) void {
             log.info("drag-out: restoring survivor wid={d} to workspace", .{solo_wid});
             ws.addWindow(solo_wid) catch {};
             g_layout_roots[ws_idx] = layout.insertWindow(
-                g_layout_roots[ws_idx], solo_wid, g_next_split_dir, g_allocator,
+                g_layout_roots[ws_idx],
+                solo_wid,
+                g_next_split_dir,
+                g_allocator,
             ) catch return;
         }
     }
@@ -1174,7 +1284,12 @@ fn switchWorkspace(target_id: u8) void {
     for (old_ws.windows.items) |wid| {
         if (g_store.get(wid)) |win| {
             _ = shim.bw_ax_set_window_frame(
-                win.pid, wid, hide_x, hide_y, hide_w, hide_h,
+                win.pid,
+                wid,
+                hide_x,
+                hide_y,
+                hide_w,
+                hide_h,
             );
         }
     }
@@ -1213,7 +1328,10 @@ fn moveWindowToWorkspace(target_id: u8) void {
     // Add to target workspace BSP + list
     target_ws.addWindow(wid) catch return;
     g_layout_roots[target_idx] = layout.insertWindow(
-        g_layout_roots[target_idx], wid, g_next_split_dir, g_allocator,
+        g_layout_roots[target_idx],
+        wid,
+        g_next_split_dir,
+        g_allocator,
     ) catch return;
     if (target_ws.focused_wid == null) {
         target_ws.focused_wid = wid;
@@ -1230,7 +1348,12 @@ fn moveWindowToWorkspace(target_id: u8) void {
     if (!target_ws.is_visible) {
         if (g_store.get(wid)) |win| {
             _ = shim.bw_ax_set_window_frame(
-                win.pid, wid, hide_x, hide_y, hide_w, hide_h,
+                win.pid,
+                wid,
+                hide_x,
+                hide_y,
+                hide_w,
+                hide_h,
             );
         }
     }
@@ -1295,6 +1418,12 @@ fn focusDirection(dir: FocusDir) void {
 // ---------------------------------------------------------------------------
 
 fn ipcDispatch(cmd: []const u8, client_fd: posix.socket_t) void {
+    const started_ns = std.time.nanoTimestamp();
+    defer {
+        const elapsed_ms = @divTrunc(std.time.nanoTimestamp() - started_ns, std.time.ns_per_ms);
+        log.debug("[trace] ipc dispatch cmd={s} elapsed_ms={}", .{ cmd, elapsed_ms });
+    }
+
     if (std.mem.eql(u8, cmd, "retile")) {
         retile();
         ipc.writeResponse(client_fd, "ok\n");
@@ -1347,10 +1476,12 @@ fn ipcDispatch(cmd: []const u8, client_fd: posix.socket_t) void {
 }
 
 fn ipcQueryWindows(fd: posix.socket_t) void {
+    const started_ns = std.time.nanoTimestamp();
     const ws = g_workspaces.active();
     var buf: [8192]u8 = undefined;
     var fbs = std.io.fixedBufferStream(&buf);
     const w = fbs.writer();
+    var written: usize = 0;
 
     for (ws.windows.items) |wid| {
         if (g_store.get(wid)) |win| {
@@ -1359,22 +1490,28 @@ fn ipcQueryWindows(fd: posix.socket_t) void {
             const bundle_id: []const u8 = if (id_len > 0) id_buf[0..id_len] else "(unknown)";
 
             w.print("{d} {d} {s} {d} {d:.0} {d:.0} {d:.0} {d:.0}\n", .{
-                win.wid, win.pid, bundle_id, win.workspace_id,
+                win.wid,     win.pid,     bundle_id,       win.workspace_id,
                 win.frame.x, win.frame.y, win.frame.width, win.frame.height,
             }) catch break;
+            written += 1;
         }
     }
 
-    ipc.writeResponse(fd, fbs.getWritten());
+    const payload = fbs.getWritten();
+    ipc.writeResponse(fd, payload);
+    const elapsed_ms = @divTrunc(std.time.nanoTimestamp() - started_ns, std.time.ns_per_ms);
+    log.debug("[trace] query windows rows={} bytes={} elapsed_ms={}", .{ written, payload.len, elapsed_ms });
 }
 
 fn ipcQueryApps(fd: posix.socket_t) void {
+    const started_ns = std.time.nanoTimestamp();
     var buf: [8192]u8 = undefined;
     var fbs = std.io.fixedBufferStream(&buf);
     const w = fbs.writer();
 
     var seen_pids: [256]i32 = undefined;
     var seen_count: usize = 0;
+    var written: usize = 0;
 
     for (&g_workspaces.workspaces) |*ws| {
         for (ws.windows.items) |wid| {
@@ -1397,14 +1534,19 @@ fn ipcQueryApps(fd: posix.socket_t) void {
                 const bundle_id: []const u8 = if (id_len > 0) id_buf[0..id_len] else "(unknown)";
 
                 w.print("{s}\t{d}\n", .{ bundle_id, win.pid }) catch break;
+                written += 1;
             }
         }
     }
 
-    ipc.writeResponse(fd, fbs.getWritten());
+    const payload = fbs.getWritten();
+    ipc.writeResponse(fd, payload);
+    const elapsed_ms = @divTrunc(std.time.nanoTimestamp() - started_ns, std.time.ns_per_ms);
+    log.debug("[trace] query apps rows={} unique_pids={} bytes={} elapsed_ms={}", .{ written, seen_count, payload.len, elapsed_ms });
 }
 
 fn ipcQueryWorkspaces(fd: posix.socket_t) void {
+    const started_ns = std.time.nanoTimestamp();
     var buf: [1024]u8 = undefined;
     var fbs = std.io.fixedBufferStream(&buf);
     const w = fbs.writer();
@@ -1419,5 +1561,8 @@ fn ipcQueryWorkspaces(fd: posix.socket_t) void {
         }) catch break;
     }
 
-    ipc.writeResponse(fd, fbs.getWritten());
+    const payload = fbs.getWritten();
+    ipc.writeResponse(fd, payload);
+    const elapsed_ms = @divTrunc(std.time.nanoTimestamp() - started_ns, std.time.ns_per_ms);
+    log.debug("[trace] query workspaces rows={} bytes={} elapsed_ms={}", .{ g_workspaces.workspaces.len, payload.len, elapsed_ms });
 }
