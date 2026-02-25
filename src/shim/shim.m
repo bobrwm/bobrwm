@@ -325,24 +325,6 @@ uint32_t bw_discover_windows(bw_window_info *out, uint32_t max_count) {
 }
 
 // ---------------------------------------------------------------------------
-// Display
-// ---------------------------------------------------------------------------
-
-bw_frame bw_get_display_frame(void) {
-    NSScreen *screen = [NSScreen mainScreen];
-    NSRect visible = screen.visibleFrame;
-    NSRect full    = screen.frame;
-    // AppKit uses bottom-left origin; CG uses top-left
-    double cg_y = full.size.height - visible.origin.y - visible.size.height;
-    return (bw_frame){
-        .x = visible.origin.x,
-        .y = cg_y,
-        .w = visible.size.width,
-        .h = visible.size.height,
-    };
-}
-
-// ---------------------------------------------------------------------------
 // AX window operations
 // ---------------------------------------------------------------------------
 

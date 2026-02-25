@@ -15,6 +15,21 @@ const tabgroup = @import("tabgroup.zig");
 const config_mod = @import("config.zig");
 const statusbar = @import("statusbar.zig");
 
+const NSPoint = extern struct {
+    x: f64,
+    y: f64,
+};
+
+const NSSize = extern struct {
+    width: f64,
+    height: f64,
+};
+
+const NSRect = extern struct {
+    origin: NSPoint,
+    size: NSSize,
+};
+
 pub const std_options = std.Options{
     .log_level = if (build_options.log_level_int) |l|
         @enumFromInt(l)
@@ -92,6 +107,43 @@ fn initApp() objc.Object {
     // NSApplicationActivationPolicyAccessory = 1
     _ = app.msgSend(bool, "setActivationPolicy:", .{@as(i64, 1)});
     return app;
+}
+
+/// Get the usable display frame (menu bar / dock excluded), CG coordinates.
+/// Exported for C callers while implemented in Zig via zig-objc.
+export fn bw_get_display_frame() shim.bw_frame {
+    const NSScreen = objc.getClass("NSScreen") orelse return .{
+        .x = 0,
+        .y = 0,
+        .w = 0,
+        .h = 0,
+    };
+
+    const screen = NSScreen.msgSend(objc.Object, "mainScreen", .{});
+    if (screen.value == null) return .{
+        .x = 0,
+        .y = 0,
+        .w = 0,
+        .h = 0,
+    };
+
+    const visible = screen.msgSend(NSRect, "visibleFrame", .{});
+    const full = screen.msgSend(NSRect, "frame", .{});
+
+    std.debug.assert(visible.size.width >= 0);
+    std.debug.assert(visible.size.height >= 0);
+
+    // AppKit uses bottom-left origin; CG uses top-left.
+    const cg_y = full.size.height - visible.origin.y - visible.size.height;
+    const frame: shim.bw_frame = .{
+        .x = visible.origin.x,
+        .y = cg_y,
+        .w = visible.size.width,
+        .h = visible.size.height,
+    };
+    std.debug.assert(frame.w >= 0);
+    std.debug.assert(frame.h >= 0);
+    return frame;
 }
 
 // ---------------------------------------------------------------------------
