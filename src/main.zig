@@ -204,8 +204,24 @@ fn runClient(cmd: []const u8) void {
         stderr.writeAll("error: write failed\n") catch {};
         return;
     };
+    posix.shutdown(fd, .send) catch {};
 
     while (true) {
+        var poll_fds = [_]posix.pollfd{.{
+            .fd = fd,
+            .events = posix.POLL.IN,
+            .revents = 0,
+        }};
+        const ready = posix.poll(&poll_fds, 2000) catch {
+            stderr.writeAll("error: IPC poll failed\n") catch {};
+            break;
+        };
+        if (ready == 0) {
+            stderr.writeAll("error: IPC response timeout\n") catch {};
+            log.warn("ipc client timeout waiting for response cmd={s}", .{cmd});
+            break;
+        }
+
         var buf: [4096]u8 = undefined;
         const n = posix.read(fd, &buf) catch break;
         if (n == 0) break;

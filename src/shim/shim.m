@@ -60,6 +60,7 @@ void bw_ax_prompt(void) {
 
 static CFMachPortRef g_tap_port = NULL;
 static CFRunLoopRef g_observer_runloop = NULL;
+static dispatch_source_t g_ipc_source = NULL;
 
 // Configurable keybind table (set from Zig via bw_set_keybinds)
 #define MAX_KEYBINDS 128
@@ -203,13 +204,18 @@ void bw_setup_sources(int ipc_fd) {
                       kCFRunLoopCommonModes);
 
     // --- IPC dispatch source ---
-    dispatch_source_t ipc_source = dispatch_source_create(
+    if (g_ipc_source) {
+        dispatch_source_cancel(g_ipc_source);
+        g_ipc_source = NULL;
+    }
+
+    g_ipc_source = dispatch_source_create(
         DISPATCH_SOURCE_TYPE_READ, (uintptr_t)ipc_fd, 0,
         dispatch_get_main_queue());
-    dispatch_source_set_event_handler(ipc_source, ^{
+    dispatch_source_set_event_handler(g_ipc_source, ^{
         bw_handle_ipc_client(ipc_fd);
     });
-    dispatch_resume(ipc_source);
+    dispatch_resume(g_ipc_source);
 }
 
 // ---------------------------------------------------------------------------
