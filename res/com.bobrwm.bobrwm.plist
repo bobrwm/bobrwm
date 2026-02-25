@@ -17,7 +17,12 @@
 	<key>RunAtLoad</key>
 	<true/>
 	<key>KeepAlive</key>
-	<true/>
+	<dict>
+		<key>SuccessfulExit</key>
+		<false/>
+		<key>Crashed</key>
+		<true/>
+	</dict>
 	<key>StandardOutPath</key>
 	<string>/tmp/bobrwm_{user}.out.log</string>
 	<key>StandardErrorPath</key>
