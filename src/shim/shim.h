@@ -68,14 +68,26 @@ typedef struct {
 
 extern void bw_emit_event(uint8_t kind, int32_t pid, uint32_t wid);
 
+// --- Zig callbacks (called from ObjC into Zig) ---
+
+extern void bw_drain_events(void);
+extern void bw_handle_ipc_client(int server_fd);
+extern void bw_will_quit(void);
+extern void bw_retile(void);
+
 // --- Accessibility ---
 
 bool bw_ax_is_trusted(void);
 void bw_ax_prompt(void);
 
-// --- Observer ---
+// --- Source setup ---
 
-void bw_start_observer(void);
+/// Set up observers, CGEventTap, waker, IPC source, and status bar on the
+/// main run loop. Call after NSApp is initialised (from Zig via zig-objc).
+void bw_setup_sources(int ipc_fd);
+
+/// Signal the main run loop to drain the event ring.
+void bw_signal_waker(void);
 
 // --- Window discovery ---
 
@@ -119,10 +131,6 @@ void bw_observe_app(int32_t pid);
 
 /// Stop watching a specific app (call on app termination).
 void bw_unobserve_app(int32_t pid);
-
-/// Block until the observer thread's run loop is ready.
-/// Call once after bw_start_observer().
-void bw_wait_observer_ready(void);
 
 // --- Configurable keybinds ---
 

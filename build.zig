@@ -30,8 +30,8 @@ pub fn build(b: *std.Build) void {
     build_options.addOption(?u3, "log_level_int", log_level_int);
     exe_mod.addImport("build_options", build_options.createModule());
 
-    const xev_dep = b.dependency("libxev", .{ .target = target, .optimize = optimize });
-    exe_mod.addImport("xev", xev_dep.module("xev"));
+    const objc_dep = b.dependency("zig_objc", .{ .target = target, .optimize = optimize });
+    exe_mod.addImport("objc", objc_dep.module("objc"));
 
     exe_mod.addCSourceFile(.{
         .file = b.path("src/shim/shim.m"),

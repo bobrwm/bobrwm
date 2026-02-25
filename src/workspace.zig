@@ -6,6 +6,7 @@ pub const max_workspaces = 10;
 
 pub const Workspace = struct {
     id: WorkspaceId,
+    name: []const u8 = "",
     windows: std.ArrayList(Window.WindowId),
     focused_wid: ?Window.WindowId,
     is_visible: bool,

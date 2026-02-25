@@ -85,6 +85,20 @@ const foo = Type{ .field = value };     // Avoid
 
 **Tests:** Inline in the same file, register in src/main.zig test block
 
+## ObjC Interop
+
+Use zig-objc (`@import("objc")`) for all Objective-C runtime calls from Zig. The ObjC shim (`src/shim/shim.m`) should only contain code that genuinely requires the ObjC compiler — `@interface`/`@implementation` class definitions with selector-based callbacks. Everything else (message sends, class lookups, NSApp lifecycle, AX operations, window discovery) belongs in Zig via zig-objc.
+
+**Message sends:**
+```zig
+const objc = @import("objc");
+const NSApplication = objc.getClass("NSApplication").?;
+const app = NSApplication.msgSend(objc.Object, "sharedApplication", .{});
+_ = app.msgSend(bool, "setActivationPolicy:", .{@as(i64, 1)});
+```
+
+**Architecture:** Single main thread running `[NSApp run]` via zig-objc. The CFRunLoop multiplexes all event sources (observers, CGEventTap, AX observers, IPC, status bar). No separate threads for event processing.
+
 ## Safety Conventions
 
 Inspired by [TigerStyle](https://github.com/tigerbeetle/tigerbeetle/blob/main/docs/TIGER_STYLE.md).

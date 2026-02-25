@@ -1,7 +1,7 @@
 const std = @import("std");
 const posix = std.posix;
 const build_options = @import("build_options");
-const xev = @import("xev");
+const objc = @import("objc");
 const shim = @cImport({
     @cInclude("shim.h");
 });
@@ -13,6 +13,7 @@ const layout = @import("layout.zig");
 const ipc = @import("ipc.zig");
 const tabgroup = @import("tabgroup.zig");
 const config_mod = @import("config.zig");
+const statusbar = @import("statusbar.zig");
 
 pub const std_options = std.Options{
     .log_level = if (build_options.log_level_int) |l|
@@ -67,7 +68,6 @@ const hide_h: f64 = 1;
 // ---------------------------------------------------------------------------
 
 var g_ring: EventRing = .{};
-var g_waker: xev.Async = undefined;
 var g_sky: ?skylight.SkyLight = null;
 var g_allocator: std.mem.Allocator = undefined;
 var g_store: window_mod.WindowStore = undefined;
@@ -80,7 +80,22 @@ var g_ipc: ipc.Server = undefined;
 var g_config: config_mod.Config = .{};
 
 // ---------------------------------------------------------------------------
-// Event bridge (called from ObjC observer thread)
+// NSApp lifecycle (zig-objc)
+// ---------------------------------------------------------------------------
+
+/// Initialise NSApplication with accessory activation policy (menu bar icon,
+/// no dock icon). Returns the shared application object for the run loop.
+fn initApp() objc.Object {
+    const NSApplication = objc.getClass("NSApplication") orelse
+        @panic("NSApplication class not found");
+    const app = NSApplication.msgSend(objc.Object, "sharedApplication", .{});
+    // NSApplicationActivationPolicyAccessory = 1
+    _ = app.msgSend(bool, "setActivationPolicy:", .{@as(i64, 1)});
+    return app;
+}
+
+// ---------------------------------------------------------------------------
+// Event bridge (called from ObjC shim)
 // ---------------------------------------------------------------------------
 
 export fn bw_emit_event(kind: u8, pid: i32, wid: u32) void {
@@ -89,7 +104,7 @@ export fn bw_emit_event(kind: u8, pid: i32, wid: u32) void {
         .pid = pid,
         .wid = wid,
     });
-    g_waker.notify() catch {};
+    shim.bw_signal_waker();
 }
 
 // ---------------------------------------------------------------------------
@@ -177,6 +192,12 @@ pub fn main() !void {
     g_tab_groups = tabgroup.TabGroupManager.init(g_allocator);
     defer g_tab_groups.deinit();
 
+    // -- Apply workspace names from config --
+    for (g_config.workspace_names, 0..) |name, i| {
+        if (i >= workspace_mod.max_workspaces) break;
+        g_workspaces.workspaces[i].name = name;
+    }
+
     // -- Crash handlers (restore hidden windows on abnormal exit) --
     installCrashHandlers();
     errdefer restoreAllWindows();
@@ -186,15 +207,6 @@ pub fn main() !void {
     log.info("discovered {} windows", .{g_store.count()});
     retile();
 
-    // -- Async waker (mach port on macOS) --
-    g_waker = try xev.Async.init();
-    defer g_waker.deinit();
-
-    // -- Start ObjC observer thread --
-    shim.bw_start_observer();
-    shim.bw_wait_observer_ready();
-    observeDiscoveredApps();
-
     // -- IPC server --
     g_ipc = ipc.Server.init(g_allocator) catch |err| {
         log.err("IPC init failed: {}", .{err});
@@ -203,40 +215,66 @@ pub fn main() !void {
     defer g_ipc.deinit(g_allocator);
     ipc.g_dispatch = ipcDispatch;
 
-    // -- xev loop --
-    var loop = try xev.Loop.init(.{});
-    defer loop.deinit();
+    // -- NSApp (zig-objc) --
+    const NSApp = initApp();
 
-    var waker_completion: xev.Completion = .{};
-    g_waker.wait(&loop, &waker_completion, void, null, asyncCallback);
-    g_ipc.startAccept(&loop);
+    // -- Sources (observers, CGEventTap, waker, IPC) --
+    shim.bw_setup_sources(g_ipc.fd);
+    observeDiscoveredApps();
 
-    log.info("entering event loop", .{});
+    // -- Status bar (zig-objc) --
+    statusbar.init();
+    const active = g_workspaces.active();
+    statusbar.setTitle(active.name, active.id);
+
+    // -- Enter NSApp run loop (never returns) --
+    log.info("entering run loop", .{});
     defer restoreAllWindows();
-    try loop.run(.until_done);
+    NSApp.msgSend(void, "run", .{});
 }
 
 // ---------------------------------------------------------------------------
-// Async callback (main thread, fired by mach port waker)
+// Exported callbacks (called from ObjC shim on main thread)
 // ---------------------------------------------------------------------------
 
-fn asyncCallback(
-    _: ?*void,
-    loop: *xev.Loop,
-    completion: *xev.Completion,
-    result: xev.Async.WaitError!void,
-) xev.CallbackAction {
-    _ = result catch |err| {
-        log.err("async wait error: {}", .{err});
-        return .disarm;
-    };
-
+/// Drain the event ring buffer — called by the CFRunLoopSource waker.
+export fn bw_drain_events() void {
     while (g_ring.pop()) |ev| {
         handleEvent(&ev);
     }
+}
 
-    g_waker.wait(loop, completion, void, null, asyncCallback);
-    return .disarm;
+/// Accept and handle one IPC client connection — called by dispatch_source.
+export fn bw_handle_ipc_client(server_fd: c_int) void {
+    const client_fd = posix.accept(@intCast(server_fd), null, null, 0) catch |err| {
+        log.err("accept failed: {}", .{err});
+        return;
+    };
+    defer posix.close(client_fd);
+
+    var buf: [512]u8 = undefined;
+    const n = posix.read(client_fd, &buf) catch |err| {
+        log.err("IPC read: {}", .{err});
+        return;
+    };
+    if (n == 0) return;
+
+    const cmd = std.mem.trimRight(u8, buf[0..n], &.{ '\n', '\r', ' ', 0 });
+    if (cmd.len == 0) return;
+
+    if (ipc.g_dispatch) |dispatch| {
+        dispatch(cmd, client_fd);
+    }
+}
+
+/// Clean shutdown — called from status bar Quit action.
+export fn bw_will_quit() void {
+    restoreAllWindows();
+}
+
+/// Retile — called from status bar Retile action.
+export fn bw_retile() void {
+    retile();
 }
 
 // ---------------------------------------------------------------------------
@@ -1147,6 +1185,7 @@ fn switchWorkspace(target_id: u8) void {
     target_ws.is_visible = true;
 
     retile();
+    statusbar.setTitle(target_ws.name, target_ws.id);
 
     // Focus the remembered window on the target workspace
     if (target_ws.focused_wid) |fwid| {

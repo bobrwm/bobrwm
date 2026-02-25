@@ -1,7 +1,6 @@
 #import <AppKit/AppKit.h>
 #import <ApplicationServices/ApplicationServices.h>
 #import <Carbon/Carbon.h>
-#import <pthread.h>
 #import "shim.h"
 
 // ---------------------------------------------------------------------------
@@ -65,7 +64,6 @@ void bw_ax_prompt(void) {
 
 static CFMachPortRef g_tap_port = NULL;
 static CFRunLoopRef g_observer_runloop = NULL;
-static dispatch_semaphore_t g_observer_ready_sem = NULL;
 
 // Configurable keybind table (set from Zig via bw_set_keybinds)
 #define MAX_KEYBINDS 128
@@ -110,80 +108,112 @@ static CGEventRef hotkey_callback(CGEventTapProxy proxy, CGEventType type,
 }
 
 // ---------------------------------------------------------------------------
-// Observer thread
+// Waker — CFRunLoopSource to drain the event ring on the main thread
 // ---------------------------------------------------------------------------
 
-static void *observer_thread(void *arg) {
-    (void)arg;
-    @autoreleasepool {
-        BWObserver *obs = [[BWObserver alloc] init];
-        NSNotificationCenter *wsnc = [[NSWorkspace sharedWorkspace] notificationCenter];
+static CFRunLoopSourceRef g_waker_source = NULL;
 
-        [wsnc addObserver:obs
-                 selector:@selector(appLaunched:)
-                     name:NSWorkspaceDidLaunchApplicationNotification
-                   object:nil];
-
-        [wsnc addObserver:obs
-                 selector:@selector(appTerminated:)
-                     name:NSWorkspaceDidTerminateApplicationNotification
-                   object:nil];
-
-        [wsnc addObserver:obs
-                 selector:@selector(spaceChanged:)
-                     name:NSWorkspaceActiveSpaceDidChangeNotification
-                   object:nil];
-
-        [wsnc addObserver:obs
-                 selector:@selector(activeAppChanged:)
-                     name:NSWorkspaceDidActivateApplicationNotification
-                   object:nil];
-
-        // CGEventTap for global hotkeys
-        CGEventMask mask = (1 << kCGEventKeyDown);
-        g_tap_port = CGEventTapCreate(
-            kCGSessionEventTap,
-            kCGHeadInsertEventTap,
-            kCGEventTapOptionDefault,
-            mask,
-            hotkey_callback,
-            NULL);
-
-        if (g_tap_port) {
-            CFRunLoopSourceRef tap_source =
-                CFMachPortCreateRunLoopSource(NULL, g_tap_port, 0);
-            CFRunLoopAddSource(CFRunLoopGetCurrent(), tap_source,
-                             kCFRunLoopCommonModes);
-            CFRelease(tap_source);
-            CGEventTapEnable(g_tap_port, true);
-        }
-
-        // Publish run loop for AX observers registered from the main thread
-        g_observer_runloop = CFRunLoopGetCurrent();
-        if (g_observer_ready_sem) {
-            dispatch_semaphore_signal(g_observer_ready_sem);
-        }
-
-        CFRunLoopRun();
-    }
-    return NULL;
+static void waker_perform(void *info) {
+    (void)info;
+    bw_drain_events();
 }
 
-void bw_start_observer(void) {
-    g_observer_ready_sem = dispatch_semaphore_create(0);
-    pthread_t tid;
-    pthread_attr_t attr;
-    pthread_attr_init(&attr);
-    pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
-    pthread_create(&tid, &attr, observer_thread, NULL);
-    pthread_attr_destroy(&attr);
+void bw_signal_waker(void) {
+    if (g_waker_source) CFRunLoopSourceSignal(g_waker_source);
+    CFRunLoopRef rl = CFRunLoopGetMain();
+    if (rl) CFRunLoopWakeUp(rl);
 }
 
-void bw_wait_observer_ready(void) {
-    if (g_observer_ready_sem) {
-        dispatch_semaphore_wait(g_observer_ready_sem, DISPATCH_TIME_FOREVER);
-        g_observer_ready_sem = NULL;
+// ---------------------------------------------------------------------------
+// Status bar
+// ---------------------------------------------------------------------------
+
+@interface BWStatusBarDelegate : NSObject
+- (void)retile:(id)sender;
+- (void)quit:(id)sender;
+@end
+
+@implementation BWStatusBarDelegate
+
+- (void)retile:(id)sender {
+    (void)sender;
+    bw_retile();
+}
+
+- (void)quit:(id)sender {
+    (void)sender;
+    bw_will_quit();
+    [NSApp terminate:nil];
+}
+
+@end
+
+// ---------------------------------------------------------------------------
+// Source setup (observers, waker, IPC)
+// ---------------------------------------------------------------------------
+
+void bw_setup_sources(int ipc_fd) {
+    // --- NSWorkspace observers (main run loop) ---
+    BWObserver *obs = [[BWObserver alloc] init];
+    NSNotificationCenter *wsnc = [[NSWorkspace sharedWorkspace] notificationCenter];
+
+    [wsnc addObserver:obs
+             selector:@selector(appLaunched:)
+                 name:NSWorkspaceDidLaunchApplicationNotification
+               object:nil];
+
+    [wsnc addObserver:obs
+             selector:@selector(appTerminated:)
+                 name:NSWorkspaceDidTerminateApplicationNotification
+               object:nil];
+
+    [wsnc addObserver:obs
+             selector:@selector(spaceChanged:)
+                 name:NSWorkspaceActiveSpaceDidChangeNotification
+               object:nil];
+
+    [wsnc addObserver:obs
+             selector:@selector(activeAppChanged:)
+                 name:NSWorkspaceDidActivateApplicationNotification
+               object:nil];
+
+    // --- CGEventTap for global hotkeys (main run loop) ---
+    CGEventMask mask = (1 << kCGEventKeyDown);
+    g_tap_port = CGEventTapCreate(
+        kCGSessionEventTap,
+        kCGHeadInsertEventTap,
+        kCGEventTapOptionDefault,
+        mask,
+        hotkey_callback,
+        NULL);
+
+    if (g_tap_port) {
+        CFRunLoopSourceRef tap_source =
+            CFMachPortCreateRunLoopSource(NULL, g_tap_port, 0);
+        CFRunLoopAddSource(CFRunLoopGetMain(), tap_source,
+                         kCFRunLoopCommonModes);
+        CFRelease(tap_source);
+        CGEventTapEnable(g_tap_port, true);
     }
+
+    // --- Observer run loop (AX observers use this) ---
+    g_observer_runloop = CFRunLoopGetMain();
+
+    // --- Waker source (drains event ring on main thread) ---
+    CFRunLoopSourceContext ctx = {0};
+    ctx.perform = waker_perform;
+    g_waker_source = CFRunLoopSourceCreate(NULL, 0, &ctx);
+    CFRunLoopAddSource(CFRunLoopGetMain(), g_waker_source,
+                      kCFRunLoopCommonModes);
+
+    // --- IPC dispatch source ---
+    dispatch_source_t ipc_source = dispatch_source_create(
+        DISPATCH_SOURCE_TYPE_READ, (uintptr_t)ipc_fd, 0,
+        dispatch_get_main_queue());
+    dispatch_source_set_event_handler(ipc_source, ^{
+        bw_handle_ipc_client(ipc_fd);
+    });
+    dispatch_resume(ipc_source);
 }
 
 // ---------------------------------------------------------------------------
