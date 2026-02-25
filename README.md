@@ -20,6 +20,16 @@ bobrwm query workspaces   # IPC: list workspaces
 bobrwm query apps         # IPC: list observed apps
 ```
 
+### Logging
+
+Log level is compile-time configurable. Default follows build mode (`debug` in Debug, `info` otherwise).
+
+```bash
+zig build -Dlog_level=debug
+LOG_LEVEL=debug zig build
+LOG_LEVEL=trace zig build   # alias of debug (extra trace-style diagnostics)
+```
+
 ## Configuration
 
 Config is loaded from (in order):

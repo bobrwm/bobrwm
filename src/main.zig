@@ -174,6 +174,8 @@ export fn bw_emit_event(kind: u8, pid: i32, wid: u32) void {
 fn runClient(cmd: []const u8) void {
     const stdout = std.fs.File.stdout();
     const stderr = std.fs.File.stderr();
+    const started_ns = std.time.nanoTimestamp();
+    var response_bytes: usize = 0;
 
     var path_buf: [128]u8 = undefined;
     const path = std.fmt.bufPrintZ(&path_buf, "/tmp/bobrwm_{d}.sock", .{std.c.getuid()}) catch {
@@ -191,6 +193,8 @@ fn runClient(cmd: []const u8) void {
     @memcpy(addr.path[0..path.len], path[0..path.len]);
     if (path.len < addr.path.len) addr.path[path.len] = 0;
 
+    log.debug("[trace] ipc client connecting path={s} cmd={s}", .{ path, cmd });
+
     posix.connect(fd, @ptrCast(&addr), @sizeOf(posix.sockaddr.un)) catch {
         stderr.writeAll("error: bobrwm is not running\n") catch {};
         return;
@@ -205,8 +209,12 @@ fn runClient(cmd: []const u8) void {
         var buf: [4096]u8 = undefined;
         const n = posix.read(fd, &buf) catch break;
         if (n == 0) break;
+        response_bytes += n;
         stdout.writeAll(buf[0..n]) catch break;
     }
+
+    const elapsed_ms = @divTrunc(std.time.nanoTimestamp() - started_ns, std.time.ns_per_ms);
+    log.debug("[trace] ipc client completed bytes={} elapsed_ms={}", .{ response_bytes, elapsed_ms });
 }
 
 // ---------------------------------------------------------------------------
@@ -225,7 +233,7 @@ pub fn main() !void {
     }
 
     // -- Daemon mode --
-    log.info("bobrwm starting...", .{});
+    log.info("bobrwm starting (log_level={s})...", .{@tagName(std_options.log_level)});
 
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
@@ -311,6 +319,7 @@ export fn bw_handle_ipc_client(server_fd: c_int) void {
         return;
     };
     defer posix.close(client_fd);
+    const started_ns = std.time.nanoTimestamp();
 
     var buf: [512]u8 = undefined;
     const n = posix.read(client_fd, &buf) catch |err| {
@@ -321,9 +330,14 @@ export fn bw_handle_ipc_client(server_fd: c_int) void {
 
     const cmd = std.mem.trimRight(u8, buf[0..n], &.{ '\n', '\r', ' ', 0 });
     if (cmd.len == 0) return;
+    log.debug("[trace] ipc recv fd={} bytes={} cmd={s}", .{ client_fd, n, cmd });
 
     if (ipc.g_dispatch) |dispatch| {
         dispatch(cmd, client_fd);
+        const elapsed_ms = @divTrunc(std.time.nanoTimestamp() - started_ns, std.time.ns_per_ms);
+        log.debug("[trace] ipc handled fd={} cmd={s} elapsed_ms={}", .{ client_fd, cmd, elapsed_ms });
+    } else {
+        log.warn("ipc dispatch callback missing", .{});
     }
 }
 
@@ -1388,6 +1402,12 @@ fn focusDirection(dir: FocusDir) void {
 // ---------------------------------------------------------------------------
 
 fn ipcDispatch(cmd: []const u8, client_fd: posix.socket_t) void {
+    const started_ns = std.time.nanoTimestamp();
+    defer {
+        const elapsed_ms = @divTrunc(std.time.nanoTimestamp() - started_ns, std.time.ns_per_ms);
+        log.debug("[trace] ipc dispatch cmd={s} elapsed_ms={}", .{ cmd, elapsed_ms });
+    }
+
     if (std.mem.eql(u8, cmd, "retile")) {
         retile();
         ipc.writeResponse(client_fd, "ok\n");
@@ -1440,10 +1460,12 @@ fn ipcDispatch(cmd: []const u8, client_fd: posix.socket_t) void {
 }
 
 fn ipcQueryWindows(fd: posix.socket_t) void {
+    const started_ns = std.time.nanoTimestamp();
     const ws = g_workspaces.active();
     var buf: [8192]u8 = undefined;
     var fbs = std.io.fixedBufferStream(&buf);
     const w = fbs.writer();
+    var written: usize = 0;
 
     for (ws.windows.items) |wid| {
         if (g_store.get(wid)) |win| {
@@ -1455,19 +1477,25 @@ fn ipcQueryWindows(fd: posix.socket_t) void {
                 win.wid,     win.pid,     bundle_id,       win.workspace_id,
                 win.frame.x, win.frame.y, win.frame.width, win.frame.height,
             }) catch break;
+            written += 1;
         }
     }
 
-    ipc.writeResponse(fd, fbs.getWritten());
+    const payload = fbs.getWritten();
+    ipc.writeResponse(fd, payload);
+    const elapsed_ms = @divTrunc(std.time.nanoTimestamp() - started_ns, std.time.ns_per_ms);
+    log.debug("[trace] query windows rows={} bytes={} elapsed_ms={}", .{ written, payload.len, elapsed_ms });
 }
 
 fn ipcQueryApps(fd: posix.socket_t) void {
+    const started_ns = std.time.nanoTimestamp();
     var buf: [8192]u8 = undefined;
     var fbs = std.io.fixedBufferStream(&buf);
     const w = fbs.writer();
 
     var seen_pids: [256]i32 = undefined;
     var seen_count: usize = 0;
+    var written: usize = 0;
 
     for (&g_workspaces.workspaces) |*ws| {
         for (ws.windows.items) |wid| {
@@ -1490,14 +1518,19 @@ fn ipcQueryApps(fd: posix.socket_t) void {
                 const bundle_id: []const u8 = if (id_len > 0) id_buf[0..id_len] else "(unknown)";
 
                 w.print("{s}\t{d}\n", .{ bundle_id, win.pid }) catch break;
+                written += 1;
             }
         }
     }
 
-    ipc.writeResponse(fd, fbs.getWritten());
+    const payload = fbs.getWritten();
+    ipc.writeResponse(fd, payload);
+    const elapsed_ms = @divTrunc(std.time.nanoTimestamp() - started_ns, std.time.ns_per_ms);
+    log.debug("[trace] query apps rows={} unique_pids={} bytes={} elapsed_ms={}", .{ written, seen_count, payload.len, elapsed_ms });
 }
 
 fn ipcQueryWorkspaces(fd: posix.socket_t) void {
+    const started_ns = std.time.nanoTimestamp();
     var buf: [1024]u8 = undefined;
     var fbs = std.io.fixedBufferStream(&buf);
     const w = fbs.writer();
@@ -1512,5 +1545,8 @@ fn ipcQueryWorkspaces(fd: posix.socket_t) void {
         }) catch break;
     }
 
-    ipc.writeResponse(fd, fbs.getWritten());
+    const payload = fbs.getWritten();
+    ipc.writeResponse(fd, payload);
+    const elapsed_ms = @divTrunc(std.time.nanoTimestamp() - started_ns, std.time.ns_per_ms);
+    log.debug("[trace] query workspaces rows={} bytes={} elapsed_ms={}", .{ g_workspaces.workspaces.len, payload.len, elapsed_ms });
 }

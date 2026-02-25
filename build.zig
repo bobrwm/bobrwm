@@ -1,5 +1,18 @@
 const std = @import("std");
 
+fn parseLogLevelEnv(raw: []const u8) ?std.log.Level {
+    const trimmed = std.mem.trim(u8, raw, &.{ ' ', '\t', '\r', '\n' });
+    if (trimmed.len == 0) return null;
+    if (std.ascii.eqlIgnoreCase(trimmed, "trace")) return .debug;
+
+    inline for (comptime std.meta.fields(std.log.Level)) |field| {
+        if (std.ascii.eqlIgnoreCase(trimmed, field.name)) {
+            return @enumFromInt(field.value);
+        }
+    }
+    return null;
+}
+
 pub fn build(b: *std.Build) void {
     const target = b.resolveTargetQuery(.{
         .cpu_arch = .aarch64,
@@ -20,7 +33,7 @@ pub fn build(b: *std.Build) void {
         "log_level",
         "Log level (debug, info, warn, err)",
     ) orelse if (std.posix.getenv("LOG_LEVEL")) |env|
-        std.meta.stringToEnum(std.log.Level, env)
+        parseLogLevelEnv(env)
     else
         null;
 
