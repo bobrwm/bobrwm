@@ -679,24 +679,3 @@ void bw_unobserve_app(int32_t pid) {
         return;
     }
 }
-
-// ---------------------------------------------------------------------------
-// App identity
-// ---------------------------------------------------------------------------
-
-uint32_t bw_get_app_bundle_id(int32_t pid, char *out, uint32_t max_len) {
-    @autoreleasepool {
-        NSRunningApplication *app =
-            [NSRunningApplication runningApplicationWithProcessIdentifier:(pid_t)pid];
-        if (!app || !app.bundleIdentifier) return 0;
-
-        const char *utf8 = [app.bundleIdentifier UTF8String];
-        if (!utf8) return 0;
-
-        uint32_t len = (uint32_t)strlen(utf8);
-        if (len >= max_len) len = max_len - 1;
-        memcpy(out, utf8, len);
-        out[len] = '\0';
-        return len;
-    }
-}
