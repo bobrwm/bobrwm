@@ -58,8 +58,7 @@ pub fn init() void {
 /// Update the status bar title to reflect the active workspace.
 pub fn setTitle(name: []const u8, id: u8) void {
     var buf: [64]u8 = undefined;
-    const title: []const u8 = if (name.len > 0) name else
-        std.fmt.bufPrint(&buf, "{d}", .{id}) catch return;
+    const title: []const u8 = if (name.len > 0) name else std.fmt.bufPrint(&buf, "{d}", .{id}) catch return;
 
     // Null-terminate for stringWithUTF8String:
     var z: [65]u8 = undefined;

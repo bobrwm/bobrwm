@@ -476,7 +476,12 @@ fn discoverWindows() void {
         // If assigned to a non-visible workspace, hide immediately
         if (!target_ws.is_visible) {
             _ = shim.bw_ax_set_window_frame(
-                info.pid, info.wid, hide_x, hide_y, hide_w, hide_h,
+                info.pid,
+                info.wid,
+                hide_x,
+                hide_y,
+                hide_w,
+                hide_h,
             );
         }
     }
@@ -592,8 +597,9 @@ fn tryFormTabGroupOnCreate(pid: i32, new_wid: u32) bool {
 
             const still_on_screen = shim.bw_is_window_on_screen(existing_wid);
             log.debug("tryFormTabGroup: existing wid={d} on_screen={} frame=({d:.0},{d:.0},{d:.0},{d:.0})", .{
-                existing_wid, still_on_screen,
-                existing.frame.x, existing.frame.y, existing.frame.width, existing.frame.height,
+                existing_wid,         still_on_screen,
+                existing.frame.x,     existing.frame.y,
+                existing.frame.width, existing.frame.height,
             });
 
             if (still_on_screen) continue;
@@ -614,8 +620,10 @@ fn tryFormTabGroupOnCreate(pid: i32, new_wid: u32) bool {
             };
             log.debug("tryFormTabGroup: existing wid={d} SkyLight bounds=({d:.0},{d:.0},{d:.0},{d:.0})", .{
                 existing_wid,
-                existing_sky_frame.x, existing_sky_frame.y,
-                existing_sky_frame.width, existing_sky_frame.height,
+                existing_sky_frame.x,
+                existing_sky_frame.y,
+                existing_sky_frame.width,
+                existing_sky_frame.height,
             });
 
             // Native tab members share the same frame. If bounds diverge
@@ -717,7 +725,10 @@ fn removeWindow(wid: u32) void {
                 log.info("removeWindow: restoring tab survivor wid={d} to workspace", .{solo_wid});
                 ws.addWindow(solo_wid) catch {};
                 g_layout_roots[ws_idx] = layout.insertWindow(
-                    g_layout_roots[ws_idx], solo_wid, g_next_split_dir, g_allocator,
+                    g_layout_roots[ws_idx],
+                    solo_wid,
+                    g_next_split_dir,
+                    g_allocator,
                 ) catch return;
             }
         }
@@ -812,9 +823,12 @@ fn retile() void {
         // Two-pass for fullscreen to handle macOS size clamping
         if (win.is_fullscreen) {
             _ = shim.bw_ax_set_window_frame(
-                win.pid, entry.wid,
-                target_frame.x, target_frame.y,
-                target_frame.width, target_frame.height,
+                win.pid,
+                entry.wid,
+                target_frame.x,
+                target_frame.y,
+                target_frame.width,
+                target_frame.height,
             );
         }
         var updated = win;
@@ -1117,7 +1131,10 @@ fn checkTabDragOut(_: i32, wid: u32) void {
     const ws_idx: usize = ws.id - 1;
     ws.addWindow(wid) catch return;
     g_layout_roots[ws_idx] = layout.insertWindow(
-        g_layout_roots[ws_idx], wid, g_next_split_dir, g_allocator,
+        g_layout_roots[ws_idx],
+        wid,
+        g_next_split_dir,
+        g_allocator,
     ) catch return;
     ws.focused_wid = wid;
 
@@ -1134,7 +1151,10 @@ fn checkTabDragOut(_: i32, wid: u32) void {
             log.info("drag-out: restoring survivor wid={d} to workspace", .{solo_wid});
             ws.addWindow(solo_wid) catch {};
             g_layout_roots[ws_idx] = layout.insertWindow(
-                g_layout_roots[ws_idx], solo_wid, g_next_split_dir, g_allocator,
+                g_layout_roots[ws_idx],
+                solo_wid,
+                g_next_split_dir,
+                g_allocator,
             ) catch return;
         }
     }
@@ -1174,7 +1194,12 @@ fn switchWorkspace(target_id: u8) void {
     for (old_ws.windows.items) |wid| {
         if (g_store.get(wid)) |win| {
             _ = shim.bw_ax_set_window_frame(
-                win.pid, wid, hide_x, hide_y, hide_w, hide_h,
+                win.pid,
+                wid,
+                hide_x,
+                hide_y,
+                hide_w,
+                hide_h,
             );
         }
     }
@@ -1213,7 +1238,10 @@ fn moveWindowToWorkspace(target_id: u8) void {
     // Add to target workspace BSP + list
     target_ws.addWindow(wid) catch return;
     g_layout_roots[target_idx] = layout.insertWindow(
-        g_layout_roots[target_idx], wid, g_next_split_dir, g_allocator,
+        g_layout_roots[target_idx],
+        wid,
+        g_next_split_dir,
+        g_allocator,
     ) catch return;
     if (target_ws.focused_wid == null) {
         target_ws.focused_wid = wid;
@@ -1230,7 +1258,12 @@ fn moveWindowToWorkspace(target_id: u8) void {
     if (!target_ws.is_visible) {
         if (g_store.get(wid)) |win| {
             _ = shim.bw_ax_set_window_frame(
-                win.pid, wid, hide_x, hide_y, hide_w, hide_h,
+                win.pid,
+                wid,
+                hide_x,
+                hide_y,
+                hide_w,
+                hide_h,
             );
         }
     }
@@ -1359,7 +1392,7 @@ fn ipcQueryWindows(fd: posix.socket_t) void {
             const bundle_id: []const u8 = if (id_len > 0) id_buf[0..id_len] else "(unknown)";
 
             w.print("{d} {d} {s} {d} {d:.0} {d:.0} {d:.0} {d:.0}\n", .{
-                win.wid, win.pid, bundle_id, win.workspace_id,
+                win.wid,     win.pid,     bundle_id,       win.workspace_id,
                 win.frame.x, win.frame.y, win.frame.width, win.frame.height,
             }) catch break;
         }
