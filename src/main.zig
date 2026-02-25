@@ -17,6 +17,7 @@ const ipc = @import("ipc.zig");
 const tabgroup = @import("tabgroup.zig");
 const config_mod = @import("config.zig");
 const statusbar = @import("statusbar.zig");
+const launchd = @import("launchd.zig");
 
 const NSPoint = extern struct {
     x: f64,
@@ -241,6 +242,20 @@ pub fn main() !void {
     // -- Arg parsing (before anything else) --
     var cmd_buf: [512]u8 = undefined;
     const args = config_mod.parseArgs(&cmd_buf);
+
+    // Service management: handle locally (not via IPC)
+    if (args.command) |cmd| {
+        if (std.mem.eql(u8, cmd, "service") or std.mem.startsWith(u8, cmd, "service ")) {
+            if (parseServiceCommand(cmd)) |service_cmd| {
+                launchd.run(service_cmd);
+            } else {
+                std.fs.File.stderr().writeAll(
+                    "usage: bobrwm service <install|uninstall|start|stop|restart>\n",
+                ) catch {};
+            }
+            return;
+        }
+    }
 
     // Client mode: forward command to running daemon via IPC
     if (args.command) |cmd| {
@@ -1411,6 +1426,17 @@ fn focusDirection(dir: FocusDir) void {
             ws.focused_wid = wid; // track the leader
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Service command parsing
+// ---------------------------------------------------------------------------
+
+fn parseServiceCommand(cmd: []const u8) ?launchd.Command {
+    const prefix = "service ";
+    if (!std.mem.startsWith(u8, cmd, prefix)) return null;
+    const sub = cmd[prefix.len..];
+    return std.meta.stringToEnum(launchd.Command, sub);
 }
 
 // ---------------------------------------------------------------------------
