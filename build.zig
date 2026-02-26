@@ -100,4 +100,26 @@ pub fn build(b: *std.Build) void {
 
     const run_step = b.step("run", "Run bobrwm");
     run_step.dependOn(&run_cmd.step);
+
+    const test_mod = b.createModule(.{
+        .root_source_file = b.path("src/config.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+
+    test_mod.addIncludePath(b.path("src/shim"));
+
+    if (sdk_path) |sdk| {
+        test_mod.addSystemIncludePath(.{ .cwd_relative = b.fmt("{s}/usr/include", .{sdk}) });
+    }
+
+    const tests = b.addTest(.{
+        .name = "config-tests",
+        .root_module = test_mod,
+    });
+
+    const run_tests = b.addRunArtifact(tests);
+    const test_step = b.step("test", "Run unit tests");
+    test_step.dependOn(&run_tests.step);
 }

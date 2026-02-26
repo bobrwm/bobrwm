@@ -270,3 +270,153 @@ fn keyNameToCode(name: []const u8) ?u16 {
     }
     return null;
 }
+const t = std.testing;
+
+test "keyNameToCode" {
+    // letters
+    try t.expectEqual(@as(u16, 0x00), keyNameToCode("a").?);
+    try t.expectEqual(@as(u16, 0x04), keyNameToCode("h").?);
+    try t.expectEqual(@as(u16, 0x26), keyNameToCode("j").?);
+    try t.expectEqual(@as(u16, 0x28), keyNameToCode("k").?);
+    try t.expectEqual(@as(u16, 0x25), keyNameToCode("l").?);
+
+    // digits
+    try t.expectEqual(@as(u16, 0x12), keyNameToCode("1").?);
+    try t.expectEqual(@as(u16, 0x1D), keyNameToCode("0").?);
+
+    // special + arrows
+    try t.expectEqual(@as(u16, 0x24), keyNameToCode("return").?);
+    try t.expectEqual(@as(u16, 0x31), keyNameToCode("space").?);
+    try t.expectEqual(@as(u16, 0x35), keyNameToCode("escape").?);
+    try t.expectEqual(@as(u16, 0x7B), keyNameToCode("left").?);
+    try t.expectEqual(@as(u16, 0x7E), keyNameToCode("up").?);
+
+    // unknown
+    try t.expectEqual(@as(?u16, null), keyNameToCode("F1"));
+    try t.expectEqual(@as(?u16, null), keyNameToCode(""));
+}
+
+test "workspaceForApp" {
+    const cfg: Config = .{
+        .workspace_assignments = &.{
+            .{ .app_id = "com.apple.Safari", .workspace = 2 },
+            .{ .app_id = "com.apple.MobileSMS", .workspace = 3 },
+        },
+    };
+    try t.expectEqual(@as(?u8, 2), cfg.workspaceForApp("com.apple.Safari"));
+    try t.expectEqual(@as(?u8, 3), cfg.workspaceForApp("com.apple.MobileSMS"));
+    try t.expectEqual(@as(?u8, null), cfg.workspaceForApp("com.apple.Terminal"));
+
+    const empty: Config = .{};
+    try t.expectEqual(@as(?u8, null), empty.workspaceForApp("com.apple.Safari"));
+}
+
+test "default config" {
+    const cfg: Config = .{};
+    try t.expectEqual(@as(usize, 23), cfg.keybinds.len);
+    try t.expectEqual(@as(usize, 0), cfg.workspace_assignments.len);
+    try t.expectEqual(@as(usize, 0), cfg.workspace_names.len);
+    try t.expectEqual(@as(u16, 0), cfg.gaps.inner);
+    try t.expectEqual(@as(u16, 0), cfg.gaps.outer.left);
+}
+
+test "default_keybinds" {
+    // alt+1..9 focus workspace
+    for (0..9) |i| {
+        const kb = default_keybinds[i];
+        try t.expectEqual(Action.focus_workspace, kb.action);
+        try t.expect(kb.mods.alt);
+        try t.expect(!kb.mods.shift);
+        try t.expectEqual(@as(u8, @intCast(i + 1)), kb.arg);
+    }
+
+    // alt+shift+1..9 move to workspace
+    for (9..18) |i| {
+        const kb = default_keybinds[i];
+        try t.expectEqual(Action.move_to_workspace, kb.action);
+        try t.expect(kb.mods.alt and kb.mods.shift);
+        try t.expectEqual(@as(u8, @intCast(i - 8)), kb.arg);
+    }
+
+    // hjkl
+    const dirs = [_]Action{ .focus_left, .focus_down, .focus_up, .focus_right };
+    const keys = [_][]const u8{ "h", "j", "k", "l" };
+    for (dirs, keys, 18..) |action, key, i| {
+        try t.expectEqual(action, default_keybinds[i].action);
+        try t.expect(std.mem.eql(u8, key, default_keybinds[i].key));
+    }
+
+    // alt+return toggle split
+    try t.expectEqual(Action.toggle_split, default_keybinds[22].action);
+    try t.expect(std.mem.eql(u8, "return", default_keybinds[22].key));
+}
+
+test "loadFromPath: missing file" {
+    try t.expectEqual(@as(?Config, null), loadFromPath(t.allocator, "/tmp/bobrwm_no_such_file.zon"));
+}
+
+test "loadFromPath: examples/config.zon" {
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+
+    const cfg = loadFromPath(arena.allocator(), "examples/config.zon") orelse
+        return error.TestUnexpectedResult;
+
+    try t.expectEqual(@as(usize, 24), cfg.keybinds.len);
+
+    try t.expectEqual(Action.focus_workspace, cfg.keybinds[0].action);
+    try t.expectEqual(@as(u8, 1), cfg.keybinds[0].arg);
+
+    try t.expectEqual(Action.move_to_workspace, cfg.keybinds[9].action);
+    try t.expect(cfg.keybinds[9].mods.shift);
+
+    try t.expectEqual(Action.toggle_fullscreen, cfg.keybinds[23].action);
+    try t.expect(std.mem.eql(u8, "f", cfg.keybinds[23].key));
+
+    try t.expectEqual(@as(usize, 0), cfg.workspace_assignments.len);
+    try t.expectEqual(@as(u16, 0), cfg.gaps.inner);
+}
+
+test "loadFromPath: custom zon" {
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const zon =
+        \\.{
+        \\    .keybinds = .{
+        \\        .{ .key = "f", .mods = .{ .alt = true }, .action = .toggle_fullscreen },
+        \\        .{ .key = "space", .mods = .{ .alt = true, .shift = true }, .action = .toggle_float },
+        \\    },
+        \\    .workspace_assignments = .{
+        \\        .{ .app_id = "com.test.App", .workspace = 3 },
+        \\    },
+        \\    .gaps = .{ .inner = 8, .outer = .{ .left = 4, .right = 4, .top = 4, .bottom = 4 } },
+        \\}
+    ;
+
+    tmp.dir.writeFile(.{ .sub_path = "config.zon", .data = zon }) catch
+        return error.TestUnexpectedResult;
+    const path = tmp.dir.realpathAlloc(allocator, "config.zon") catch
+        return error.TestUnexpectedResult;
+
+    const cfg = loadFromPath(allocator, path) orelse
+        return error.TestUnexpectedResult;
+
+    try t.expectEqual(@as(usize, 2), cfg.keybinds.len);
+    try t.expectEqual(Action.toggle_fullscreen, cfg.keybinds[0].action);
+    try t.expectEqual(Action.toggle_float, cfg.keybinds[1].action);
+
+    try t.expectEqual(@as(usize, 1), cfg.workspace_assignments.len);
+    try t.expect(std.mem.eql(u8, "com.test.App", cfg.workspace_assignments[0].app_id));
+    try t.expectEqual(@as(u8, 3), cfg.workspace_assignments[0].workspace);
+
+    try t.expectEqual(@as(u16, 8), cfg.gaps.inner);
+    try t.expectEqual(@as(u16, 4), cfg.gaps.outer.left);
+    try t.expectEqual(@as(u16, 4), cfg.gaps.outer.right);
+    try t.expectEqual(@as(u16, 4), cfg.gaps.outer.top);
+    try t.expectEqual(@as(u16, 4), cfg.gaps.outer.bottom);
+}
