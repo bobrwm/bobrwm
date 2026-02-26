@@ -52,6 +52,10 @@ pub fn build(b: *std.Build) void {
     });
 
     exe_mod.addIncludePath(b.path("src/shim"));
+    exe_mod.addAnonymousImport("launchd_plist", .{
+        .root_source_file = b.path("res/com.bobrwm.bobrwm.plist"),
+    });
+    exe_mod.addAssemblyFile(b.path("src/info_plist.s"));
 
     exe_mod.linkFramework("ApplicationServices", .{});
     exe_mod.linkFramework("CoreGraphics", .{});
