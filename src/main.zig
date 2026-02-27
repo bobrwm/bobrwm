@@ -74,13 +74,30 @@ const EventRing = struct {
 };
 
 // ---------------------------------------------------------------------------
-// Hidden-window position (as far off-screen and as small as possible)
+// Hidden-window position (bottom-right corner, barely visible)
 // ---------------------------------------------------------------------------
 
-const hide_x: f64 = -99999;
-const hide_y: f64 = -99999;
-const hide_w: f64 = 1;
-const hide_h: f64 = 1;
+/// Pixels visible in the corner when a window is hidden off-screen.
+const hide_peek: f64 = 5;
+
+/// Hide a window by moving it to the bottom-right corner of the display,
+/// preserving its stored frame size so there is no layout shift when the
+/// workspace becomes visible again.
+fn hideWindow(pid: i32, wid: u32) void {
+    const display = shim.bw_get_display_frame();
+    const pos_x = display.x + display.w - hide_peek;
+    const pos_y = display.y + display.h - hide_peek;
+
+    // Use stored frame dimensions to avoid layout shift on workspace switch
+    if (g_store.get(wid)) |win| {
+        if (win.frame.width > 1 and win.frame.height > 1) {
+            _ = shim.bw_ax_set_window_frame(pid, wid, pos_x, pos_y, win.frame.width, win.frame.height);
+            return;
+        }
+    }
+    // Window not yet tiled — just move off-screen with minimal size
+    _ = shim.bw_ax_set_window_frame(pid, wid, pos_x, pos_y, 1, 1);
+}
 
 // ---------------------------------------------------------------------------
 // Globals
@@ -581,14 +598,7 @@ fn discoverWindows() void {
 
         // If assigned to a non-visible workspace, hide immediately
         if (!target_ws.is_visible) {
-            _ = shim.bw_ax_set_window_frame(
-                info.pid,
-                info.wid,
-                hide_x,
-                hide_y,
-                hide_w,
-                hide_h,
-            );
+            hideWindow(info.pid, info.wid);
         }
     }
 
@@ -667,7 +677,7 @@ fn addNewWindow(pid: i32, wid: u32) void {
 
     // If assigned to a non-visible workspace, hide immediately
     if (!ws.is_visible) {
-        _ = shim.bw_ax_set_window_frame(pid, wid, hide_x, hide_y, hide_w, hide_h);
+        hideWindow(pid, wid);
     }
 
     log.info("addNewWindow: tiled wid={d} on workspace {d}", .{ wid, ws.id });
@@ -1295,18 +1305,11 @@ fn switchWorkspace(target_id: u8) void {
     if (target_id == g_workspaces.active_id) return;
     const target_ws = g_workspaces.get(target_id) orelse return;
 
-    // Hide current workspace windows (move off-screen, shrink to 1×1)
+    // Hide current workspace windows (move to bottom-right corner, keep size)
     const old_ws = g_workspaces.active();
     for (old_ws.windows.items) |wid| {
         if (g_store.get(wid)) |win| {
-            _ = shim.bw_ax_set_window_frame(
-                win.pid,
-                wid,
-                hide_x,
-                hide_y,
-                hide_w,
-                hide_h,
-            );
+            hideWindow(win.pid, wid);
         }
     }
     old_ws.is_visible = false;
@@ -1363,14 +1366,7 @@ fn moveWindowToWorkspace(target_id: u8) void {
     // If target is not visible, hide the window
     if (!target_ws.is_visible) {
         if (g_store.get(wid)) |win| {
-            _ = shim.bw_ax_set_window_frame(
-                win.pid,
-                wid,
-                hide_x,
-                hide_y,
-                hide_w,
-                hide_h,
-            );
+            hideWindow(win.pid, wid);
         }
     }
 
