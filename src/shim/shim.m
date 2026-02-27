@@ -258,72 +258,143 @@ static AXUIElementRef find_ax_window(pid_t pid, uint32_t target_wid) {
 }
 
 // ---------------------------------------------------------------------------
-// Window discovery
+// Window discovery (AX-first)
 // ---------------------------------------------------------------------------
 
-uint32_t bw_discover_windows(bw_window_info *out, uint32_t max_count) {
-    CFArrayRef window_list = CGWindowListCopyWindowInfo(
-        kCGWindowListOptionOnScreenOnly | kCGWindowListExcludeDesktopElements,
-        kCGNullWindowID);
-    if (!window_list) return 0;
-
-    uint32_t count = 0;
-    CFIndex total = CFArrayGetCount(window_list);
-
-    for (CFIndex i = 0; i < total && count < max_count; i++) {
-        @autoreleasepool {
-            CFDictionaryRef info =
-                (CFDictionaryRef)CFArrayGetValueAtIndex(window_list, i);
-
-            // Layer filter — only normal windows (layer 0)
-            int32_t layer = 0;
-            CFNumberRef layer_ref = CFDictionaryGetValue(info, kCGWindowLayer);
-            if (layer_ref)
-                CFNumberGetValue(layer_ref, kCFNumberSInt32Type, &layer);
-            if (layer != 0) continue;
-
-            // Window ID
-            uint32_t wid = 0;
-            CFNumberRef wid_ref = CFDictionaryGetValue(info, kCGWindowNumber);
-            if (!wid_ref) continue;
-            CFNumberGetValue(wid_ref, kCFNumberSInt32Type, &wid);
-
-            // Owner PID
-            int32_t pid = 0;
-            CFNumberRef pid_ref =
-                CFDictionaryGetValue(info, kCGWindowOwnerPID);
-            if (!pid_ref) continue;
-            CFNumberGetValue(pid_ref, kCFNumberSInt32Type, &pid);
-
-            // Activation policy — only regular apps (with dock icon)
-            NSRunningApplication *app = [NSRunningApplication
-                runningApplicationWithProcessIdentifier:pid];
-            if (!app ||
-                app.activationPolicy !=
-                    NSApplicationActivationPolicyRegular)
-                continue;
-
-            // Bounds
-            CGRect bounds = CGRectZero;
-            CFDictionaryRef bounds_ref =
-                CFDictionaryGetValue(info, kCGWindowBounds);
-            if (bounds_ref)
-                CGRectMakeWithDictionaryRepresentation(bounds_ref, &bounds);
-            if (bounds.size.width < 1 || bounds.size.height < 1) continue;
-
-            out[count++] = (bw_window_info){
-                .wid = wid,
-                .pid = pid,
-                .x   = bounds.origin.x,
-                .y   = bounds.origin.y,
-                .w   = bounds.size.width,
-                .h   = bounds.size.height,
-            };
-        }
+/// Check if an AX window element has kAXWindowRole + kAXStandardWindowSubrole.
+static bool ax_element_is_standard_window(AXUIElementRef win) {
+    CFStringRef role = NULL;
+    AXUIElementCopyAttributeValue(win, kAXRoleAttribute, (CFTypeRef *)&role);
+    if (role) {
+        bool is_window = CFEqual(role, kAXWindowRole);
+        CFRelease(role);
+        if (!is_window) return false;
     }
 
-    CFRelease(window_list);
-    return count;
+    CFStringRef subrole = NULL;
+    AXUIElementCopyAttributeValue(win, kAXSubroleAttribute,
+                                  (CFTypeRef *)&subrole);
+    bool is_standard = !subrole || CFEqual(subrole, kAXStandardWindowSubrole);
+    if (subrole) CFRelease(subrole);
+
+    return is_standard;
+}
+
+/// Get the AX position and size for a window element.
+/// Returns false if attributes are unavailable.
+static bool ax_element_get_frame(AXUIElementRef win,
+                                  double *x, double *y,
+                                  double *w, double *h) {
+    AXValueRef pos_val = NULL;
+    AXUIElementCopyAttributeValue(win, kAXPositionAttribute,
+                                  (CFTypeRef *)&pos_val);
+    if (!pos_val) return false;
+    CGPoint pos;
+    AXValueGetValue(pos_val, kAXValueTypeCGPoint, &pos);
+    CFRelease(pos_val);
+
+    AXValueRef size_val = NULL;
+    AXUIElementCopyAttributeValue(win, kAXSizeAttribute,
+                                  (CFTypeRef *)&size_val);
+    if (!size_val) return false;
+    CGSize size;
+    AXValueGetValue(size_val, kAXValueTypeCGSize, &size);
+    CFRelease(size_val);
+
+    *x = pos.x;
+    *y = pos.y;
+    *w = size.width;
+    *h = size.height;
+    return true;
+}
+
+/// Build a set of on-screen CG window IDs for fast membership checks.
+/// Caller must CFRelease the returned set (may be NULL on failure).
+static CFSetRef copy_on_screen_wid_set(void) {
+    CFArrayRef cg_list = CGWindowListCopyWindowInfo(
+        kCGWindowListOptionOnScreenOnly | kCGWindowListExcludeDesktopElements,
+        kCGNullWindowID);
+    if (!cg_list) return NULL;
+
+    CFIndex total = CFArrayGetCount(cg_list);
+    CFMutableSetRef set = CFSetCreateMutable(NULL, (CFIndex)total, NULL);
+
+    for (CFIndex i = 0; i < total; i++) {
+        CFDictionaryRef info =
+            (CFDictionaryRef)CFArrayGetValueAtIndex(cg_list, i);
+        CFNumberRef wid_ref = CFDictionaryGetValue(info, kCGWindowNumber);
+        if (!wid_ref) continue;
+        uint32_t wid = 0;
+        CFNumberGetValue(wid_ref, kCFNumberSInt32Type, &wid);
+        CFSetAddValue(set, (const void *)(uintptr_t)wid);
+    }
+
+    CFRelease(cg_list);
+    return set;
+}
+
+uint32_t bw_discover_windows(bw_window_info *out, uint32_t max_count) {
+    @autoreleasepool {
+        // One CG query to know which windows are actually on screen.
+        // Background tabs (native macOS tabs) are NOT on screen.
+        CFSetRef on_screen = copy_on_screen_wid_set();
+
+        NSArray<NSRunningApplication *> *apps =
+            [[NSWorkspace sharedWorkspace] runningApplications];
+        uint32_t count = 0;
+
+        for (NSRunningApplication *app in apps) {
+            if (count >= max_count) break;
+            if (app.activationPolicy != NSApplicationActivationPolicyRegular)
+                continue;
+
+            pid_t pid = app.processIdentifier;
+            AXUIElementRef ax_app = AXUIElementCreateApplication(pid);
+            if (!ax_app) continue;
+
+            CFArrayRef windows = NULL;
+            AXError err = AXUIElementCopyAttributeValue(
+                ax_app, kAXWindowsAttribute, (CFTypeRef *)&windows);
+            CFRelease(ax_app);
+
+            if (err != kAXErrorSuccess || !windows) continue;
+
+            CFIndex win_count = CFArrayGetCount(windows);
+            for (CFIndex i = 0; i < win_count && count < max_count; i++) {
+                AXUIElementRef win =
+                    (AXUIElementRef)CFArrayGetValueAtIndex(windows, i);
+
+                uint32_t wid = 0;
+                _AXUIElementGetWindow(win, &wid);
+                if (wid == 0) continue;
+
+                // Skip background tabs / off-screen windows
+                if (on_screen &&
+                    !CFSetContainsValue(on_screen, (const void *)(uintptr_t)wid))
+                    continue;
+
+                if (!ax_element_is_standard_window(win)) continue;
+
+                double x, y, w, h;
+                if (!ax_element_get_frame(win, &x, &y, &w, &h)) continue;
+                if (w < 1 || h < 1) continue;
+
+                out[count++] = (bw_window_info){
+                    .wid = wid,
+                    .pid = (int32_t)pid,
+                    .x   = x,
+                    .y   = y,
+                    .w   = w,
+                    .h   = h,
+                };
+            }
+
+            CFRelease(windows);
+        }
+
+        if (on_screen) CFRelease(on_screen);
+        return count;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -375,32 +446,12 @@ bool bw_should_manage_window(int32_t pid, uint32_t wid) {
         app.activationPolicy != NSApplicationActivationPolicyRegular)
         return false;
 
-    // AX element may not be queryable yet for a brand-new window.
-    // Accept the window rather than silently dropping it.
     AXUIElementRef win = find_ax_window((pid_t)pid, wid);
-    if (!win) return true;
+    if (!win) return false;
 
-    CFStringRef role = NULL;
-    AXUIElementCopyAttributeValue(win, kAXRoleAttribute, (CFTypeRef *)&role);
-    if (role) {
-        bool is_window = CFEqual(role, kAXWindowRole);
-        CFRelease(role);
-        if (!is_window) {
-            CFRelease(win);
-            return false;
-        }
-    }
-    // role == NULL → AX not ready, fall through and accept
-
-    CFStringRef subrole = NULL;
-    AXUIElementCopyAttributeValue(win, kAXSubroleAttribute,
-                                  (CFTypeRef *)&subrole);
-    // Accept when subrole is absent (timing / app doesn't set it)
-    bool is_standard = !subrole || CFEqual(subrole, kAXStandardWindowSubrole);
-    if (subrole) CFRelease(subrole);
-
+    bool result = ax_element_is_standard_window(win);
     CFRelease(win);
-    return is_standard;
+    return result;
 }
 
 uint32_t bw_ax_get_focused_window(int32_t pid) {
@@ -695,6 +746,164 @@ void bw_unobserve_app(int32_t pid) {
 // ---------------------------------------------------------------------------
 // App identity
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// Debug: dump CG windows with AX properties
+// ---------------------------------------------------------------------------
+
+static bool str_contains_ci(const char *haystack, const char *needle) {
+    size_t hlen = strlen(haystack);
+    size_t nlen = strlen(needle);
+    if (nlen > hlen) return false;
+    for (size_t i = 0; i <= hlen - nlen; i++) {
+        if (strncasecmp(haystack + i, needle, nlen) == 0) return true;
+    }
+    return false;
+}
+
+uint32_t bw_debug_windows(char *out, uint32_t max_len, const char *filter) {
+    CFArrayRef window_list = CGWindowListCopyWindowInfo(
+        kCGWindowListOptionAll | kCGWindowListExcludeDesktopElements,
+        kCGNullWindowID);
+    if (!window_list) return 0;
+
+    uint32_t pos = 0;
+    CFIndex total = CFArrayGetCount(window_list);
+
+#define DPRINTF(...) do { \
+    int n_ = snprintf(out + pos, max_len - pos, __VA_ARGS__); \
+    if (n_ > 0) pos += (uint32_t)n_; \
+    if (pos >= max_len) goto done; \
+} while(0)
+
+    for (CFIndex i = 0; i < total; i++) {
+        @autoreleasepool {
+            CFDictionaryRef info =
+                (CFDictionaryRef)CFArrayGetValueAtIndex(window_list, i);
+
+            uint32_t wid = 0;
+            CFNumberRef wid_ref = CFDictionaryGetValue(info, kCGWindowNumber);
+            if (!wid_ref) continue;
+            CFNumberGetValue(wid_ref, kCFNumberSInt32Type, &wid);
+
+            int32_t pid = 0;
+            CFNumberRef pid_ref =
+                CFDictionaryGetValue(info, kCGWindowOwnerPID);
+            if (!pid_ref) continue;
+            CFNumberGetValue(pid_ref, kCFNumberSInt32Type, &pid);
+
+            int32_t layer = 0;
+            CFNumberRef layer_ref = CFDictionaryGetValue(info, kCGWindowLayer);
+            if (layer_ref)
+                CFNumberGetValue(layer_ref, kCFNumberSInt32Type, &layer);
+
+            CFStringRef owner_name_ref =
+                CFDictionaryGetValue(info, kCGWindowOwnerName);
+            char owner_name[128] = "(unknown)";
+            if (owner_name_ref)
+                CFStringGetCString(owner_name_ref, owner_name, sizeof(owner_name),
+                                   kCFStringEncodingUTF8);
+
+            char bundle_id[256] = "(unknown)";
+            NSRunningApplication *app = [NSRunningApplication
+                runningApplicationWithProcessIdentifier:pid];
+            if (app && app.bundleIdentifier) {
+                const char *utf8 = [app.bundleIdentifier UTF8String];
+                if (utf8) strlcpy(bundle_id, utf8, sizeof(bundle_id));
+            }
+
+            NSApplicationActivationPolicy policy =
+                app ? app.activationPolicy : -1;
+
+            if (filter) {
+                if (layer != 0) continue;
+                if (policy != NSApplicationActivationPolicyRegular) continue;
+                if (!str_contains_ci(bundle_id, filter) &&
+                    !str_contains_ci(owner_name, filter))
+                    continue;
+            }
+
+            const char *policy_str = "(no app)";
+            if (app) {
+                switch (policy) {
+                    case NSApplicationActivationPolicyRegular:
+                        policy_str = "regular";
+                        break;
+                    case NSApplicationActivationPolicyAccessory:
+                        policy_str = "accessory";
+                        break;
+                    case NSApplicationActivationPolicyProhibited:
+                        policy_str = "prohibited";
+                        break;
+                    default:
+                        policy_str = "unknown";
+                        break;
+                }
+            }
+
+            CGRect bounds = CGRectZero;
+            CFDictionaryRef bounds_ref =
+                CFDictionaryGetValue(info, kCGWindowBounds);
+            if (bounds_ref)
+                CGRectMakeWithDictionaryRepresentation(bounds_ref, &bounds);
+
+            CFStringRef win_name_ref =
+                CFDictionaryGetValue(info, kCGWindowName);
+            char win_name[256] = "";
+            if (win_name_ref)
+                CFStringGetCString(win_name_ref, win_name, sizeof(win_name),
+                                   kCFStringEncodingUTF8);
+
+            bool on_screen = bw_is_window_on_screen(wid);
+
+            char ax_role[64] = "(n/a)";
+            char ax_subrole[64] = "(n/a)";
+            AXUIElementRef ax_win = find_ax_window((pid_t)pid, wid);
+            if (ax_win) {
+                CFStringRef role = NULL;
+                AXUIElementCopyAttributeValue(ax_win, kAXRoleAttribute,
+                                              (CFTypeRef *)&role);
+                if (role) {
+                    CFStringGetCString(role, ax_role, sizeof(ax_role),
+                                       kCFStringEncodingUTF8);
+                    CFRelease(role);
+                }
+
+                CFStringRef subrole = NULL;
+                AXUIElementCopyAttributeValue(ax_win, kAXSubroleAttribute,
+                                              (CFTypeRef *)&subrole);
+                if (subrole) {
+                    CFStringGetCString(subrole, ax_subrole, sizeof(ax_subrole),
+                                       kCFStringEncodingUTF8);
+                    CFRelease(subrole);
+                }
+                CFRelease(ax_win);
+            }
+
+            bool should_manage = bw_should_manage_window(pid, wid);
+
+            DPRINTF("wid=%u pid=%d layer=%d on_screen=%s\n"
+                    "  app=%s bundle=%s policy=%s\n"
+                    "  title=%s\n"
+                    "  bounds=(%.0f,%.0f,%.0f,%.0f)\n"
+                    "  ax_role=%s ax_subrole=%s\n"
+                    "  should_manage=%s\n\n",
+                    wid, pid, layer, on_screen ? "yes" : "no",
+                    owner_name, bundle_id, policy_str,
+                    win_name[0] ? win_name : "(none)",
+                    bounds.origin.x, bounds.origin.y,
+                    bounds.size.width, bounds.size.height,
+                    ax_role, ax_subrole,
+                    should_manage ? "yes" : "no");
+        }
+    }
+
+done:
+    CFRelease(window_list);
+    return pos;
+
+#undef DPRINTF
+}
 
 uint32_t bw_get_app_bundle_id(int32_t pid, char *out, uint32_t max_len) {
     @autoreleasepool {
