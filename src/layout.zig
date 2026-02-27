@@ -135,6 +135,20 @@ pub fn applyLayout(node: Node, frame: Frame, inner_gap: f64, output: *std.ArrayL
     }
 }
 
+/// Replace a window ID in the BSP tree. Used for tab switches where the
+/// new active tab inherits the old tab's position in the layout.
+pub fn swapWindow(node: *Node, old_wid: WindowId, new_wid: WindowId) void {
+    switch (node.*) {
+        .leaf => |*leaf| {
+            if (leaf.wid == old_wid) leaf.wid = new_wid;
+        },
+        .split => |split| {
+            swapWindow(&split.left, old_wid, new_wid);
+            swapWindow(&split.right, old_wid, new_wid);
+        },
+    }
+}
+
 /// Recursively free all Split nodes in the tree.
 pub fn destroyTree(node: Node, allocator: std.mem.Allocator) void {
     switch (node) {

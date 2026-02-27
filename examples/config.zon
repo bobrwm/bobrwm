@@ -47,4 +47,10 @@
         // .{ .app_id = "com.apple.Safari", .workspace = 2 },
         // .{ .app_id = "com.apple.MobileSMS", .workspace = 3 },
     },
+
+    // Extra apps with native macOS tabs (each tab = separate AXWindow).
+    // Ghostty, Finder, and Safari are built-in — add others here.
+    // .tabbed_apps = .{
+    //     "com.brave.Browser",
+    // },
 }

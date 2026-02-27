@@ -17,6 +17,7 @@ pub const Config = struct {
     keybinds: []const Keybind = &default_keybinds,
     workspace_assignments: []const WorkspaceAssignment = &.{},
     workspace_names: []const []const u8 = &.{},
+    tabbed_apps: []const []const u8 = &.{},
     gaps: Gaps = .{},
 
     /// Look up the assigned workspace for a given bundle identifier.

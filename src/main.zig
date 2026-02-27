@@ -423,16 +423,37 @@ fn handleEvent(ev: *const event_mod.Event) void {
             log.info("window focused pid={}", .{ev.pid});
             const wid = shim.bw_ax_get_focused_window(ev.pid);
             if (wid != 0) {
-                if (g_store.get(wid) == null) {
-                    shim.bw_observe_app(ev.pid);
-                    discoverWindows();
-                    retile();
+                if (isTabbedApp(ev.pid) and (g_tab_groups.isSuppressed(wid) or g_store.get(wid) == null)) {
+                    handleTabSwitch(ev.pid, wid);
+                } else {
+                    if (g_store.get(wid) == null) {
+                        shim.bw_observe_app(ev.pid);
+                        discoverWindows();
+                        retile();
+                    }
+                    // Only update focus if this window is on the active workspace
+                    if (g_store.get(wid)) |win| {
+                        if (win.workspace_id == g_workspaces.active_id) {
+                            g_workspaces.active().focused_wid = wid;
+                        }
+                    }
                 }
-                g_workspaces.active().focused_wid = wid;
             }
         },
         .focused_window_changed => {
             log.info("focused window changed pid={}", .{ev.pid});
+            if (isTabbedApp(ev.pid)) {
+                const wid = shim.bw_ax_get_focused_window(ev.pid);
+                if (wid != 0) {
+                    if (g_tab_groups.isSuppressed(wid) or g_store.get(wid) == null) {
+                        handleTabSwitch(ev.pid, wid);
+                    } else if (g_store.get(wid)) |win| {
+                        if (g_workspaces.get(win.workspace_id)) |ws| {
+                            if (ws.is_visible) ws.focused_wid = wid;
+                        }
+                    }
+                }
+            }
         },
         .window_created => {
             log.info("window created pid={} wid={}", .{ ev.pid, ev.wid });
@@ -616,13 +637,67 @@ fn addNewWindow(pid: i32, wid: u32) void {
         return;
     }
 
-    // Background tabs (native macOS tabs) fire kAXWindowCreatedNotification
-    // but are not on screen — skip them to avoid tiling invisible windows.
-    if (!shim.bw_is_window_on_screen(wid)) {
+    const is_tabbed = isTabbedApp(pid);
+    const on_screen = shim.bw_is_window_on_screen(wid);
+
+    // Background tab of a tabbed app — track as suppressed, skip BSP/workspace
+    if (is_tabbed and !on_screen) {
+        const ws = resolveWorkspace(pid);
+        g_store.put(.{
+            .wid = wid,
+            .pid = pid,
+            .title = null,
+            .frame = .{ .x = 0, .y = 0, .width = 0, .height = 0 },
+            .is_minimized = false,
+            .mode = .tiled,
+            .workspace_id = ws.id,
+        }) catch return;
+        g_tab_groups.suppress(wid);
+        log.info("addNewWindow: suppressed background tab wid={d} pid={d}", .{ wid, pid });
+        return;
+    }
+
+    // Non-tabbed off-screen window — skip entirely
+    if (!on_screen) {
         log.debug("addNewWindow: wid={d} not on screen, skipping", .{wid});
         return;
     }
 
+    // On-screen tabbed app window — check if it replaces an existing tab
+    if (is_tabbed) {
+        const ws = resolveWorkspace(pid);
+        for (ws.windows.items) |existing_wid| {
+            const existing = g_store.get(existing_wid) orelse continue;
+            if (existing.pid == pid and !shim.bw_is_window_on_screen(existing_wid)) {
+                // Tab switch during creation — swap in place
+                const ws_idx: usize = ws.id - 1;
+                g_store.put(.{
+                    .wid = wid,
+                    .pid = pid,
+                    .title = null,
+                    .frame = existing.frame,
+                    .is_minimized = false,
+                    .mode = .tiled,
+                    .workspace_id = ws.id,
+                }) catch return;
+                if (g_layout_roots[ws_idx]) |*root| {
+                    layout.swapWindow(root, existing_wid, wid);
+                }
+                ws.replaceWindow(existing_wid, wid);
+                g_tab_groups.suppress(existing_wid);
+                ws.focused_wid = wid;
+                log.info("addNewWindow: tab swap wid={d} → wid={d} pid={d}", .{ existing_wid, wid, pid });
+                if (!ws.is_visible) {
+                    hideWindow(pid, wid);
+                } else {
+                    retile();
+                }
+                return;
+            }
+        }
+    }
+
+    // Normal window addition
     const ws = resolveWorkspace(pid);
     const ws_idx: usize = ws.id - 1;
 
@@ -655,8 +730,32 @@ fn addNewWindow(pid: i32, wid: u32) void {
 }
 
 fn removeWindow(wid: u32) void {
+    // Suppressed background tab — just clean up tracking + store
+    if (g_tab_groups.isSuppressed(wid)) {
+        g_tab_groups.remove(wid);
+        g_store.remove(wid);
+        return;
+    }
+
     const win = g_store.get(wid) orelse return;
     const ws_idx: usize = win.workspace_id - 1;
+
+    // For tabbed apps, try to promote an on-screen suppressed tab
+    if (isTabbedApp(win.pid)) {
+        if (findPromotedTab(win.pid, win.workspace_id)) |replacement_wid| {
+            if (g_layout_roots[ws_idx]) |*root| {
+                layout.swapWindow(root, wid, replacement_wid);
+            }
+            if (g_workspaces.get(win.workspace_id)) |ws| {
+                ws.replaceWindow(wid, replacement_wid);
+            }
+            g_tab_groups.unsuppress(replacement_wid);
+            g_store.remove(wid);
+            log.info("tab promoted: wid={d} replaces wid={d}", .{ replacement_wid, wid });
+            return;
+        }
+    }
+
     g_store.remove(wid);
     if (g_workspaces.get(win.workspace_id)) |ws| {
         ws.removeWindow(wid);
@@ -704,6 +803,7 @@ fn removeAppWindows(pid: i32) void {
     }
 
     for (wids[0..n], ws_ids[0..n]) |wid, ws_id| {
+        g_tab_groups.remove(wid);
         g_store.remove(wid);
         if (g_workspaces.get(ws_id)) |ws| {
             ws.removeWindow(wid);
@@ -829,6 +929,104 @@ fn installCrashHandlers() void {
         };
         posix.sigaction(sig, &sa, null);
     }
+}
+
+// ---------------------------------------------------------------------------
+// Tab group helpers
+// ---------------------------------------------------------------------------
+
+/// Check if an app PID belongs to a known natively-tabbed application.
+fn isTabbedApp(pid: i32) bool {
+    var id_buf: [256]u8 = undefined;
+    const bundle_id = config_mod.getAppBundleId(pid, &id_buf) orelse return false;
+    return tabgroup.isTabbedApp(bundle_id, g_config.tabbed_apps);
+}
+
+/// Handle a tab switch: new_wid is the newly focused/active tab.
+/// Swaps it into the BSP slot of the old active tab from the same app.
+fn handleTabSwitch(pid: i32, new_wid: u32) void {
+    // Ensure new wid is in the store
+    if (g_store.get(new_wid) == null) {
+        if (!shim.bw_should_manage_window(pid, new_wid)) return;
+        const ws = resolveWorkspace(pid);
+        g_store.put(.{
+            .wid = new_wid,
+            .pid = pid,
+            .title = null,
+            .frame = .{ .x = 0, .y = 0, .width = 0, .height = 0 },
+            .is_minimized = false,
+            .mode = .tiled,
+            .workspace_id = ws.id,
+        }) catch return;
+    }
+
+    const new_win = g_store.get(new_wid).?;
+    const ws = g_workspaces.get(new_win.workspace_id) orelse return;
+    const ws_idx: usize = new_win.workspace_id - 1;
+
+    // Find the old active tab from same app that went off-screen
+    var old_wid: ?u32 = null;
+    for (ws.windows.items) |wid| {
+        if (wid == new_wid) continue;
+        const win = g_store.get(wid) orelse continue;
+        if (win.pid == pid and !shim.bw_is_window_on_screen(wid)) {
+            old_wid = wid;
+            break;
+        }
+    }
+
+    if (old_wid) |ow| {
+        // Swap in BSP tree
+        if (g_layout_roots[ws_idx]) |*root| {
+            layout.swapWindow(root, ow, new_wid);
+        }
+        // Swap in workspace window list
+        ws.replaceWindow(ow, new_wid);
+        // Copy frame from old tab
+        if (g_store.get(ow)) |old_win| {
+            var updated = new_win;
+            updated.frame = old_win.frame;
+            g_store.put(updated) catch {};
+        }
+        // Update suppressed tracking
+        g_tab_groups.unsuppress(new_wid);
+        g_tab_groups.suppress(ow);
+        ws.focused_wid = new_wid;
+        log.info("tab switch: wid={d} → wid={d} pid={d}", .{ ow, new_wid, pid });
+    } else {
+        // No old tab to swap with — add as new window
+        g_tab_groups.unsuppress(new_wid);
+        ws.addWindow(new_wid) catch return;
+        g_layout_roots[ws_idx] = layout.insertWindow(
+            g_layout_roots[ws_idx],
+            new_wid,
+            g_next_split_dir,
+            g_allocator,
+        ) catch return;
+        ws.focused_wid = new_wid;
+    }
+
+    // Non-visible workspace: hide the window instead of retiling
+    if (!ws.is_visible) {
+        hideWindow(pid, new_wid);
+        return;
+    }
+    retile();
+}
+
+/// Find a suppressed tab from the same app/workspace that's now on-screen
+/// (promoted by macOS after the active tab was closed).
+fn findPromotedTab(pid: i32, workspace_id: u8) ?u32 {
+    var it = g_tab_groups.suppressed.iterator();
+    while (it.next()) |entry| {
+        const wid = entry.key_ptr.*;
+        if (g_store.get(wid)) |win| {
+            if (win.pid == pid and win.workspace_id == workspace_id and shim.bw_is_window_on_screen(wid)) {
+                return wid;
+            }
+        }
+    }
+    return null;
 }
 
 // ---------------------------------------------------------------------------
