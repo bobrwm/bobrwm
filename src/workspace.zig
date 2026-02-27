@@ -33,6 +33,17 @@ pub const Workspace = struct {
         try self.windows.append(self.allocator, wid);
     }
 
+    /// Replace a window ID in the window list. Used for tab switches.
+    pub fn replaceWindow(self: *Workspace, old_wid: Window.WindowId, new_wid: Window.WindowId) void {
+        for (self.windows.items) |*wid| {
+            if (wid.* == old_wid) {
+                wid.* = new_wid;
+                if (self.focused_wid == old_wid) self.focused_wid = new_wid;
+                return;
+            }
+        }
+    }
+
     pub fn removeWindow(self: *Workspace, wid: Window.WindowId) void {
         for (self.windows.items, 0..) |existing, i| {
             if (existing == wid) {

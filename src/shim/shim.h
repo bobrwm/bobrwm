@@ -143,4 +143,14 @@ void bw_set_keybinds(const bw_keybind *binds, uint32_t count);
 /// Returns the number of bytes written to `out` (0 on failure).
 uint32_t bw_get_app_bundle_id(int32_t pid, char *out, uint32_t max_len);
 
+// --- Debug ---
+
+/// Dump CG windows with their AX attributes and management status.
+/// When `filter` is non-NULL, only windows whose bundle ID or owner name
+/// contains the filter string (case-insensitive) are included and system
+/// cruft (non-regular activation policy, non-zero layer) is excluded.
+/// Pass NULL to dump everything unfiltered.
+/// Returns the number of bytes written to `out`.
+uint32_t bw_debug_windows(char *out, uint32_t max_len, const char *filter);
+
 #endif
