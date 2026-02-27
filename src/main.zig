@@ -80,23 +80,81 @@ const EventRing = struct {
 /// Pixels visible in the corner when a window is hidden off-screen.
 const hide_peek: f64 = 5;
 
-/// Hide a window by moving it to the bottom-right corner of the display,
-/// preserving its stored frame size so there is no layout shift when the
-/// workspace becomes visible again.
-fn hideWindow(pid: i32, wid: u32) void {
-    const display = shim.bw_get_display_frame();
-    const pos_x = display.x + display.w - hide_peek;
-    const pos_y = display.y + display.h - hide_peek;
+const HideCorner = enum { bottom_right, bottom_left };
 
-    // Use stored frame dimensions to avoid layout shift on workspace switch
+/// Pick the bottom corner that does not border an adjacent monitor.
+/// Falls back to bottom-right on single-monitor setups.
+fn hideCorner() HideCorner {
+    const NSScreen_class = objc.getClass("NSScreen") orelse return .bottom_right;
+    const screens = NSScreen_class.msgSend(objc.Object, "screens", .{});
+    const count = screens.msgSend(usize, "count", .{});
+    if (count <= 1) return .bottom_right;
+
+    const main_screen = NSScreen_class.msgSend(objc.Object, "mainScreen", .{});
+    if (main_screen.value == null) return .bottom_right;
+    const main_frame = main_screen.msgSend(NSRect, "frame", .{});
+    const main_right = main_frame.origin.x + main_frame.size.width;
+
+    var i: usize = 0;
+    while (i < count) : (i += 1) {
+        const screen = screens.msgSend(objc.Object, "objectAtIndex:", .{i});
+        if (screen.value == main_screen.value) continue;
+        const frame = screen.msgSend(NSRect, "frame", .{});
+        // Adjacent to the right: other screen's left edge meets our right edge
+        if (@abs(frame.origin.x - main_right) < 5) return .bottom_left;
+    }
+    return .bottom_right;
+}
+
+/// Precomputed hide parameters (display frame + corner), so callers that
+/// hide many windows in a loop only query NSScreen once.
+const HideCtx = struct {
+    display: shim.bw_frame,
+    corner: HideCorner,
+
+    fn init() HideCtx {
+        return .{ .display = shim.bw_get_display_frame(), .corner = hideCorner() };
+    }
+
+    /// Move a single window to the chosen bottom corner, preserving its
+    /// stored frame size so there is no layout shift on workspace switch.
+    fn hide(self: HideCtx, pid: i32, wid: u32) void {
+        const pos_y = self.display.y + self.display.h - hide_peek;
+
+        if (g_store.get(wid)) |win| {
+            if (win.frame.width > 1 and win.frame.height > 1) {
+                const pos_x = switch (self.corner) {
+                    .bottom_right => self.display.x + self.display.w - hide_peek,
+                    .bottom_left => self.display.x - win.frame.width + hide_peek,
+                };
+                _ = shim.bw_ax_set_window_frame(pid, wid, pos_x, pos_y, win.frame.width, win.frame.height);
+                return;
+            }
+        }
+        // Window not yet tiled — just move off-screen with minimal size
+        const pos_x = switch (self.corner) {
+            .bottom_right => self.display.x + self.display.w - hide_peek,
+            .bottom_left => self.display.x - 1 + hide_peek,
+        };
+        _ = shim.bw_ax_set_window_frame(pid, wid, pos_x, pos_y, 1, 1);
+    }
+};
+
+/// Convenience wrapper for single-window hides outside of loops.
+fn hideWindow(pid: i32, wid: u32) void {
+    (HideCtx.init()).hide(pid, wid);
+}
+
+/// Workspace-aware on-screen check. Windows on hidden workspaces are parked
+/// in a screen corner with a few peek pixels visible — CG considers them
+/// "on screen" but they should not be treated as such.
+fn isVisibleOnScreen(wid: u32) bool {
     if (g_store.get(wid)) |win| {
-        if (win.frame.width > 1 and win.frame.height > 1) {
-            _ = shim.bw_ax_set_window_frame(pid, wid, pos_x, pos_y, win.frame.width, win.frame.height);
-            return;
+        if (g_workspaces.get(win.workspace_id)) |ws| {
+            if (!ws.is_visible) return false;
         }
     }
-    // Window not yet tiled — just move off-screen with minimal size
-    _ = shim.bw_ax_set_window_frame(pid, wid, pos_x, pos_y, 1, 1);
+    return shim.bw_is_window_on_screen(wid);
 }
 
 // ---------------------------------------------------------------------------
@@ -620,7 +678,7 @@ fn addNewWindow(pid: i32, wid: u32) void {
         return;
     }
 
-    const on_screen = shim.bw_is_window_on_screen(wid);
+    const on_screen = isVisibleOnScreen(wid);
     log.debug("addNewWindow: on_screen={}", .{on_screen});
 
     // Background tabs in native tab groups are not on screen — skip them.
@@ -711,7 +769,7 @@ fn tryFormTabGroupOnCreate(pid: i32, new_wid: u32) bool {
             const existing = g_store.get(existing_wid) orelse continue;
             if (existing.pid != pid) continue;
 
-            const still_on_screen = shim.bw_is_window_on_screen(existing_wid);
+            const still_on_screen = isVisibleOnScreen(existing_wid);
             log.debug("tryFormTabGroup: existing wid={d} on_screen={} frame=({d:.0},{d:.0},{d:.0},{d:.0})", .{
                 existing_wid,         still_on_screen,
                 existing.frame.x,     existing.frame.y,
@@ -1108,7 +1166,7 @@ fn reconcileAppTabs(pid: i32) void {
         focused_frame.x, focused_frame.y, focused_frame.width, focused_frame.height,
     });
 
-    const on_screen = shim.bw_is_window_on_screen(focused_wid);
+    const on_screen = isVisibleOnScreen(focused_wid);
     log.debug("reconcile: on_screen={}", .{on_screen});
 
     // Look for a managed window (in any workspace) with same PID and matching bounds
@@ -1231,7 +1289,7 @@ fn checkTabDragOut(_: i32, wid: u32) void {
     if (tabgroup.TabGroupManager.framesMatch(frame, g.canonical_frame)) return;
 
     // Bounds diverged — this tab was dragged out to a standalone window
-    if (!shim.bw_is_window_on_screen(wid)) return; // still off-screen, not a drag-out
+    if (!isVisibleOnScreen(wid)) return; // still off-screen, not a drag-out
 
     log.info("tab drag-out detected: wid={d} promoted to standalone", .{wid});
     const survivor = g_tab_groups.removeMember(wid);
@@ -1305,11 +1363,12 @@ fn switchWorkspace(target_id: u8) void {
     if (target_id == g_workspaces.active_id) return;
     const target_ws = g_workspaces.get(target_id) orelse return;
 
-    // Hide current workspace windows (move to bottom-right corner, keep size)
+    // Hide current workspace windows (move to safe bottom corner, keep size)
     const old_ws = g_workspaces.active();
+    const hctx = HideCtx.init();
     for (old_ws.windows.items) |wid| {
         if (g_store.get(wid)) |win| {
-            hideWindow(win.pid, wid);
+            hctx.hide(win.pid, wid);
         }
     }
     old_ws.is_visible = false;
