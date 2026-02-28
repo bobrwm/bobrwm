@@ -3,6 +3,7 @@ const posix = std.posix;
 const build_options = @import("build_options");
 const c = @cImport({
     @cInclude("ApplicationServices/ApplicationServices.h");
+    @cInclude("pthread.h");
 });
 const objc = @import("objc");
 const shim = @cImport({
@@ -46,8 +47,11 @@ pub const std_options = std.Options{
 const log = std.log.scoped(.bobrwm);
 
 // ---------------------------------------------------------------------------
-// Lock-free MPSC ring buffer
+// Lock-free SPSC ring buffer
 // ---------------------------------------------------------------------------
+// Single-producer (main thread) only. All emitters must run on the
+// main thread / main queue. The consumer is bw_drain_events, also on
+// the main run-loop.
 
 const EventRing = struct {
     const capacity = 256;
@@ -159,7 +163,10 @@ export fn bw_ax_is_trusted() bool {
 // Event bridge (called from ObjC shim)
 // ---------------------------------------------------------------------------
 
+// Single-producer (main thread) only — all ObjC emitters must dispatch
+// on the main queue so the ring buffer stays SPSC.
 export fn bw_emit_event(kind: u8, pid: i32, wid: u32) void {
+    std.debug.assert(c.pthread_main_np() != 0);
     g_ring.push(.{
         .kind = @enumFromInt(kind),
         .pid = pid,

@@ -33,7 +33,7 @@ static CFAbsoluteTime g_last_display_changed_at = 0;
     // the launch notification fires. Re-emit after a delay so bw_observe_app
     // and discoverWindows get a second chance. The handler is idempotent.
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1 * NSEC_PER_SEC)),
-                   dispatch_get_global_queue(0, 0), ^{
+                   dispatch_get_main_queue(), ^{
         bw_emit_event(BW_EVENT_APP_LAUNCHED, pid, 0);
     });
 }
@@ -582,7 +582,7 @@ static void bw_retry_resolve_wid(void *context) {
 
     ctx->attempts_remaining--;
     dispatch_after_f(dispatch_time(DISPATCH_TIME_NOW, 50 * NSEC_PER_MSEC),
-                     dispatch_get_global_queue(0, 0),
+                     dispatch_get_main_queue(),
                      ctx, bw_retry_resolve_wid);
 }
 
@@ -611,7 +611,7 @@ static void ax_notification_handler(AXObserverRef observer,
         ctx->pid = pid;
         ctx->attempts_remaining = 5;
         dispatch_after_f(dispatch_time(DISPATCH_TIME_NOW, 50 * NSEC_PER_MSEC),
-                         dispatch_get_global_queue(0, 0),
+                         dispatch_get_main_queue(),
                          ctx, bw_retry_resolve_wid);
     } else if (CFEqual(notification, kAXFocusedWindowChangedNotification)) {
         // App-level (wid=0 in refcon): emit so Zig can reconcile tab groups
