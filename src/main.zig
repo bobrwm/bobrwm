@@ -441,6 +441,7 @@ fn handleEvent(ev: *const event_mod.Event) void {
         },
         .display_changed => {
             log.info("display changed", .{});
+            discoverWindows();
             retile();
         },
         .space_changed => log.info("space changed", .{}),

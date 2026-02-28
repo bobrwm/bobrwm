@@ -19,6 +19,9 @@ void bw_ax_prompt(void) {
 @interface BWObserver : NSObject
 @end
 
+static CFAbsoluteTime g_last_space_changed_at = 0;
+static CFAbsoluteTime g_last_display_changed_at = 0;
+
 @implementation BWObserver
 
 - (void)appLaunched:(NSNotification *)note {
@@ -42,7 +45,22 @@ void bw_ax_prompt(void) {
 
 - (void)spaceChanged:(NSNotification *)note {
     (void)note;
+    const CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
+    if (g_last_space_changed_at != 0 && (now - g_last_space_changed_at) < 0.05) {
+        return;
+    }
+    g_last_space_changed_at = now;
     bw_emit_event(BW_EVENT_SPACE_CHANGED, 0, 0);
+}
+
+- (void)displayChanged:(NSNotification *)note {
+    (void)note;
+    const CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
+    if (g_last_display_changed_at != 0 && (now - g_last_display_changed_at) < 0.05) {
+        return;
+    }
+    g_last_display_changed_at = now;
+    bw_emit_event(BW_EVENT_DISPLAY_CHANGED, 0, 0);
 }
 
 - (void)activeAppChanged:(NSNotification *)note {
@@ -153,6 +171,7 @@ void bw_setup_sources(int ipc_fd) {
     // --- NSWorkspace observers (main run loop) ---
     BWObserver *obs = [[BWObserver alloc] init];
     NSNotificationCenter *wsnc = [[NSWorkspace sharedWorkspace] notificationCenter];
+    NSNotificationCenter *nc = [NSNotificationCenter defaultCenter];
 
     [wsnc addObserver:obs
              selector:@selector(appLaunched:)
@@ -173,6 +192,11 @@ void bw_setup_sources(int ipc_fd) {
              selector:@selector(activeAppChanged:)
                  name:NSWorkspaceDidActivateApplicationNotification
                object:nil];
+
+    [nc addObserver:obs
+           selector:@selector(displayChanged:)
+               name:NSApplicationDidChangeScreenParametersNotification
+             object:nil];
 
     // --- CGEventTap for global hotkeys (main run loop) ---
     CGEventMask mask = (1 << kCGEventKeyDown);
