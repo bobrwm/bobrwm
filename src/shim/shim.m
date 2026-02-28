@@ -44,19 +44,19 @@ static CFAbsoluteTime g_last_display_changed_at = 0;
 }
 
 - (void)spaceChanged:(NSNotification *)note {
-    (void)note;
+(void)note;
     const CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
-    if (g_last_space_changed_at != 0 && (now - g_last_space_changed_at) < 0.05) {
+    if (g_last_space_changed_at != 0 && fabs(now - g_last_space_changed_at) < 0.05) {
         return;
     }
     g_last_space_changed_at = now;
-    bw_emit_event(BW_EVENT_SPACE_CHANGED, 0, 0);
+bw_emit_event(BW_EVENT_SPACE_CHANGED, 0, 0);
 }
 
 - (void)displayChanged:(NSNotification *)note {
     (void)note;
     const CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
-    if (g_last_display_changed_at != 0 && (now - g_last_display_changed_at) < 0.05) {
+    if (g_last_display_changed_at != 0 && fabs(now - g_last_display_changed_at) < 0.05) {
         return;
     }
     g_last_display_changed_at = now;
