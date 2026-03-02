@@ -68,6 +68,38 @@ pub fn removeWindow(root: Node, wid: WindowId, allocator: std.mem.Allocator) ?No
     return removeFrom(root, wid, allocator);
 }
 
+/// Swap two window IDs in-place inside an existing BSP tree.
+///
+/// Returns true when both windows were present and swapped.
+pub fn swapWindowIds(root: *Node, first_wid: WindowId, second_wid: WindowId) bool {
+    if (first_wid == second_wid) return false;
+    var first_leaf: ?*Node.Leaf = null;
+    var second_leaf: ?*Node.Leaf = null;
+    findLeaf(root, first_wid, &first_leaf);
+    findLeaf(root, second_wid, &second_leaf);
+    if (first_leaf == null or second_leaf == null) return false;
+
+    const first = first_leaf.?;
+    const second = second_leaf.?;
+    const first_id = first.wid;
+    first.wid = second.wid;
+    second.wid = first_id;
+    return true;
+}
+
+fn findLeaf(node: *Node, wid: WindowId, out: *?*Node.Leaf) void {
+    if (out.* != null) return;
+    switch (node.*) {
+        .leaf => |*leaf| {
+            if (leaf.wid == wid) out.* = leaf;
+        },
+        .split => |split| {
+            findLeaf(&split.left, wid, out);
+            findLeaf(&split.right, wid, out);
+        },
+    }
+}
+
 fn removeFrom(node: Node, wid: WindowId, allocator: std.mem.Allocator) ?Node {
     switch (node) {
         .leaf => |leaf| {
