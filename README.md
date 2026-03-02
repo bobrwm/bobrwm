@@ -17,7 +17,9 @@ bobrwm                    # start daemon
 bobrwm -c /path/to/config.zon  # start with explicit config
 bobrwm query windows      # IPC: list managed windows
 bobrwm query workspaces   # IPC: list workspaces
+bobrwm query displays     # IPC: list connected displays
 bobrwm query apps         # IPC: list observed apps
+bobrwm move-to-display 2  # IPC: move focused window to display slot 2
 ```
 
 ### Logging
