@@ -57,6 +57,7 @@ pub const TabGroupManager = struct {
         self.next_id += 1;
 
         var members: std.ArrayListUnmanaged(WindowId) = .{};
+        try members.ensureTotalCapacity(self.allocator, 4);
         try members.append(self.allocator, wid);
 
         try self.groups.put(self.allocator, id, .{
@@ -79,6 +80,13 @@ pub const TabGroupManager = struct {
         for (g.members.items) |m| {
             if (m == wid) return;
         }
+
+        if (g.members.items.len == g.members.capacity) {
+            const current_capacity = g.members.capacity;
+            const next_capacity: usize = if (current_capacity < 4) 4 else current_capacity * 2;
+            try g.members.ensureTotalCapacity(self.allocator, next_capacity);
+        }
+
         try g.members.append(self.allocator, wid);
         try self.wid_to_group.put(self.allocator, wid, group_id);
 

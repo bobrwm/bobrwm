@@ -16,6 +16,7 @@ pub const Window = struct {
     is_fullscreen: bool = false,
     mode: WindowMode = .tiled,
     workspace_id: u8,
+    display_id: u32,
 
     pub const Frame = struct {
         x: f64,
