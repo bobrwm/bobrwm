@@ -20,6 +20,8 @@ enum bw_event_kind {
     BW_EVENT_SPACE_CHANGED        = 10,
     BW_EVENT_DISPLAY_CHANGED      = 11,
     BW_EVENT_FOCUSED_WINDOW_CHANGED = 12,
+    BW_EVENT_MOUSE_DOWN           = 13,
+    BW_EVENT_MOUSE_UP             = 14,
 
     BW_HK_FOCUS_WORKSPACE        = 20,
     BW_HK_MOVE_TO_WORKSPACE      = 21,
@@ -119,6 +121,10 @@ bool bw_should_manage_window(int32_t pid, uint32_t wid);
 /// Check if a window is currently on screen (CGWindowList cross-check).
 /// Background tabs in native macOS tab groups are NOT on screen.
 bool bw_is_window_on_screen(uint32_t wid);
+
+/// Show/hide the live tiling destination preview overlay (CG coordinates).
+void bw_show_tile_preview(double x, double y, double w, double h);
+void bw_hide_tile_preview(void);
 
 /// Get all AX window IDs for a given PID (includes background tabs).
 /// Returns the number of entries written to `out`.
