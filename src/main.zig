@@ -829,10 +829,17 @@ fn commitWindowMovePreview(wid: u32) void {
     if (g_drag_preview.source_wid == null or g_drag_preview.source_wid.? != wid) return;
     defer clearDragPreview();
 
-    const target_wid = g_drag_preview.target_wid orelse return;
+    const source = g_store.get(wid) orelse return;
+    if (source.mode != .tiled or source.is_fullscreen) return;
+
+    const target_wid = g_drag_preview.target_wid orelse {
+        // Drag ended without crossing another tiled slot, so snap the window
+        // back to its managed frame instead of waiting for a later retile.
+        retile();
+        return;
+    };
     if (target_wid == wid) return;
 
-    const source = g_store.get(wid) orelse return;
     const target = g_store.get(target_wid) orelse return;
     if (source.mode != .tiled or target.mode != .tiled) return;
     if (source.is_fullscreen or target.is_fullscreen) return;
