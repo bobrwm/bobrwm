@@ -18,7 +18,7 @@
     ziglint-nix,
     ...
   }: let
-    allSystems = ["x86_64-linux" "aarch64-linux" "aarch64-darwin"];
+    allSystems = ["aarch64-darwin"];
     forAllSystems = f:
       nixpkgs.lib.genAttrs allSystems (system:
         f {
