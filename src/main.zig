@@ -881,6 +881,7 @@ fn handleEvent(ev: *const event_mod.Event) void {
         },
         .window_focused => {
             log.info("window focused pid={}", .{ev.pid});
+            const removed_stale = cleanupWorkspaceWindowsForPid(ev.pid);
             const wid = shim.bw_ax_get_focused_window(ev.pid);
             if (wid != 0) {
                 if (g_store.get(wid) == null) {
@@ -897,10 +898,17 @@ fn handleEvent(ev: *const event_mod.Event) void {
                     }
                 }
             }
+            if (removed_stale) {
+                retile();
+            }
         },
         .focused_window_changed => {
             log.info("focused window changed pid={}", .{ev.pid});
+            const removed_stale = cleanupWorkspaceWindowsForPid(ev.pid);
             reconcileAppTabs(ev.pid);
+            if (removed_stale) {
+                retile();
+            }
         },
         .window_created => {
             log.info("window created pid={} wid={}", .{ ev.pid, ev.wid });
@@ -1055,6 +1063,7 @@ fn discoverWindows() void {
 
     for (slice) |info| {
         if (g_store.get(info.wid) != null) continue;
+        if (!shim.bw_should_manage_window(info.pid, info.wid)) continue;
         const frame: window_mod.Window.Frame = .{ .x = info.x, .y = info.y, .width = info.w, .height = info.h };
         const display_id = displayIdForFrame(frame);
         const target_ws = resolveWorkspace(info.pid, display_id);
@@ -1192,8 +1201,14 @@ fn tryFormTabGroupOnCreate(pid: i32, new_wid: u32) bool {
         new_wid, new_frame.x, new_frame.y, new_frame.width, new_frame.height,
     });
 
+    // Collect stale windows for deferred cleanup — can't call removeWindow
+    // while iterating workspace window lists (swapRemove invalidates indices).
+    var stale_wids: [64]u32 = undefined;
+    var stale_count: usize = 0;
+    var formed = false;
+
     // Scan all workspaces for a same-PID window that is now off-screen
-    for (&g_workspaces.workspaces) |*ws| {
+    outer: for (&g_workspaces.workspaces) |*ws| {
         for (ws.windows.items) |existing_wid| {
             const existing = g_store.get(existing_wid) orelse continue;
             if (existing.pid != pid) continue;
@@ -1208,10 +1223,15 @@ fn tryFormTabGroupOnCreate(pid: i32, new_wid: u32) bool {
             if (still_on_screen) continue;
 
             // Verify the window still exists in CG. A destroyed window
-            // (e.g. a splash screen) fails the SkyLight lookup — skip it.
+            // (e.g. a splash screen, closed dialog) fails the SkyLight
+            // lookup — mark for removal so ghost windows don't persist.
             var existing_rect: skylight.CGRect = undefined;
             if (sky.getWindowBounds(conn, existing_wid, &existing_rect) != 0) {
-                log.debug("tryFormTabGroup: existing wid={d} destroyed (SkyLight lookup failed), skipping", .{existing_wid});
+                log.debug("tryFormTabGroup: existing wid={d} destroyed (SkyLight lookup failed), queuing removal", .{existing_wid});
+                if (stale_count < stale_wids.len) {
+                    stale_wids[stale_count] = existing_wid;
+                    stale_count += 1;
+                }
                 continue;
             }
 
@@ -1241,9 +1261,9 @@ fn tryFormTabGroupOnCreate(pid: i32, new_wid: u32) bool {
             const group_id = if (g_tab_groups.groupOf(existing_wid)) |g|
                 g.id
             else
-                g_tab_groups.createGroup(pid, existing_wid, existing.frame) catch return false;
+                g_tab_groups.createGroup(pid, existing_wid, existing.frame) catch break :outer;
 
-            g_tab_groups.addMember(group_id, new_wid) catch return false;
+            g_tab_groups.addMember(group_id, new_wid) catch break :outer;
             g_tab_groups.setActive(new_wid);
 
             // Store the new window (suppressed — not in workspace/layout)
@@ -1256,7 +1276,7 @@ fn tryFormTabGroupOnCreate(pid: i32, new_wid: u32) bool {
                 .mode = .tiled,
                 .workspace_id = ws.id,
                 .display_id = existing.display_id,
-            }) catch return false;
+            }) catch break :outer;
 
             // Also discover any other background tabs
             var ax_wids: [128]u32 = undefined;
@@ -1294,12 +1314,22 @@ fn tryFormTabGroupOnCreate(pid: i32, new_wid: u32) bool {
                 new_wid,
                 if (g_tab_groups.groupOf(existing_wid)) |g| g.members.items.len else 1,
             });
-            return true;
+            formed = true;
+            break :outer;
         }
     }
 
-    log.debug("tryFormTabGroup: no off-screen sibling found, proceeding as standalone", .{});
-    return false;
+    // Remove stale windows whose backing CG window no longer exists.
+    // Deferred to here because removeWindow mutates workspace window lists.
+    for (stale_wids[0..stale_count]) |stale_wid| {
+        log.info("tryFormTabGroup: removing stale window wid={d}", .{stale_wid});
+        removeWindow(stale_wid);
+    }
+
+    if (!formed) {
+        log.debug("tryFormTabGroup: no off-screen sibling found, proceeding as standalone", .{});
+    }
+    return formed;
 }
 
 fn removeWindow(wid: u32) void {
@@ -1384,6 +1414,57 @@ fn removeAppWindows(pid: i32) void {
         }
         removeFromLayout(ws_id, display_id, wid);
     }
+}
+
+/// Remove stale or ineligible managed windows for a single app process.
+///
+/// This catches cases where AX/WindowServer event ordering misses a
+/// destroy notification and a ghost window remains in workspace state.
+fn cleanupWorkspaceWindowsForPid(pid: i32) bool {
+    const sky = g_sky orelse return false;
+    const conn = sky.mainConnectionID();
+
+    var stale_wids: [128]u32 = undefined;
+    var stale_count: usize = 0;
+
+    for (&g_workspaces.workspaces) |*ws| {
+        for (ws.windows.items) |wid| {
+            const win = g_store.get(wid) orelse continue;
+            if (win.pid != pid) continue;
+
+            var should_remove = false;
+            var rect: skylight.CGRect = undefined;
+            if (sky.getWindowBounds(conn, wid, &rect) != 0) {
+                should_remove = true;
+                log.info("cleanup: removing wid={d} pid={d} reason=missing-windowserver", .{ wid, pid });
+            } else if (!shim.bw_should_manage_window(pid, wid)) {
+                should_remove = true;
+                log.info("cleanup: removing wid={d} pid={d} reason=should-manage=false", .{ wid, pid });
+            }
+
+            if (!should_remove) continue;
+
+            var already_queued = false;
+            for (stale_wids[0..stale_count]) |existing| {
+                if (existing == wid) {
+                    already_queued = true;
+                    break;
+                }
+            }
+            if (already_queued) continue;
+
+            if (stale_count < stale_wids.len) {
+                stale_wids[stale_count] = wid;
+                stale_count += 1;
+            }
+        }
+    }
+
+    for (stale_wids[0..stale_count]) |wid| {
+        removeWindow(wid);
+    }
+
+    return stale_count > 0;
 }
 
 /// Updates `display_id` when a moved/resized window crosses monitors.
