@@ -91,6 +91,17 @@ const DisplayInfo = struct {
     is_primary: bool,
 };
 
+const DragPreviewState = struct {
+    source_wid: ?u32 = null,
+    target_wid: ?u32 = null,
+    visible: bool = false,
+};
+
+const DropTarget = struct {
+    wid: u32,
+    frame: window_mod.Window.Frame,
+};
+
 const HideCorner = enum { bottom_right, bottom_left };
 
 fn nsString(str: [*:0]const u8) objc.Object {
@@ -361,6 +372,8 @@ var g_next_split_dir: layout.Direction = .horizontal;
 var g_tab_groups: tabgroup.TabGroupManager = undefined;
 var g_ipc: ipc.Server = undefined;
 var g_config: config_mod.Config = .{};
+var g_drag_preview: DragPreviewState = .{};
+var g_mouse_left_down = false;
 
 // ---------------------------------------------------------------------------
 // NSApp lifecycle (zig-objc)
@@ -649,7 +662,7 @@ export fn bw_will_quit() void {
 
 /// Retile — called from status bar Retile action.
 export fn bw_retile() void {
-    retileAllDisplays();
+    retile();
 }
 
 fn layoutRootPtr(workspace_id: u8, display_id: u32) ?*?layout.Node {
@@ -671,7 +684,172 @@ fn insertIntoLayout(workspace_id: u8, display_id: u32, wid: u32) void {
     root_ptr.* = updated;
 }
 
+fn clearDragPreview() void {
+    if (g_drag_preview.visible) {
+        shim.bw_hide_tile_preview();
+    }
+    g_drag_preview = .{};
+}
+
+fn displayContentFrame(display_id: u32) ?window_mod.Window.Frame {
+    const display_slot = displayIndexById(display_id) orelse return null;
+    const display = g_displays[display_slot].visible;
+    const outer = g_config.gaps.outer;
+    return .{
+        .x = display.x + @as(f64, @floatFromInt(outer.left)),
+        .y = display.y + @as(f64, @floatFromInt(outer.top)),
+        .width = display.w - @as(f64, @floatFromInt(@as(u32, outer.left) + @as(u32, outer.right))),
+        .height = display.h - @as(f64, @floatFromInt(@as(u32, outer.top) + @as(u32, outer.bottom))),
+    };
+}
+
+fn frameContainsPoint(frame: window_mod.Window.Frame, point_x: f64, point_y: f64) bool {
+    return point_x >= frame.x and
+        point_x <= frame.x + frame.width and
+        point_y >= frame.y and
+        point_y <= frame.y + frame.height;
+}
+
+fn findDropTargetInLayout(
+    node: layout.Node,
+    frame: window_mod.Window.Frame,
+    inner_gap: f64,
+    dragged_wid: u32,
+    center_x: f64,
+    center_y: f64,
+    workspace_id: u8,
+    display_id: u32,
+) ?DropTarget {
+    std.debug.assert(inner_gap >= 0);
+    switch (node) {
+        .leaf => |leaf| {
+            if (leaf.wid == dragged_wid) return null;
+            if (!frameContainsPoint(frame, center_x, center_y)) return null;
+            const target = g_store.get(leaf.wid) orelse return null;
+            if (target.mode != .tiled or target.is_fullscreen) return null;
+            if (target.workspace_id != workspace_id or target.display_id != display_id) return null;
+            return .{ .wid = leaf.wid, .frame = frame };
+        },
+        .split => |split| {
+            const half_gap = inner_gap / 2.0;
+            var left_frame = frame;
+            var right_frame = frame;
+
+            switch (split.direction) {
+                .horizontal => {
+                    const left_width = frame.width * split.ratio;
+                    left_frame.width = left_width - half_gap;
+                    right_frame.x = frame.x + left_width + half_gap;
+                    right_frame.width = frame.width - left_width - half_gap;
+                },
+                .vertical => {
+                    const top_height = frame.height * split.ratio;
+                    left_frame.height = top_height - half_gap;
+                    right_frame.y = frame.y + top_height + half_gap;
+                    right_frame.height = frame.height - top_height - half_gap;
+                },
+            }
+
+            if (frameContainsPoint(left_frame, center_x, center_y)) {
+                if (findDropTargetInLayout(split.left, left_frame, inner_gap, dragged_wid, center_x, center_y, workspace_id, display_id)) |target| {
+                    return target;
+                }
+            }
+            if (frameContainsPoint(right_frame, center_x, center_y)) {
+                if (findDropTargetInLayout(split.right, right_frame, inner_gap, dragged_wid, center_x, center_y, workspace_id, display_id)) |target| {
+                    return target;
+                }
+            }
+            return null;
+        },
+    }
+}
+
+fn updateWindowMovePreview(wid: u32) void {
+    const win = g_store.get(wid) orelse {
+        clearDragPreview();
+        return;
+    };
+
+    if (win.mode != .tiled or win.is_fullscreen) {
+        clearDragPreview();
+        return;
+    }
+    if (!workspaceVisibleOnDisplay(win.workspace_id, win.display_id)) {
+        clearDragPreview();
+        return;
+    }
+
+    const root_ptr = layoutRootPtr(win.workspace_id, win.display_id) orelse {
+        clearDragPreview();
+        return;
+    };
+    const root = root_ptr.* orelse {
+        clearDragPreview();
+        return;
+    };
+    const display_frame = displayContentFrame(win.display_id) orelse {
+        clearDragPreview();
+        return;
+    };
+
+    const center_x = win.frame.x + win.frame.width / 2.0;
+    const center_y = win.frame.y + win.frame.height / 2.0;
+    const target_entry = findDropTargetInLayout(
+        root,
+        display_frame,
+        @floatFromInt(g_config.gaps.inner),
+        wid,
+        center_x,
+        center_y,
+        win.workspace_id,
+        win.display_id,
+    );
+
+    g_drag_preview.source_wid = wid;
+
+    if (target_entry) |entry| {
+        const target_changed = g_drag_preview.target_wid == null or g_drag_preview.target_wid.? != entry.wid;
+        g_drag_preview.target_wid = entry.wid;
+        if (!g_drag_preview.visible or target_changed) {
+            shim.bw_show_tile_preview(entry.frame.x, entry.frame.y, entry.frame.width, entry.frame.height);
+            g_drag_preview.visible = true;
+        }
+        return;
+    }
+
+    g_drag_preview.target_wid = null;
+    if (g_drag_preview.visible) {
+        shim.bw_hide_tile_preview();
+        g_drag_preview.visible = false;
+    }
+}
+
+fn commitWindowMovePreview(wid: u32) void {
+    if (g_drag_preview.source_wid == null or g_drag_preview.source_wid.? != wid) return;
+    defer clearDragPreview();
+
+    const target_wid = g_drag_preview.target_wid orelse return;
+    if (target_wid == wid) return;
+
+    const source = g_store.get(wid) orelse return;
+    const target = g_store.get(target_wid) orelse return;
+    if (source.mode != .tiled or target.mode != .tiled) return;
+    if (source.is_fullscreen or target.is_fullscreen) return;
+    if (source.workspace_id != target.workspace_id) return;
+    if (source.display_id != target.display_id) return;
+
+    const root_ptr = layoutRootPtr(source.workspace_id, source.display_id) orelse return;
+    if (root_ptr.*) |*root| {
+        if (layout.swapWindowIds(root, wid, target_wid)) {
+            log.info("window move swap wid={d} target={d}", .{ wid, target_wid });
+            retile();
+        }
+    }
+}
+
 fn retile() void {
+    clearDragPreview();
     retileAllDisplays();
 }
 
@@ -744,6 +922,17 @@ fn handleEvent(ev: *const event_mod.Event) void {
             retile();
         },
         .space_changed => log.info("space changed", .{}),
+        .mouse_down => {
+            g_mouse_left_down = true;
+        },
+        .mouse_up => {
+            g_mouse_left_down = false;
+            if (g_drag_preview.source_wid) |source_wid| {
+                commitWindowMovePreview(source_wid);
+            } else {
+                clearDragPreview();
+            }
+        },
         .window_moved, .window_resized => {
             log.info("window {s} wid={}", .{
                 if (ev.kind == .window_moved) "moved" else "resized",
@@ -761,6 +950,14 @@ fn handleEvent(ev: *const event_mod.Event) void {
                 }
             }
             checkTabDragOut(ev.pid, ev.wid);
+            if (ev.kind == .window_moved) {
+                // Ignore synthetic move events generated by our own retile calls.
+                if (g_mouse_left_down) {
+                    updateWindowMovePreview(ev.wid);
+                }
+            } else {
+                clearDragPreview();
+            }
         },
 
         // -- Hotkey actions --
@@ -1099,6 +1296,9 @@ fn tryFormTabGroupOnCreate(pid: i32, new_wid: u32) bool {
 }
 
 fn removeWindow(wid: u32) void {
+    if (g_drag_preview.source_wid == wid or g_drag_preview.target_wid == wid) {
+        clearDragPreview();
+    }
     // Clean up tab group membership first
     const survivor = g_tab_groups.removeMember(wid);
 
@@ -1129,6 +1329,7 @@ fn removeWindow(wid: u32) void {
 }
 
 fn removeAppWindows(pid: i32) void {
+    clearDragPreview();
     var wids: [128]u32 = undefined;
     var ws_ids: [128]u8 = undefined;
     var display_ids: [128]u32 = undefined;
@@ -2009,8 +2210,8 @@ fn ipcQueryWindows(fd: posix.socket_t) void {
             const bundle_id: []const u8 = if (id_len > 0) id_buf[0..id_len] else "(unknown)";
 
             w.print("{d} {d} {s} {d} {d} {d:.0} {d:.0} {d:.0} {d:.0}\n", .{
-                win.wid,     win.pid,        bundle_id,       win.workspace_id, win.display_id,
-                win.frame.x, win.frame.y,    win.frame.width, win.frame.height,
+                win.wid,     win.pid,     bundle_id,       win.workspace_id, win.display_id,
+                win.frame.x, win.frame.y, win.frame.width, win.frame.height,
             }) catch break;
             written += 1;
         }
