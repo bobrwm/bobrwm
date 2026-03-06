@@ -22,6 +22,7 @@ enum bw_event_kind {
     BW_EVENT_FOCUSED_WINDOW_CHANGED = 12,
     BW_EVENT_MOUSE_DOWN           = 13,
     BW_EVENT_MOUSE_UP             = 14,
+    BW_EVENT_ROLE_POLL_TICK       = 15,
 
     BW_HK_FOCUS_WORKSPACE        = 20,
     BW_HK_MOVE_TO_WORKSPACE      = 21,
@@ -65,6 +66,12 @@ typedef struct {
     double w;
     double h;
 } bw_frame;
+
+enum bw_manage_state {
+    BW_MANAGE_REJECT = 0,
+    BW_MANAGE_READY = 1,
+    BW_MANAGE_PENDING = 2,
+};
 
 // --- Event bridge (Zig → C) ---
 
@@ -115,8 +122,18 @@ bool bw_ax_focus_window(int32_t pid, uint32_t wid);
 /// Returns 0 on failure.
 uint32_t bw_ax_get_focused_window(int32_t pid);
 
-/// Check if a window should be managed (regular app, standard AX window role).
+/// Legacy management predicate.
+/// Returns false only when a window is definitely not manageable.
+/// Returns true for both READY and PENDING role states.
 bool bw_should_manage_window(int32_t pid, uint32_t wid);
+
+/// Returns role readiness for management decision.
+/// READY means role/subrole are present and match a standard window.
+/// PENDING means AX has not published role/subrole yet.
+uint8_t bw_window_manage_state(int32_t pid, uint32_t wid);
+
+/// Enable/disable periodic role readiness polling (100ms).
+void bw_set_role_polling(bool enabled);
 
 /// Check if a window is currently on screen (CGWindowList cross-check).
 /// Background tabs in native macOS tab groups are NOT on screen.
