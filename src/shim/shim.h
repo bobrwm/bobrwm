@@ -91,8 +91,8 @@ void bw_ax_prompt(void);
 
 // --- Source setup ---
 
-/// Set up observers, CGEventTap, waker, IPC source, and status bar on the
-/// main run loop. Call after NSApp is initialised (from Zig via zig-objc).
+/// Set up CGEventTap, waker, and IPC source on the main run loop.
+/// Call after NSApp is initialised and workspace observers are registered.
 void bw_setup_sources(int ipc_fd);
 
 /// Signal the main run loop to drain the event ring.

@@ -407,6 +407,7 @@ var g_next_split_dir: layout.Direction = .horizontal;
 var g_tab_groups: tabgroup.TabGroupManager = undefined;
 var g_pending_role_windows: PendingRoleWindowMap = undefined;
 var g_deferred_window_candidates: DeferredWindowCandidateMap = undefined;
+var g_workspace_observer: ?objc.Object = null;
 var g_ipc: ipc.Server = undefined;
 var g_config: config_mod.Config = .{};
 var g_drag_preview: DragPreviewState = .{};
@@ -425,6 +426,58 @@ fn initApp() objc.Object {
     // NSApplicationActivationPolicyAccessory = 1
     _ = app.msgSend(bool, "setActivationPolicy:", .{@as(i64, 1)});
     return app;
+}
+
+/// Register NSWorkspace/NSNotificationCenter observers via zig-objc while
+/// keeping selector callbacks in BWObserver (ObjC class in shim.m).
+fn initWorkspaceObservers() void {
+    const BWObserver = objc.getClass("BWObserver") orelse
+        @panic("BWObserver class not found");
+    const NSWorkspace = objc.getClass("NSWorkspace") orelse
+        @panic("NSWorkspace class not found");
+    const NSNotificationCenter = objc.getClass("NSNotificationCenter") orelse
+        @panic("NSNotificationCenter class not found");
+
+    const workspace = NSWorkspace.msgSend(objc.Object, "sharedWorkspace", .{});
+    const workspace_notification_center = workspace.msgSend(objc.Object, "notificationCenter", .{});
+    const default_notification_center = NSNotificationCenter.msgSend(objc.Object, "defaultCenter", .{});
+    const observer = BWObserver.msgSend(objc.Object, "new", .{});
+    std.debug.assert(observer.value != null);
+    g_workspace_observer = observer;
+
+    // NSNotificationCenter does not retain selector-based observers.
+    std.debug.assert(g_workspace_observer.?.value != null);
+    const nil_object: objc.Object = .{ .value = null };
+    workspace_notification_center.msgSend(void, "addObserver:selector:name:object:", .{
+        observer,
+        objc.sel("appLaunched:"),
+        nsString("NSWorkspaceDidLaunchApplicationNotification"),
+        nil_object,
+    });
+    workspace_notification_center.msgSend(void, "addObserver:selector:name:object:", .{
+        observer,
+        objc.sel("appTerminated:"),
+        nsString("NSWorkspaceDidTerminateApplicationNotification"),
+        nil_object,
+    });
+    workspace_notification_center.msgSend(void, "addObserver:selector:name:object:", .{
+        observer,
+        objc.sel("spaceChanged:"),
+        nsString("NSWorkspaceActiveSpaceDidChangeNotification"),
+        nil_object,
+    });
+    workspace_notification_center.msgSend(void, "addObserver:selector:name:object:", .{
+        observer,
+        objc.sel("activeAppChanged:"),
+        nsString("NSWorkspaceDidActivateApplicationNotification"),
+        nil_object,
+    });
+    default_notification_center.msgSend(void, "addObserver:selector:name:object:", .{
+        observer,
+        objc.sel("displayChanged:"),
+        nsString("NSApplicationDidChangeScreenParametersNotification"),
+        nil_object,
+    });
 }
 
 /// Get the usable display frame (menu bar / dock excluded), CG coordinates.
@@ -643,6 +696,7 @@ pub fn main() !void {
 
     // -- NSApp (zig-objc) --
     const NSApp = initApp();
+    initWorkspaceObservers();
 
     // -- Sources (observers, CGEventTap, waker, IPC) --
     shim.bw_setup_sources(g_ipc.fd);
