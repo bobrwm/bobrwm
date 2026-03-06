@@ -83,6 +83,11 @@ const EventRing = struct {
 
 /// Pixels visible in the corner when a window is hidden off-screen.
 const hide_peek: f64 = 5;
+/// Poll cadence for windows that are waiting on role readiness or visibility.
+const role_poll_interval_ms: u64 = 100;
+/// Retry budget for deferred candidates before they are dropped or fall back.
+/// Electron-family apps can take multiple seconds before publishing stable AX roles.
+const role_poll_attempts_max: u8 = 50;
 
 const DisplayInfo = struct {
     id: u32,
@@ -103,6 +108,36 @@ const DropTarget = struct {
 };
 
 const HideCorner = enum { bottom_right, bottom_left };
+
+const WindowRoleState = enum {
+    reject,
+    ready,
+    pending,
+};
+
+const PendingRoleWindow = struct {
+    pid: i32,
+    attempts_remaining: u8,
+};
+
+const PendingRoleCandidate = struct {
+    pid: i32,
+    wid: u32,
+    from_timeout: bool,
+};
+
+const DeferredWindowCandidate = struct {
+    pid: i32,
+    attempts_remaining: u8,
+};
+
+const DeferredWindowPromotion = struct {
+    pid: i32,
+    wid: u32,
+};
+
+const PendingRoleWindowMap = std.AutoHashMap(u32, PendingRoleWindow);
+const DeferredWindowCandidateMap = std.AutoHashMap(u32, DeferredWindowCandidate);
 
 fn nsString(str: [*:0]const u8) objc.Object {
     const NSString = objc.getClass("NSString") orelse
@@ -370,6 +405,8 @@ var g_displays: [workspace_mod.max_displays]DisplayInfo = undefined;
 var g_display_count: usize = 0;
 var g_next_split_dir: layout.Direction = .horizontal;
 var g_tab_groups: tabgroup.TabGroupManager = undefined;
+var g_pending_role_windows: PendingRoleWindowMap = undefined;
+var g_deferred_window_candidates: DeferredWindowCandidateMap = undefined;
 var g_ipc: ipc.Server = undefined;
 var g_config: config_mod.Config = .{};
 var g_drag_preview: DragPreviewState = .{};
@@ -572,6 +609,13 @@ pub fn main() !void {
     clearLayoutRoots();
     g_tab_groups = tabgroup.TabGroupManager.init(g_allocator);
     defer g_tab_groups.deinit();
+    g_pending_role_windows = PendingRoleWindowMap.init(g_allocator);
+    g_deferred_window_candidates = DeferredWindowCandidateMap.init(g_allocator);
+    defer {
+        shim.bw_set_role_polling(false);
+        g_deferred_window_candidates.deinit();
+        g_pending_role_windows.deinit();
+    }
     refreshDisplays();
 
     // -- Apply workspace names from config --
@@ -602,6 +646,7 @@ pub fn main() !void {
 
     // -- Sources (observers, CGEventTap, waker, IPC) --
     shim.bw_setup_sources(g_ipc.fd);
+    refreshRolePolling();
     observeDiscoveredApps();
 
     // -- Status bar (zig-objc) --
@@ -937,6 +982,13 @@ fn handleEvent(ev: *const event_mod.Event) void {
             retile();
         },
         .space_changed => log.info("space changed", .{}),
+        .role_poll_tick => {
+            const promoted_pending = processPendingRoleWindows();
+            const promoted_deferred = processDeferredWindowCandidates();
+            if (promoted_pending or promoted_deferred) {
+                retile();
+            }
+        },
         .mouse_down => {
             g_mouse_left_down = true;
         },
@@ -1047,6 +1099,315 @@ fn setWindowMode(wid: u32, target: window_mod.WindowMode) void {
 // Window management helpers
 // ---------------------------------------------------------------------------
 
+fn windowRoleState(pid: i32, wid: u32) WindowRoleState {
+    std.debug.assert(wid != 0);
+    const raw_state = shim.bw_window_manage_state(pid, wid);
+    return switch (raw_state) {
+        shim.BW_MANAGE_REJECT => .reject,
+        shim.BW_MANAGE_READY => .ready,
+        shim.BW_MANAGE_PENDING => .pending,
+        else => {
+            log.warn("pending-role: unknown manage state pid={d} wid={d} state={d}", .{ pid, wid, raw_state });
+            return .pending;
+        },
+    };
+}
+
+fn refreshRolePolling() void {
+    const has_pending = g_pending_role_windows.count() > 0 or
+        g_deferred_window_candidates.count() > 0;
+    shim.bw_set_role_polling(has_pending);
+}
+
+fn trackPendingRoleWindow(pid: i32, wid: u32) void {
+    std.debug.assert(wid != 0);
+    if (g_store.get(wid) != null) return;
+
+    if (g_pending_role_windows.getPtr(wid)) |pending| {
+        pending.pid = pid;
+        pending.attempts_remaining = role_poll_attempts_max;
+    } else {
+        g_pending_role_windows.put(wid, .{
+            .pid = pid,
+            .attempts_remaining = role_poll_attempts_max,
+        }) catch {
+            log.err("pending-role: failed to track pid={d} wid={d}", .{ pid, wid });
+            return;
+        };
+    }
+
+    refreshRolePolling();
+}
+
+fn untrackPendingRoleWindow(wid: u32) void {
+    std.debug.assert(wid != 0);
+    if (g_pending_role_windows.remove(wid)) {
+        refreshRolePolling();
+    }
+}
+
+/// Remove all entries matching `pid` from a wid-keyed map whose values
+/// carry a `.pid` field. Batched to avoid iterator invalidation.
+fn removeEntriesForPid(comptime V: type, map: *std.AutoHashMap(u32, V), pid: i32) bool {
+    var removed_any = false;
+
+    while (true) {
+        var remove_batch: [64]u32 = undefined;
+        var remove_count: usize = 0;
+
+        var it = map.iterator();
+        while (it.next()) |entry| {
+            if (entry.value_ptr.pid != pid) continue;
+            if (remove_count == remove_batch.len) break;
+            remove_batch[remove_count] = entry.key_ptr.*;
+            remove_count += 1;
+        }
+
+        if (remove_count == 0) break;
+
+        for (remove_batch[0..remove_count]) |wid| {
+            if (map.remove(wid)) {
+                removed_any = true;
+            }
+        }
+
+        if (remove_count < remove_batch.len) break;
+    }
+
+    return removed_any;
+}
+
+fn untrackPendingRoleWindowsForPid(pid: i32) void {
+    if (removeEntriesForPid(PendingRoleWindow, &g_pending_role_windows, pid)) {
+        refreshRolePolling();
+    }
+}
+
+fn trackDeferredWindowCandidate(pid: i32, wid: u32) void {
+    std.debug.assert(wid != 0);
+    if (g_store.get(wid) != null) {
+        if (g_deferred_window_candidates.remove(wid)) {
+            refreshRolePolling();
+        }
+        return;
+    }
+
+    if (g_deferred_window_candidates.getPtr(wid)) |candidate| {
+        candidate.pid = pid;
+        candidate.attempts_remaining = role_poll_attempts_max;
+    } else {
+        g_deferred_window_candidates.put(wid, .{
+            .pid = pid,
+            .attempts_remaining = role_poll_attempts_max,
+        }) catch {
+            log.err("deferred-window: failed to track pid={d} wid={d}", .{ pid, wid });
+            return;
+        };
+    }
+
+    refreshRolePolling();
+}
+
+fn untrackDeferredWindowCandidate(wid: u32) void {
+    std.debug.assert(wid != 0);
+    if (g_deferred_window_candidates.remove(wid)) {
+        refreshRolePolling();
+    }
+}
+
+fn untrackDeferredWindowCandidatesForPid(pid: i32) void {
+    if (removeEntriesForPid(DeferredWindowCandidate, &g_deferred_window_candidates, pid)) {
+        refreshRolePolling();
+    }
+}
+
+fn addNewWindowLegacyPendingFallback(pid: i32, wid: u32) bool {
+    std.debug.assert(wid != 0);
+    if (g_store.get(wid) != null) return false;
+    if (!shim.bw_should_manage_window(pid, wid)) {
+        log.debug("pending-role: fallback rejected pid={d} wid={d}", .{ pid, wid });
+        return false;
+    }
+    return addNewWindowManaged(pid, wid);
+}
+
+fn processPendingRoleWindows() bool {
+    if (g_pending_role_windows.count() == 0) {
+        refreshRolePolling();
+        return false;
+    }
+
+    var remove_wids: [128]u32 = undefined;
+    var remove_count: usize = 0;
+    var candidates: [128]PendingRoleCandidate = undefined;
+    var candidate_count: usize = 0;
+    var truncated = false;
+
+    var it = g_pending_role_windows.iterator();
+    while (it.next()) |entry| {
+        const wid = entry.key_ptr.*;
+        const pid = entry.value_ptr.pid;
+
+        const state = windowRoleState(pid, wid);
+        switch (state) {
+            .reject => {
+                if (remove_count == remove_wids.len) {
+                    truncated = true;
+                    break;
+                }
+                remove_wids[remove_count] = wid;
+                remove_count += 1;
+            },
+            .ready => {
+                if (remove_count == remove_wids.len or candidate_count == candidates.len) {
+                    truncated = true;
+                    break;
+                }
+                remove_wids[remove_count] = wid;
+                remove_count += 1;
+                candidates[candidate_count] = .{ .pid = pid, .wid = wid, .from_timeout = false };
+                candidate_count += 1;
+            },
+            .pending => {
+                if (entry.value_ptr.attempts_remaining == 0) {
+                    if (remove_count == remove_wids.len or candidate_count == candidates.len) {
+                        truncated = true;
+                        break;
+                    }
+                    remove_wids[remove_count] = wid;
+                    remove_count += 1;
+                    candidates[candidate_count] = .{ .pid = pid, .wid = wid, .from_timeout = true };
+                    candidate_count += 1;
+                } else {
+                    entry.value_ptr.attempts_remaining -= 1;
+                }
+            },
+        }
+    }
+
+    for (remove_wids[0..remove_count]) |wid| {
+        _ = g_pending_role_windows.remove(wid);
+    }
+    refreshRolePolling();
+
+    if (truncated) {
+        log.warn("pending-role: batch truncated remaining={d}", .{g_pending_role_windows.count()});
+    }
+
+    var added_any = false;
+    for (candidates[0..candidate_count]) |candidate| {
+        if (candidate.from_timeout) {
+            const timeout_ms = @as(u64, role_poll_attempts_max) * role_poll_interval_ms;
+            log.info("pending-role: timeout pid={d} wid={d} after {d}ms, applying legacy fallback", .{ candidate.pid, candidate.wid, timeout_ms });
+            if (addNewWindowLegacyPendingFallback(candidate.pid, candidate.wid)) {
+                added_any = true;
+            }
+            continue;
+        }
+
+        if (addNewWindowManaged(candidate.pid, candidate.wid)) {
+            added_any = true;
+        }
+    }
+
+    return added_any;
+}
+
+fn processDeferredWindowCandidates() bool {
+    if (g_deferred_window_candidates.count() == 0) {
+        refreshRolePolling();
+        return false;
+    }
+
+    var remove_wids: [128]u32 = undefined;
+    var remove_count: usize = 0;
+    var promote_candidates: [128]DeferredWindowPromotion = undefined;
+    var promote_count: usize = 0;
+    var truncated = false;
+    const timeout_ms = @as(u64, role_poll_attempts_max) * role_poll_interval_ms;
+
+    var it = g_deferred_window_candidates.iterator();
+    while (it.next()) |entry| {
+        const wid = entry.key_ptr.*;
+        const pid = entry.value_ptr.pid;
+
+        if (g_store.get(wid) != null) {
+            if (remove_count == remove_wids.len) {
+                truncated = true;
+                break;
+            }
+            remove_wids[remove_count] = wid;
+            remove_count += 1;
+            continue;
+        }
+
+        switch (windowRoleState(pid, wid)) {
+            .reject => {
+                if (remove_count == remove_wids.len) {
+                    truncated = true;
+                    break;
+                }
+                remove_wids[remove_count] = wid;
+                remove_count += 1;
+            },
+            .pending => {
+                if (entry.value_ptr.attempts_remaining == 0) {
+                    if (remove_count == remove_wids.len) {
+                        truncated = true;
+                        break;
+                    }
+                    remove_wids[remove_count] = wid;
+                    remove_count += 1;
+                    log.info("deferred-window: timeout pid={d} wid={d} after {d}ms while role is pending", .{ pid, wid, timeout_ms });
+                } else {
+                    entry.value_ptr.attempts_remaining -= 1;
+                }
+            },
+            .ready => {
+                if (isVisibleOnScreen(wid)) {
+                    if (remove_count == remove_wids.len or promote_count == promote_candidates.len) {
+                        truncated = true;
+                        break;
+                    }
+                    remove_wids[remove_count] = wid;
+                    remove_count += 1;
+                    promote_candidates[promote_count] = .{ .pid = pid, .wid = wid };
+                    promote_count += 1;
+                } else {
+                    if (entry.value_ptr.attempts_remaining == 0) {
+                        if (remove_count == remove_wids.len) {
+                            truncated = true;
+                            break;
+                        }
+                        remove_wids[remove_count] = wid;
+                        remove_count += 1;
+                        log.info("deferred-window: timeout pid={d} wid={d} after {d}ms while still off-screen", .{ pid, wid, timeout_ms });
+                    } else {
+                        entry.value_ptr.attempts_remaining -= 1;
+                    }
+                }
+            },
+        }
+    }
+
+    for (remove_wids[0..remove_count]) |wid| {
+        _ = g_deferred_window_candidates.remove(wid);
+    }
+    refreshRolePolling();
+
+    if (truncated) {
+        log.warn("deferred-window: batch truncated remaining={d}", .{g_deferred_window_candidates.count()});
+    }
+
+    var added_any = false;
+    for (promote_candidates[0..promote_count]) |candidate| {
+        if (addNewWindowManaged(candidate.pid, candidate.wid)) {
+            added_any = true;
+        }
+    }
+    return added_any;
+}
+
 fn discoverWindows() void {
     var buf: [256]shim.bw_window_info = undefined;
     const count = shim.bw_discover_windows(&buf, 256);
@@ -1062,8 +1423,27 @@ fn discoverWindows() void {
     }.lessThan);
 
     for (slice) |info| {
+        // Observe the owning app even if this specific window is not yet
+        // manageable (for example AX role/subrole is still pending).
+        shim.bw_observe_app(info.pid);
+
         if (g_store.get(info.wid) != null) continue;
-        if (!shim.bw_should_manage_window(info.pid, info.wid)) continue;
+
+        switch (windowRoleState(info.pid, info.wid)) {
+            .reject => {
+                untrackPendingRoleWindow(info.wid);
+                continue;
+            },
+            .pending => {
+                trackPendingRoleWindow(info.pid, info.wid);
+                continue;
+            },
+            .ready => {
+                untrackPendingRoleWindow(info.wid);
+                untrackDeferredWindowCandidate(info.wid);
+            },
+        }
+
         const frame: window_mod.Window.Frame = .{ .x = info.x, .y = info.y, .width = info.w, .height = info.h };
         const display_id = displayIdForFrame(frame);
         const target_ws = resolveWorkspace(info.pid, display_id);
@@ -1096,48 +1476,30 @@ fn discoverWindows() void {
     }
 }
 
-fn addNewWindow(pid: i32, wid: u32) void {
+fn addNewWindowManaged(pid: i32, wid: u32) bool {
     log.debug("addNewWindow: pid={d} wid={d}", .{ pid, wid });
     if (g_store.get(wid) != null) {
         log.debug("addNewWindow: already in store, skipping", .{});
-        return;
-    }
-    if (!shim.bw_should_manage_window(pid, wid)) {
-        log.debug("addNewWindow: bw_should_manage_window=false, skipping", .{});
-        return;
+        return false;
     }
 
     const on_screen = isVisibleOnScreen(wid);
     log.debug("addNewWindow: on_screen={}", .{on_screen});
 
-    // Background tabs in native tab groups are not on screen — skip them.
-    // However, brand-new windows from just-launched apps (Discord, Electron)
-    // may not appear in the CG window list yet. Distinguish the two cases
-    // by checking whether this app already has any tiled windows.
+    // New windows from Electron-family apps can be created before WindowServer
+    // reports them as on-screen. Queue them for bounded re-evaluation rather
+    // than dropping them on a one-shot check.
     if (!on_screen) {
-        var app_has_tiled = false;
-        for (&g_workspaces.workspaces) |*ws| {
-            for (ws.windows.items) |existing_wid| {
-                if (g_store.get(existing_wid)) |existing| {
-                    if (existing.pid == pid) {
-                        app_has_tiled = true;
-                        break;
-                    }
-                }
-            }
-            if (app_has_tiled) break;
-        }
-        if (app_has_tiled) {
-            log.info("addNewWindow: off-screen wid={d} with existing windows → background tab, skipping", .{wid});
-            return;
-        }
-        log.debug("addNewWindow: off-screen wid={d}, first window for pid → CG timing, accepting", .{wid});
+        trackDeferredWindowCandidate(pid, wid);
+        log.info("addNewWindow: deferred pid={d} wid={d} while off-screen", .{ pid, wid });
+        return false;
     }
+    defer untrackDeferredWindowCandidate(wid);
 
     // Check if this new on-screen window replaces an existing same-PID window
     // that just went off-screen (i.e. a new tab was created and became active,
     // pushing the old tab to background). If so, form a tab group.
-    if (tryFormTabGroupOnCreate(pid, wid)) return;
+    if (tryFormTabGroupOnCreate(pid, wid)) return false;
 
     var window_frame: window_mod.Window.Frame = .{ .x = 0, .y = 0, .width = 0, .height = 0 };
     var display_id = focusedDisplayId();
@@ -1166,8 +1528,8 @@ fn addNewWindow(pid: i32, wid: u32) void {
         .display_id = display_id,
     };
 
-    g_store.put(win) catch return;
-    ws.addWindow(wid) catch return;
+    g_store.put(win) catch return false;
+    ws.addWindow(wid) catch return false;
     insertIntoLayout(ws.id, display_id, wid);
     ws.focused_wid = wid;
 
@@ -1177,6 +1539,29 @@ fn addNewWindow(pid: i32, wid: u32) void {
     }
 
     log.info("addNewWindow: tiled wid={d} on workspace {d}", .{ wid, ws.id });
+    return true;
+}
+
+fn addNewWindow(pid: i32, wid: u32) void {
+    std.debug.assert(wid != 0);
+    if (g_store.get(wid) != null) return;
+
+    switch (windowRoleState(pid, wid)) {
+        .reject => {
+            untrackPendingRoleWindow(wid);
+            untrackDeferredWindowCandidate(wid);
+            log.debug("addNewWindow: role gate rejected pid={d} wid={d}", .{ pid, wid });
+        },
+        .ready => {
+            untrackPendingRoleWindow(wid);
+            _ = addNewWindowManaged(pid, wid);
+        },
+        .pending => {
+            trackPendingRoleWindow(pid, wid);
+            trackDeferredWindowCandidate(pid, wid);
+            log.debug("addNewWindow: role gate pending pid={d} wid={d}", .{ pid, wid });
+        },
+    }
 }
 
 /// When a new on-screen window appears, check if an existing managed window
@@ -1333,6 +1718,8 @@ fn tryFormTabGroupOnCreate(pid: i32, new_wid: u32) bool {
 }
 
 fn removeWindow(wid: u32) void {
+    untrackPendingRoleWindow(wid);
+    untrackDeferredWindowCandidate(wid);
     if (g_drag_preview.source_wid == wid or g_drag_preview.target_wid == wid) {
         clearDragPreview();
     }
@@ -1366,6 +1753,8 @@ fn removeWindow(wid: u32) void {
 }
 
 fn removeAppWindows(pid: i32) void {
+    untrackPendingRoleWindowsForPid(pid);
+    untrackDeferredWindowCandidatesForPid(pid);
     clearDragPreview();
     var wids: [128]u32 = undefined;
     var ws_ids: [128]u8 = undefined;

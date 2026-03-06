@@ -80,7 +80,11 @@ bw_emit_event(BW_EVENT_SPACE_CHANGED, 0, 0);
 static CFMachPortRef g_tap_port = NULL;
 static CFRunLoopRef g_observer_runloop = NULL;
 static dispatch_source_t g_ipc_source = NULL;
+static dispatch_source_t g_role_poll_source = NULL;
+static dispatch_source_t g_observe_retry_source = NULL;
+static dispatch_source_t g_window_scan_source = NULL;
 static NSPanel *g_tile_preview_panel = nil;
+static BWObserver *g_workspace_observer = nil;
 
 // Configurable keybind table (set from Zig via bw_set_keybinds)
 #define MAX_KEYBINDS 128
@@ -247,9 +251,18 @@ void bw_hide_tile_preview(void) {
 
 void bw_setup_sources(int ipc_fd) {
     // --- NSWorkspace observers (main run loop) ---
-    BWObserver *obs = [[BWObserver alloc] init];
     NSNotificationCenter *wsnc = [[NSWorkspace sharedWorkspace] notificationCenter];
     NSNotificationCenter *nc = [NSNotificationCenter defaultCenter];
+
+    if (!g_workspace_observer) {
+        g_workspace_observer = [[BWObserver alloc] init];
+    } else {
+        // bw_setup_sources can be called multiple times in development runs.
+        // Clear stale registrations before re-registering this shared observer.
+        [wsnc removeObserver:g_workspace_observer];
+        [nc removeObserver:g_workspace_observer];
+    }
+    BWObserver *obs = g_workspace_observer;
 
     [wsnc addObserver:obs
              selector:@selector(appLaunched:)
@@ -313,6 +326,21 @@ void bw_setup_sources(int ipc_fd) {
         g_ipc_source = NULL;
     }
 
+    if (g_role_poll_source) {
+        dispatch_source_cancel(g_role_poll_source);
+        g_role_poll_source = NULL;
+    }
+
+    if (g_observe_retry_source) {
+        dispatch_source_cancel(g_observe_retry_source);
+        g_observe_retry_source = NULL;
+    }
+
+    if (g_window_scan_source) {
+        dispatch_source_cancel(g_window_scan_source);
+        g_window_scan_source = NULL;
+    }
+
     g_ipc_source = dispatch_source_create(
         DISPATCH_SOURCE_TYPE_READ, (uintptr_t)ipc_fd, 0,
         dispatch_get_main_queue());
@@ -320,6 +348,32 @@ void bw_setup_sources(int ipc_fd) {
         bw_handle_ipc_client(ipc_fd);
     });
     dispatch_resume(g_ipc_source);
+}
+
+void bw_set_role_polling(bool enabled) {
+    if (!enabled) {
+        if (g_role_poll_source) {
+            dispatch_source_cancel(g_role_poll_source);
+            g_role_poll_source = NULL;
+        }
+        return;
+    }
+
+    if (g_role_poll_source) return;
+
+    g_role_poll_source = dispatch_source_create(
+        DISPATCH_SOURCE_TYPE_TIMER, 0, 0, dispatch_get_main_queue());
+    if (!g_role_poll_source) return;
+
+    dispatch_source_set_timer(
+        g_role_poll_source,
+        dispatch_time(DISPATCH_TIME_NOW, 100 * NSEC_PER_MSEC),
+        100 * NSEC_PER_MSEC,
+        20 * NSEC_PER_MSEC);
+    dispatch_source_set_event_handler(g_role_poll_source, ^{
+        bw_emit_event(BW_EVENT_ROLE_POLL_TICK, 0, 0);
+    });
+    dispatch_resume(g_role_poll_source);
 }
 
 // ---------------------------------------------------------------------------
@@ -472,39 +526,62 @@ bool bw_ax_focus_window(int32_t pid, uint32_t wid) {
     return true;
 }
 
-bool bw_should_manage_window(int32_t pid, uint32_t wid) {
+static enum bw_manage_state bw_manage_state_for_window(int32_t pid,
+                                                        uint32_t wid) {
     NSRunningApplication *app =
         [NSRunningApplication runningApplicationWithProcessIdentifier:pid];
     if (!app ||
         app.activationPolicy != NSApplicationActivationPolicyRegular)
-        return false;
+        return BW_MANAGE_REJECT;
 
     // AX element may not be queryable yet for a brand-new window.
-    // Accept the window rather than silently dropping it.
+    // Mark as pending so callers can retry without silently dropping.
     AXUIElementRef win = find_ax_window((pid_t)pid, wid);
-    if (!win) return true;
+    if (!win) return BW_MANAGE_PENDING;
 
     CFStringRef role = NULL;
     AXUIElementCopyAttributeValue(win, kAXRoleAttribute, (CFTypeRef *)&role);
-    if (role) {
-        bool is_window = CFEqual(role, kAXWindowRole);
-        CFRelease(role);
-        if (!is_window) {
-            CFRelease(win);
-            return false;
-        }
+    if (!role) {
+        CFRelease(win);
+        return BW_MANAGE_PENDING;
     }
-    // role == NULL → AX not ready, fall through and accept
+
+    const bool is_window = CFEqual(role, kAXWindowRole);
+    const bool is_unknown_role = CFEqual(role, kAXUnknownRole);
+    CFRelease(role);
+    if (!is_window) {
+        CFRelease(win);
+        return is_unknown_role ? BW_MANAGE_PENDING : BW_MANAGE_REJECT;
+    }
 
     CFStringRef subrole = NULL;
     AXUIElementCopyAttributeValue(win, kAXSubroleAttribute,
                                   (CFTypeRef *)&subrole);
-    // Accept when subrole is absent (timing / app doesn't set it)
-    bool is_standard = !subrole || CFEqual(subrole, kAXStandardWindowSubrole);
-    if (subrole) CFRelease(subrole);
+    if (!subrole) {
+        CFRelease(win);
+        return BW_MANAGE_PENDING;
+    }
+
+    const bool is_standard = CFEqual(subrole, kAXStandardWindowSubrole);
+    const bool is_unknown_subrole = CFEqual(subrole, kAXUnknownSubrole);
+    CFRelease(subrole);
+
+    if (!is_standard && is_unknown_subrole) {
+        CFRelease(win);
+        return BW_MANAGE_PENDING;
+    }
 
     CFRelease(win);
-    return is_standard;
+    return is_standard ? BW_MANAGE_READY : BW_MANAGE_REJECT;
+}
+
+bool bw_should_manage_window(int32_t pid, uint32_t wid) {
+    const enum bw_manage_state state = bw_manage_state_for_window(pid, wid);
+    return state != BW_MANAGE_REJECT;
+}
+
+uint8_t bw_window_manage_state(int32_t pid, uint32_t wid) {
+    return (uint8_t)bw_manage_state_for_window(pid, wid);
 }
 
 uint32_t bw_ax_get_focused_window(int32_t pid) {
@@ -586,14 +663,201 @@ uint32_t bw_get_app_window_ids(int32_t pid, uint32_t *out,
 // ---------------------------------------------------------------------------
 
 #define MAX_OBSERVED_APPS 128
+#define MAX_KNOWN_WINDOWS_PER_APP 256
+#define BW_OBSERVE_RETRY_INTERVAL_MS 500
+#define BW_OBSERVE_RETRY_ATTEMPTS 40
+#define BW_WINDOW_SCAN_INTERVAL_MS 500
+#define BW_WINDOW_SCAN_IDLE_LIMIT 10
+#define BW_WID_RETRY_DELAY_MS 50
+#define BW_WID_RETRY_ATTEMPTS 60
 
 typedef struct {
     pid_t pid;
     AXObserverRef observer;
+    uint32_t known_window_count;
+    uint32_t known_windows[MAX_KNOWN_WINDOWS_PER_APP];
 } bw_app_observer_entry;
+
+typedef struct {
+    pid_t pid;
+    uint8_t attempts_remaining;
+} bw_observe_retry_entry;
 
 static bw_app_observer_entry g_app_observers[MAX_OBSERVED_APPS];
 static uint32_t g_app_observer_count = 0;
+static bw_observe_retry_entry g_observe_retry_entries[MAX_OBSERVED_APPS];
+static uint32_t g_observe_retry_count = 0;
+static uint32_t g_window_scan_idle_ticks = 0;
+
+static bool bw_try_observe_app(pid_t pid);
+static void process_window_scan_tick(void);
+static void update_window_scan_source(void);
+
+static int32_t app_observer_index(pid_t pid) {
+    for (uint32_t i = 0; i < g_app_observer_count; i++) {
+        if (g_app_observers[i].pid == pid) return (int32_t)i;
+    }
+    return -1;
+}
+
+static bool app_track_window(pid_t pid, uint32_t wid) {
+    if (wid == 0) return false;
+
+    const int32_t index = app_observer_index(pid);
+    if (index < 0) return false;
+
+    bw_app_observer_entry *entry = &g_app_observers[(uint32_t)index];
+    for (uint32_t i = 0; i < entry->known_window_count; i++) {
+        if (entry->known_windows[i] == wid) return false;
+    }
+
+    if (entry->known_window_count < MAX_KNOWN_WINDOWS_PER_APP) {
+        entry->known_windows[entry->known_window_count++] = wid;
+        return true;
+    }
+
+    // Preserve progress when an app has unusually many windows.
+    entry->known_windows[entry->known_window_count - 1] = wid;
+    return true;
+}
+
+static void app_untrack_window(pid_t pid, uint32_t wid) {
+    if (wid == 0) return;
+
+    const int32_t index = app_observer_index(pid);
+    if (index < 0) return;
+
+    bw_app_observer_entry *entry = &g_app_observers[(uint32_t)index];
+    for (uint32_t i = 0; i < entry->known_window_count; i++) {
+        if (entry->known_windows[i] != wid) continue;
+        entry->known_windows[i] = entry->known_windows[entry->known_window_count - 1];
+        entry->known_window_count--;
+        return;
+    }
+}
+
+static bool app_observer_exists(pid_t pid) {
+    return app_observer_index(pid) >= 0;
+}
+
+static int32_t observe_retry_index(pid_t pid) {
+    for (uint32_t i = 0; i < g_observe_retry_count; i++) {
+        if (g_observe_retry_entries[i].pid == pid) return (int32_t)i;
+    }
+    return -1;
+}
+
+static void observe_retry_remove_index(uint32_t index) {
+    if (index >= g_observe_retry_count) return;
+    g_observe_retry_entries[index] = g_observe_retry_entries[--g_observe_retry_count];
+}
+
+static void observe_retry_stop_if_idle(void) {
+    if (g_observe_retry_count != 0) return;
+    if (!g_observe_retry_source) return;
+    dispatch_source_cancel(g_observe_retry_source);
+    g_observe_retry_source = NULL;
+}
+
+static void process_observe_retry_tick(void) {
+    uint32_t i = 0;
+    while (i < g_observe_retry_count) {
+        bw_observe_retry_entry *entry = &g_observe_retry_entries[i];
+
+        NSRunningApplication *app =
+            [NSRunningApplication runningApplicationWithProcessIdentifier:entry->pid];
+        if (!app || app.terminated) {
+            observe_retry_remove_index(i);
+            continue;
+        }
+
+        if (app_observer_exists(entry->pid)) {
+            observe_retry_remove_index(i);
+            continue;
+        }
+
+        if (bw_try_observe_app(entry->pid)) {
+            observe_retry_remove_index(i);
+            continue;
+        }
+
+        if (entry->attempts_remaining == 0) {
+            observe_retry_remove_index(i);
+            continue;
+        }
+        entry->attempts_remaining--;
+        i++;
+    }
+
+    observe_retry_stop_if_idle();
+}
+
+static void schedule_observe_retry(pid_t pid) {
+    if (app_observer_exists(pid)) return;
+
+    const int32_t existing = observe_retry_index(pid);
+    if (existing >= 0) {
+        g_observe_retry_entries[(uint32_t)existing].attempts_remaining =
+            BW_OBSERVE_RETRY_ATTEMPTS;
+    } else {
+        if (g_observe_retry_count >= MAX_OBSERVED_APPS) return;
+        g_observe_retry_entries[g_observe_retry_count++] = (bw_observe_retry_entry){
+            .pid = pid,
+            .attempts_remaining = BW_OBSERVE_RETRY_ATTEMPTS,
+        };
+    }
+
+    if (g_observe_retry_source) return;
+
+    g_observe_retry_source = dispatch_source_create(
+        DISPATCH_SOURCE_TYPE_TIMER, 0, 0, dispatch_get_main_queue());
+    if (!g_observe_retry_source) return;
+
+    dispatch_source_set_timer(
+        g_observe_retry_source,
+        dispatch_time(DISPATCH_TIME_NOW,
+                      BW_OBSERVE_RETRY_INTERVAL_MS * NSEC_PER_MSEC),
+        BW_OBSERVE_RETRY_INTERVAL_MS * NSEC_PER_MSEC,
+        100 * NSEC_PER_MSEC);
+    dispatch_source_set_event_handler(g_observe_retry_source, ^{
+        process_observe_retry_tick();
+    });
+    dispatch_resume(g_observe_retry_source);
+}
+
+static void cancel_observe_retry(pid_t pid) {
+    const int32_t index = observe_retry_index(pid);
+    if (index < 0) return;
+    observe_retry_remove_index((uint32_t)index);
+    observe_retry_stop_if_idle();
+}
+
+static void update_window_scan_source(void) {
+    if (g_app_observer_count == 0) {
+        if (g_window_scan_source) {
+            dispatch_source_cancel(g_window_scan_source);
+            g_window_scan_source = NULL;
+        }
+        return;
+    }
+
+    if (g_window_scan_source) return;
+
+    g_window_scan_source = dispatch_source_create(
+        DISPATCH_SOURCE_TYPE_TIMER, 0, 0, dispatch_get_main_queue());
+    if (!g_window_scan_source) return;
+
+    dispatch_source_set_timer(
+        g_window_scan_source,
+        dispatch_time(DISPATCH_TIME_NOW,
+                      BW_WINDOW_SCAN_INTERVAL_MS * NSEC_PER_MSEC),
+        BW_WINDOW_SCAN_INTERVAL_MS * NSEC_PER_MSEC,
+        100 * NSEC_PER_MSEC);
+    dispatch_source_set_event_handler(g_window_scan_source, ^{
+        process_window_scan_tick();
+    });
+    dispatch_resume(g_window_scan_source);
+}
 
 // Pack pid (low 32) + wid (high 32) into a single pointer-sized refcon.
 // Per-window notifications store the wid at registration time so it's
@@ -627,6 +891,56 @@ static void register_window_ax_notifications(AXObserverRef observer,
                               kAXWindowDeminiaturizedNotification, refcon);
 }
 
+static void process_window_scan_tick(void) {
+    bool found_new = false;
+
+    for (uint32_t i = 0; i < g_app_observer_count; i++) {
+        const pid_t pid = g_app_observers[i].pid;
+        AXObserverRef observer = g_app_observers[i].observer;
+
+        AXUIElementRef app = AXUIElementCreateApplication(pid);
+        if (!app) continue;
+
+        CFArrayRef windows = NULL;
+        AXError err = AXUIElementCopyAttributeValue(
+            app, kAXWindowsAttribute, (CFTypeRef *)&windows);
+        CFRelease(app);
+
+        if (err != kAXErrorSuccess || !windows) continue;
+
+        const CFIndex count = CFArrayGetCount(windows);
+        for (CFIndex wi = 0; wi < count; wi++) {
+            AXUIElementRef win =
+                (AXUIElementRef)CFArrayGetValueAtIndex(windows, wi);
+            uint32_t wid = 0;
+            _AXUIElementGetWindow(win, &wid);
+            if (wid == 0) continue;
+
+            if (!app_track_window(pid, wid)) continue;
+
+            found_new = true;
+            register_window_ax_notifications(observer, win, pid);
+            bw_emit_event(BW_EVENT_WINDOW_CREATED, (int32_t)pid, wid);
+        }
+
+        CFRelease(windows);
+    }
+
+    // Stop the repeating scan after consecutive idle ticks to avoid
+    // paying the AX enumeration cost forever at steady state.
+    if (found_new) {
+        g_window_scan_idle_ticks = 0;
+    } else {
+        g_window_scan_idle_ticks++;
+        if (g_window_scan_idle_ticks >= BW_WINDOW_SCAN_IDLE_LIMIT) {
+            if (g_window_scan_source) {
+                dispatch_source_cancel(g_window_scan_source);
+                g_window_scan_source = NULL;
+            }
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Deferred wid resolution — retry when CGWindowID is not yet assigned
 // ---------------------------------------------------------------------------
@@ -638,12 +952,51 @@ typedef struct {
     uint8_t attempts_remaining;
 } bw_wid_retry_ctx;
 
+static void bw_retry_resolve_wid(void *context);
+
+static void schedule_wid_resolution_retry(AXObserverRef observer,
+                                          AXUIElementRef element,
+                                          pid_t pid) {
+    bw_wid_retry_ctx *ctx = malloc(sizeof(bw_wid_retry_ctx));
+    if (!ctx) return;
+
+    ctx->observer = (AXObserverRef)CFRetain(observer);
+    ctx->element = (AXUIElementRef)CFRetain(element);
+    ctx->pid = pid;
+    ctx->attempts_remaining = BW_WID_RETRY_ATTEMPTS;
+    dispatch_after_f(
+        dispatch_time(DISPATCH_TIME_NOW, BW_WID_RETRY_DELAY_MS * NSEC_PER_MSEC),
+        dispatch_get_main_queue(),
+        ctx,
+        bw_retry_resolve_wid);
+}
+
 static void bw_retry_resolve_wid(void *context) {
     bw_wid_retry_ctx *ctx = (bw_wid_retry_ctx *)context;
+
+    // Bail out if the owning app was unobserved or terminated while this
+    // retry was in flight. Without this guard a stale callback can emit
+    // WINDOW_CREATED for a pid we no longer track.
+    NSRunningApplication *app =
+        [NSRunningApplication runningApplicationWithProcessIdentifier:ctx->pid];
+    if (!app_observer_exists(ctx->pid) || !app || app.terminated) {
+        CFRelease(ctx->observer);
+        CFRelease(ctx->element);
+        free(ctx);
+        return;
+    }
+
     uint32_t wid = 0;
     _AXUIElementGetWindow(ctx->element, &wid);
 
     if (wid != 0) {
+        const bool is_new_window = app_track_window(ctx->pid, wid);
+        if (!is_new_window) {
+            CFRelease(ctx->observer);
+            CFRelease(ctx->element);
+            free(ctx);
+            return;
+        }
         register_window_ax_notifications(ctx->observer,
                                           ctx->element, ctx->pid);
         bw_emit_event(BW_EVENT_WINDOW_CREATED, ctx->pid, wid);
@@ -661,7 +1014,7 @@ static void bw_retry_resolve_wid(void *context) {
     }
 
     ctx->attempts_remaining--;
-    dispatch_after_f(dispatch_time(DISPATCH_TIME_NOW, 50 * NSEC_PER_MSEC),
+    dispatch_after_f(dispatch_time(DISPATCH_TIME_NOW, BW_WID_RETRY_DELAY_MS * NSEC_PER_MSEC),
                      dispatch_get_main_queue(),
                      ctx, bw_retry_resolve_wid);
 }
@@ -679,26 +1032,20 @@ static void ax_notification_handler(AXObserverRef observer,
         // App-level: wid is 0 in refcon, resolve from the new element
         _AXUIElementGetWindow(element, &wid);
         if (wid != 0) {
+            if (!app_track_window(pid, wid)) return;
             register_window_ax_notifications(observer, element, pid);
             bw_emit_event(BW_EVENT_WINDOW_CREATED, pid, wid);
             return;
         }
         // CGWindowID not assigned yet — schedule retries
-        bw_wid_retry_ctx *ctx = malloc(sizeof(bw_wid_retry_ctx));
-        if (!ctx) return;
-        ctx->observer = (AXObserverRef)CFRetain(observer);
-        ctx->element = (AXUIElementRef)CFRetain(element);
-        ctx->pid = pid;
-        ctx->attempts_remaining = 5;
-        dispatch_after_f(dispatch_time(DISPATCH_TIME_NOW, 50 * NSEC_PER_MSEC),
-                         dispatch_get_main_queue(),
-                         ctx, bw_retry_resolve_wid);
+        schedule_wid_resolution_retry(observer, element, pid);
     } else if (CFEqual(notification, kAXFocusedWindowChangedNotification)) {
         // App-level (wid=0 in refcon): emit so Zig can reconcile tab groups
         bw_emit_event(BW_EVENT_FOCUSED_WINDOW_CHANGED, pid, 0);
     } else if (wid == 0) {
         return; // Per-window notification but wid was unknown at registration
     } else if (CFEqual(notification, kAXUIElementDestroyedNotification)) {
+        app_untrack_window(pid, wid);
         bw_emit_event(BW_EVENT_WINDOW_DESTROYED, pid, wid);
     } else if (CFEqual(notification, kAXMovedNotification)) {
         bw_emit_event(BW_EVENT_WINDOW_MOVED, pid, wid);
@@ -711,64 +1058,34 @@ static void ax_notification_handler(AXObserverRef observer,
     }
 }
 
-void bw_observe_app(int32_t pid) {
-    for (uint32_t i = 0; i < g_app_observer_count; i++) {
-        if (g_app_observers[i].pid == (pid_t)pid) return;
-    }
-    if (g_app_observer_count >= MAX_OBSERVED_APPS) return;
-    if (!g_observer_runloop) return;
+static bool bw_try_observe_app(pid_t pid) {
+    if (app_observer_exists(pid)) return true;
+    if (g_app_observer_count >= MAX_OBSERVED_APPS) return false;
+    if (!g_observer_runloop) return false;
 
     AXObserverRef observer = NULL;
-    AXError err = AXObserverCreate((pid_t)pid, ax_notification_handler,
-                                   &observer);
-    if (err != kAXErrorSuccess || !observer) return;
+    AXError err = AXObserverCreate(pid, ax_notification_handler, &observer);
+    if (err != kAXErrorSuccess || !observer) return false;
 
-    AXUIElementRef app = AXUIElementCreateApplication((pid_t)pid);
+    AXUIElementRef app = AXUIElementCreateApplication(pid);
     if (!app) {
         CFRelease(observer);
-        return;
+        return false;
     }
 
-    void *app_refcon = pack_refcon((pid_t)pid, 0);
+    void *app_refcon = pack_refcon(pid, 0);
 
     // App-level notifications (wid=0 in refcon).
     // If the critical notification fails, the app's AX interface isn't ready.
-    // Bail out WITHOUT adding to g_app_observers so a future retry can succeed.
     AXError add_err = AXObserverAddNotification(
         observer, app, kAXWindowCreatedNotification, app_refcon);
     if (add_err != kAXErrorSuccess) {
         CFRelease(app);
         CFRelease(observer);
-        return;
+        return false;
     }
     AXObserverAddNotification(observer, app,
                               kAXFocusedWindowChangedNotification, app_refcon);
-
-    // Per-window: move, resize, destroy, minimize, deminimize.
-    // Also emit WINDOW_CREATED for each pre-existing window so the Zig side
-    // can tile windows that were created before the observer was registered
-    // (common with Electron/Discord where AX readiness lags behind window
-    // creation).
-    CFArrayRef windows = NULL;
-    err = AXUIElementCopyAttributeValue(app, kAXWindowsAttribute,
-                                         (CFTypeRef *)&windows);
-    if (err == kAXErrorSuccess && windows) {
-        CFIndex count = CFArrayGetCount(windows);
-        for (CFIndex i = 0; i < count; i++) {
-            AXUIElementRef win =
-                (AXUIElementRef)CFArrayGetValueAtIndex(windows, i);
-            register_window_ax_notifications(observer, win, (pid_t)pid);
-
-            uint32_t wid = 0;
-            _AXUIElementGetWindow(win, &wid);
-            if (wid != 0) {
-                bw_emit_event(BW_EVENT_WINDOW_CREATED, (int32_t)pid, wid);
-            }
-        }
-        CFRelease(windows);
-    }
-
-    CFRelease(app);
 
     CFRunLoopAddSource(g_observer_runloop,
                        AXObserverGetRunLoopSource(observer),
@@ -776,12 +1093,53 @@ void bw_observe_app(int32_t pid) {
     CFRunLoopWakeUp(g_observer_runloop);
 
     g_app_observers[g_app_observer_count++] = (bw_app_observer_entry){
-        .pid = (pid_t)pid,
+        .pid = pid,
         .observer = observer,
+        .known_window_count = 0,
     };
+    g_window_scan_idle_ticks = 0;
+    update_window_scan_source();
+
+    // Per-window: move, resize, destroy, minimize, deminimize.
+    // Also emit WINDOW_CREATED for each pre-existing window so the Zig side
+    // can tile windows that were created before the observer was registered.
+    CFArrayRef windows = NULL;
+    err = AXUIElementCopyAttributeValue(app, kAXWindowsAttribute,
+                                        (CFTypeRef *)&windows);
+    if (err == kAXErrorSuccess && windows) {
+        CFIndex count = CFArrayGetCount(windows);
+        for (CFIndex i = 0; i < count; i++) {
+            AXUIElementRef win =
+                (AXUIElementRef)CFArrayGetValueAtIndex(windows, i);
+            uint32_t wid = 0;
+            _AXUIElementGetWindow(win, &wid);
+            if (wid != 0) {
+                if (!app_track_window(pid, wid)) continue;
+                register_window_ax_notifications(observer, win, pid);
+                bw_emit_event(BW_EVENT_WINDOW_CREATED, (int32_t)pid, wid);
+            } else {
+                // Some apps expose the AX window before WindowServer assigns
+                // a CGWindowID. Retry so this pre-existing window is not lost.
+                schedule_wid_resolution_retry(observer, win, pid);
+            }
+        }
+        CFRelease(windows);
+    }
+
+    CFRelease(app);
+    return true;
+}
+
+void bw_observe_app(int32_t pid) {
+    if (bw_try_observe_app((pid_t)pid)) {
+        cancel_observe_retry((pid_t)pid);
+        return;
+    }
+    schedule_observe_retry((pid_t)pid);
 }
 
 void bw_unobserve_app(int32_t pid) {
+    cancel_observe_retry((pid_t)pid);
     for (uint32_t i = 0; i < g_app_observer_count; i++) {
         if (g_app_observers[i].pid != (pid_t)pid) continue;
         if (g_observer_runloop) {
@@ -792,6 +1150,7 @@ void bw_unobserve_app(int32_t pid) {
         }
         CFRelease(g_app_observers[i].observer);
         g_app_observers[i] = g_app_observers[--g_app_observer_count];
+        update_window_scan_source();
         return;
     }
 }
