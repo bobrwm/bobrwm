@@ -84,7 +84,6 @@ static dispatch_source_t g_role_poll_source = NULL;
 static dispatch_source_t g_observe_retry_source = NULL;
 static dispatch_source_t g_window_scan_source = NULL;
 static NSPanel *g_tile_preview_panel = nil;
-static BWObserver *g_workspace_observer = nil;
 
 // Configurable keybind table (set from Zig via bw_set_keybinds)
 #define MAX_KEYBINDS 128
@@ -250,45 +249,6 @@ void bw_hide_tile_preview(void) {
 // ---------------------------------------------------------------------------
 
 void bw_setup_sources(int ipc_fd) {
-    // --- NSWorkspace observers (main run loop) ---
-    NSNotificationCenter *wsnc = [[NSWorkspace sharedWorkspace] notificationCenter];
-    NSNotificationCenter *nc = [NSNotificationCenter defaultCenter];
-
-    if (!g_workspace_observer) {
-        g_workspace_observer = [[BWObserver alloc] init];
-    } else {
-        // bw_setup_sources can be called multiple times in development runs.
-        // Clear stale registrations before re-registering this shared observer.
-        [wsnc removeObserver:g_workspace_observer];
-        [nc removeObserver:g_workspace_observer];
-    }
-    BWObserver *obs = g_workspace_observer;
-
-    [wsnc addObserver:obs
-             selector:@selector(appLaunched:)
-                 name:NSWorkspaceDidLaunchApplicationNotification
-               object:nil];
-
-    [wsnc addObserver:obs
-             selector:@selector(appTerminated:)
-                 name:NSWorkspaceDidTerminateApplicationNotification
-               object:nil];
-
-    [wsnc addObserver:obs
-             selector:@selector(spaceChanged:)
-                 name:NSWorkspaceActiveSpaceDidChangeNotification
-               object:nil];
-
-    [wsnc addObserver:obs
-             selector:@selector(activeAppChanged:)
-                 name:NSWorkspaceDidActivateApplicationNotification
-               object:nil];
-
-    [nc addObserver:obs
-           selector:@selector(displayChanged:)
-               name:NSApplicationDidChangeScreenParametersNotification
-             object:nil];
-
     // --- CGEventTap for global hotkeys (main run loop) ---
     CGEventMask mask = (1 << kCGEventKeyDown) |
                        (1 << kCGEventLeftMouseDown) |
