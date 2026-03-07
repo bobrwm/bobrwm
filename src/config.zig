@@ -147,12 +147,17 @@ pub fn load(allocator: std.mem.Allocator, explicit_path: ?[]const u8) Config {
     }
 
     // XDG_CONFIG_HOME / ~/.config
-    const config_home = std.posix.getenv("XDG_CONFIG_HOME") orelse blk: {
-        const home = std.posix.getenv("HOME") orelse return .{};
-        break :blk std.fmt.allocPrint(allocator, "{s}/.config", .{home}) catch return .{};
-    };
+    var path_buf: [2048]u8 = undefined;
+    const path = blk: {
+        if (std.posix.getenv("XDG_CONFIG_HOME")) |config_home| {
+            break :blk std.fmt.bufPrint(&path_buf, "{s}/bobrwm/config.zon", .{config_home}) catch return .{};
+        }
 
-    const path = std.fmt.allocPrint(allocator, "{s}/bobrwm/config.zon", .{config_home}) catch return .{};
+        const home = std.posix.getenv("HOME") orelse return .{};
+        break :blk std.fmt.bufPrint(&path_buf, "{s}/.config/bobrwm/config.zon", .{home}) catch return .{};
+    };
+    std.debug.assert(path.len > 0);
+
     return loadFromPath(allocator, path) orelse {
         log.info("no config file found, using defaults", .{});
         return .{};
