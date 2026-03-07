@@ -98,9 +98,8 @@ bool bw_ax_is_trusted(void);
 
 // --- Source setup ---
 
-/// Set up CGEventTap, waker, and IPC source on the main run loop.
-/// Call after NSApp is initialised and workspace observers are registered.
-void bw_setup_sources(int ipc_fd);
+/// Set up shim-side runtime state after NSApp/workspace observer init.
+void bw_setup_sources(void);
 
 /// Signal the main run loop to drain the event ring.
 void bw_signal_waker(void);
