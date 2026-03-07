@@ -148,7 +148,7 @@ void bw_hide_tile_preview(void) {
 @end
 
 // ---------------------------------------------------------------------------
-// Source setup (observers, waker, IPC)
+// Source setup (observer runtime state)
 // ---------------------------------------------------------------------------
 
 static void cancel_runtime_sources(void) {
@@ -163,9 +163,7 @@ static void cancel_runtime_sources(void) {
     }
 }
 
-void bw_setup_sources(int ipc_fd) {
-    (void)ipc_fd;
-
+void bw_setup_sources(void) {
     // --- Observer run loop (AX observers use this) ---
     g_observer_runloop = CFRunLoopGetMain();
 
@@ -190,6 +188,7 @@ extern AXError _AXUIElementGetWindow(AXUIElementRef element, uint32_t *wid);
 #define BW_WINDOW_SCAN_IDLE_LIMIT 10
 #define BW_WID_RETRY_DELAY_MS 50
 #define BW_WID_RETRY_ATTEMPTS 60
+#define MAX_WID_RETRY_CONTEXTS (MAX_OBSERVED_APPS * 8)
 
 typedef struct {
     pid_t pid;
@@ -473,25 +472,47 @@ static void process_window_scan_tick(void) {
 // ---------------------------------------------------------------------------
 
 typedef struct {
+    bool in_use;
     AXObserverRef observer;
     AXUIElementRef element;
     pid_t pid;
     uint8_t attempts_remaining;
 } bw_wid_retry_ctx;
 
+static bw_wid_retry_ctx g_wid_retry_contexts[MAX_WID_RETRY_CONTEXTS];
+
 static void bw_retry_resolve_wid(void *context);
 
+static bw_wid_retry_ctx *acquire_wid_retry_ctx(void) {
+    for (uint32_t i = 0; i < MAX_WID_RETRY_CONTEXTS; i++) {
+        bw_wid_retry_ctx *ctx = &g_wid_retry_contexts[i];
+        if (ctx->in_use) continue;
+
+        ctx->in_use = true;
+        ctx->observer = NULL;
+        ctx->element = NULL;
+        ctx->pid = 0;
+        ctx->attempts_remaining = 0;
+        return ctx;
+    }
+    return NULL;
+}
+
 static void release_wid_retry_ctx(bw_wid_retry_ctx *ctx) {
-    if (!ctx) return;
-    CFRelease(ctx->observer);
-    CFRelease(ctx->element);
-    free(ctx);
+    if (!ctx || !ctx->in_use) return;
+    if (ctx->observer) CFRelease(ctx->observer);
+    if (ctx->element) CFRelease(ctx->element);
+    ctx->observer = NULL;
+    ctx->element = NULL;
+    ctx->pid = 0;
+    ctx->attempts_remaining = 0;
+    ctx->in_use = false;
 }
 
 static void schedule_wid_resolution_retry(AXObserverRef observer,
                                           AXUIElementRef element,
                                           pid_t pid) {
-    bw_wid_retry_ctx *ctx = malloc(sizeof(bw_wid_retry_ctx));
+    bw_wid_retry_ctx *ctx = acquire_wid_retry_ctx();
     if (!ctx) return;
 
     ctx->observer = (AXObserverRef)CFRetain(observer);
@@ -507,6 +528,7 @@ static void schedule_wid_resolution_retry(AXObserverRef observer,
 
 static void bw_retry_resolve_wid(void *context) {
     bw_wid_retry_ctx *ctx = (bw_wid_retry_ctx *)context;
+    if (!ctx || !ctx->in_use) return;
 
     // Bail out if the owning app was unobserved or terminated while this
     // retry was in flight. Without this guard a stale callback can emit

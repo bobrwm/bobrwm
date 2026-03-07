@@ -93,6 +93,11 @@ const role_poll_interval_ms: u64 = 100;
 const role_poll_attempts_max: u8 = 50;
 /// Launch retry budget to re-run discovery after app startup settles.
 const app_launch_retry_attempts_max: u8 = 10;
+/// Capacity reserved for wid-keyed role/deferred maps to avoid growth churn.
+const pending_role_window_capacity: usize = 256;
+const deferred_window_candidate_capacity: usize = 256;
+/// Capacity reserved for app launch retries (pid-keyed, bounded by observers).
+const app_launch_retry_capacity: usize = 64;
 /// Debounce workspace/display notifications that can fire in short bursts.
 const workspace_event_debounce_interval_s: f64 = 0.05;
 
@@ -151,6 +156,98 @@ fn nsString(str: [*:0]const u8) objc.Object {
     const NSString = objc.getClass("NSString") orelse
         @panic("NSString class not found");
     return NSString.msgSend(objc.Object, "stringWithUTF8String:", .{str});
+}
+
+const AxStrings = struct {
+    focused_window_attr: c.CFStringRef,
+    windows_attr: c.CFStringRef,
+    size_attr: c.CFStringRef,
+    position_attr: c.CFStringRef,
+    raise_action: c.CFStringRef,
+    main_attr: c.CFStringRef,
+    role_attr: c.CFStringRef,
+    window_role: c.CFStringRef,
+    unknown_role: c.CFStringRef,
+    subrole_attr: c.CFStringRef,
+    standard_window_subrole: c.CFStringRef,
+    unknown_subrole: c.CFStringRef,
+};
+
+fn createAxString(raw: [*:0]const u8) ?c.CFStringRef {
+    return c.CFStringCreateWithCString(null, raw, c.kCFStringEncodingUTF8);
+}
+
+fn releaseAxString(value: c.CFStringRef) void {
+    c.CFRelease(@ptrCast(value));
+}
+
+fn ensureAxStrings() ?*const AxStrings {
+    if (g_ax_strings) |*strings| return strings;
+
+    const names = [_][*:0]const u8{
+        "AXFocusedWindow",
+        "AXWindows",
+        "AXSize",
+        "AXPosition",
+        "AXRaise",
+        "AXMain",
+        "AXRole",
+        "AXWindow",
+        "AXUnknown",
+        "AXSubrole",
+        "AXStandardWindow",
+        "AXUnknown",
+    };
+    var refs: [names.len]c.CFStringRef = undefined;
+
+    for (names, 0..) |name, i| {
+        refs[i] = createAxString(name) orelse {
+            var created_count: usize = i;
+            while (created_count > 0) : (created_count -= 1) {
+                releaseAxString(refs[created_count - 1]);
+            }
+            return null;
+        };
+    }
+
+    g_ax_strings = .{
+        .focused_window_attr = refs[0],
+        .windows_attr = refs[1],
+        .size_attr = refs[2],
+        .position_attr = refs[3],
+        .raise_action = refs[4],
+        .main_attr = refs[5],
+        .role_attr = refs[6],
+        .window_role = refs[7],
+        .unknown_role = refs[8],
+        .subrole_attr = refs[9],
+        .standard_window_subrole = refs[10],
+        .unknown_subrole = refs[11],
+    };
+    return &g_ax_strings.?;
+}
+
+fn deinitAxStrings() void {
+    if (g_ax_strings) |strings| {
+        const refs = [_]c.CFStringRef{
+            strings.unknown_subrole,
+            strings.standard_window_subrole,
+            strings.subrole_attr,
+            strings.unknown_role,
+            strings.window_role,
+            strings.role_attr,
+            strings.main_attr,
+            strings.raise_action,
+            strings.position_attr,
+            strings.size_attr,
+            strings.windows_attr,
+            strings.focused_window_attr,
+        };
+        for (refs) |value| {
+            releaseAxString(value);
+        }
+        g_ax_strings = null;
+    }
 }
 
 fn displayIndexById(display_id: u32) ?usize {
@@ -429,6 +526,7 @@ var g_waker_source: c.CFRunLoopSourceRef = null;
 var g_role_poll_source: c.dispatch_source_t = null;
 var g_ipc_source: c.dispatch_source_t = null;
 var g_tap_port: c.CFMachPortRef = null;
+var g_ax_strings: ?AxStrings = null;
 
 fn shouldHandleWorkspaceEvent(last_event_at_s: *f64) bool {
     std.debug.assert(last_event_at_s.* >= 0);
@@ -617,9 +715,8 @@ export fn bw_ax_get_focused_window(pid: i32) u32 {
     const app = c.AXUIElementCreateApplication(pid) orelse return 0;
     defer c.CFRelease(@ptrCast(app));
 
-    const focused_attr_obj = nsString("AXFocusedWindow");
-    const focused_attr: c.CFStringRef = @ptrCast(focused_attr_obj.value orelse return 0);
-    std.debug.assert(focused_attr_obj.value != null);
+    const ax = ensureAxStrings() orelse return 0;
+    const focused_attr = ax.focused_window_attr;
 
     var focused: c.AXUIElementRef = null;
     const err = c.AXUIElementCopyAttributeValue(
@@ -677,8 +774,8 @@ export fn bw_get_app_window_ids(pid: i32, out: ?[*]u32, max_count: u32) u32 {
     const app = c.AXUIElementCreateApplication(pid) orelse return 0;
     defer c.CFRelease(@ptrCast(app));
 
-    const windows_attr_obj = nsString("AXWindows");
-    const windows_attr: c.CFStringRef = @ptrCast(windows_attr_obj.value orelse return 0);
+    const ax = ensureAxStrings() orelse return 0;
+    const windows_attr = ax.windows_attr;
 
     var windows: c.CFArrayRef = null;
     const err = c.AXUIElementCopyAttributeValue(
@@ -710,12 +807,6 @@ export fn bw_get_app_window_ids(pid: i32, out: ?[*]u32, max_count: u32) u32 {
     return @intCast(written);
 }
 
-fn cfString(name: [*:0]const u8) c.CFStringRef {
-    const string_obj = nsString(name);
-    const string_value = string_obj.value orelse return null;
-    return @ptrCast(string_value);
-}
-
 fn isRegularActivationApp(pid: i32) bool {
     std.debug.assert(pid > 0);
 
@@ -735,7 +826,8 @@ fn findAxWindow(pid: i32, target_wid: u32) ?c.AXUIElementRef {
     const app = c.AXUIElementCreateApplication(pid) orelse return null;
     defer c.CFRelease(@ptrCast(app));
 
-    const windows_attr = cfString("AXWindows") orelse return null;
+    const ax = ensureAxStrings() orelse return null;
+    const windows_attr = ax.windows_attr;
     var windows: c.CFArrayRef = null;
     const err = c.AXUIElementCopyAttributeValue(app, windows_attr, @ptrCast(&windows));
     if (err != c.kAXErrorSuccess or windows == null) return null;
@@ -770,8 +862,9 @@ export fn bw_ax_set_window_frame(pid: i32, wid: u32, x: f64, y: f64, w: f64, h: 
     const win = findAxWindow(pid, wid) orelse return false;
     defer c.CFRelease(@ptrCast(win));
 
-    const size_attr = cfString("AXSize") orelse return false;
-    const position_attr = cfString("AXPosition") orelse return false;
+    const ax = ensureAxStrings() orelse return false;
+    const size_attr = ax.size_attr;
+    const position_attr = ax.position_attr;
 
     const size: c.CGSize = .{ .width = w, .height = h };
     const size_value = c.AXValueCreate(c.kAXValueTypeCGSize, &size) orelse return false;
@@ -794,8 +887,9 @@ export fn bw_ax_focus_window(pid: i32, wid: u32) bool {
     const win = findAxWindow(pid, wid) orelse return false;
     defer c.CFRelease(@ptrCast(win));
 
-    const raise_action = cfString("AXRaise") orelse return false;
-    const main_attr = cfString("AXMain") orelse return false;
+    const ax = ensureAxStrings() orelse return false;
+    const raise_action = ax.raise_action;
+    const main_attr = ax.main_attr;
 
     _ = c.AXUIElementPerformAction(win, raise_action);
     _ = c.AXUIElementSetAttributeValue(win, main_attr, c.kCFBooleanTrue);
@@ -818,15 +912,16 @@ fn manageStateForWindow(pid: i32, wid: u32) u8 {
     const win = findAxWindow(pid, wid) orelse return shim.BW_MANAGE_PENDING;
     defer c.CFRelease(@ptrCast(win));
 
-    const role_attr = cfString("AXRole") orelse return shim.BW_MANAGE_PENDING;
+    const ax = ensureAxStrings() orelse return shim.BW_MANAGE_PENDING;
+    const role_attr = ax.role_attr;
     var role_any: c.CFTypeRef = null;
     const role_err = c.AXUIElementCopyAttributeValue(win, role_attr, @ptrCast(&role_any));
     if (role_err != c.kAXErrorSuccess or role_any == null) return shim.BW_MANAGE_PENDING;
     const role_ref: c.CFStringRef = @ptrCast(role_any orelse return shim.BW_MANAGE_PENDING);
     defer c.CFRelease(@ptrCast(role_ref));
 
-    const window_role = cfString("AXWindow") orelse return shim.BW_MANAGE_PENDING;
-    const unknown_role = cfString("AXUnknown") orelse return shim.BW_MANAGE_PENDING;
+    const window_role = ax.window_role;
+    const unknown_role = ax.unknown_role;
 
     const is_window = c.CFEqual(@ptrCast(role_ref), @ptrCast(window_role)) != 0;
     const is_unknown_role = c.CFEqual(@ptrCast(role_ref), @ptrCast(unknown_role)) != 0;
@@ -834,15 +929,15 @@ fn manageStateForWindow(pid: i32, wid: u32) u8 {
         return if (is_unknown_role) shim.BW_MANAGE_PENDING else shim.BW_MANAGE_REJECT;
     }
 
-    const subrole_attr = cfString("AXSubrole") orelse return shim.BW_MANAGE_PENDING;
+    const subrole_attr = ax.subrole_attr;
     var subrole_any: c.CFTypeRef = null;
     const subrole_err = c.AXUIElementCopyAttributeValue(win, subrole_attr, @ptrCast(&subrole_any));
     if (subrole_err != c.kAXErrorSuccess or subrole_any == null) return shim.BW_MANAGE_PENDING;
     const subrole_ref: c.CFStringRef = @ptrCast(subrole_any orelse return shim.BW_MANAGE_PENDING);
     defer c.CFRelease(@ptrCast(subrole_ref));
 
-    const standard_subrole = cfString("AXStandardWindow") orelse return shim.BW_MANAGE_PENDING;
-    const unknown_subrole = cfString("AXUnknown") orelse return shim.BW_MANAGE_PENDING;
+    const standard_subrole = ax.standard_window_subrole;
+    const unknown_subrole = ax.unknown_subrole;
 
     const is_standard = c.CFEqual(@ptrCast(subrole_ref), @ptrCast(standard_subrole)) != 0;
     const is_unknown_subrole = c.CFEqual(@ptrCast(subrole_ref), @ptrCast(unknown_subrole)) != 0;
@@ -1289,6 +1384,7 @@ pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
     g_allocator = gpa.allocator();
+    defer deinitAxStrings();
 
     // -- Config --
     g_config = config_mod.load(g_allocator, args.config_path);
@@ -1313,8 +1409,23 @@ pub fn main() !void {
     g_tab_groups = tabgroup.TabGroupManager.init(g_allocator);
     defer g_tab_groups.deinit();
     g_pending_role_windows = PendingRoleWindowMap.init(g_allocator);
+    errdefer g_pending_role_windows.deinit();
+    g_pending_role_windows.ensureTotalCapacity(pending_role_window_capacity) catch |err| {
+        log.err("pending-role map reserve failed: {}", .{err});
+        return err;
+    };
     g_deferred_window_candidates = DeferredWindowCandidateMap.init(g_allocator);
+    errdefer g_deferred_window_candidates.deinit();
+    g_deferred_window_candidates.ensureTotalCapacity(deferred_window_candidate_capacity) catch |err| {
+        log.err("deferred-window map reserve failed: {}", .{err});
+        return err;
+    };
     g_app_launch_retries = AppLaunchRetryMap.init(g_allocator);
+    errdefer g_app_launch_retries.deinit();
+    g_app_launch_retries.ensureTotalCapacity(app_launch_retry_capacity) catch |err| {
+        log.err("app-launch-retry map reserve failed: {}", .{err});
+        return err;
+    };
     defer {
         setRolePolling(false);
         g_app_launch_retries.deinit();
@@ -1352,7 +1463,7 @@ pub fn main() !void {
     initWorkspaceObservers();
 
     // -- Sources (observers, CGEventTap, waker, IPC) --
-    shim.bw_setup_sources(g_ipc.fd);
+    shim.bw_setup_sources();
     setupHotkeyEventTap();
     initWakerSource();
     initIpcSource(@intCast(g_ipc.fd));
