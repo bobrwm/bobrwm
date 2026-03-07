@@ -7,9 +7,7 @@ const c = @cImport({
     @cInclude("pthread.h");
 });
 const objc = @import("objc");
-const shim = @cImport({
-    @cInclude("shim.h");
-});
+const shim = @import("shim_api.zig");
 const skylight = @import("skylight.zig");
 const event_mod = @import("event.zig");
 const window_mod = @import("window.zig");
