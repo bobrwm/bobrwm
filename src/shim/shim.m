@@ -30,12 +30,12 @@
 
 - (void)spaceChanged:(NSNotification *)note {
     (void)note;
-    bw_emit_event(BW_EVENT_SPACE_CHANGED, 0, 0);
+    bw_workspace_space_changed();
 }
 
 - (void)displayChanged:(NSNotification *)note {
     (void)note;
-    bw_emit_event(BW_EVENT_DISPLAY_CHANGED, 0, 0);
+    bw_workspace_display_changed();
 }
 
 - (void)activeAppChanged:(NSNotification *)note {
@@ -51,107 +51,10 @@
 // Hotkey engine (CGEventTap)
 // ---------------------------------------------------------------------------
 
-static CFMachPortRef g_tap_port = NULL;
 static CFRunLoopRef g_observer_runloop = NULL;
-static dispatch_source_t g_ipc_source = NULL;
-static dispatch_source_t g_role_poll_source = NULL;
 static dispatch_source_t g_observe_retry_source = NULL;
 static dispatch_source_t g_window_scan_source = NULL;
 static NSPanel *g_tile_preview_panel = nil;
-
-// Configurable keybind table (set from Zig via bw_set_keybinds)
-#define MAX_KEYBINDS 128
-static bw_keybind g_keybinds[MAX_KEYBINDS];
-static uint32_t   g_keybind_count = 0;
-
-void bw_set_keybinds(const bw_keybind *binds, uint32_t count) {
-    if (count > MAX_KEYBINDS) count = MAX_KEYBINDS;
-    memcpy(g_keybinds, binds, count * sizeof(bw_keybind));
-    g_keybind_count = count;
-}
-
-static bool handle_tap_disable_event(CGEventType type, CGEventRef event) {
-    if (type != kCGEventTapDisabledByTimeout &&
-        type != kCGEventTapDisabledByUserInput) {
-        return false;
-    }
-    if (g_tap_port) CGEventTapEnable(g_tap_port, true);
-    (void)event;
-    return true;
-}
-
-static bool emit_mouse_event_if_needed(CGEventType type) {
-    if (type == kCGEventLeftMouseDown) {
-        bw_emit_event(BW_EVENT_MOUSE_DOWN, 0, 0);
-        return true;
-    }
-    if (type == kCGEventLeftMouseUp) {
-        bw_emit_event(BW_EVENT_MOUSE_UP, 0, 0);
-        return true;
-    }
-    return false;
-}
-
-static uint8_t mods_from_event_flags(CGEventFlags flags) {
-    uint8_t mods = 0;
-    if (flags & kCGEventFlagMaskAlternate) mods |= BW_MOD_ALT;
-    if (flags & kCGEventFlagMaskShift)     mods |= BW_MOD_SHIFT;
-    if (flags & kCGEventFlagMaskCommand)   mods |= BW_MOD_CMD;
-    if (flags & kCGEventFlagMaskControl)   mods |= BW_MOD_CTRL;
-    return mods;
-}
-
-static bool dispatch_matching_keybind(CGKeyCode keycode, uint8_t mods) {
-    for (uint32_t i = 0; i < g_keybind_count; i++) {
-        if (g_keybinds[i].keycode != keycode) continue;
-        if (g_keybinds[i].mods != mods) continue;
-        bw_emit_event(g_keybinds[i].action, 0, g_keybinds[i].arg);
-        return true;
-    }
-    return false;
-}
-
-static CGEventRef hotkey_callback(CGEventTapProxy proxy, CGEventType type,
-                                   CGEventRef event, void *refcon) {
-    (void)proxy;
-    (void)refcon;
-
-    if (handle_tap_disable_event(type, event)) {
-        return event;
-    }
-
-    if (emit_mouse_event_if_needed(type)) {
-        return event;
-    }
-
-    CGEventFlags flags = CGEventGetFlags(event);
-    CGKeyCode keycode = (CGKeyCode)CGEventGetIntegerValueField(
-        event, kCGKeyboardEventKeycode);
-
-    const uint8_t current_mods = mods_from_event_flags(flags);
-    if (dispatch_matching_keybind(keycode, current_mods)) {
-        return NULL;
-    }
-
-    return event;
-}
-
-// ---------------------------------------------------------------------------
-// Waker — CFRunLoopSource to drain the event ring on the main thread
-// ---------------------------------------------------------------------------
-
-static CFRunLoopSourceRef g_waker_source = NULL;
-
-static void waker_perform(void *info) {
-    (void)info;
-    bw_drain_events();
-}
-
-void bw_signal_waker(void) {
-    if (g_waker_source) CFRunLoopSourceSignal(g_waker_source);
-    CFRunLoopRef rl = CFRunLoopGetMain();
-    if (rl) CFRunLoopWakeUp(rl);
-}
 
 // ---------------------------------------------------------------------------
 // Tiling destination preview overlay
@@ -248,47 +151,7 @@ void bw_hide_tile_preview(void) {
 // Source setup (observers, waker, IPC)
 // ---------------------------------------------------------------------------
 
-static void setup_hotkey_event_tap(void) {
-    CGEventMask mask = (1 << kCGEventKeyDown) |
-                       (1 << kCGEventLeftMouseDown) |
-                       (1 << kCGEventLeftMouseUp);
-    g_tap_port = CGEventTapCreate(
-        kCGSessionEventTap,
-        kCGHeadInsertEventTap,
-        kCGEventTapOptionDefault,
-        mask,
-        hotkey_callback,
-        NULL);
-
-    if (!g_tap_port) return;
-
-    CFRunLoopSourceRef tap_source =
-        CFMachPortCreateRunLoopSource(NULL, g_tap_port, 0);
-    CFRunLoopAddSource(CFRunLoopGetMain(), tap_source,
-                       kCFRunLoopCommonModes);
-    CFRelease(tap_source);
-    CGEventTapEnable(g_tap_port, true);
-}
-
-static void setup_waker_source(void) {
-    CFRunLoopSourceContext ctx = {0};
-    ctx.perform = waker_perform;
-    g_waker_source = CFRunLoopSourceCreate(NULL, 0, &ctx);
-    CFRunLoopAddSource(CFRunLoopGetMain(), g_waker_source,
-                       kCFRunLoopCommonModes);
-}
-
 static void cancel_runtime_sources(void) {
-    if (g_ipc_source) {
-        dispatch_source_cancel(g_ipc_source);
-        g_ipc_source = NULL;
-    }
-
-    if (g_role_poll_source) {
-        dispatch_source_cancel(g_role_poll_source);
-        g_role_poll_source = NULL;
-    }
-
     if (g_observe_retry_source) {
         dispatch_source_cancel(g_observe_retry_source);
         g_observe_retry_source = NULL;
@@ -300,55 +163,14 @@ static void cancel_runtime_sources(void) {
     }
 }
 
-static void setup_ipc_source(int ipc_fd) {
-    g_ipc_source = dispatch_source_create(
-        DISPATCH_SOURCE_TYPE_READ, (uintptr_t)ipc_fd, 0,
-        dispatch_get_main_queue());
-    dispatch_source_set_event_handler(g_ipc_source, ^{
-        bw_handle_ipc_client(ipc_fd);
-    });
-    dispatch_resume(g_ipc_source);
-}
-
 void bw_setup_sources(int ipc_fd) {
-    // --- CGEventTap for global hotkeys (main run loop) ---
-    setup_hotkey_event_tap();
+    (void)ipc_fd;
 
     // --- Observer run loop (AX observers use this) ---
     g_observer_runloop = CFRunLoopGetMain();
 
-    // --- Waker source (drains event ring on main thread) ---
-    setup_waker_source();
-
-    // --- IPC dispatch source ---
+    // --- Runtime dispatch sources ---
     cancel_runtime_sources();
-    setup_ipc_source(ipc_fd);
-}
-
-void bw_set_role_polling(bool enabled) {
-    if (!enabled) {
-        if (g_role_poll_source) {
-            dispatch_source_cancel(g_role_poll_source);
-            g_role_poll_source = NULL;
-        }
-        return;
-    }
-
-    if (g_role_poll_source) return;
-
-    g_role_poll_source = dispatch_source_create(
-        DISPATCH_SOURCE_TYPE_TIMER, 0, 0, dispatch_get_main_queue());
-    if (!g_role_poll_source) return;
-
-    dispatch_source_set_timer(
-        g_role_poll_source,
-        dispatch_time(DISPATCH_TIME_NOW, 100 * NSEC_PER_MSEC),
-        100 * NSEC_PER_MSEC,
-        20 * NSEC_PER_MSEC);
-    dispatch_source_set_event_handler(g_role_poll_source, ^{
-        bw_emit_event(BW_EVENT_ROLE_POLL_TICK, 0, 0);
-    });
-    dispatch_resume(g_role_poll_source);
 }
 
 // ---------------------------------------------------------------------------
@@ -357,209 +179,6 @@ void bw_set_role_polling(bool enabled) {
 
 extern AXError _AXUIElementGetWindow(AXUIElementRef element, uint32_t *wid);
 
-// ---------------------------------------------------------------------------
-// AX helpers
-// ---------------------------------------------------------------------------
-
-/// Find the AXUIElementRef for a window by PID + CGWindowID.
-/// Caller must CFRelease the result.
-static AXUIElementRef find_ax_window(pid_t pid, uint32_t target_wid) {
-    AXUIElementRef app = AXUIElementCreateApplication(pid);
-    if (!app) return NULL;
-
-    CFArrayRef windows = NULL;
-    AXError err = AXUIElementCopyAttributeValue(
-        app, kAXWindowsAttribute, (CFTypeRef *)&windows);
-    CFRelease(app);
-
-    if (err != kAXErrorSuccess || !windows) return NULL;
-
-    AXUIElementRef result = NULL;
-    CFIndex count = CFArrayGetCount(windows);
-    for (CFIndex i = 0; i < count; i++) {
-        AXUIElementRef win = (AXUIElementRef)CFArrayGetValueAtIndex(windows, i);
-        uint32_t wid = 0;
-        if (_AXUIElementGetWindow(win, &wid) == kAXErrorSuccess &&
-            wid == target_wid) {
-            result = (AXUIElementRef)CFRetain(win);
-            break;
-        }
-    }
-
-    CFRelease(windows);
-    return result;
-}
-
-// ---------------------------------------------------------------------------
-// Window discovery
-// ---------------------------------------------------------------------------
-
-uint32_t bw_discover_windows(bw_window_info *out, uint32_t max_count) {
-    CFArrayRef window_list = CGWindowListCopyWindowInfo(
-        kCGWindowListOptionOnScreenOnly | kCGWindowListExcludeDesktopElements,
-        kCGNullWindowID);
-    if (!window_list) return 0;
-
-    uint32_t count = 0;
-    CFIndex total = CFArrayGetCount(window_list);
-
-    for (CFIndex i = 0; i < total && count < max_count; i++) {
-        @autoreleasepool {
-            CFDictionaryRef info =
-                (CFDictionaryRef)CFArrayGetValueAtIndex(window_list, i);
-
-            // Layer filter — only normal windows (layer 0)
-            int32_t layer = 0;
-            CFNumberRef layer_ref = CFDictionaryGetValue(info, kCGWindowLayer);
-            if (layer_ref)
-                CFNumberGetValue(layer_ref, kCFNumberSInt32Type, &layer);
-            if (layer != 0) continue;
-
-            // Window ID
-            uint32_t wid = 0;
-            CFNumberRef wid_ref = CFDictionaryGetValue(info, kCGWindowNumber);
-            if (!wid_ref) continue;
-            CFNumberGetValue(wid_ref, kCFNumberSInt32Type, &wid);
-
-            // Owner PID
-            int32_t pid = 0;
-            CFNumberRef pid_ref =
-                CFDictionaryGetValue(info, kCGWindowOwnerPID);
-            if (!pid_ref) continue;
-            CFNumberGetValue(pid_ref, kCFNumberSInt32Type, &pid);
-
-            // Activation policy — only regular apps (with dock icon)
-            NSRunningApplication *app = [NSRunningApplication
-                runningApplicationWithProcessIdentifier:pid];
-            if (!app ||
-                app.activationPolicy !=
-                    NSApplicationActivationPolicyRegular)
-                continue;
-
-            // Bounds
-            CGRect bounds = CGRectZero;
-            CFDictionaryRef bounds_ref =
-                CFDictionaryGetValue(info, kCGWindowBounds);
-            if (bounds_ref)
-                CGRectMakeWithDictionaryRepresentation(bounds_ref, &bounds);
-            if (bounds.size.width < 1 || bounds.size.height < 1) continue;
-
-            out[count++] = (bw_window_info){
-                .wid = wid,
-                .pid = pid,
-                .x   = bounds.origin.x,
-                .y   = bounds.origin.y,
-                .w   = bounds.size.width,
-                .h   = bounds.size.height,
-            };
-        }
-    }
-
-    CFRelease(window_list);
-    return count;
-}
-
-// ---------------------------------------------------------------------------
-// AX window operations
-// ---------------------------------------------------------------------------
-
-bool bw_ax_set_window_frame(int32_t pid, uint32_t wid,
-                            double x, double y, double w, double h) {
-    AXUIElementRef win = find_ax_window((pid_t)pid, wid);
-    if (!win) return false;
-
-    // Shrink first so the window fits at its new position, then reposition.
-    // A second position pass handles the case where the window grew and the
-    // initial position was clamped by screen edges.
-    CGSize size = { w, h };
-    AXValueRef size_val = AXValueCreate(kAXValueTypeCGSize, &size);
-    AXUIElementSetAttributeValue(win, kAXSizeAttribute, (CFTypeRef)size_val);
-    CFRelease(size_val);
-
-    CGPoint pos = { x, y };
-    AXValueRef pos_val = AXValueCreate(kAXValueTypeCGPoint, &pos);
-    AXError err = AXUIElementSetAttributeValue(
-        win, kAXPositionAttribute, (CFTypeRef)pos_val);
-    CFRelease(pos_val);
-
-    CFRelease(win);
-    return err == kAXErrorSuccess;
-}
-
-bool bw_ax_focus_window(int32_t pid, uint32_t wid) {
-    AXUIElementRef win = find_ax_window((pid_t)pid, wid);
-    if (!win) return false;
-
-    AXUIElementPerformAction(win, kAXRaiseAction);
-    AXUIElementSetAttributeValue(win, kAXMainAttribute, kCFBooleanTrue);
-    CFRelease(win);
-
-    NSRunningApplication *app =
-        [NSRunningApplication runningApplicationWithProcessIdentifier:pid];
-    [app activateWithOptions:NSApplicationActivateIgnoringOtherApps];
-
-    return true;
-}
-
-static enum bw_manage_state bw_manage_state_for_window(int32_t pid,
-                                                        uint32_t wid) {
-    NSRunningApplication *app =
-        [NSRunningApplication runningApplicationWithProcessIdentifier:pid];
-    if (!app ||
-        app.activationPolicy != NSApplicationActivationPolicyRegular)
-        return BW_MANAGE_REJECT;
-
-    // AX element may not be queryable yet for a brand-new window.
-    // Mark as pending so callers can retry without silently dropping.
-    AXUIElementRef win = find_ax_window((pid_t)pid, wid);
-    if (!win) return BW_MANAGE_PENDING;
-
-    CFStringRef role = NULL;
-    AXUIElementCopyAttributeValue(win, kAXRoleAttribute, (CFTypeRef *)&role);
-    if (!role) {
-        CFRelease(win);
-        return BW_MANAGE_PENDING;
-    }
-
-    const bool is_window = CFEqual(role, kAXWindowRole);
-    const bool is_unknown_role = CFEqual(role, kAXUnknownRole);
-    CFRelease(role);
-    if (!is_window) {
-        CFRelease(win);
-        return is_unknown_role ? BW_MANAGE_PENDING : BW_MANAGE_REJECT;
-    }
-
-    CFStringRef subrole = NULL;
-    AXUIElementCopyAttributeValue(win, kAXSubroleAttribute,
-                                  (CFTypeRef *)&subrole);
-    if (!subrole) {
-        CFRelease(win);
-        return BW_MANAGE_PENDING;
-    }
-
-    const bool is_standard = CFEqual(subrole, kAXStandardWindowSubrole);
-    const bool is_unknown_subrole = CFEqual(subrole, kAXUnknownSubrole);
-    CFRelease(subrole);
-
-    if (!is_standard && is_unknown_subrole) {
-        CFRelease(win);
-        return BW_MANAGE_PENDING;
-    }
-
-    CFRelease(win);
-    return is_standard ? BW_MANAGE_READY : BW_MANAGE_REJECT;
-}
-
-bool bw_should_manage_window(int32_t pid, uint32_t wid) {
-    const enum bw_manage_state state = bw_manage_state_for_window(pid, wid);
-    return state != BW_MANAGE_REJECT;
-}
-
-uint8_t bw_window_manage_state(int32_t pid, uint32_t wid) {
-    return (uint8_t)bw_manage_state_for_window(pid, wid);
-}
-
-// ---------------------------------------------------------------------------
 // Per-app AX observers
 // ---------------------------------------------------------------------------
 

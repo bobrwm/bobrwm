@@ -86,6 +86,11 @@ extern void bw_retile(void);
 extern void bw_workspace_app_launched(int32_t pid);
 extern void bw_workspace_app_terminated(int32_t pid);
 extern void bw_workspace_active_app_changed(int32_t pid);
+extern void bw_workspace_space_changed(void);
+extern void bw_workspace_display_changed(void);
+extern void bw_hotkey_mouse_down(void);
+extern void bw_hotkey_mouse_up(void);
+extern bool bw_hotkey_handle_keydown(uint16_t keycode, uint8_t mods);
 
 // --- Accessibility ---
 
