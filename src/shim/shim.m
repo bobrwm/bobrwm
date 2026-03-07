@@ -1,7 +1,6 @@
 #import <AppKit/AppKit.h>
 #import <ApplicationServices/ApplicationServices.h>
 #import <Carbon/Carbon.h>
-#import <float.h>
 #import "shim.h"
 
 // ---------------------------------------------------------------------------
@@ -54,74 +53,6 @@
 static CFRunLoopRef g_observer_runloop = NULL;
 static dispatch_source_t g_observe_retry_source = NULL;
 static dispatch_source_t g_window_scan_source = NULL;
-static NSPanel *g_tile_preview_panel = nil;
-
-// ---------------------------------------------------------------------------
-// Tiling destination preview overlay
-// ---------------------------------------------------------------------------
-
-static NSRect bw_ns_rect_from_cg(double x, double y, double w, double h) {
-    NSArray<NSScreen *> *screens = [NSScreen screens];
-    if (screens.count == 0) {
-        return NSMakeRect(x, y, w, h);
-    }
-
-    double global_top = -DBL_MAX;
-    for (NSScreen *screen in screens) {
-        const NSRect frame = screen.frame;
-        const double top = frame.origin.y + frame.size.height;
-        if (top > global_top) global_top = top;
-    }
-    const double ns_y = global_top - (y + h);
-    return NSMakeRect(x, ns_y, w, h);
-}
-
-static NSPanel *bw_tile_preview_panel(void) {
-    if (g_tile_preview_panel) return g_tile_preview_panel;
-
-    NSPanel *panel = [[NSPanel alloc]
-        initWithContentRect:NSMakeRect(0, 0, 100, 100)
-                  styleMask:NSWindowStyleMaskBorderless
-                    backing:NSBackingStoreBuffered
-                      defer:NO];
-    panel.opaque = NO;
-    panel.backgroundColor = [NSColor clearColor];
-    panel.hasShadow = NO;
-    panel.ignoresMouseEvents = YES;
-    panel.hidesOnDeactivate = NO;
-    panel.level = NSStatusWindowLevel + 1;
-    panel.collectionBehavior =
-        NSWindowCollectionBehaviorCanJoinAllSpaces |
-        NSWindowCollectionBehaviorFullScreenAuxiliary |
-        NSWindowCollectionBehaviorTransient;
-
-    NSView *content = [[NSView alloc] initWithFrame:panel.contentView.bounds];
-    content.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
-    content.wantsLayer = YES;
-    content.layer.cornerRadius = 10.0;
-    content.layer.borderWidth = 3.0;
-    content.layer.borderColor =
-        [[NSColor colorWithSRGBRed:0.13 green:0.62 blue:1.0 alpha:0.95] CGColor];
-    content.layer.backgroundColor =
-        [[NSColor colorWithSRGBRed:0.13 green:0.62 blue:1.0 alpha:0.18] CGColor];
-    panel.contentView = content;
-
-    g_tile_preview_panel = panel;
-    return g_tile_preview_panel;
-}
-
-void bw_show_tile_preview(double x, double y, double w, double h) {
-    if (w <= 0 || h <= 0) return;
-    NSPanel *panel = bw_tile_preview_panel();
-    const NSRect frame = bw_ns_rect_from_cg(x, y, w, h);
-    [panel setFrame:frame display:YES];
-    [panel orderFront:nil];
-}
-
-void bw_hide_tile_preview(void) {
-    if (!g_tile_preview_panel) return;
-    [g_tile_preview_panel orderOut:nil];
-}
 
 // ---------------------------------------------------------------------------
 // Status bar

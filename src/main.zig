@@ -19,6 +19,7 @@ const ipc = @import("ipc.zig");
 const tabgroup = @import("tabgroup.zig");
 const config_mod = @import("config.zig");
 const statusbar = @import("statusbar.zig");
+const tile_preview = @import("tile_preview.zig");
 const launchd = @import("launchd.zig");
 
 extern fn _AXUIElementGetWindow(element: c.AXUIElementRef, wid: *u32) c.AXError;
@@ -1552,7 +1553,7 @@ fn insertIntoLayout(workspace_id: u8, display_id: u32, wid: u32) void {
 
 fn clearDragPreview() void {
     if (g_drag_preview.visible) {
-        shim.bw_hide_tile_preview();
+        tile_preview.hide();
     }
     g_drag_preview = .{};
 }
@@ -1678,7 +1679,7 @@ fn updateWindowMovePreview(wid: u32) void {
         const target_changed = g_drag_preview.target_wid == null or g_drag_preview.target_wid.? != entry.wid;
         g_drag_preview.target_wid = entry.wid;
         if (!g_drag_preview.visible or target_changed) {
-            shim.bw_show_tile_preview(entry.frame.x, entry.frame.y, entry.frame.width, entry.frame.height);
+            tile_preview.show(entry.frame.x, entry.frame.y, entry.frame.width, entry.frame.height);
             g_drag_preview.visible = true;
         }
         return;
@@ -1686,7 +1687,7 @@ fn updateWindowMovePreview(wid: u32) void {
 
     g_drag_preview.target_wid = null;
     if (g_drag_preview.visible) {
-        shim.bw_hide_tile_preview();
+        tile_preview.hide();
         g_drag_preview.visible = false;
     }
 }
