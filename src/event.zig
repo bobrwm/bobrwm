@@ -15,6 +15,7 @@ pub const EventKind = enum(u8) {
     focused_window_changed = 12,
     mouse_down = 13,
     mouse_up = 14,
+    role_poll_tick = 15,
 
     hk_focus_workspace = 20,
     hk_move_to_workspace = 21,

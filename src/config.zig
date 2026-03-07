@@ -3,9 +3,7 @@
 //! ~/.config/bobrwm/config.zon, or a path passed via CLI.
 
 const std = @import("std");
-const shim = @cImport({
-    @cInclude("shim.h");
-});
+const shim = @import("shim_api.zig");
 
 const log = std.log.scoped(.config);
 
