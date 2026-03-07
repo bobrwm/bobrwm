@@ -2376,6 +2376,49 @@ fn discoverWindows() void {
     }
 }
 
+/// Guards tab inference against standalone window creation races.
+/// If another managed on-screen sibling already occupies the same frame,
+/// the focused/created window should be treated as a standalone window.
+fn hasOnScreenMatchingManagedSibling(
+    pid: i32,
+    exclude_wid: u32,
+    target_frame: window_mod.Window.Frame,
+    sky: skylight.SkyLight,
+    conn: c_int,
+) bool {
+    var store_it = g_store.windows.iterator();
+    while (store_it.next()) |entry| {
+        const candidate_wid = entry.key_ptr.*;
+        const candidate = entry.value_ptr.*;
+        if (candidate_wid == exclude_wid) continue;
+        if (candidate.pid != pid) continue;
+        if (!isVisibleOnScreen(candidate_wid)) continue;
+
+        var rect: skylight.CGRect = undefined;
+        if (sky.getWindowBounds(conn, candidate_wid, &rect) != 0) continue;
+
+        const candidate_frame = window_mod.Window.Frame{
+            .x = rect.origin.x,
+            .y = rect.origin.y,
+            .width = rect.size.width,
+            .height = rect.size.height,
+        };
+        const matches = tabgroup.TabGroupManager.framesMatch(candidate_frame, target_frame);
+        log.debug("tab-match-guard: candidate wid={d} frame=({d:.0},{d:.0},{d:.0},{d:.0}) match={}", .{
+            candidate_wid,
+            candidate_frame.x,
+            candidate_frame.y,
+            candidate_frame.width,
+            candidate_frame.height,
+            matches,
+        });
+
+        if (matches) return true;
+    }
+
+    return false;
+}
+
 fn addNewWindowManaged(pid: i32, wid: u32) bool {
     log.debug("addNewWindow: pid={d} wid={d}", .{ pid, wid });
     if (g_store.get(wid) != null) {
@@ -2485,6 +2528,11 @@ fn tryFormTabGroupOnCreate(pid: i32, new_wid: u32) bool {
     log.debug("tryFormTabGroup: new wid={d} bounds=({d:.0},{d:.0},{d:.0},{d:.0})", .{
         new_wid, new_frame.x, new_frame.y, new_frame.width, new_frame.height,
     });
+
+    if (hasOnScreenMatchingManagedSibling(pid, new_wid, new_frame, sky, conn)) {
+        log.debug("tryFormTabGroup: on-screen sibling matches new wid={d}, treating as standalone", .{new_wid});
+        return false;
+    }
 
     // Collect stale windows for deferred cleanup — can't call removeWindow
     // while iterating workspace window lists (swapRemove invalidates indices).
@@ -3127,7 +3175,17 @@ fn reconcileAppTabs(pid: i32) void {
     const on_screen = isVisibleOnScreen(focused_wid);
     log.debug("reconcile: on_screen={}", .{on_screen});
 
-    // Look for a managed window (in any workspace) with same PID and matching bounds
+    if (hasOnScreenMatchingManagedSibling(pid, focused_wid, focused_frame, sky, conn)) {
+        log.debug("reconcile: on-screen sibling matches focused wid={d}, treating as new window", .{focused_wid});
+        addNewWindow(pid, focused_wid);
+        retile();
+        return;
+    }
+
+    // Look for a managed off-screen window (in any workspace) with the same
+    // PID and matching bounds. Matching an on-screen sibling is not a native
+    // tab transition signal because standalone windows can share the same
+    // tiled frame during focus/create event races.
     var matching_wid: ?u32 = null;
     var matching_ws_id: u8 = 0;
     var matching_display_id: u32 = 0;
@@ -3135,11 +3193,19 @@ fn reconcileAppTabs(pid: i32) void {
         for (ws.windows.items) |wid| {
             if (g_store.get(wid)) |win| {
                 if (win.pid == pid) {
+                    const candidate_on_screen = isVisibleOnScreen(wid);
                     const matches = tabgroup.TabGroupManager.framesMatch(win.frame, focused_frame);
-                    log.debug("reconcile: candidate wid={d} ws={d} frame=({d:.0},{d:.0},{d:.0},{d:.0}) match={}", .{
-                        wid, ws.id, win.frame.x, win.frame.y, win.frame.width, win.frame.height, matches,
+                    log.debug("reconcile: candidate wid={d} ws={d} frame=({d:.0},{d:.0},{d:.0},{d:.0}) on_screen={} match={}", .{
+                        wid,
+                        ws.id,
+                        win.frame.x,
+                        win.frame.y,
+                        win.frame.width,
+                        win.frame.height,
+                        candidate_on_screen,
+                        matches,
                     });
-                    if (matches) {
+                    if (matches and !candidate_on_screen) {
                         matching_wid = wid;
                         matching_ws_id = ws.id;
                         matching_display_id = win.display_id;
