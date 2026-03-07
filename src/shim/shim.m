@@ -70,23 +70,57 @@ void bw_set_keybinds(const bw_keybind *binds, uint32_t count) {
     g_keybind_count = count;
 }
 
+static bool handle_tap_disable_event(CGEventType type, CGEventRef event) {
+    if (type != kCGEventTapDisabledByTimeout &&
+        type != kCGEventTapDisabledByUserInput) {
+        return false;
+    }
+    if (g_tap_port) CGEventTapEnable(g_tap_port, true);
+    (void)event;
+    return true;
+}
+
+static bool emit_mouse_event_if_needed(CGEventType type) {
+    if (type == kCGEventLeftMouseDown) {
+        bw_emit_event(BW_EVENT_MOUSE_DOWN, 0, 0);
+        return true;
+    }
+    if (type == kCGEventLeftMouseUp) {
+        bw_emit_event(BW_EVENT_MOUSE_UP, 0, 0);
+        return true;
+    }
+    return false;
+}
+
+static uint8_t mods_from_event_flags(CGEventFlags flags) {
+    uint8_t mods = 0;
+    if (flags & kCGEventFlagMaskAlternate) mods |= BW_MOD_ALT;
+    if (flags & kCGEventFlagMaskShift)     mods |= BW_MOD_SHIFT;
+    if (flags & kCGEventFlagMaskCommand)   mods |= BW_MOD_CMD;
+    if (flags & kCGEventFlagMaskControl)   mods |= BW_MOD_CTRL;
+    return mods;
+}
+
+static bool dispatch_matching_keybind(CGKeyCode keycode, uint8_t mods) {
+    for (uint32_t i = 0; i < g_keybind_count; i++) {
+        if (g_keybinds[i].keycode != keycode) continue;
+        if (g_keybinds[i].mods != mods) continue;
+        bw_emit_event(g_keybinds[i].action, 0, g_keybinds[i].arg);
+        return true;
+    }
+    return false;
+}
+
 static CGEventRef hotkey_callback(CGEventTapProxy proxy, CGEventType type,
                                    CGEventRef event, void *refcon) {
     (void)proxy;
     (void)refcon;
 
-    if (type == kCGEventTapDisabledByTimeout ||
-        type == kCGEventTapDisabledByUserInput) {
-        if (g_tap_port) CGEventTapEnable(g_tap_port, true);
+    if (handle_tap_disable_event(type, event)) {
         return event;
     }
 
-    if (type == kCGEventLeftMouseDown) {
-        bw_emit_event(BW_EVENT_MOUSE_DOWN, 0, 0);
-        return event;
-    }
-    if (type == kCGEventLeftMouseUp) {
-        bw_emit_event(BW_EVENT_MOUSE_UP, 0, 0);
+    if (emit_mouse_event_if_needed(type)) {
         return event;
     }
 
@@ -94,17 +128,9 @@ static CGEventRef hotkey_callback(CGEventTapProxy proxy, CGEventType type,
     CGKeyCode keycode = (CGKeyCode)CGEventGetIntegerValueField(
         event, kCGKeyboardEventKeycode);
 
-    uint8_t current_mods = 0;
-    if (flags & kCGEventFlagMaskAlternate) current_mods |= BW_MOD_ALT;
-    if (flags & kCGEventFlagMaskShift)     current_mods |= BW_MOD_SHIFT;
-    if (flags & kCGEventFlagMaskCommand)   current_mods |= BW_MOD_CMD;
-    if (flags & kCGEventFlagMaskControl)   current_mods |= BW_MOD_CTRL;
-
-    for (uint32_t i = 0; i < g_keybind_count; i++) {
-        if (g_keybinds[i].keycode == keycode && g_keybinds[i].mods == current_mods) {
-            bw_emit_event(g_keybinds[i].action, 0, g_keybinds[i].arg);
-            return NULL;
-        }
+    const uint8_t current_mods = mods_from_event_flags(flags);
+    if (dispatch_matching_keybind(keycode, current_mods)) {
+        return NULL;
     }
 
     return event;
@@ -222,8 +248,7 @@ void bw_hide_tile_preview(void) {
 // Source setup (observers, waker, IPC)
 // ---------------------------------------------------------------------------
 
-void bw_setup_sources(int ipc_fd) {
-    // --- CGEventTap for global hotkeys (main run loop) ---
+static void setup_hotkey_event_tap(void) {
     CGEventMask mask = (1 << kCGEventKeyDown) |
                        (1 << kCGEventLeftMouseDown) |
                        (1 << kCGEventLeftMouseUp);
@@ -235,26 +260,25 @@ void bw_setup_sources(int ipc_fd) {
         hotkey_callback,
         NULL);
 
-    if (g_tap_port) {
-        CFRunLoopSourceRef tap_source =
-            CFMachPortCreateRunLoopSource(NULL, g_tap_port, 0);
-        CFRunLoopAddSource(CFRunLoopGetMain(), tap_source,
-                         kCFRunLoopCommonModes);
-        CFRelease(tap_source);
-        CGEventTapEnable(g_tap_port, true);
-    }
+    if (!g_tap_port) return;
 
-    // --- Observer run loop (AX observers use this) ---
-    g_observer_runloop = CFRunLoopGetMain();
+    CFRunLoopSourceRef tap_source =
+        CFMachPortCreateRunLoopSource(NULL, g_tap_port, 0);
+    CFRunLoopAddSource(CFRunLoopGetMain(), tap_source,
+                       kCFRunLoopCommonModes);
+    CFRelease(tap_source);
+    CGEventTapEnable(g_tap_port, true);
+}
 
-    // --- Waker source (drains event ring on main thread) ---
+static void setup_waker_source(void) {
     CFRunLoopSourceContext ctx = {0};
     ctx.perform = waker_perform;
     g_waker_source = CFRunLoopSourceCreate(NULL, 0, &ctx);
     CFRunLoopAddSource(CFRunLoopGetMain(), g_waker_source,
-                      kCFRunLoopCommonModes);
+                       kCFRunLoopCommonModes);
+}
 
-    // --- IPC dispatch source ---
+static void cancel_runtime_sources(void) {
     if (g_ipc_source) {
         dispatch_source_cancel(g_ipc_source);
         g_ipc_source = NULL;
@@ -274,7 +298,9 @@ void bw_setup_sources(int ipc_fd) {
         dispatch_source_cancel(g_window_scan_source);
         g_window_scan_source = NULL;
     }
+}
 
+static void setup_ipc_source(int ipc_fd) {
     g_ipc_source = dispatch_source_create(
         DISPATCH_SOURCE_TYPE_READ, (uintptr_t)ipc_fd, 0,
         dispatch_get_main_queue());
@@ -282,6 +308,21 @@ void bw_setup_sources(int ipc_fd) {
         bw_handle_ipc_client(ipc_fd);
     });
     dispatch_resume(g_ipc_source);
+}
+
+void bw_setup_sources(int ipc_fd) {
+    // --- CGEventTap for global hotkeys (main run loop) ---
+    setup_hotkey_event_tap();
+
+    // --- Observer run loop (AX observers use this) ---
+    g_observer_runloop = CFRunLoopGetMain();
+
+    // --- Waker source (drains event ring on main thread) ---
+    setup_waker_source();
+
+    // --- IPC dispatch source ---
+    cancel_runtime_sources();
+    setup_ipc_source(ipc_fd);
 }
 
 void bw_set_role_polling(bool enabled) {
@@ -619,19 +660,19 @@ static void observe_retry_stop_if_idle(void) {
     g_observe_retry_source = NULL;
 }
 
+static bool should_drop_observe_retry_entry(pid_t pid) {
+    NSRunningApplication *app =
+        [NSRunningApplication runningApplicationWithProcessIdentifier:pid];
+    if (!app || app.terminated) return true;
+    return app_observer_exists(pid);
+}
+
 static void process_observe_retry_tick(void) {
     uint32_t i = 0;
     while (i < g_observe_retry_count) {
         bw_observe_retry_entry *entry = &g_observe_retry_entries[i];
 
-        NSRunningApplication *app =
-            [NSRunningApplication runningApplicationWithProcessIdentifier:entry->pid];
-        if (!app || app.terminated) {
-            observe_retry_remove_index(i);
-            continue;
-        }
-
-        if (app_observer_exists(entry->pid)) {
+        if (should_drop_observe_retry_entry(entry->pid)) {
             observe_retry_remove_index(i);
             continue;
         }
@@ -751,39 +792,46 @@ static void register_window_ax_notifications(AXObserverRef observer,
                               kAXWindowDeminiaturizedNotification, refcon);
 }
 
+static bool scan_app_windows_for_new_entries(pid_t pid, AXObserverRef observer) {
+    AXUIElementRef app = AXUIElementCreateApplication(pid);
+    if (!app) return false;
+
+    CFArrayRef windows = NULL;
+    AXError err = AXUIElementCopyAttributeValue(
+        app, kAXWindowsAttribute, (CFTypeRef *)&windows);
+    CFRelease(app);
+
+    if (err != kAXErrorSuccess || !windows) return false;
+
+    bool found_new = false;
+    const CFIndex count = CFArrayGetCount(windows);
+    for (CFIndex wi = 0; wi < count; wi++) {
+        AXUIElementRef win =
+            (AXUIElementRef)CFArrayGetValueAtIndex(windows, wi);
+        uint32_t wid = 0;
+        _AXUIElementGetWindow(win, &wid);
+        if (wid == 0) continue;
+
+        if (!app_track_window(pid, wid)) continue;
+
+        found_new = true;
+        register_window_ax_notifications(observer, win, pid);
+        bw_emit_event(BW_EVENT_WINDOW_CREATED, (int32_t)pid, wid);
+    }
+
+    CFRelease(windows);
+    return found_new;
+}
+
 static void process_window_scan_tick(void) {
     bool found_new = false;
 
     for (uint32_t i = 0; i < g_app_observer_count; i++) {
         const pid_t pid = g_app_observers[i].pid;
         AXObserverRef observer = g_app_observers[i].observer;
-
-        AXUIElementRef app = AXUIElementCreateApplication(pid);
-        if (!app) continue;
-
-        CFArrayRef windows = NULL;
-        AXError err = AXUIElementCopyAttributeValue(
-            app, kAXWindowsAttribute, (CFTypeRef *)&windows);
-        CFRelease(app);
-
-        if (err != kAXErrorSuccess || !windows) continue;
-
-        const CFIndex count = CFArrayGetCount(windows);
-        for (CFIndex wi = 0; wi < count; wi++) {
-            AXUIElementRef win =
-                (AXUIElementRef)CFArrayGetValueAtIndex(windows, wi);
-            uint32_t wid = 0;
-            _AXUIElementGetWindow(win, &wid);
-            if (wid == 0) continue;
-
-            if (!app_track_window(pid, wid)) continue;
-
+        if (scan_app_windows_for_new_entries(pid, observer)) {
             found_new = true;
-            register_window_ax_notifications(observer, win, pid);
-            bw_emit_event(BW_EVENT_WINDOW_CREATED, (int32_t)pid, wid);
         }
-
-        CFRelease(windows);
     }
 
     // Stop the repeating scan after consecutive idle ticks to avoid
@@ -814,6 +862,13 @@ typedef struct {
 
 static void bw_retry_resolve_wid(void *context);
 
+static void release_wid_retry_ctx(bw_wid_retry_ctx *ctx) {
+    if (!ctx) return;
+    CFRelease(ctx->observer);
+    CFRelease(ctx->element);
+    free(ctx);
+}
+
 static void schedule_wid_resolution_retry(AXObserverRef observer,
                                           AXUIElementRef element,
                                           pid_t pid) {
@@ -840,9 +895,7 @@ static void bw_retry_resolve_wid(void *context) {
     NSRunningApplication *app =
         [NSRunningApplication runningApplicationWithProcessIdentifier:ctx->pid];
     if (!app_observer_exists(ctx->pid) || !app || app.terminated) {
-        CFRelease(ctx->observer);
-        CFRelease(ctx->element);
-        free(ctx);
+        release_wid_retry_ctx(ctx);
         return;
     }
 
@@ -852,24 +905,18 @@ static void bw_retry_resolve_wid(void *context) {
     if (wid != 0) {
         const bool is_new_window = app_track_window(ctx->pid, wid);
         if (!is_new_window) {
-            CFRelease(ctx->observer);
-            CFRelease(ctx->element);
-            free(ctx);
+            release_wid_retry_ctx(ctx);
             return;
         }
         register_window_ax_notifications(ctx->observer,
                                           ctx->element, ctx->pid);
         bw_emit_event(BW_EVENT_WINDOW_CREATED, ctx->pid, wid);
-        CFRelease(ctx->observer);
-        CFRelease(ctx->element);
-        free(ctx);
+        release_wid_retry_ctx(ctx);
         return;
     }
 
     if (ctx->attempts_remaining == 0) {
-        CFRelease(ctx->observer);
-        CFRelease(ctx->element);
-        free(ctx);
+        release_wid_retry_ctx(ctx);
         return;
     }
 
@@ -918,6 +965,61 @@ static void ax_notification_handler(AXObserverRef observer,
     }
 }
 
+static bool register_app_level_ax_notifications(AXObserverRef observer,
+                                                AXUIElementRef app,
+                                                void *app_refcon) {
+    // If the critical create notification fails, the app AX interface is not ready.
+    AXError add_err = AXObserverAddNotification(
+        observer, app, kAXWindowCreatedNotification, app_refcon);
+    if (add_err != kAXErrorSuccess) return false;
+
+    AXObserverAddNotification(observer, app,
+                              kAXFocusedWindowChangedNotification, app_refcon);
+    return true;
+}
+
+static void prime_observed_app_windows(pid_t pid,
+                                       AXObserverRef observer,
+                                       AXUIElementRef app) {
+    // Emit WINDOW_CREATED for pre-existing windows so Zig can tile immediately.
+    CFArrayRef windows = NULL;
+    AXError err = AXUIElementCopyAttributeValue(app, kAXWindowsAttribute,
+                                                (CFTypeRef *)&windows);
+    if (err != kAXErrorSuccess || !windows) return;
+
+    CFIndex count = CFArrayGetCount(windows);
+    for (CFIndex i = 0; i < count; i++) {
+        AXUIElementRef win =
+            (AXUIElementRef)CFArrayGetValueAtIndex(windows, i);
+        uint32_t wid = 0;
+        _AXUIElementGetWindow(win, &wid);
+        if (wid != 0) {
+            if (!app_track_window(pid, wid)) continue;
+            register_window_ax_notifications(observer, win, pid);
+            bw_emit_event(BW_EVENT_WINDOW_CREATED, (int32_t)pid, wid);
+            continue;
+        }
+
+        // Some apps expose AX windows before WindowServer assigns CGWindowID.
+        schedule_wid_resolution_retry(observer, win, pid);
+    }
+
+    CFRelease(windows);
+}
+
+static void remove_app_observer_at_index(uint32_t index) {
+    if (index >= g_app_observer_count) return;
+    if (g_observer_runloop) {
+        CFRunLoopRemoveSource(
+            g_observer_runloop,
+            AXObserverGetRunLoopSource(g_app_observers[index].observer),
+            kCFRunLoopCommonModes);
+    }
+    CFRelease(g_app_observers[index].observer);
+    g_app_observers[index] = g_app_observers[--g_app_observer_count];
+    update_window_scan_source();
+}
+
 static bool bw_try_observe_app(pid_t pid) {
     if (app_observer_exists(pid)) return true;
     if (g_app_observer_count >= MAX_OBSERVED_APPS) return false;
@@ -935,17 +1037,11 @@ static bool bw_try_observe_app(pid_t pid) {
 
     void *app_refcon = pack_refcon(pid, 0);
 
-    // App-level notifications (wid=0 in refcon).
-    // If the critical notification fails, the app's AX interface isn't ready.
-    AXError add_err = AXObserverAddNotification(
-        observer, app, kAXWindowCreatedNotification, app_refcon);
-    if (add_err != kAXErrorSuccess) {
+    if (!register_app_level_ax_notifications(observer, app, app_refcon)) {
         CFRelease(app);
         CFRelease(observer);
         return false;
     }
-    AXObserverAddNotification(observer, app,
-                              kAXFocusedWindowChangedNotification, app_refcon);
 
     CFRunLoopAddSource(g_observer_runloop,
                        AXObserverGetRunLoopSource(observer),
@@ -960,31 +1056,7 @@ static bool bw_try_observe_app(pid_t pid) {
     g_window_scan_idle_ticks = 0;
     update_window_scan_source();
 
-    // Per-window: move, resize, destroy, minimize, deminimize.
-    // Also emit WINDOW_CREATED for each pre-existing window so the Zig side
-    // can tile windows that were created before the observer was registered.
-    CFArrayRef windows = NULL;
-    err = AXUIElementCopyAttributeValue(app, kAXWindowsAttribute,
-                                        (CFTypeRef *)&windows);
-    if (err == kAXErrorSuccess && windows) {
-        CFIndex count = CFArrayGetCount(windows);
-        for (CFIndex i = 0; i < count; i++) {
-            AXUIElementRef win =
-                (AXUIElementRef)CFArrayGetValueAtIndex(windows, i);
-            uint32_t wid = 0;
-            _AXUIElementGetWindow(win, &wid);
-            if (wid != 0) {
-                if (!app_track_window(pid, wid)) continue;
-                register_window_ax_notifications(observer, win, pid);
-                bw_emit_event(BW_EVENT_WINDOW_CREATED, (int32_t)pid, wid);
-            } else {
-                // Some apps expose the AX window before WindowServer assigns
-                // a CGWindowID. Retry so this pre-existing window is not lost.
-                schedule_wid_resolution_retry(observer, win, pid);
-            }
-        }
-        CFRelease(windows);
-    }
+    prime_observed_app_windows(pid, observer, app);
 
     CFRelease(app);
     return true;
@@ -1002,15 +1074,7 @@ void bw_unobserve_app(int32_t pid) {
     cancel_observe_retry((pid_t)pid);
     for (uint32_t i = 0; i < g_app_observer_count; i++) {
         if (g_app_observers[i].pid != (pid_t)pid) continue;
-        if (g_observer_runloop) {
-            CFRunLoopRemoveSource(
-                g_observer_runloop,
-                AXObserverGetRunLoopSource(g_app_observers[i].observer),
-                kCFRunLoopCommonModes);
-        }
-        CFRelease(g_app_observers[i].observer);
-        g_app_observers[i] = g_app_observers[--g_app_observer_count];
-        update_window_scan_source();
+        remove_app_observer_at_index(i);
         return;
     }
 }
