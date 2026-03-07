@@ -2806,21 +2806,15 @@ fn removeAppWindows(pid: i32) void {
     // Also collect suppressed tab members from the store
     var store_it = g_store.windows.iterator();
     while (store_it.next()) |entry| {
-        if (entry.value_ptr.pid == pid and n < wids.len) {
-            var already = false;
-            for (wids[0..n]) |existing| {
-                if (existing == entry.key_ptr.*) {
-                    already = true;
-                    break;
-                }
-            }
-            if (!already) {
-                wids[n] = entry.key_ptr.*;
-                ws_ids[n] = entry.value_ptr.workspace_id;
-                display_ids[n] = entry.value_ptr.display_id;
-                n += 1;
-            }
-        }
+        const wid = entry.key_ptr.*;
+        if (entry.value_ptr.pid != pid) continue;
+        if (!g_tab_groups.isSuppressed(wid)) continue;
+        if (n >= wids.len) continue;
+
+        wids[n] = wid;
+        ws_ids[n] = entry.value_ptr.workspace_id;
+        display_ids[n] = entry.value_ptr.display_id;
+        n += 1;
     }
 
     for (wids[0..n], ws_ids[0..n], display_ids[0..n]) |wid, ws_id, display_id| {
@@ -2843,6 +2837,7 @@ fn cleanupWorkspaceWindowsForPid(pid: i32) bool {
 
     var stale_wids: [128]u32 = undefined;
     var stale_count: usize = 0;
+    var truncated = false;
 
     for (&g_workspaces.workspaces) |*ws| {
         for (ws.windows.items) |wid| {
@@ -2861,20 +2856,17 @@ fn cleanupWorkspaceWindowsForPid(pid: i32) bool {
 
             if (!should_remove) continue;
 
-            var already_queued = false;
-            for (stale_wids[0..stale_count]) |existing| {
-                if (existing == wid) {
-                    already_queued = true;
-                    break;
-                }
-            }
-            if (already_queued) continue;
-
             if (stale_count < stale_wids.len) {
                 stale_wids[stale_count] = wid;
                 stale_count += 1;
+            } else {
+                truncated = true;
             }
         }
+    }
+
+    if (truncated) {
+        log.warn("cleanup: stale-wid batch truncated pid={d} queued={d}", .{ pid, stale_count });
     }
 
     for (stale_wids[0..stale_count]) |wid| {
@@ -2891,6 +2883,7 @@ fn cleanupWorkspaceWindowsForPid(pid: i32) bool {
 fn cleanupOffscreenManagedWindows() bool {
     var stale_wids: [128]u32 = undefined;
     var stale_count: usize = 0;
+    var truncated = false;
 
     for (&g_workspaces.workspaces) |*ws| {
         for (ws.windows.items) |wid| {
@@ -2902,21 +2895,18 @@ fn cleanupOffscreenManagedWindows() bool {
 
             if (shim.bw_is_window_on_screen(wid)) continue;
 
-            var already_queued = false;
-            for (stale_wids[0..stale_count]) |existing| {
-                if (existing == wid) {
-                    already_queued = true;
-                    break;
-                }
-            }
-            if (already_queued) continue;
-
             log.info("cleanup: removing wid={d} pid={d} reason=offscreen", .{ wid, win.pid });
             if (stale_count < stale_wids.len) {
                 stale_wids[stale_count] = wid;
                 stale_count += 1;
+            } else {
+                truncated = true;
             }
         }
+    }
+
+    if (truncated) {
+        log.warn("cleanup: offscreen batch truncated queued={d}", .{stale_count});
     }
 
     for (stale_wids[0..stale_count]) |wid| {
