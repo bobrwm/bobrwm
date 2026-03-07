@@ -98,8 +98,6 @@ const pending_role_window_capacity: usize = 256;
 const deferred_window_candidate_capacity: usize = 256;
 /// Capacity reserved for app launch retries (pid-keyed, bounded by observers).
 const app_launch_retry_capacity: usize = 64;
-/// Capacity reserved for per-tick on-screen window snapshots.
-const visibility_snapshot_capacity: usize = 512;
 /// Debounce workspace/display notifications that can fire in short bursts.
 const workspace_event_debounce_interval_s: f64 = 0.05;
 
@@ -153,59 +151,6 @@ const DeferredWindowPromotion = struct {
 const PendingRoleWindowMap = std.AutoHashMap(u32, PendingRoleWindow);
 const DeferredWindowCandidateMap = std.AutoHashMap(u32, DeferredWindowCandidate);
 const AppLaunchRetryMap = std.AutoHashMap(i32, u8);
-
-const VisibilitySnapshot = struct {
-    on_screen_wids: std.AutoHashMap(u32, void),
-    valid: bool,
-
-    fn init(allocator: std.mem.Allocator) VisibilitySnapshot {
-        return .{
-            .on_screen_wids = std.AutoHashMap(u32, void).init(allocator),
-            .valid = false,
-        };
-    }
-
-    fn deinit(self: *VisibilitySnapshot) void {
-        self.on_screen_wids.deinit();
-    }
-
-    fn refresh(self: *VisibilitySnapshot) void {
-        self.on_screen_wids.clearRetainingCapacity();
-        self.valid = false;
-
-        const options: c.CGWindowListOption =
-            c.kCGWindowListOptionOnScreenOnly | c.kCGWindowListExcludeDesktopElements;
-        const list = c.CGWindowListCopyWindowInfo(options, c.kCGNullWindowID) orelse return;
-        defer c.CFRelease(@ptrCast(list));
-
-        const count = c.CFArrayGetCount(list);
-        std.debug.assert(count >= 0);
-        var i: c.CFIndex = 0;
-        while (i < count) : (i += 1) {
-            const info_any = c.CFArrayGetValueAtIndex(list, i) orelse continue;
-            const info: c.CFDictionaryRef = @ptrCast(info_any);
-            const wid_ref_any = c.CFDictionaryGetValue(info, c.kCGWindowNumber) orelse continue;
-            const wid_ref: c.CFNumberRef = @ptrCast(wid_ref_any);
-
-            var wid: u32 = 0;
-            const ok = c.CFNumberGetValue(wid_ref, c.kCFNumberSInt32Type, &wid);
-            if (ok == 0 or wid == 0) continue;
-
-            self.on_screen_wids.put(wid, {}) catch {
-                log.err("visibility snapshot insert failed wid={d}", .{wid});
-                self.on_screen_wids.clearRetainingCapacity();
-                return;
-            };
-        }
-
-        self.valid = true;
-    }
-
-    fn contains(self: *const VisibilitySnapshot, wid: u32) bool {
-        std.debug.assert(wid > 0);
-        return self.valid and self.on_screen_wids.contains(wid);
-    }
-};
 
 fn nsString(str: [*:0]const u8) objc.Object {
     const NSString = objc.getClass("NSString") orelse
@@ -545,34 +490,14 @@ fn hideWindow(pid: i32, wid: u32) void {
     (HideCtx.init(display_id)).hide(pid, wid);
 }
 
-fn isOnScreenWithSnapshot(wid: u32, visibility_snapshot: ?*const VisibilitySnapshot) bool {
-    std.debug.assert(wid > 0);
-    if (visibility_snapshot) |snapshot| {
-        if (snapshot.valid) {
-            return snapshot.contains(wid);
-        }
-    }
-    return shim.bw_is_window_on_screen(wid);
-}
-
-fn isVisibleOnScreenWithSnapshot(wid: u32, visibility_snapshot: ?*const VisibilitySnapshot) bool {
-    std.debug.assert(wid > 0);
-    if (g_store.get(wid)) |win| {
-        if (!workspaceVisibleOnDisplay(win.workspace_id, win.display_id)) return false;
-    }
-    return isOnScreenWithSnapshot(wid, visibility_snapshot);
-}
-
 /// Workspace-aware on-screen check. Windows on hidden workspaces are parked
 /// in a screen corner with a few peek pixels visible — CG considers them
 /// "on screen" but they should not be treated as such.
 fn isVisibleOnScreen(wid: u32) bool {
-    return isVisibleOnScreenWithSnapshot(wid, null);
-}
-
-fn refreshVisibilitySnapshot() *const VisibilitySnapshot {
-    g_visibility_snapshot.refresh();
-    return &g_visibility_snapshot;
+    if (g_store.get(wid)) |win| {
+        if (!workspaceVisibleOnDisplay(win.workspace_id, win.display_id)) return false;
+    }
+    return shim.bw_is_window_on_screen(wid);
 }
 
 // ---------------------------------------------------------------------------
@@ -592,7 +517,6 @@ var g_tab_groups: tabgroup.TabGroupManager = undefined;
 var g_pending_role_windows: PendingRoleWindowMap = undefined;
 var g_deferred_window_candidates: DeferredWindowCandidateMap = undefined;
 var g_app_launch_retries: AppLaunchRetryMap = undefined;
-var g_visibility_snapshot: VisibilitySnapshot = undefined;
 var g_workspace_observer: ?objc.Object = null;
 var g_ipc: ipc.Server = undefined;
 var g_config: config_mod.Config = .{};
@@ -1545,15 +1469,8 @@ pub fn main() !void {
         log.err("app-launch-retry map reserve failed: {}", .{err});
         return err;
     };
-    g_visibility_snapshot = VisibilitySnapshot.init(g_allocator);
-    errdefer g_visibility_snapshot.deinit();
-    g_visibility_snapshot.on_screen_wids.ensureTotalCapacity(visibility_snapshot_capacity) catch |err| {
-        log.err("visibility snapshot reserve failed: {}", .{err});
-        return err;
-    };
     defer {
         setRolePolling(false);
-        g_visibility_snapshot.deinit();
         g_app_launch_retries.deinit();
         g_deferred_window_candidates.deinit();
         g_pending_role_windows.deinit();
@@ -1876,9 +1793,8 @@ fn handleEvent(ev: *const event_mod.Event) void {
         },
         .window_focused => {
             log.info("window focused pid={}", .{ev.pid});
-            const visibility_snapshot = refreshVisibilitySnapshot();
             const removed_stale = cleanupWorkspaceWindowsForPid(ev.pid);
-            const removed_offscreen = cleanupOffscreenManagedWindows(visibility_snapshot);
+            const removed_offscreen = cleanupOffscreenManagedWindows();
             const wid = shim.bw_ax_get_focused_window(ev.pid);
             if (wid != 0) {
                 if (g_store.get(wid) == null) {
@@ -1901,10 +1817,9 @@ fn handleEvent(ev: *const event_mod.Event) void {
         },
         .focused_window_changed => {
             log.info("focused window changed pid={}", .{ev.pid});
-            const visibility_snapshot = refreshVisibilitySnapshot();
             const removed_stale = cleanupWorkspaceWindowsForPid(ev.pid);
-            const removed_offscreen = cleanupOffscreenManagedWindows(visibility_snapshot);
-            reconcileAppTabs(ev.pid, visibility_snapshot);
+            const removed_offscreen = cleanupOffscreenManagedWindows();
+            reconcileAppTabs(ev.pid);
             if (removed_stale or removed_offscreen) {
                 retile();
             }
@@ -2513,7 +2428,6 @@ fn hasOnScreenMatchingManagedSibling(
     target_frame: window_mod.Window.Frame,
     sky: skylight.SkyLight,
     conn: c_int,
-    visibility_snapshot: ?*const VisibilitySnapshot,
 ) bool {
     var store_it = g_store.windows.iterator();
     while (store_it.next()) |entry| {
@@ -2521,7 +2435,7 @@ fn hasOnScreenMatchingManagedSibling(
         const candidate = entry.value_ptr.*;
         if (candidate_wid == exclude_wid) continue;
         if (candidate.pid != pid) continue;
-        if (!isVisibleOnScreenWithSnapshot(candidate_wid, visibility_snapshot)) continue;
+        if (!isVisibleOnScreen(candidate_wid)) continue;
 
         var rect: skylight.CGRect = undefined;
         if (sky.getWindowBounds(conn, candidate_wid, &rect) != 0) continue;
@@ -2677,7 +2591,7 @@ fn tryFormTabGroupOnCreate(pid: i32, new_wid: u32) bool {
         new_wid, new_frame.x, new_frame.y, new_frame.width, new_frame.height,
     });
 
-    if (hasOnScreenMatchingManagedSibling(pid, new_wid, new_frame, sky, conn, null)) {
+    if (hasOnScreenMatchingManagedSibling(pid, new_wid, new_frame, sky, conn)) {
         log.debug("tryFormTabGroup: on-screen sibling matches new wid={d}, treating as standalone", .{new_wid});
         return false;
     }
@@ -2956,7 +2870,7 @@ fn cleanupWorkspaceWindowsForPid(pid: i32) bool {
 ///
 /// Some Electron apps (Discord) close-to-background without emitting AX
 /// destroy/minimize notifications. This catches those ghost entries.
-fn cleanupOffscreenManagedWindows(visibility_snapshot: ?*const VisibilitySnapshot) bool {
+fn cleanupOffscreenManagedWindows() bool {
     var stale_wids: [128]u32 = undefined;
     var stale_count: usize = 0;
 
@@ -2968,7 +2882,7 @@ fn cleanupOffscreenManagedWindows(visibility_snapshot: ?*const VisibilitySnapsho
             // tab is active; treating them as ghosts causes layout churn.
             if (g_tab_groups.groupOf(wid) != null) continue;
 
-            if (isOnScreenWithSnapshot(wid, visibility_snapshot)) continue;
+            if (shim.bw_is_window_on_screen(wid)) continue;
 
             var already_queued = false;
             for (stale_wids[0..stale_count]) |existing| {
@@ -3095,6 +3009,13 @@ fn reconcileDisplayChange() void {
     }
 }
 
+fn layoutLeafCount(node: layout.Node) usize {
+    return switch (node) {
+        .leaf => 1,
+        .split => |split| layoutLeafCount(split.left) + layoutLeafCount(split.right),
+    };
+}
+
 fn retileDisplay(display_id: u32) void {
     const ws_id = activeWorkspaceIdForDisplay(display_id);
     const root_ptr = layoutRootPtr(ws_id, display_id) orelse return;
@@ -3110,11 +3031,36 @@ fn retileDisplay(display_id: u32) void {
         .height = display.h - @as(f64, @floatFromInt(@as(u32, outer.top) + @as(u32, outer.bottom))),
     };
 
-    var buf: [256 * @sizeOf(layout.LayoutEntry)]u8 = undefined;
-    var fba = std.heap.FixedBufferAllocator.init(&buf);
+    var stack_buf: [256 * @sizeOf(layout.LayoutEntry)]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&stack_buf);
     var entries: std.ArrayList(layout.LayoutEntry) = .{};
+    var entries_allocator = fba.allocator();
+    var using_heap_entries = false;
+    defer if (using_heap_entries) {
+        entries.deinit(g_allocator);
+    };
 
-    layout.applyLayout(root, frame, @floatFromInt(g_config.gaps.inner), &entries, fba.allocator()) catch return;
+    layout.applyLayout(root, frame, @floatFromInt(g_config.gaps.inner), &entries, entries_allocator) catch |err| {
+        if (err != error.OutOfMemory) return;
+
+        const leaf_count = layoutLeafCount(root);
+        std.debug.assert(leaf_count > 0);
+
+        entries = .{};
+        entries.ensureTotalCapacity(g_allocator, leaf_count) catch {
+            log.err("retile: fallback reserve failed display={d} leaves={d}", .{ display_id, leaf_count });
+            return;
+        };
+        using_heap_entries = true;
+        entries_allocator = g_allocator;
+
+        layout.applyLayout(root, frame, @floatFromInt(g_config.gaps.inner), &entries, entries_allocator) catch {
+            log.err("retile: fallback apply failed display={d} leaves={d}", .{ display_id, leaf_count });
+            return;
+        };
+
+        log.warn("retile: stack layout buffer overflowed display={d} leaves={d}", .{ display_id, leaf_count });
+    };
 
     for (entries.items) |entry| {
         const win = g_store.get(entry.wid) orelse continue;
@@ -3248,7 +3194,7 @@ fn installCrashHandlers() void {
 
 /// Called on kAXFocusedWindowChangedNotification — detects tab switches and
 /// forms/updates tab groups so only the active tab occupies a layout slot.
-fn reconcileAppTabs(pid: i32, visibility_snapshot: ?*const VisibilitySnapshot) void {
+fn reconcileAppTabs(pid: i32) void {
     const focused_wid = shim.bw_ax_get_focused_window(pid);
     log.debug("reconcile: pid={d} focused_wid={d}", .{ pid, focused_wid });
     if (focused_wid == 0) {
@@ -3320,10 +3266,10 @@ fn reconcileAppTabs(pid: i32, visibility_snapshot: ?*const VisibilitySnapshot) v
         focused_frame.x, focused_frame.y, focused_frame.width, focused_frame.height,
     });
 
-    const on_screen = isVisibleOnScreenWithSnapshot(focused_wid, visibility_snapshot);
+    const on_screen = isVisibleOnScreen(focused_wid);
     log.debug("reconcile: on_screen={}", .{on_screen});
 
-    if (hasOnScreenMatchingManagedSibling(pid, focused_wid, focused_frame, sky, conn, visibility_snapshot)) {
+    if (hasOnScreenMatchingManagedSibling(pid, focused_wid, focused_frame, sky, conn)) {
         log.debug("reconcile: on-screen sibling matches focused wid={d}, treating as new window", .{focused_wid});
         addNewWindow(pid, focused_wid);
         retile();
@@ -3341,7 +3287,7 @@ fn reconcileAppTabs(pid: i32, visibility_snapshot: ?*const VisibilitySnapshot) v
         for (ws.windows.items) |wid| {
             if (g_store.get(wid)) |win| {
                 if (win.pid == pid) {
-                    const candidate_on_screen = isVisibleOnScreenWithSnapshot(wid, visibility_snapshot);
+                    const candidate_on_screen = isVisibleOnScreen(wid);
                     const matches = tabgroup.TabGroupManager.framesMatch(win.frame, focused_frame);
                     log.debug("reconcile: candidate wid={d} ws={d} frame=({d:.0},{d:.0},{d:.0},{d:.0}) on_screen={} match={}", .{
                         wid,
