@@ -83,11 +83,13 @@ extern void bw_drain_events(void);
 extern void bw_handle_ipc_client(int server_fd);
 extern void bw_will_quit(void);
 extern void bw_retile(void);
+extern void bw_workspace_app_launched(int32_t pid);
+extern void bw_workspace_app_terminated(int32_t pid);
+extern void bw_workspace_active_app_changed(int32_t pid);
 
 // --- Accessibility ---
 
 bool bw_ax_is_trusted(void);
-void bw_ax_prompt(void);
 
 // --- Source setup ---
 

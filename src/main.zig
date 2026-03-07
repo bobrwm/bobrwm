@@ -20,6 +20,8 @@ const config_mod = @import("config.zig");
 const statusbar = @import("statusbar.zig");
 const launchd = @import("launchd.zig");
 
+extern fn _AXUIElementGetWindow(element: c.AXUIElementRef, wid: *u32) c.AXError;
+
 const NSPoint = extern struct {
     x: f64,
     y: f64,
@@ -88,6 +90,10 @@ const role_poll_interval_ms: u64 = 100;
 /// Retry budget for deferred candidates before they are dropped or fall back.
 /// Electron-family apps can take multiple seconds before publishing stable AX roles.
 const role_poll_attempts_max: u8 = 50;
+/// Launch retry budget to re-run discovery after app startup settles.
+const app_launch_retry_attempts_max: u8 = 10;
+/// Debounce workspace/display notifications that can fire in short bursts.
+const workspace_event_debounce_interval_s: f64 = 0.05;
 
 const DisplayInfo = struct {
     id: u32,
@@ -138,6 +144,7 @@ const DeferredWindowPromotion = struct {
 
 const PendingRoleWindowMap = std.AutoHashMap(u32, PendingRoleWindow);
 const DeferredWindowCandidateMap = std.AutoHashMap(u32, DeferredWindowCandidate);
+const AppLaunchRetryMap = std.AutoHashMap(i32, u8);
 
 fn nsString(str: [*:0]const u8) objc.Object {
     const NSString = objc.getClass("NSString") orelse
@@ -407,11 +414,29 @@ var g_next_split_dir: layout.Direction = .horizontal;
 var g_tab_groups: tabgroup.TabGroupManager = undefined;
 var g_pending_role_windows: PendingRoleWindowMap = undefined;
 var g_deferred_window_candidates: DeferredWindowCandidateMap = undefined;
+var g_app_launch_retries: AppLaunchRetryMap = undefined;
 var g_workspace_observer: ?objc.Object = null;
 var g_ipc: ipc.Server = undefined;
 var g_config: config_mod.Config = .{};
 var g_drag_preview: DragPreviewState = .{};
 var g_mouse_left_down = false;
+var g_last_space_changed_at_s: f64 = 0;
+var g_last_display_changed_at_s: f64 = 0;
+
+fn shouldHandleWorkspaceEvent(last_event_at_s: *f64) bool {
+    std.debug.assert(last_event_at_s.* >= 0);
+    std.debug.assert(workspace_event_debounce_interval_s > 0);
+
+    const now_s: f64 = c.CFAbsoluteTimeGetCurrent();
+    std.debug.assert(now_s > 0);
+    if (last_event_at_s.* != 0 and @abs(now_s - last_event_at_s.*) < workspace_event_debounce_interval_s) {
+        return false;
+    }
+
+    last_event_at_s.* = now_s;
+    std.debug.assert(last_event_at_s.* == now_s);
+    return true;
+}
 
 // ---------------------------------------------------------------------------
 // NSApp lifecycle (zig-objc)
@@ -522,6 +547,162 @@ export fn bw_ax_is_trusted() bool {
     return c.AXIsProcessTrusted() != 0;
 }
 
+/// Prompt for Accessibility permission in System Settings.
+fn axPrompt() void {
+    const NSDictionary = objc.getClass("NSDictionary") orelse {
+        _ = c.AXIsProcessTrustedWithOptions(null);
+        return;
+    };
+    const NSNumber = objc.getClass("NSNumber") orelse {
+        _ = c.AXIsProcessTrustedWithOptions(null);
+        return;
+    };
+
+    const enabled = NSNumber.msgSend(objc.Object, "numberWithBool:", .{true});
+    const options = NSDictionary.msgSend(objc.Object, "dictionaryWithObject:forKey:", .{
+        enabled,
+        nsString("AXTrustedCheckOptionPrompt"),
+    });
+    const options_value = options.value orelse return;
+
+    std.debug.assert(enabled.value != null);
+    std.debug.assert(options.value != null);
+    _ = c.AXIsProcessTrustedWithOptions(@ptrCast(options_value));
+}
+
+/// Get the bundle identifier for a PID.
+/// Writes a NUL-terminated string into `out` and returns bytes written.
+export fn bw_get_app_bundle_id(pid: i32, out: ?[*]u8, max_len: u32) u32 {
+    const out_ptr = out orelse return 0;
+    if (max_len == 0) return 0;
+
+    std.debug.assert(pid > 0);
+    std.debug.assert(max_len > 0);
+
+    const max_len_usize: usize = @intCast(max_len);
+    const buffer = out_ptr[0..max_len_usize];
+
+    const NSRunningApplication = objc.getClass("NSRunningApplication") orelse return 0;
+    const app = NSRunningApplication.msgSend(objc.Object, "runningApplicationWithProcessIdentifier:", .{pid});
+    if (app.value == null) return 0;
+
+    const bundle_identifier = app.msgSend(objc.Object, "bundleIdentifier", .{});
+    if (bundle_identifier.value == null) return 0;
+
+    const utf8 = bundle_identifier.msgSend(?[*:0]const u8, "UTF8String", .{}) orelse return 0;
+    const bundle_id = std.mem.sliceTo(utf8, 0);
+    if (bundle_id.len == 0) return 0;
+
+    const copy_len = @min(bundle_id.len, buffer.len - 1);
+    @memcpy(buffer[0..copy_len], bundle_id[0..copy_len]);
+    buffer[copy_len] = 0;
+
+    std.debug.assert(copy_len < buffer.len);
+    std.debug.assert(buffer[copy_len] == 0);
+    return @intCast(copy_len);
+}
+
+/// Get the focused window ID for a given application PID.
+/// Returns 0 when no focused AX window is available.
+export fn bw_ax_get_focused_window(pid: i32) u32 {
+    std.debug.assert(pid > 0);
+
+    const app = c.AXUIElementCreateApplication(pid) orelse return 0;
+    defer c.CFRelease(@ptrCast(app));
+
+    const focused_attr_obj = nsString("AXFocusedWindow");
+    const focused_attr: c.CFStringRef = @ptrCast(focused_attr_obj.value orelse return 0);
+    std.debug.assert(focused_attr_obj.value != null);
+
+    var focused: c.AXUIElementRef = null;
+    const err = c.AXUIElementCopyAttributeValue(
+        app,
+        focused_attr,
+        @ptrCast(&focused),
+    );
+    if (err != c.kAXErrorSuccess or focused == null) return 0;
+    const focused_ref = focused orelse return 0;
+    defer c.CFRelease(@ptrCast(focused_ref));
+
+    var wid: u32 = 0;
+    _ = _AXUIElementGetWindow(focused_ref, &wid);
+    return wid;
+}
+
+/// Check if a window currently appears in the on-screen CG window list.
+/// This excludes desktop elements and naturally filters background tabs.
+export fn bw_is_window_on_screen(target_wid: u32) bool {
+    std.debug.assert(target_wid > 0);
+
+    const options: c.CGWindowListOption =
+        c.kCGWindowListOptionOnScreenOnly | c.kCGWindowListExcludeDesktopElements;
+    const list = c.CGWindowListCopyWindowInfo(options, c.kCGNullWindowID) orelse return false;
+    defer c.CFRelease(@ptrCast(list));
+
+    const count = c.CFArrayGetCount(list);
+    std.debug.assert(count >= 0);
+    var i: c.CFIndex = 0;
+    while (i < count) : (i += 1) {
+        const info_any = c.CFArrayGetValueAtIndex(list, i) orelse continue;
+        const info: c.CFDictionaryRef = @ptrCast(info_any);
+        const wid_ref_any = c.CFDictionaryGetValue(info, c.kCGWindowNumber) orelse continue;
+        const wid_ref: c.CFNumberRef = @ptrCast(wid_ref_any);
+
+        var wid: u32 = 0;
+        const ok = c.CFNumberGetValue(wid_ref, c.kCFNumberSInt32Type, &wid);
+        if (ok == 0) continue;
+        if (wid == target_wid) return true;
+    }
+
+    return false;
+}
+
+/// Get all AX-backed window IDs for an application PID.
+/// Includes windows that may not currently be visible on screen.
+export fn bw_get_app_window_ids(pid: i32, out: ?[*]u32, max_count: u32) u32 {
+    const out_ptr = out orelse return 0;
+    if (max_count == 0) return 0;
+
+    std.debug.assert(pid > 0);
+    std.debug.assert(max_count > 0);
+
+    const out_buf = out_ptr[0..@as(usize, @intCast(max_count))];
+    const app = c.AXUIElementCreateApplication(pid) orelse return 0;
+    defer c.CFRelease(@ptrCast(app));
+
+    const windows_attr_obj = nsString("AXWindows");
+    const windows_attr: c.CFStringRef = @ptrCast(windows_attr_obj.value orelse return 0);
+
+    var windows: c.CFArrayRef = null;
+    const err = c.AXUIElementCopyAttributeValue(
+        app,
+        windows_attr,
+        @ptrCast(&windows),
+    );
+    if (err != c.kAXErrorSuccess or windows == null) return 0;
+    const windows_ref = windows orelse return 0;
+    defer c.CFRelease(@ptrCast(windows_ref));
+
+    var written: usize = 0;
+    const total = c.CFArrayGetCount(windows_ref);
+    std.debug.assert(total >= 0);
+
+    var i: c.CFIndex = 0;
+    while (i < total and written < out_buf.len) : (i += 1) {
+        const win_any = c.CFArrayGetValueAtIndex(windows_ref, i) orelse continue;
+        const win: c.AXUIElementRef = @ptrCast(win_any);
+
+        var wid: u32 = 0;
+        if (_AXUIElementGetWindow(win, &wid) == c.kAXErrorSuccess and wid != 0) {
+            out_buf[written] = wid;
+            written += 1;
+        }
+    }
+
+    std.debug.assert(written <= out_buf.len);
+    return @intCast(written);
+}
+
 // ---------------------------------------------------------------------------
 // Event bridge (called from ObjC shim)
 // ---------------------------------------------------------------------------
@@ -536,6 +717,24 @@ export fn bw_emit_event(kind: u8, pid: i32, wid: u32) void {
         .wid = wid,
     });
     shim.bw_signal_waker();
+}
+
+/// Callback target for BWObserver.appTerminated: selector.
+export fn bw_workspace_app_terminated(pid: i32) void {
+    std.debug.assert(pid > 0);
+    bw_emit_event(shim.BW_EVENT_APP_TERMINATED, pid, 0);
+}
+
+/// Callback target for BWObserver.appLaunched: selector.
+export fn bw_workspace_app_launched(pid: i32) void {
+    std.debug.assert(pid > 0);
+    bw_emit_event(shim.BW_EVENT_APP_LAUNCHED, pid, 0);
+}
+
+/// Callback target for BWObserver.activeAppChanged: selector.
+export fn bw_workspace_active_app_changed(pid: i32) void {
+    std.debug.assert(pid > 0);
+    bw_emit_event(shim.BW_EVENT_WINDOW_FOCUSED, pid, 0);
 }
 
 // ---------------------------------------------------------------------------
@@ -648,7 +847,7 @@ pub fn main() !void {
     if (!shim.bw_ax_is_trusted()) {
         log.warn("accessibility not trusted — prompting user", .{});
         log.warn("after granting access, restart with: bobrwm service restart", .{});
-        shim.bw_ax_prompt();
+        axPrompt();
     }
 
     // -- SkyLight (optional) --
@@ -664,8 +863,10 @@ pub fn main() !void {
     defer g_tab_groups.deinit();
     g_pending_role_windows = PendingRoleWindowMap.init(g_allocator);
     g_deferred_window_candidates = DeferredWindowCandidateMap.init(g_allocator);
+    g_app_launch_retries = AppLaunchRetryMap.init(g_allocator);
     defer {
         shim.bw_set_role_polling(false);
+        g_app_launch_retries.deinit();
         g_deferred_window_candidates.deinit();
         g_pending_role_windows.deinit();
     }
@@ -970,10 +1171,12 @@ fn handleEvent(ev: *const event_mod.Event) void {
             log.info("app launched pid={}", .{ev.pid});
             discoverWindows();
             shim.bw_observe_app(ev.pid);
+            trackAppLaunchRetry(ev.pid);
             retile();
         },
         .app_terminated => {
             log.info("app terminated pid={}", .{ev.pid});
+            untrackAppLaunchRetry(ev.pid);
             shim.bw_unobserve_app(ev.pid);
             removeAppWindows(ev.pid);
             retile();
@@ -1032,16 +1235,21 @@ fn handleEvent(ev: *const event_mod.Event) void {
             retile();
         },
         .display_changed => {
+            if (!shouldHandleWorkspaceEvent(&g_last_display_changed_at_s)) return;
             log.info("display changed", .{});
             reconcileDisplayChange();
             discoverWindows();
             retile();
         },
-        .space_changed => log.info("space changed", .{}),
+        .space_changed => {
+            if (!shouldHandleWorkspaceEvent(&g_last_space_changed_at_s)) return;
+            log.info("space changed", .{});
+        },
         .role_poll_tick => {
             const promoted_pending = processPendingRoleWindows();
             const promoted_deferred = processDeferredWindowCandidates();
-            if (promoted_pending or promoted_deferred) {
+            const retried_launch = processAppLaunchRetries();
+            if (promoted_pending or promoted_deferred or retried_launch) {
                 retile();
             }
         },
@@ -1171,8 +1379,77 @@ fn windowRoleState(pid: i32, wid: u32) WindowRoleState {
 
 fn refreshRolePolling() void {
     const has_pending = g_pending_role_windows.count() > 0 or
-        g_deferred_window_candidates.count() > 0;
+        g_deferred_window_candidates.count() > 0 or
+        g_app_launch_retries.count() > 0;
     shim.bw_set_role_polling(has_pending);
+}
+
+fn trackAppLaunchRetry(pid: i32) void {
+    std.debug.assert(pid > 0);
+
+    if (g_app_launch_retries.getPtr(pid)) |attempts_remaining| {
+        attempts_remaining.* = app_launch_retry_attempts_max;
+    } else {
+        g_app_launch_retries.put(pid, app_launch_retry_attempts_max) catch {
+            log.err("app-launch-retry: failed to track pid={d}", .{pid});
+            return;
+        };
+    }
+
+    refreshRolePolling();
+}
+
+fn untrackAppLaunchRetry(pid: i32) void {
+    std.debug.assert(pid > 0);
+    if (g_app_launch_retries.remove(pid)) {
+        refreshRolePolling();
+    }
+}
+
+fn processAppLaunchRetries() bool {
+    if (g_app_launch_retries.count() == 0) {
+        refreshRolePolling();
+        return false;
+    }
+
+    var retry_pids: [64]i32 = undefined;
+    var retry_count: usize = 0;
+    var truncated = false;
+
+    var it = g_app_launch_retries.iterator();
+    while (it.next()) |entry| {
+        const pid = entry.key_ptr.*;
+        std.debug.assert(pid > 0);
+
+        if (entry.value_ptr.* == 0) {
+            if (retry_count == retry_pids.len) {
+                truncated = true;
+                break;
+            }
+            retry_pids[retry_count] = pid;
+            retry_count += 1;
+        } else {
+            entry.value_ptr.* -= 1;
+        }
+    }
+
+    for (retry_pids[0..retry_count]) |pid| {
+        _ = g_app_launch_retries.remove(pid);
+    }
+    refreshRolePolling();
+
+    if (truncated) {
+        log.warn("app-launch-retry: batch truncated remaining={d}", .{g_app_launch_retries.count()});
+    }
+
+    if (retry_count == 0) return false;
+
+    for (retry_pids[0..retry_count]) |pid| {
+        log.info("app-launch-retry: retrying discovery for pid={d}", .{pid});
+        shim.bw_observe_app(pid);
+    }
+    discoverWindows();
+    return true;
 }
 
 fn trackPendingRoleWindow(pid: i32, wid: u32) void {
