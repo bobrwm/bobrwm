@@ -3,6 +3,7 @@ const posix = std.posix;
 const build_options = @import("build_options");
 const c = @cImport({
     @cInclude("ApplicationServices/ApplicationServices.h");
+    @cInclude("dispatch/dispatch.h");
     @cInclude("pthread.h");
 });
 const objc = @import("objc");
@@ -422,6 +423,12 @@ var g_drag_preview: DragPreviewState = .{};
 var g_mouse_left_down = false;
 var g_last_space_changed_at_s: f64 = 0;
 var g_last_display_changed_at_s: f64 = 0;
+var g_hotkey_bindings: [128]shim.bw_keybind = undefined;
+var g_hotkey_binding_count: u32 = 0;
+var g_waker_source: c.CFRunLoopSourceRef = null;
+var g_role_poll_source: c.dispatch_source_t = null;
+var g_ipc_source: c.dispatch_source_t = null;
+var g_tap_port: c.CFMachPortRef = null;
 
 fn shouldHandleWorkspaceEvent(last_event_at_s: *f64) bool {
     std.debug.assert(last_event_at_s.* >= 0);
@@ -703,6 +710,391 @@ export fn bw_get_app_window_ids(pid: i32, out: ?[*]u32, max_count: u32) u32 {
     return @intCast(written);
 }
 
+fn cfString(name: [*:0]const u8) c.CFStringRef {
+    const string_obj = nsString(name);
+    const string_value = string_obj.value orelse return null;
+    return @ptrCast(string_value);
+}
+
+fn isRegularActivationApp(pid: i32) bool {
+    std.debug.assert(pid > 0);
+
+    const NSRunningApplication = objc.getClass("NSRunningApplication") orelse return false;
+    const app = NSRunningApplication.msgSend(objc.Object, "runningApplicationWithProcessIdentifier:", .{pid});
+    if (app.value == null) return false;
+
+    // NSApplicationActivationPolicyRegular == 0.
+    const activation_policy = app.msgSend(i64, "activationPolicy", .{});
+    return activation_policy == 0;
+}
+
+fn findAxWindow(pid: i32, target_wid: u32) ?c.AXUIElementRef {
+    std.debug.assert(pid > 0);
+    std.debug.assert(target_wid > 0);
+
+    const app = c.AXUIElementCreateApplication(pid) orelse return null;
+    defer c.CFRelease(@ptrCast(app));
+
+    const windows_attr = cfString("AXWindows") orelse return null;
+    var windows: c.CFArrayRef = null;
+    const err = c.AXUIElementCopyAttributeValue(app, windows_attr, @ptrCast(&windows));
+    if (err != c.kAXErrorSuccess or windows == null) return null;
+    const windows_ref = windows orelse return null;
+    defer c.CFRelease(@ptrCast(windows_ref));
+
+    const count = c.CFArrayGetCount(windows_ref);
+    std.debug.assert(count >= 0);
+
+    var i: c.CFIndex = 0;
+    while (i < count) : (i += 1) {
+        const win_any = c.CFArrayGetValueAtIndex(windows_ref, i) orelse continue;
+        const win: c.AXUIElementRef = @ptrCast(win_any);
+
+        var wid: u32 = 0;
+        if (_AXUIElementGetWindow(win, &wid) != c.kAXErrorSuccess) continue;
+        if (wid != target_wid) continue;
+
+        _ = c.CFRetain(@ptrCast(win));
+        return win;
+    }
+
+    return null;
+}
+
+/// Move and resize a window using AX attributes.
+export fn bw_ax_set_window_frame(pid: i32, wid: u32, x: f64, y: f64, w: f64, h: f64) bool {
+    std.debug.assert(pid > 0);
+    std.debug.assert(wid > 0);
+
+    if (w <= 0 or h <= 0) return false;
+    const win = findAxWindow(pid, wid) orelse return false;
+    defer c.CFRelease(@ptrCast(win));
+
+    const size_attr = cfString("AXSize") orelse return false;
+    const position_attr = cfString("AXPosition") orelse return false;
+
+    const size: c.CGSize = .{ .width = w, .height = h };
+    const size_value = c.AXValueCreate(c.kAXValueTypeCGSize, &size) orelse return false;
+    defer c.CFRelease(@ptrCast(size_value));
+    _ = c.AXUIElementSetAttributeValue(win, size_attr, @ptrCast(size_value));
+
+    const position: c.CGPoint = .{ .x = x, .y = y };
+    const position_value = c.AXValueCreate(c.kAXValueTypeCGPoint, &position) orelse return false;
+    defer c.CFRelease(@ptrCast(position_value));
+    const err = c.AXUIElementSetAttributeValue(win, position_attr, @ptrCast(position_value));
+
+    return err == c.kAXErrorSuccess;
+}
+
+/// Raise and focus a window, then activate its owning app.
+export fn bw_ax_focus_window(pid: i32, wid: u32) bool {
+    std.debug.assert(pid > 0);
+    std.debug.assert(wid > 0);
+
+    const win = findAxWindow(pid, wid) orelse return false;
+    defer c.CFRelease(@ptrCast(win));
+
+    const raise_action = cfString("AXRaise") orelse return false;
+    const main_attr = cfString("AXMain") orelse return false;
+
+    _ = c.AXUIElementPerformAction(win, raise_action);
+    _ = c.AXUIElementSetAttributeValue(win, main_attr, c.kCFBooleanTrue);
+
+    const NSRunningApplication = objc.getClass("NSRunningApplication") orelse return true;
+    const app = NSRunningApplication.msgSend(objc.Object, "runningApplicationWithProcessIdentifier:", .{pid});
+    if (app.value != null) {
+        // NSApplicationActivateIgnoringOtherApps == 2.
+        _ = app.msgSend(bool, "activateWithOptions:", .{@as(usize, 2)});
+    }
+    return true;
+}
+
+fn manageStateForWindow(pid: i32, wid: u32) u8 {
+    std.debug.assert(pid > 0);
+    std.debug.assert(wid > 0);
+
+    if (!isRegularActivationApp(pid)) return shim.BW_MANAGE_REJECT;
+
+    const win = findAxWindow(pid, wid) orelse return shim.BW_MANAGE_PENDING;
+    defer c.CFRelease(@ptrCast(win));
+
+    const role_attr = cfString("AXRole") orelse return shim.BW_MANAGE_PENDING;
+    var role_any: c.CFTypeRef = null;
+    const role_err = c.AXUIElementCopyAttributeValue(win, role_attr, @ptrCast(&role_any));
+    if (role_err != c.kAXErrorSuccess or role_any == null) return shim.BW_MANAGE_PENDING;
+    const role_ref: c.CFStringRef = @ptrCast(role_any orelse return shim.BW_MANAGE_PENDING);
+    defer c.CFRelease(@ptrCast(role_ref));
+
+    const window_role = cfString("AXWindow") orelse return shim.BW_MANAGE_PENDING;
+    const unknown_role = cfString("AXUnknown") orelse return shim.BW_MANAGE_PENDING;
+
+    const is_window = c.CFEqual(@ptrCast(role_ref), @ptrCast(window_role)) != 0;
+    const is_unknown_role = c.CFEqual(@ptrCast(role_ref), @ptrCast(unknown_role)) != 0;
+    if (!is_window) {
+        return if (is_unknown_role) shim.BW_MANAGE_PENDING else shim.BW_MANAGE_REJECT;
+    }
+
+    const subrole_attr = cfString("AXSubrole") orelse return shim.BW_MANAGE_PENDING;
+    var subrole_any: c.CFTypeRef = null;
+    const subrole_err = c.AXUIElementCopyAttributeValue(win, subrole_attr, @ptrCast(&subrole_any));
+    if (subrole_err != c.kAXErrorSuccess or subrole_any == null) return shim.BW_MANAGE_PENDING;
+    const subrole_ref: c.CFStringRef = @ptrCast(subrole_any orelse return shim.BW_MANAGE_PENDING);
+    defer c.CFRelease(@ptrCast(subrole_ref));
+
+    const standard_subrole = cfString("AXStandardWindow") orelse return shim.BW_MANAGE_PENDING;
+    const unknown_subrole = cfString("AXUnknown") orelse return shim.BW_MANAGE_PENDING;
+
+    const is_standard = c.CFEqual(@ptrCast(subrole_ref), @ptrCast(standard_subrole)) != 0;
+    const is_unknown_subrole = c.CFEqual(@ptrCast(subrole_ref), @ptrCast(unknown_subrole)) != 0;
+    if (!is_standard and is_unknown_subrole) return shim.BW_MANAGE_PENDING;
+
+    return if (is_standard) shim.BW_MANAGE_READY else shim.BW_MANAGE_REJECT;
+}
+
+/// Legacy management predicate: true for READY or PENDING states.
+export fn bw_should_manage_window(pid: i32, wid: u32) bool {
+    const state = manageStateForWindow(pid, wid);
+    return state != shim.BW_MANAGE_REJECT;
+}
+
+/// Returns management state for a given window.
+export fn bw_window_manage_state(pid: i32, wid: u32) u8 {
+    return manageStateForWindow(pid, wid);
+}
+
+/// Enumerate on-screen layer-0 windows for regular applications.
+export fn bw_discover_windows(out: ?[*]shim.bw_window_info, max_count: u32) u32 {
+    const out_ptr = out orelse return 0;
+    if (max_count == 0) return 0;
+
+    std.debug.assert(max_count > 0);
+    const out_buf = out_ptr[0..@as(usize, @intCast(max_count))];
+
+    const options: c.CGWindowListOption =
+        c.kCGWindowListOptionOnScreenOnly | c.kCGWindowListExcludeDesktopElements;
+    const window_list = c.CGWindowListCopyWindowInfo(options, c.kCGNullWindowID) orelse return 0;
+    defer c.CFRelease(@ptrCast(window_list));
+
+    const total = c.CFArrayGetCount(window_list);
+    std.debug.assert(total >= 0);
+
+    var count: usize = 0;
+    var i: c.CFIndex = 0;
+    while (i < total and count < out_buf.len) : (i += 1) {
+        const info_any = c.CFArrayGetValueAtIndex(window_list, i) orelse continue;
+        const info: c.CFDictionaryRef = @ptrCast(info_any);
+
+        var layer: i32 = 0;
+        if (c.CFDictionaryGetValue(info, c.kCGWindowLayer)) |layer_ref_any| {
+            const layer_ref: c.CFNumberRef = @ptrCast(layer_ref_any);
+            _ = c.CFNumberGetValue(layer_ref, c.kCFNumberSInt32Type, &layer);
+        }
+        if (layer != 0) continue;
+
+        const wid_ref_any = c.CFDictionaryGetValue(info, c.kCGWindowNumber) orelse continue;
+        const wid_ref: c.CFNumberRef = @ptrCast(wid_ref_any);
+        var wid: u32 = 0;
+        _ = c.CFNumberGetValue(wid_ref, c.kCFNumberSInt32Type, &wid);
+
+        const pid_ref_any = c.CFDictionaryGetValue(info, c.kCGWindowOwnerPID) orelse continue;
+        const pid_ref: c.CFNumberRef = @ptrCast(pid_ref_any);
+        var pid: i32 = 0;
+        _ = c.CFNumberGetValue(pid_ref, c.kCFNumberSInt32Type, &pid);
+        if (pid <= 0) continue;
+        if (!isRegularActivationApp(pid)) continue;
+
+        var bounds: c.CGRect = std.mem.zeroes(c.CGRect);
+        if (c.CFDictionaryGetValue(info, c.kCGWindowBounds)) |bounds_ref_any| {
+            const bounds_ref: c.CFDictionaryRef = @ptrCast(bounds_ref_any);
+            _ = c.CGRectMakeWithDictionaryRepresentation(bounds_ref, &bounds);
+        }
+        if (bounds.size.width < 1 or bounds.size.height < 1) continue;
+
+        out_buf[count] = .{
+            .wid = wid,
+            .pid = pid,
+            .x = bounds.origin.x,
+            .y = bounds.origin.y,
+            .w = bounds.size.width,
+            .h = bounds.size.height,
+        };
+        count += 1;
+    }
+
+    std.debug.assert(count <= out_buf.len);
+    return @intCast(count);
+}
+
+fn wakerPerform(info: ?*anyopaque) callconv(.c) void {
+    _ = info;
+    bw_drain_events();
+}
+
+fn initWakerSource() void {
+    if (g_waker_source != null) return;
+
+    var context: c.CFRunLoopSourceContext = std.mem.zeroes(c.CFRunLoopSourceContext);
+    context.perform = wakerPerform;
+
+    g_waker_source = c.CFRunLoopSourceCreate(null, 0, &context);
+    const source = g_waker_source orelse return;
+    c.CFRunLoopAddSource(c.CFRunLoopGetMain(), source, c.kCFRunLoopCommonModes);
+}
+
+fn signalWaker() void {
+    if (g_waker_source) |source| {
+        c.CFRunLoopSourceSignal(source);
+    }
+    const run_loop = c.CFRunLoopGetMain();
+    if (run_loop != null) {
+        c.CFRunLoopWakeUp(run_loop);
+    }
+}
+
+fn rolePollTimerTick(context: ?*anyopaque) callconv(.c) void {
+    _ = context;
+    bw_emit_event(shim.BW_EVENT_ROLE_POLL_TICK, 0, 0);
+}
+
+fn setRolePolling(enabled: bool) void {
+    if (!enabled) {
+        if (g_role_poll_source) |source| {
+            c.dispatch_source_cancel(source);
+            g_role_poll_source = null;
+        }
+        return;
+    }
+
+    if (g_role_poll_source != null) return;
+
+    const source = c.dispatch_source_create(
+        c.DISPATCH_SOURCE_TYPE_TIMER,
+        0,
+        0,
+        c.dispatch_get_main_queue(),
+    );
+    if (source == null) return;
+
+    c.dispatch_source_set_timer(
+        source,
+        c.dispatch_time(c.DISPATCH_TIME_NOW, @as(i64, 100) * c.NSEC_PER_MSEC),
+        @as(u64, 100) * c.NSEC_PER_MSEC,
+        @as(u64, 20) * c.NSEC_PER_MSEC,
+    );
+    c.dispatch_source_set_event_handler_f(source, rolePollTimerTick);
+    c.dispatch_resume(.{ ._ds = source });
+    g_role_poll_source = source;
+}
+
+fn modsFromEventFlags(flags: c.CGEventFlags) u8 {
+    var mods: u8 = 0;
+    if ((flags & c.kCGEventFlagMaskAlternate) != 0) mods |= shim.BW_MOD_ALT;
+    if ((flags & c.kCGEventFlagMaskShift) != 0) mods |= shim.BW_MOD_SHIFT;
+    if ((flags & c.kCGEventFlagMaskCommand) != 0) mods |= shim.BW_MOD_CMD;
+    if ((flags & c.kCGEventFlagMaskControl) != 0) mods |= shim.BW_MOD_CTRL;
+    return mods;
+}
+
+fn hotkeyTapCallback(
+    proxy: c.CGEventTapProxy,
+    event_type: c.CGEventType,
+    event: c.CGEventRef,
+    refcon: ?*anyopaque,
+) callconv(.c) c.CGEventRef {
+    _ = proxy;
+    _ = refcon;
+
+    if (event_type == c.kCGEventTapDisabledByTimeout or event_type == c.kCGEventTapDisabledByUserInput) {
+        if (g_tap_port) |tap| c.CGEventTapEnable(tap, true);
+        return event;
+    }
+
+    if (event_type == c.kCGEventLeftMouseDown) {
+        bw_hotkey_mouse_down();
+        return event;
+    }
+    if (event_type == c.kCGEventLeftMouseUp) {
+        bw_hotkey_mouse_up();
+        return event;
+    }
+
+    const flags = c.CGEventGetFlags(event);
+    const keycode_raw = c.CGEventGetIntegerValueField(event, c.kCGKeyboardEventKeycode);
+    const keycode: u16 = @intCast(keycode_raw);
+    const mods = modsFromEventFlags(flags);
+
+    if (bw_hotkey_handle_keydown(keycode, mods)) {
+        return null;
+    }
+    return event;
+}
+
+fn setupHotkeyEventTap() void {
+    const mask: c.CGEventMask =
+        (@as(c.CGEventMask, 1) << @intCast(c.kCGEventKeyDown)) |
+        (@as(c.CGEventMask, 1) << @intCast(c.kCGEventLeftMouseDown)) |
+        (@as(c.CGEventMask, 1) << @intCast(c.kCGEventLeftMouseUp));
+
+    g_tap_port = c.CGEventTapCreate(
+        c.kCGSessionEventTap,
+        c.kCGHeadInsertEventTap,
+        c.kCGEventTapOptionDefault,
+        mask,
+        hotkeyTapCallback,
+        null,
+    );
+    const tap = g_tap_port orelse return;
+
+    const tap_source = c.CFMachPortCreateRunLoopSource(null, tap, 0) orelse return;
+    defer c.CFRelease(@ptrCast(tap_source));
+
+    c.CFRunLoopAddSource(c.CFRunLoopGetMain(), tap_source, c.kCFRunLoopCommonModes);
+    c.CGEventTapEnable(tap, true);
+}
+
+fn ipcSourceTick(context: ?*anyopaque) callconv(.c) void {
+    const fd_raw = @intFromPtr(context orelse return);
+    const server_fd: c_int = @intCast(fd_raw);
+    bw_handle_ipc_client(server_fd);
+}
+
+fn initIpcSource(server_fd: c_int) void {
+    if (g_ipc_source) |source| {
+        c.dispatch_source_cancel(source);
+        g_ipc_source = null;
+    }
+
+    const source = c.dispatch_source_create(
+        c.DISPATCH_SOURCE_TYPE_READ,
+        @intCast(server_fd),
+        0,
+        c.dispatch_get_main_queue(),
+    );
+    if (source == null) return;
+
+    c.dispatch_set_context(.{ ._ds = source }, @ptrFromInt(@as(usize, @intCast(server_fd))));
+    c.dispatch_source_set_event_handler_f(source, ipcSourceTick);
+    c.dispatch_resume(.{ ._ds = source });
+    g_ipc_source = source;
+}
+
+fn cancelIpcSource() void {
+    if (g_ipc_source) |source| {
+        c.dispatch_source_cancel(source);
+        g_ipc_source = null;
+    }
+}
+
+/// Signal the main run loop to drain queued events.
+export fn bw_signal_waker() void {
+    signalWaker();
+}
+
+/// Enable or disable periodic role polling.
+export fn bw_set_role_polling(enabled: bool) void {
+    setRolePolling(enabled);
+}
+
 // ---------------------------------------------------------------------------
 // Event bridge (called from ObjC shim)
 // ---------------------------------------------------------------------------
@@ -716,7 +1108,7 @@ export fn bw_emit_event(kind: u8, pid: i32, wid: u32) void {
         .pid = pid,
         .wid = wid,
     });
-    shim.bw_signal_waker();
+    signalWaker();
 }
 
 /// Callback target for BWObserver.appTerminated: selector.
@@ -735,6 +1127,65 @@ export fn bw_workspace_app_launched(pid: i32) void {
 export fn bw_workspace_active_app_changed(pid: i32) void {
     std.debug.assert(pid > 0);
     bw_emit_event(shim.BW_EVENT_WINDOW_FOCUSED, pid, 0);
+}
+
+/// Callback target for BWObserver.spaceChanged: selector.
+export fn bw_workspace_space_changed() void {
+    bw_emit_event(shim.BW_EVENT_SPACE_CHANGED, 0, 0);
+}
+
+/// Callback target for BWObserver.displayChanged: selector.
+export fn bw_workspace_display_changed() void {
+    bw_emit_event(shim.BW_EVENT_DISPLAY_CHANGED, 0, 0);
+}
+
+/// Callback target for shim hotkey mouse down events.
+export fn bw_hotkey_mouse_down() void {
+    bw_emit_event(shim.BW_EVENT_MOUSE_DOWN, 0, 0);
+}
+
+/// Callback target for shim hotkey mouse up events.
+export fn bw_hotkey_mouse_up() void {
+    bw_emit_event(shim.BW_EVENT_MOUSE_UP, 0, 0);
+}
+
+/// Accept keybind table from config and keep it in Zig-owned state.
+export fn bw_set_keybinds(binds: ?[*]const shim.bw_keybind, count: u32) void {
+    if (count == 0) {
+        g_hotkey_binding_count = 0;
+        return;
+    }
+
+    const src = binds orelse {
+        g_hotkey_binding_count = 0;
+        return;
+    };
+
+    const max_count: u32 = @intCast(g_hotkey_bindings.len);
+    const clamped_count_u32: u32 = @min(count, max_count);
+    const clamped_count: usize = @intCast(clamped_count_u32);
+
+    @memcpy(g_hotkey_bindings[0..clamped_count], src[0..clamped_count]);
+    g_hotkey_binding_count = clamped_count_u32;
+
+    std.debug.assert(g_hotkey_binding_count <= max_count);
+}
+
+/// Resolve a key press against current keybinds and emit matching action.
+export fn bw_hotkey_handle_keydown(keycode: u16, mods: u8) bool {
+    const total: usize = @intCast(g_hotkey_binding_count);
+    std.debug.assert(total <= g_hotkey_bindings.len);
+
+    var i: usize = 0;
+    while (i < total) : (i += 1) {
+        const binding = g_hotkey_bindings[i];
+        if (binding.keycode != keycode) continue;
+        if (binding.mods != mods) continue;
+
+        bw_emit_event(binding.action, 0, binding.arg);
+        return true;
+    }
+    return false;
 }
 
 // ---------------------------------------------------------------------------
@@ -865,7 +1316,7 @@ pub fn main() !void {
     g_deferred_window_candidates = DeferredWindowCandidateMap.init(g_allocator);
     g_app_launch_retries = AppLaunchRetryMap.init(g_allocator);
     defer {
-        shim.bw_set_role_polling(false);
+        setRolePolling(false);
         g_app_launch_retries.deinit();
         g_deferred_window_candidates.deinit();
         g_pending_role_windows.deinit();
@@ -892,6 +1343,7 @@ pub fn main() !void {
         log.err("IPC init failed: {}", .{err});
         return err;
     };
+    defer cancelIpcSource();
     defer g_ipc.deinit(g_allocator);
     ipc.g_dispatch = ipcDispatch;
 
@@ -901,6 +1353,9 @@ pub fn main() !void {
 
     // -- Sources (observers, CGEventTap, waker, IPC) --
     shim.bw_setup_sources(g_ipc.fd);
+    setupHotkeyEventTap();
+    initWakerSource();
+    initIpcSource(@intCast(g_ipc.fd));
     refreshRolePolling();
     observeDiscoveredApps();
 
@@ -1381,7 +1836,7 @@ fn refreshRolePolling() void {
     const has_pending = g_pending_role_windows.count() > 0 or
         g_deferred_window_candidates.count() > 0 or
         g_app_launch_retries.count() > 0;
-    shim.bw_set_role_polling(has_pending);
+    setRolePolling(has_pending);
 }
 
 fn trackAppLaunchRetry(pid: i32) void {
