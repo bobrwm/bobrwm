@@ -2354,6 +2354,8 @@ fn processDeferredWindowCandidates() bool {
 fn discoverWindows() void {
     var buf: [256]shim.bw_window_info = undefined;
     const count = shim.bw_discover_windows(&buf, 256);
+    var observed_pids: [128]i32 = undefined;
+    var observed_pid_count: usize = 0;
 
     // Sort windows by current x-position so the BSP tree order matches
     // their on-screen placement. Without this, windows discovered in
@@ -2366,9 +2368,25 @@ fn discoverWindows() void {
     }.lessThan);
 
     for (slice) |info| {
+        std.debug.assert(info.pid > 0);
+
+        var already_observed = false;
+        for (observed_pids[0..observed_pid_count]) |observed_pid| {
+            if (observed_pid == info.pid) {
+                already_observed = true;
+                break;
+            }
+        }
+
         // Observe the owning app even if this specific window is not yet
         // manageable (for example AX role/subrole is still pending).
-        ax_observer.observeApp(info.pid);
+        if (!already_observed) {
+            ax_observer.observeApp(info.pid);
+            if (observed_pid_count < observed_pids.len) {
+                observed_pids[observed_pid_count] = info.pid;
+                observed_pid_count += 1;
+            }
+        }
 
         if (g_store.get(info.wid) != null) continue;
 
