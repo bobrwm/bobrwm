@@ -171,6 +171,7 @@ const AxStrings = struct {
     subrole_attr: c.CFStringRef,
     standard_window_subrole: c.CFStringRef,
     unknown_subrole: c.CFStringRef,
+    enhanced_ui_attr: c.CFStringRef,
 };
 
 fn createAxString(raw: [*:0]const u8) ?c.CFStringRef {
@@ -197,6 +198,7 @@ fn ensureAxStrings() ?*const AxStrings {
         "AXSubrole",
         "AXStandardWindow",
         "AXUnknown",
+        "AXEnhancedUserInterface",
     };
     var refs: [names.len]c.CFStringRef = undefined;
 
@@ -223,6 +225,7 @@ fn ensureAxStrings() ?*const AxStrings {
         .subrole_attr = refs[9],
         .standard_window_subrole = refs[10],
         .unknown_subrole = refs[11],
+        .enhanced_ui_attr = refs[12],
     };
     return &g_ax_strings.?;
 }
@@ -230,6 +233,7 @@ fn ensureAxStrings() ?*const AxStrings {
 fn deinitAxStrings() void {
     if (g_ax_strings) |strings| {
         const refs = [_]c.CFStringRef{
+            strings.enhanced_ui_attr,
             strings.unknown_subrole,
             strings.standard_window_subrole,
             strings.subrole_attr,
@@ -854,6 +858,16 @@ fn findAxWindow(pid: i32, target_wid: u32) ?c.AXUIElementRef {
 }
 
 /// Move and resize a window using AX attributes.
+///
+/// Uses a Size-Position-Size three-pass strategy because
+/// macOS clamps window dimensions to the visible screen area at the current
+/// origin. The first resize shrinks or grows the window while it is still at
+/// its old position. The move then places it at the target origin. The second
+/// resize corrects any clamping the intermediate position caused.
+///
+/// The entire sequence is wrapped in an AXEnhancedUserInterface toggle because
+/// some apps (notably Electron) silently reject geometry writes when that flag
+/// is enabled on the application element.
 export fn bw_ax_set_window_frame(pid: i32, wid: u32, x: f64, y: f64, w: f64, h: f64) bool {
     std.debug.assert(pid > 0);
     std.debug.assert(wid > 0);
@@ -866,17 +880,46 @@ export fn bw_ax_set_window_frame(pid: i32, wid: u32, x: f64, y: f64, w: f64, h: 
     const size_attr = ax.size_attr;
     const position_attr = ax.position_attr;
 
-    const size: c.CGSize = .{ .width = w, .height = h };
-    const size_value = c.AXValueCreate(c.kAXValueTypeCGSize, &size) orelse return false;
-    defer c.CFRelease(@ptrCast(size_value));
-    _ = c.AXUIElementSetAttributeValue(win, size_attr, @ptrCast(size_value));
+    const app = c.AXUIElementCreateApplication(pid) orelse return false;
+    defer c.CFRelease(@ptrCast(app));
+
+    const had_enhanced_ui = axEnhancedUserInterface(app, ax);
+    if (had_enhanced_ui) {
+        _ = c.AXUIElementSetAttributeValue(app, ax.enhanced_ui_attr, c.kCFBooleanFalse);
+    }
+    defer if (had_enhanced_ui) {
+        _ = c.AXUIElementSetAttributeValue(app, ax.enhanced_ui_attr, c.kCFBooleanTrue);
+    };
 
     const position: c.CGPoint = .{ .x = x, .y = y };
     const position_value = c.AXValueCreate(c.kAXValueTypeCGPoint, &position) orelse return false;
     defer c.CFRelease(@ptrCast(position_value));
-    const err = c.AXUIElementSetAttributeValue(win, position_attr, @ptrCast(position_value));
+
+    const size: c.CGSize = .{ .width = w, .height = h };
+    const size_value = c.AXValueCreate(c.kAXValueTypeCGSize, &size) orelse return false;
+    defer c.CFRelease(@ptrCast(size_value));
+
+    _ = c.AXUIElementSetAttributeValue(win, size_attr, @ptrCast(size_value));
+    _ = c.AXUIElementSetAttributeValue(win, position_attr, @ptrCast(position_value));
+    const err = c.AXUIElementSetAttributeValue(win, size_attr, @ptrCast(size_value));
 
     return err == c.kAXErrorSuccess;
+}
+
+/// Query whether the AXSize attribute is settable (i.e. the window can be resized).
+fn axCanResize(win_ref: c.AXUIElementRef, ax: *const AxStrings) bool {
+    var result: c.Boolean = 0;
+    const err = c.AXUIElementIsAttributeSettable(win_ref, ax.size_attr, &result);
+    return err == c.kAXErrorSuccess and result != 0;
+}
+
+/// Query whether AXEnhancedUserInterface is currently enabled on an app element.
+fn axEnhancedUserInterface(app: c.AXUIElementRef, ax: *const AxStrings) bool {
+    var value: c.CFTypeRef = null;
+    const err = c.AXUIElementCopyAttributeValue(app, ax.enhanced_ui_attr, &value);
+    if (err != c.kAXErrorSuccess or value == null) return false;
+    defer c.CFRelease(value.?);
+    return c.CFEqual(value.?, @ptrCast(c.kCFBooleanTrue)) != 0;
 }
 
 /// Raise and focus a window, then activate its owning app.
@@ -2458,7 +2501,20 @@ fn addNewWindowManaged(pid: i32, wid: u32) bool {
             display_id = displayIdForFrame(window_frame);
         }
     }
+    // Non-resizable windows that are undersized (≤500px in either dimension)
+    // are floated instead of tiled. This catches transient splash screens and
+    // updater dialogs (e.g. Discord Updater at 300x300) that have standard
+    // AX roles but are not real application windows.
+    const should_float = blk: {
+        if (window_frame.width > 500 and window_frame.height > 500) break :blk false;
+        const ax_win = findAxWindow(pid, wid) orelse break :blk false;
+        defer c.CFRelease(@ptrCast(ax_win));
+        const ax = ensureAxStrings() orelse break :blk false;
+        break :blk !axCanResize(ax_win, ax);
+    };
+
     const ws = resolveWorkspace(pid, display_id);
+    const mode: window_mod.WindowMode = if (should_float) .floating else .tiled;
 
     const win = window_mod.Window{
         .wid = wid,
@@ -2466,14 +2522,16 @@ fn addNewWindowManaged(pid: i32, wid: u32) bool {
         .title = null,
         .frame = window_frame,
         .is_minimized = false,
-        .mode = .tiled,
+        .mode = mode,
         .workspace_id = ws.id,
         .display_id = display_id,
     };
 
     g_store.put(win) catch return false;
     ws.addWindow(wid) catch return false;
-    insertIntoLayout(ws.id, display_id, wid);
+    if (mode == .tiled) {
+        insertIntoLayout(ws.id, display_id, wid);
+    }
     ws.focused_wid = wid;
 
     // If assigned to a non-visible workspace, hide immediately
@@ -2481,7 +2539,11 @@ fn addNewWindowManaged(pid: i32, wid: u32) bool {
         hideWindow(pid, wid);
     }
 
-    log.info("addNewWindow: tiled wid={d} on workspace {d}", .{ wid, ws.id });
+    log.info("addNewWindow: {s} wid={d} on workspace {d}", .{
+        if (mode == .tiled) "tiled" else "floated (undersized+non-resizable)",
+        wid,
+        ws.id,
+    });
     return true;
 }
 
