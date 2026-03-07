@@ -8,11 +8,6 @@
 // Accessibility
 // ---------------------------------------------------------------------------
 
-void bw_ax_prompt(void) {
-    NSDictionary *opts = @{(__bridge NSString *)kAXTrustedCheckOptionPrompt: @YES};
-    AXIsProcessTrustedWithOptions((__bridge CFDictionaryRef)opts);
-}
-
 // ---------------------------------------------------------------------------
 // NSWorkspace observer
 // ---------------------------------------------------------------------------
@@ -20,54 +15,33 @@ void bw_ax_prompt(void) {
 @interface BWObserver : NSObject
 @end
 
-static CFAbsoluteTime g_last_space_changed_at = 0;
-static CFAbsoluteTime g_last_display_changed_at = 0;
-
 @implementation BWObserver
 
 - (void)appLaunched:(NSNotification *)note {
     NSRunningApplication *app = note.userInfo[NSWorkspaceApplicationKey];
     pid_t pid = app.processIdentifier;
-    bw_emit_event(BW_EVENT_APP_LAUNCHED, pid, 0);
-
-    // Heavy apps (Electron/Discord) may not have a ready AX interface when
-    // the launch notification fires. Re-emit after a delay so bw_observe_app
-    // and discoverWindows get a second chance. The handler is idempotent.
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1 * NSEC_PER_SEC)),
-                   dispatch_get_main_queue(), ^{
-        bw_emit_event(BW_EVENT_APP_LAUNCHED, pid, 0);
-    });
+    bw_workspace_app_launched(pid);
 }
 
 - (void)appTerminated:(NSNotification *)note {
     NSRunningApplication *app = note.userInfo[NSWorkspaceApplicationKey];
-    bw_emit_event(BW_EVENT_APP_TERMINATED, app.processIdentifier, 0);
+    bw_workspace_app_terminated(app.processIdentifier);
 }
 
 - (void)spaceChanged:(NSNotification *)note {
-(void)note;
-    const CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
-    if (g_last_space_changed_at != 0 && fabs(now - g_last_space_changed_at) < 0.05) {
-        return;
-    }
-    g_last_space_changed_at = now;
-bw_emit_event(BW_EVENT_SPACE_CHANGED, 0, 0);
+    (void)note;
+    bw_emit_event(BW_EVENT_SPACE_CHANGED, 0, 0);
 }
 
 - (void)displayChanged:(NSNotification *)note {
     (void)note;
-    const CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
-    if (g_last_display_changed_at != 0 && fabs(now - g_last_display_changed_at) < 0.05) {
-        return;
-    }
-    g_last_display_changed_at = now;
     bw_emit_event(BW_EVENT_DISPLAY_CHANGED, 0, 0);
 }
 
 - (void)activeAppChanged:(NSNotification *)note {
     NSRunningApplication *app = note.userInfo[NSWorkspaceApplicationKey];
     if (app) {
-        bw_emit_event(BW_EVENT_WINDOW_FOCUSED, app.processIdentifier, 0);
+        bw_workspace_active_app_changed(app.processIdentifier);
     }
 }
 
@@ -542,80 +516,6 @@ bool bw_should_manage_window(int32_t pid, uint32_t wid) {
 
 uint8_t bw_window_manage_state(int32_t pid, uint32_t wid) {
     return (uint8_t)bw_manage_state_for_window(pid, wid);
-}
-
-uint32_t bw_ax_get_focused_window(int32_t pid) {
-    AXUIElementRef app = AXUIElementCreateApplication((pid_t)pid);
-    if (!app) return 0;
-
-    AXUIElementRef focused = NULL;
-    AXError err = AXUIElementCopyAttributeValue(
-        app, kAXFocusedWindowAttribute, (CFTypeRef *)&focused);
-    CFRelease(app);
-
-    if (err != kAXErrorSuccess || !focused) return 0;
-
-    uint32_t wid = 0;
-    _AXUIElementGetWindow(focused, &wid);
-    CFRelease(focused);
-    return wid;
-}
-
-// ---------------------------------------------------------------------------
-// On-screen check (tab detection)
-// ---------------------------------------------------------------------------
-
-bool bw_is_window_on_screen(uint32_t target_wid) {
-    CFArrayRef list = CGWindowListCopyWindowInfo(
-        kCGWindowListOptionOnScreenOnly | kCGWindowListExcludeDesktopElements,
-        kCGNullWindowID);
-    if (!list) return false;
-
-    bool found = false;
-    CFIndex count = CFArrayGetCount(list);
-    for (CFIndex i = 0; i < count; i++) {
-        CFDictionaryRef info =
-            (CFDictionaryRef)CFArrayGetValueAtIndex(list, i);
-        CFNumberRef wid_ref = CFDictionaryGetValue(info, kCGWindowNumber);
-        if (!wid_ref) continue;
-        uint32_t wid = 0;
-        CFNumberGetValue(wid_ref, kCFNumberSInt32Type, &wid);
-        if (wid == target_wid) { found = true; break; }
-    }
-
-    CFRelease(list);
-    return found;
-}
-
-// ---------------------------------------------------------------------------
-// AX window enumeration (includes background tabs)
-// ---------------------------------------------------------------------------
-
-uint32_t bw_get_app_window_ids(int32_t pid, uint32_t *out,
-                                uint32_t max_count) {
-    AXUIElementRef app = AXUIElementCreateApplication((pid_t)pid);
-    if (!app) return 0;
-
-    CFArrayRef windows = NULL;
-    AXError err = AXUIElementCopyAttributeValue(
-        app, kAXWindowsAttribute, (CFTypeRef *)&windows);
-    CFRelease(app);
-
-    if (err != kAXErrorSuccess || !windows) return 0;
-
-    uint32_t count = 0;
-    CFIndex total = CFArrayGetCount(windows);
-    for (CFIndex i = 0; i < total && count < max_count; i++) {
-        AXUIElementRef win =
-            (AXUIElementRef)CFArrayGetValueAtIndex(windows, i);
-        uint32_t wid = 0;
-        if (_AXUIElementGetWindow(win, &wid) == kAXErrorSuccess && wid != 0) {
-            out[count++] = wid;
-        }
-    }
-
-    CFRelease(windows);
-    return count;
 }
 
 // ---------------------------------------------------------------------------
@@ -1112,26 +1012,5 @@ void bw_unobserve_app(int32_t pid) {
         g_app_observers[i] = g_app_observers[--g_app_observer_count];
         update_window_scan_source();
         return;
-    }
-}
-
-// ---------------------------------------------------------------------------
-// App identity
-// ---------------------------------------------------------------------------
-
-uint32_t bw_get_app_bundle_id(int32_t pid, char *out, uint32_t max_len) {
-    @autoreleasepool {
-        NSRunningApplication *app =
-            [NSRunningApplication runningApplicationWithProcessIdentifier:(pid_t)pid];
-        if (!app || !app.bundleIdentifier) return 0;
-
-        const char *utf8 = [app.bundleIdentifier UTF8String];
-        if (!utf8) return 0;
-
-        uint32_t len = (uint32_t)strlen(utf8);
-        if (len >= max_len) len = max_len - 1;
-        memcpy(out, utf8, len);
-        out[len] = '\0';
-        return len;
     }
 }
