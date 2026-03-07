@@ -2,3 +2,5 @@
 
 **/.zig-cache
 **/zig-out/bin
+/result
+/.agents/skills/probing-windows/scripts/probe

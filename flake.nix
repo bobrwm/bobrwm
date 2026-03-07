@@ -62,6 +62,7 @@
           zls
           zigdoc
           ziglint
+          pkgs.nushell
         ];
       };
     });

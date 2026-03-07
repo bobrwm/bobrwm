@@ -3,12 +3,11 @@ const posix = std.posix;
 const build_options = @import("build_options");
 const c = @cImport({
     @cInclude("ApplicationServices/ApplicationServices.h");
+    @cInclude("dispatch/dispatch.h");
     @cInclude("pthread.h");
 });
 const objc = @import("objc");
-const shim = @cImport({
-    @cInclude("shim.h");
-});
+const shim = @import("shim_api.zig");
 const skylight = @import("skylight.zig");
 const event_mod = @import("event.zig");
 const window_mod = @import("window.zig");
@@ -18,7 +17,11 @@ const ipc = @import("ipc.zig");
 const tabgroup = @import("tabgroup.zig");
 const config_mod = @import("config.zig");
 const statusbar = @import("statusbar.zig");
+const tile_preview = @import("tile_preview.zig");
+const ax_observer = @import("ax_observer.zig");
 const launchd = @import("launchd.zig");
+
+extern fn _AXUIElementGetWindow(element: c.AXUIElementRef, wid: *u32) c.AXError;
 
 const NSPoint = extern struct {
     x: f64,
@@ -83,6 +86,20 @@ const EventRing = struct {
 
 /// Pixels visible in the corner when a window is hidden off-screen.
 const hide_peek: f64 = 5;
+/// Poll cadence for windows that are waiting on role readiness or visibility.
+const role_poll_interval_ms: u64 = 100;
+/// Retry budget for deferred candidates before they are dropped or fall back.
+/// Electron-family apps can take multiple seconds before publishing stable AX roles.
+const role_poll_attempts_max: u8 = 50;
+/// Launch retry budget to re-run discovery after app startup settles.
+const app_launch_retry_attempts_max: u8 = 10;
+/// Capacity reserved for wid-keyed role/deferred maps to avoid growth churn.
+const pending_role_window_capacity: usize = 256;
+const deferred_window_candidate_capacity: usize = 256;
+/// Capacity reserved for app launch retries (pid-keyed, bounded by observers).
+const app_launch_retry_capacity: usize = 64;
+/// Debounce workspace/display notifications that can fire in short bursts.
+const workspace_event_debounce_interval_s: f64 = 0.05;
 
 const DisplayInfo = struct {
     id: u32,
@@ -104,10 +121,137 @@ const DropTarget = struct {
 
 const HideCorner = enum { bottom_right, bottom_left };
 
+const WindowRoleState = enum {
+    reject,
+    ready,
+    pending,
+};
+
+const PendingRoleWindow = struct {
+    pid: i32,
+    attempts_remaining: u8,
+};
+
+const PendingRoleCandidate = struct {
+    pid: i32,
+    wid: u32,
+    from_timeout: bool,
+};
+
+const DeferredWindowCandidate = struct {
+    pid: i32,
+    attempts_remaining: u8,
+};
+
+const DeferredWindowPromotion = struct {
+    pid: i32,
+    wid: u32,
+};
+
+const PendingRoleWindowMap = std.AutoHashMap(u32, PendingRoleWindow);
+const DeferredWindowCandidateMap = std.AutoHashMap(u32, DeferredWindowCandidate);
+const AppLaunchRetryMap = std.AutoHashMap(i32, u8);
+
 fn nsString(str: [*:0]const u8) objc.Object {
     const NSString = objc.getClass("NSString") orelse
         @panic("NSString class not found");
     return NSString.msgSend(objc.Object, "stringWithUTF8String:", .{str});
+}
+
+const AxStrings = struct {
+    focused_window_attr: c.CFStringRef,
+    windows_attr: c.CFStringRef,
+    size_attr: c.CFStringRef,
+    position_attr: c.CFStringRef,
+    raise_action: c.CFStringRef,
+    main_attr: c.CFStringRef,
+    role_attr: c.CFStringRef,
+    window_role: c.CFStringRef,
+    unknown_role: c.CFStringRef,
+    subrole_attr: c.CFStringRef,
+    standard_window_subrole: c.CFStringRef,
+    unknown_subrole: c.CFStringRef,
+    enhanced_ui_attr: c.CFStringRef,
+};
+
+fn createAxString(raw: [*:0]const u8) ?c.CFStringRef {
+    return c.CFStringCreateWithCString(null, raw, c.kCFStringEncodingUTF8);
+}
+
+fn releaseAxString(value: c.CFStringRef) void {
+    c.CFRelease(@ptrCast(value));
+}
+
+fn ensureAxStrings() ?*const AxStrings {
+    if (g_ax_strings) |*strings| return strings;
+
+    const names = [_][*:0]const u8{
+        "AXFocusedWindow",
+        "AXWindows",
+        "AXSize",
+        "AXPosition",
+        "AXRaise",
+        "AXMain",
+        "AXRole",
+        "AXWindow",
+        "AXUnknown",
+        "AXSubrole",
+        "AXStandardWindow",
+        "AXUnknown",
+        "AXEnhancedUserInterface",
+    };
+    var refs: [names.len]c.CFStringRef = undefined;
+
+    for (names, 0..) |name, i| {
+        refs[i] = createAxString(name) orelse {
+            var created_count: usize = i;
+            while (created_count > 0) : (created_count -= 1) {
+                releaseAxString(refs[created_count - 1]);
+            }
+            return null;
+        };
+    }
+
+    g_ax_strings = .{
+        .focused_window_attr = refs[0],
+        .windows_attr = refs[1],
+        .size_attr = refs[2],
+        .position_attr = refs[3],
+        .raise_action = refs[4],
+        .main_attr = refs[5],
+        .role_attr = refs[6],
+        .window_role = refs[7],
+        .unknown_role = refs[8],
+        .subrole_attr = refs[9],
+        .standard_window_subrole = refs[10],
+        .unknown_subrole = refs[11],
+        .enhanced_ui_attr = refs[12],
+    };
+    return &g_ax_strings.?;
+}
+
+fn deinitAxStrings() void {
+    if (g_ax_strings) |strings| {
+        const refs = [_]c.CFStringRef{
+            strings.enhanced_ui_attr,
+            strings.unknown_subrole,
+            strings.standard_window_subrole,
+            strings.subrole_attr,
+            strings.unknown_role,
+            strings.window_role,
+            strings.role_attr,
+            strings.main_attr,
+            strings.raise_action,
+            strings.position_attr,
+            strings.size_attr,
+            strings.windows_attr,
+            strings.focused_window_attr,
+        };
+        for (refs) |value| {
+            releaseAxString(value);
+        }
+        g_ax_strings = null;
+    }
 }
 
 fn displayIndexById(display_id: u32) ?usize {
@@ -370,10 +514,38 @@ var g_displays: [workspace_mod.max_displays]DisplayInfo = undefined;
 var g_display_count: usize = 0;
 var g_next_split_dir: layout.Direction = .horizontal;
 var g_tab_groups: tabgroup.TabGroupManager = undefined;
+var g_pending_role_windows: PendingRoleWindowMap = undefined;
+var g_deferred_window_candidates: DeferredWindowCandidateMap = undefined;
+var g_app_launch_retries: AppLaunchRetryMap = undefined;
+var g_workspace_observer: ?objc.Object = null;
 var g_ipc: ipc.Server = undefined;
 var g_config: config_mod.Config = .{};
 var g_drag_preview: DragPreviewState = .{};
 var g_mouse_left_down = false;
+var g_last_space_changed_at_s: f64 = 0;
+var g_last_display_changed_at_s: f64 = 0;
+var g_hotkey_bindings: [128]shim.bw_keybind = undefined;
+var g_hotkey_binding_count: u32 = 0;
+var g_waker_source: c.CFRunLoopSourceRef = null;
+var g_role_poll_source: c.dispatch_source_t = null;
+var g_ipc_source: c.dispatch_source_t = null;
+var g_tap_port: c.CFMachPortRef = null;
+var g_ax_strings: ?AxStrings = null;
+
+fn shouldHandleWorkspaceEvent(last_event_at_s: *f64) bool {
+    std.debug.assert(last_event_at_s.* >= 0);
+    std.debug.assert(workspace_event_debounce_interval_s > 0);
+
+    const now_s: f64 = c.CFAbsoluteTimeGetCurrent();
+    std.debug.assert(now_s > 0);
+    if (last_event_at_s.* != 0 and @abs(now_s - last_event_at_s.*) < workspace_event_debounce_interval_s) {
+        return false;
+    }
+
+    last_event_at_s.* = now_s;
+    std.debug.assert(last_event_at_s.* == now_s);
+    return true;
+}
 
 // ---------------------------------------------------------------------------
 // NSApp lifecycle (zig-objc)
@@ -388,6 +560,58 @@ fn initApp() objc.Object {
     // NSApplicationActivationPolicyAccessory = 1
     _ = app.msgSend(bool, "setActivationPolicy:", .{@as(i64, 1)});
     return app;
+}
+
+/// Register NSWorkspace/NSNotificationCenter observers via zig-objc while
+/// keeping selector callbacks in BWObserver (ObjC class in shim.m).
+fn initWorkspaceObservers() void {
+    const BWObserver = objc.getClass("BWObserver") orelse
+        @panic("BWObserver class not found");
+    const NSWorkspace = objc.getClass("NSWorkspace") orelse
+        @panic("NSWorkspace class not found");
+    const NSNotificationCenter = objc.getClass("NSNotificationCenter") orelse
+        @panic("NSNotificationCenter class not found");
+
+    const workspace = NSWorkspace.msgSend(objc.Object, "sharedWorkspace", .{});
+    const workspace_notification_center = workspace.msgSend(objc.Object, "notificationCenter", .{});
+    const default_notification_center = NSNotificationCenter.msgSend(objc.Object, "defaultCenter", .{});
+    const observer = BWObserver.msgSend(objc.Object, "new", .{});
+    std.debug.assert(observer.value != null);
+    g_workspace_observer = observer;
+
+    // NSNotificationCenter does not retain selector-based observers.
+    std.debug.assert(g_workspace_observer.?.value != null);
+    const nil_object: objc.Object = .{ .value = null };
+    workspace_notification_center.msgSend(void, "addObserver:selector:name:object:", .{
+        observer,
+        objc.sel("appLaunched:"),
+        nsString("NSWorkspaceDidLaunchApplicationNotification"),
+        nil_object,
+    });
+    workspace_notification_center.msgSend(void, "addObserver:selector:name:object:", .{
+        observer,
+        objc.sel("appTerminated:"),
+        nsString("NSWorkspaceDidTerminateApplicationNotification"),
+        nil_object,
+    });
+    workspace_notification_center.msgSend(void, "addObserver:selector:name:object:", .{
+        observer,
+        objc.sel("spaceChanged:"),
+        nsString("NSWorkspaceActiveSpaceDidChangeNotification"),
+        nil_object,
+    });
+    workspace_notification_center.msgSend(void, "addObserver:selector:name:object:", .{
+        observer,
+        objc.sel("activeAppChanged:"),
+        nsString("NSWorkspaceDidActivateApplicationNotification"),
+        nil_object,
+    });
+    default_notification_center.msgSend(void, "addObserver:selector:name:object:", .{
+        observer,
+        objc.sel("displayChanged:"),
+        nsString("NSApplicationDidChangeScreenParametersNotification"),
+        nil_object,
+    });
 }
 
 /// Get the usable display frame (menu bar / dock excluded), CG coordinates.
@@ -432,6 +656,583 @@ export fn bw_ax_is_trusted() bool {
     return c.AXIsProcessTrusted() != 0;
 }
 
+/// Prompt for Accessibility permission in System Settings.
+fn axPrompt() void {
+    const NSDictionary = objc.getClass("NSDictionary") orelse {
+        _ = c.AXIsProcessTrustedWithOptions(null);
+        return;
+    };
+    const NSNumber = objc.getClass("NSNumber") orelse {
+        _ = c.AXIsProcessTrustedWithOptions(null);
+        return;
+    };
+
+    const enabled = NSNumber.msgSend(objc.Object, "numberWithBool:", .{true});
+    const options = NSDictionary.msgSend(objc.Object, "dictionaryWithObject:forKey:", .{
+        enabled,
+        nsString("AXTrustedCheckOptionPrompt"),
+    });
+    const options_value = options.value orelse return;
+
+    std.debug.assert(enabled.value != null);
+    std.debug.assert(options.value != null);
+    _ = c.AXIsProcessTrustedWithOptions(@ptrCast(options_value));
+}
+
+/// Get the bundle identifier for a PID.
+/// Writes a NUL-terminated string into `out` and returns bytes written.
+export fn bw_get_app_bundle_id(pid: i32, out: ?[*]u8, max_len: u32) u32 {
+    const out_ptr = out orelse return 0;
+    if (max_len == 0) return 0;
+
+    std.debug.assert(pid > 0);
+    std.debug.assert(max_len > 0);
+
+    const max_len_usize: usize = @intCast(max_len);
+    const buffer = out_ptr[0..max_len_usize];
+
+    const NSRunningApplication = objc.getClass("NSRunningApplication") orelse return 0;
+    const app = NSRunningApplication.msgSend(objc.Object, "runningApplicationWithProcessIdentifier:", .{pid});
+    if (app.value == null) return 0;
+
+    const bundle_identifier = app.msgSend(objc.Object, "bundleIdentifier", .{});
+    if (bundle_identifier.value == null) return 0;
+
+    const utf8 = bundle_identifier.msgSend(?[*:0]const u8, "UTF8String", .{}) orelse return 0;
+    const bundle_id = std.mem.sliceTo(utf8, 0);
+    if (bundle_id.len == 0) return 0;
+
+    const copy_len = @min(bundle_id.len, buffer.len - 1);
+    @memcpy(buffer[0..copy_len], bundle_id[0..copy_len]);
+    buffer[copy_len] = 0;
+
+    std.debug.assert(copy_len < buffer.len);
+    std.debug.assert(buffer[copy_len] == 0);
+    return @intCast(copy_len);
+}
+
+/// Get the focused window ID for a given application PID.
+/// Returns 0 when no focused AX window is available.
+export fn bw_ax_get_focused_window(pid: i32) u32 {
+    std.debug.assert(pid > 0);
+
+    const app = c.AXUIElementCreateApplication(pid) orelse return 0;
+    defer c.CFRelease(@ptrCast(app));
+
+    const ax = ensureAxStrings() orelse return 0;
+    const focused_attr = ax.focused_window_attr;
+
+    var focused: c.AXUIElementRef = null;
+    const err = c.AXUIElementCopyAttributeValue(
+        app,
+        focused_attr,
+        @ptrCast(&focused),
+    );
+    if (err != c.kAXErrorSuccess or focused == null) return 0;
+    const focused_ref = focused orelse return 0;
+    defer c.CFRelease(@ptrCast(focused_ref));
+
+    var wid: u32 = 0;
+    _ = _AXUIElementGetWindow(focused_ref, &wid);
+    return wid;
+}
+
+/// Check if a window currently appears in the on-screen CG window list.
+/// This excludes desktop elements and naturally filters background tabs.
+export fn bw_is_window_on_screen(target_wid: u32) bool {
+    std.debug.assert(target_wid > 0);
+
+    const options: c.CGWindowListOption =
+        c.kCGWindowListOptionOnScreenOnly | c.kCGWindowListExcludeDesktopElements;
+    const list = c.CGWindowListCopyWindowInfo(options, c.kCGNullWindowID) orelse return false;
+    defer c.CFRelease(@ptrCast(list));
+
+    const count = c.CFArrayGetCount(list);
+    std.debug.assert(count >= 0);
+    var i: c.CFIndex = 0;
+    while (i < count) : (i += 1) {
+        const info_any = c.CFArrayGetValueAtIndex(list, i) orelse continue;
+        const info: c.CFDictionaryRef = @ptrCast(info_any);
+        const wid_ref_any = c.CFDictionaryGetValue(info, c.kCGWindowNumber) orelse continue;
+        const wid_ref: c.CFNumberRef = @ptrCast(wid_ref_any);
+
+        var wid: u32 = 0;
+        const ok = c.CFNumberGetValue(wid_ref, c.kCFNumberSInt32Type, &wid);
+        if (ok == 0) continue;
+        if (wid == target_wid) return true;
+    }
+
+    return false;
+}
+
+/// Get all AX-backed window IDs for an application PID.
+/// Includes windows that may not currently be visible on screen.
+export fn bw_get_app_window_ids(pid: i32, out: ?[*]u32, max_count: u32) u32 {
+    const out_ptr = out orelse return 0;
+    if (max_count == 0) return 0;
+
+    std.debug.assert(pid > 0);
+    std.debug.assert(max_count > 0);
+
+    const out_buf = out_ptr[0..@as(usize, @intCast(max_count))];
+    const app = c.AXUIElementCreateApplication(pid) orelse return 0;
+    defer c.CFRelease(@ptrCast(app));
+
+    const ax = ensureAxStrings() orelse return 0;
+    const windows_attr = ax.windows_attr;
+
+    var windows: c.CFArrayRef = null;
+    const err = c.AXUIElementCopyAttributeValue(
+        app,
+        windows_attr,
+        @ptrCast(&windows),
+    );
+    if (err != c.kAXErrorSuccess or windows == null) return 0;
+    const windows_ref = windows orelse return 0;
+    defer c.CFRelease(@ptrCast(windows_ref));
+
+    var written: usize = 0;
+    const total = c.CFArrayGetCount(windows_ref);
+    std.debug.assert(total >= 0);
+
+    var i: c.CFIndex = 0;
+    while (i < total and written < out_buf.len) : (i += 1) {
+        const win_any = c.CFArrayGetValueAtIndex(windows_ref, i) orelse continue;
+        const win: c.AXUIElementRef = @ptrCast(win_any);
+
+        var wid: u32 = 0;
+        if (_AXUIElementGetWindow(win, &wid) == c.kAXErrorSuccess and wid != 0) {
+            out_buf[written] = wid;
+            written += 1;
+        }
+    }
+
+    std.debug.assert(written <= out_buf.len);
+    return @intCast(written);
+}
+
+fn isRegularActivationApp(pid: i32) bool {
+    std.debug.assert(pid > 0);
+
+    const NSRunningApplication = objc.getClass("NSRunningApplication") orelse return false;
+    const app = NSRunningApplication.msgSend(objc.Object, "runningApplicationWithProcessIdentifier:", .{pid});
+    if (app.value == null) return false;
+
+    // NSApplicationActivationPolicyRegular == 0.
+    const activation_policy = app.msgSend(i64, "activationPolicy", .{});
+    return activation_policy == 0;
+}
+
+fn findAxWindow(pid: i32, target_wid: u32) ?c.AXUIElementRef {
+    std.debug.assert(pid > 0);
+    std.debug.assert(target_wid > 0);
+
+    const app = c.AXUIElementCreateApplication(pid) orelse return null;
+    defer c.CFRelease(@ptrCast(app));
+
+    const ax = ensureAxStrings() orelse return null;
+    const windows_attr = ax.windows_attr;
+    var windows: c.CFArrayRef = null;
+    const err = c.AXUIElementCopyAttributeValue(app, windows_attr, @ptrCast(&windows));
+    if (err != c.kAXErrorSuccess or windows == null) return null;
+    const windows_ref = windows orelse return null;
+    defer c.CFRelease(@ptrCast(windows_ref));
+
+    const count = c.CFArrayGetCount(windows_ref);
+    std.debug.assert(count >= 0);
+
+    var i: c.CFIndex = 0;
+    while (i < count) : (i += 1) {
+        const win_any = c.CFArrayGetValueAtIndex(windows_ref, i) orelse continue;
+        const win: c.AXUIElementRef = @ptrCast(win_any);
+
+        var wid: u32 = 0;
+        if (_AXUIElementGetWindow(win, &wid) != c.kAXErrorSuccess) continue;
+        if (wid != target_wid) continue;
+
+        _ = c.CFRetain(@ptrCast(win));
+        return win;
+    }
+
+    return null;
+}
+
+/// Move and resize a window using AX attributes.
+///
+/// Uses a Size-Position-Size three-pass strategy because
+/// macOS clamps window dimensions to the visible screen area at the current
+/// origin. The first resize shrinks or grows the window while it is still at
+/// its old position. The move then places it at the target origin. The second
+/// resize corrects any clamping the intermediate position caused.
+///
+/// The entire sequence is wrapped in an AXEnhancedUserInterface toggle because
+/// some apps (notably Electron) silently reject geometry writes when that flag
+/// is enabled on the application element.
+export fn bw_ax_set_window_frame(pid: i32, wid: u32, x: f64, y: f64, w: f64, h: f64) bool {
+    std.debug.assert(pid > 0);
+    std.debug.assert(wid > 0);
+
+    if (w <= 0 or h <= 0) return false;
+    const win = findAxWindow(pid, wid) orelse return false;
+    defer c.CFRelease(@ptrCast(win));
+
+    const ax = ensureAxStrings() orelse return false;
+    const size_attr = ax.size_attr;
+    const position_attr = ax.position_attr;
+
+    const app = c.AXUIElementCreateApplication(pid) orelse return false;
+    defer c.CFRelease(@ptrCast(app));
+
+    const had_enhanced_ui = axEnhancedUserInterface(app, ax);
+    if (had_enhanced_ui) {
+        _ = c.AXUIElementSetAttributeValue(app, ax.enhanced_ui_attr, c.kCFBooleanFalse);
+    }
+    defer if (had_enhanced_ui) {
+        _ = c.AXUIElementSetAttributeValue(app, ax.enhanced_ui_attr, c.kCFBooleanTrue);
+    };
+
+    const position: c.CGPoint = .{ .x = x, .y = y };
+    const position_value = c.AXValueCreate(c.kAXValueTypeCGPoint, &position) orelse return false;
+    defer c.CFRelease(@ptrCast(position_value));
+
+    const size: c.CGSize = .{ .width = w, .height = h };
+    const size_value = c.AXValueCreate(c.kAXValueTypeCGSize, &size) orelse return false;
+    defer c.CFRelease(@ptrCast(size_value));
+
+    _ = c.AXUIElementSetAttributeValue(win, size_attr, @ptrCast(size_value));
+    _ = c.AXUIElementSetAttributeValue(win, position_attr, @ptrCast(position_value));
+    const err = c.AXUIElementSetAttributeValue(win, size_attr, @ptrCast(size_value));
+
+    return err == c.kAXErrorSuccess;
+}
+
+/// Query whether the AXSize attribute is settable (i.e. the window can be resized).
+fn axCanResize(win_ref: c.AXUIElementRef, ax: *const AxStrings) bool {
+    var result: c.Boolean = 0;
+    const err = c.AXUIElementIsAttributeSettable(win_ref, ax.size_attr, &result);
+    return err == c.kAXErrorSuccess and result != 0;
+}
+
+/// Query whether AXEnhancedUserInterface is currently enabled on an app element.
+fn axEnhancedUserInterface(app: c.AXUIElementRef, ax: *const AxStrings) bool {
+    var value: c.CFTypeRef = null;
+    const err = c.AXUIElementCopyAttributeValue(app, ax.enhanced_ui_attr, &value);
+    if (err != c.kAXErrorSuccess or value == null) return false;
+    defer c.CFRelease(value.?);
+    return c.CFEqual(value.?, @ptrCast(c.kCFBooleanTrue)) != 0;
+}
+
+/// Raise and focus a window, then activate its owning app.
+export fn bw_ax_focus_window(pid: i32, wid: u32) bool {
+    std.debug.assert(pid > 0);
+    std.debug.assert(wid > 0);
+
+    const win = findAxWindow(pid, wid) orelse return false;
+    defer c.CFRelease(@ptrCast(win));
+
+    const ax = ensureAxStrings() orelse return false;
+    const raise_action = ax.raise_action;
+    const main_attr = ax.main_attr;
+
+    _ = c.AXUIElementPerformAction(win, raise_action);
+    _ = c.AXUIElementSetAttributeValue(win, main_attr, c.kCFBooleanTrue);
+
+    const NSRunningApplication = objc.getClass("NSRunningApplication") orelse return true;
+    const app = NSRunningApplication.msgSend(objc.Object, "runningApplicationWithProcessIdentifier:", .{pid});
+    if (app.value != null) {
+        // NSApplicationActivateIgnoringOtherApps == 2.
+        _ = app.msgSend(bool, "activateWithOptions:", .{@as(usize, 2)});
+    }
+    return true;
+}
+
+fn manageStateForWindow(pid: i32, wid: u32) u8 {
+    std.debug.assert(pid > 0);
+    std.debug.assert(wid > 0);
+
+    if (!isRegularActivationApp(pid)) return shim.BW_MANAGE_REJECT;
+
+    const win = findAxWindow(pid, wid) orelse return shim.BW_MANAGE_PENDING;
+    defer c.CFRelease(@ptrCast(win));
+
+    const ax = ensureAxStrings() orelse return shim.BW_MANAGE_PENDING;
+    const role_attr = ax.role_attr;
+    var role_any: c.CFTypeRef = null;
+    const role_err = c.AXUIElementCopyAttributeValue(win, role_attr, @ptrCast(&role_any));
+    if (role_err != c.kAXErrorSuccess or role_any == null) return shim.BW_MANAGE_PENDING;
+    const role_ref: c.CFStringRef = @ptrCast(role_any orelse return shim.BW_MANAGE_PENDING);
+    defer c.CFRelease(@ptrCast(role_ref));
+
+    const window_role = ax.window_role;
+    const unknown_role = ax.unknown_role;
+
+    const is_window = c.CFEqual(@ptrCast(role_ref), @ptrCast(window_role)) != 0;
+    const is_unknown_role = c.CFEqual(@ptrCast(role_ref), @ptrCast(unknown_role)) != 0;
+    if (!is_window) {
+        return if (is_unknown_role) shim.BW_MANAGE_PENDING else shim.BW_MANAGE_REJECT;
+    }
+
+    const subrole_attr = ax.subrole_attr;
+    var subrole_any: c.CFTypeRef = null;
+    const subrole_err = c.AXUIElementCopyAttributeValue(win, subrole_attr, @ptrCast(&subrole_any));
+    if (subrole_err != c.kAXErrorSuccess or subrole_any == null) return shim.BW_MANAGE_PENDING;
+    const subrole_ref: c.CFStringRef = @ptrCast(subrole_any orelse return shim.BW_MANAGE_PENDING);
+    defer c.CFRelease(@ptrCast(subrole_ref));
+
+    const standard_subrole = ax.standard_window_subrole;
+    const unknown_subrole = ax.unknown_subrole;
+
+    const is_standard = c.CFEqual(@ptrCast(subrole_ref), @ptrCast(standard_subrole)) != 0;
+    const is_unknown_subrole = c.CFEqual(@ptrCast(subrole_ref), @ptrCast(unknown_subrole)) != 0;
+    if (!is_standard and is_unknown_subrole) return shim.BW_MANAGE_PENDING;
+
+    return if (is_standard) shim.BW_MANAGE_READY else shim.BW_MANAGE_REJECT;
+}
+
+/// Legacy management predicate: true for READY or PENDING states.
+export fn bw_should_manage_window(pid: i32, wid: u32) bool {
+    const state = manageStateForWindow(pid, wid);
+    return state != shim.BW_MANAGE_REJECT;
+}
+
+/// Returns management state for a given window.
+export fn bw_window_manage_state(pid: i32, wid: u32) u8 {
+    return manageStateForWindow(pid, wid);
+}
+
+/// Enumerate on-screen layer-0 windows for regular applications.
+export fn bw_discover_windows(out: ?[*]shim.bw_window_info, max_count: u32) u32 {
+    const out_ptr = out orelse return 0;
+    if (max_count == 0) return 0;
+
+    std.debug.assert(max_count > 0);
+    const out_buf = out_ptr[0..@as(usize, @intCast(max_count))];
+
+    const options: c.CGWindowListOption =
+        c.kCGWindowListOptionOnScreenOnly | c.kCGWindowListExcludeDesktopElements;
+    const window_list = c.CGWindowListCopyWindowInfo(options, c.kCGNullWindowID) orelse return 0;
+    defer c.CFRelease(@ptrCast(window_list));
+
+    const total = c.CFArrayGetCount(window_list);
+    std.debug.assert(total >= 0);
+
+    var count: usize = 0;
+    var i: c.CFIndex = 0;
+    while (i < total and count < out_buf.len) : (i += 1) {
+        const info_any = c.CFArrayGetValueAtIndex(window_list, i) orelse continue;
+        const info: c.CFDictionaryRef = @ptrCast(info_any);
+
+        var layer: i32 = 0;
+        if (c.CFDictionaryGetValue(info, c.kCGWindowLayer)) |layer_ref_any| {
+            const layer_ref: c.CFNumberRef = @ptrCast(layer_ref_any);
+            _ = c.CFNumberGetValue(layer_ref, c.kCFNumberSInt32Type, &layer);
+        }
+        if (layer != 0) continue;
+
+        const wid_ref_any = c.CFDictionaryGetValue(info, c.kCGWindowNumber) orelse continue;
+        const wid_ref: c.CFNumberRef = @ptrCast(wid_ref_any);
+        var wid: u32 = 0;
+        _ = c.CFNumberGetValue(wid_ref, c.kCFNumberSInt32Type, &wid);
+
+        const pid_ref_any = c.CFDictionaryGetValue(info, c.kCGWindowOwnerPID) orelse continue;
+        const pid_ref: c.CFNumberRef = @ptrCast(pid_ref_any);
+        var pid: i32 = 0;
+        _ = c.CFNumberGetValue(pid_ref, c.kCFNumberSInt32Type, &pid);
+        if (pid <= 0) continue;
+        if (!isRegularActivationApp(pid)) continue;
+
+        var bounds: c.CGRect = std.mem.zeroes(c.CGRect);
+        if (c.CFDictionaryGetValue(info, c.kCGWindowBounds)) |bounds_ref_any| {
+            const bounds_ref: c.CFDictionaryRef = @ptrCast(bounds_ref_any);
+            _ = c.CGRectMakeWithDictionaryRepresentation(bounds_ref, &bounds);
+        }
+        if (bounds.size.width < 1 or bounds.size.height < 1) continue;
+
+        out_buf[count] = .{
+            .wid = wid,
+            .pid = pid,
+            .x = bounds.origin.x,
+            .y = bounds.origin.y,
+            .w = bounds.size.width,
+            .h = bounds.size.height,
+        };
+        count += 1;
+    }
+
+    std.debug.assert(count <= out_buf.len);
+    return @intCast(count);
+}
+
+fn wakerPerform(info: ?*anyopaque) callconv(.c) void {
+    _ = info;
+    bw_drain_events();
+}
+
+fn initWakerSource() void {
+    if (g_waker_source != null) return;
+
+    var context: c.CFRunLoopSourceContext = std.mem.zeroes(c.CFRunLoopSourceContext);
+    context.perform = wakerPerform;
+
+    g_waker_source = c.CFRunLoopSourceCreate(null, 0, &context);
+    const source = g_waker_source orelse return;
+    c.CFRunLoopAddSource(c.CFRunLoopGetMain(), source, c.kCFRunLoopCommonModes);
+}
+
+fn signalWaker() void {
+    if (g_waker_source) |source| {
+        c.CFRunLoopSourceSignal(source);
+    }
+    const run_loop = c.CFRunLoopGetMain();
+    if (run_loop != null) {
+        c.CFRunLoopWakeUp(run_loop);
+    }
+}
+
+fn rolePollTimerTick(context: ?*anyopaque) callconv(.c) void {
+    _ = context;
+    bw_emit_event(shim.BW_EVENT_ROLE_POLL_TICK, 0, 0);
+}
+
+fn setRolePolling(enabled: bool) void {
+    if (!enabled) {
+        if (g_role_poll_source) |source| {
+            c.dispatch_source_cancel(source);
+            g_role_poll_source = null;
+        }
+        return;
+    }
+
+    if (g_role_poll_source != null) return;
+
+    const source = c.dispatch_source_create(
+        c.DISPATCH_SOURCE_TYPE_TIMER,
+        0,
+        0,
+        c.dispatch_get_main_queue(),
+    );
+    if (source == null) return;
+
+    c.dispatch_source_set_timer(
+        source,
+        c.dispatch_time(c.DISPATCH_TIME_NOW, @as(i64, 100) * c.NSEC_PER_MSEC),
+        @as(u64, 100) * c.NSEC_PER_MSEC,
+        @as(u64, 20) * c.NSEC_PER_MSEC,
+    );
+    c.dispatch_source_set_event_handler_f(source, rolePollTimerTick);
+    c.dispatch_resume(.{ ._ds = source });
+    g_role_poll_source = source;
+}
+
+fn modsFromEventFlags(flags: c.CGEventFlags) u8 {
+    var mods: u8 = 0;
+    if ((flags & c.kCGEventFlagMaskAlternate) != 0) mods |= shim.BW_MOD_ALT;
+    if ((flags & c.kCGEventFlagMaskShift) != 0) mods |= shim.BW_MOD_SHIFT;
+    if ((flags & c.kCGEventFlagMaskCommand) != 0) mods |= shim.BW_MOD_CMD;
+    if ((flags & c.kCGEventFlagMaskControl) != 0) mods |= shim.BW_MOD_CTRL;
+    return mods;
+}
+
+fn hotkeyTapCallback(
+    proxy: c.CGEventTapProxy,
+    event_type: c.CGEventType,
+    event: c.CGEventRef,
+    refcon: ?*anyopaque,
+) callconv(.c) c.CGEventRef {
+    _ = proxy;
+    _ = refcon;
+
+    if (event_type == c.kCGEventTapDisabledByTimeout or event_type == c.kCGEventTapDisabledByUserInput) {
+        if (g_tap_port) |tap| c.CGEventTapEnable(tap, true);
+        return event;
+    }
+
+    if (event_type == c.kCGEventLeftMouseDown) {
+        bw_hotkey_mouse_down();
+        return event;
+    }
+    if (event_type == c.kCGEventLeftMouseUp) {
+        bw_hotkey_mouse_up();
+        return event;
+    }
+
+    const flags = c.CGEventGetFlags(event);
+    const keycode_raw = c.CGEventGetIntegerValueField(event, c.kCGKeyboardEventKeycode);
+    const keycode: u16 = @intCast(keycode_raw);
+    const mods = modsFromEventFlags(flags);
+
+    if (bw_hotkey_handle_keydown(keycode, mods)) {
+        return null;
+    }
+    return event;
+}
+
+fn setupHotkeyEventTap() void {
+    const mask: c.CGEventMask =
+        (@as(c.CGEventMask, 1) << @intCast(c.kCGEventKeyDown)) |
+        (@as(c.CGEventMask, 1) << @intCast(c.kCGEventLeftMouseDown)) |
+        (@as(c.CGEventMask, 1) << @intCast(c.kCGEventLeftMouseUp));
+
+    g_tap_port = c.CGEventTapCreate(
+        c.kCGSessionEventTap,
+        c.kCGHeadInsertEventTap,
+        c.kCGEventTapOptionDefault,
+        mask,
+        hotkeyTapCallback,
+        null,
+    );
+    const tap = g_tap_port orelse return;
+
+    const tap_source = c.CFMachPortCreateRunLoopSource(null, tap, 0) orelse return;
+    defer c.CFRelease(@ptrCast(tap_source));
+
+    c.CFRunLoopAddSource(c.CFRunLoopGetMain(), tap_source, c.kCFRunLoopCommonModes);
+    c.CGEventTapEnable(tap, true);
+}
+
+fn ipcSourceTick(context: ?*anyopaque) callconv(.c) void {
+    const fd_raw = @intFromPtr(context orelse return);
+    const server_fd: c_int = @intCast(fd_raw);
+    bw_handle_ipc_client(server_fd);
+}
+
+fn initIpcSource(server_fd: c_int) void {
+    if (g_ipc_source) |source| {
+        c.dispatch_source_cancel(source);
+        g_ipc_source = null;
+    }
+
+    const source = c.dispatch_source_create(
+        c.DISPATCH_SOURCE_TYPE_READ,
+        @intCast(server_fd),
+        0,
+        c.dispatch_get_main_queue(),
+    );
+    if (source == null) return;
+
+    c.dispatch_set_context(.{ ._ds = source }, @ptrFromInt(@as(usize, @intCast(server_fd))));
+    c.dispatch_source_set_event_handler_f(source, ipcSourceTick);
+    c.dispatch_resume(.{ ._ds = source });
+    g_ipc_source = source;
+}
+
+fn cancelIpcSource() void {
+    if (g_ipc_source) |source| {
+        c.dispatch_source_cancel(source);
+        g_ipc_source = null;
+    }
+}
+
+/// Signal the main run loop to drain queued events.
+export fn bw_signal_waker() void {
+    signalWaker();
+}
+
+/// Enable or disable periodic role polling.
+export fn bw_set_role_polling(enabled: bool) void {
+    setRolePolling(enabled);
+}
+
 // ---------------------------------------------------------------------------
 // Event bridge (called from ObjC shim)
 // ---------------------------------------------------------------------------
@@ -445,7 +1246,84 @@ export fn bw_emit_event(kind: u8, pid: i32, wid: u32) void {
         .pid = pid,
         .wid = wid,
     });
-    shim.bw_signal_waker();
+    signalWaker();
+}
+
+/// Callback target for BWObserver.appTerminated: selector.
+export fn bw_workspace_app_terminated(pid: i32) void {
+    std.debug.assert(pid > 0);
+    bw_emit_event(shim.BW_EVENT_APP_TERMINATED, pid, 0);
+}
+
+/// Callback target for BWObserver.appLaunched: selector.
+export fn bw_workspace_app_launched(pid: i32) void {
+    std.debug.assert(pid > 0);
+    bw_emit_event(shim.BW_EVENT_APP_LAUNCHED, pid, 0);
+}
+
+/// Callback target for BWObserver.activeAppChanged: selector.
+export fn bw_workspace_active_app_changed(pid: i32) void {
+    std.debug.assert(pid > 0);
+    bw_emit_event(shim.BW_EVENT_WINDOW_FOCUSED, pid, 0);
+}
+
+/// Callback target for BWObserver.spaceChanged: selector.
+export fn bw_workspace_space_changed() void {
+    bw_emit_event(shim.BW_EVENT_SPACE_CHANGED, 0, 0);
+}
+
+/// Callback target for BWObserver.displayChanged: selector.
+export fn bw_workspace_display_changed() void {
+    bw_emit_event(shim.BW_EVENT_DISPLAY_CHANGED, 0, 0);
+}
+
+/// Callback target for shim hotkey mouse down events.
+export fn bw_hotkey_mouse_down() void {
+    bw_emit_event(shim.BW_EVENT_MOUSE_DOWN, 0, 0);
+}
+
+/// Callback target for shim hotkey mouse up events.
+export fn bw_hotkey_mouse_up() void {
+    bw_emit_event(shim.BW_EVENT_MOUSE_UP, 0, 0);
+}
+
+/// Accept keybind table from config and keep it in Zig-owned state.
+export fn bw_set_keybinds(binds: ?[*]const shim.bw_keybind, count: u32) void {
+    if (count == 0) {
+        g_hotkey_binding_count = 0;
+        return;
+    }
+
+    const src = binds orelse {
+        g_hotkey_binding_count = 0;
+        return;
+    };
+
+    const max_count: u32 = @intCast(g_hotkey_bindings.len);
+    const clamped_count_u32: u32 = @min(count, max_count);
+    const clamped_count: usize = @intCast(clamped_count_u32);
+
+    @memcpy(g_hotkey_bindings[0..clamped_count], src[0..clamped_count]);
+    g_hotkey_binding_count = clamped_count_u32;
+
+    std.debug.assert(g_hotkey_binding_count <= max_count);
+}
+
+/// Resolve a key press against current keybinds and emit matching action.
+export fn bw_hotkey_handle_keydown(keycode: u16, mods: u8) bool {
+    const total: usize = @intCast(g_hotkey_binding_count);
+    std.debug.assert(total <= g_hotkey_bindings.len);
+
+    var i: usize = 0;
+    while (i < total) : (i += 1) {
+        const binding = g_hotkey_bindings[i];
+        if (binding.keycode != keycode) continue;
+        if (binding.mods != mods) continue;
+
+        bw_emit_event(binding.action, 0, binding.arg);
+        return true;
+    }
+    return false;
 }
 
 // ---------------------------------------------------------------------------
@@ -549,6 +1427,7 @@ pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
     g_allocator = gpa.allocator();
+    defer deinitAxStrings();
 
     // -- Config --
     g_config = config_mod.load(g_allocator, args.config_path);
@@ -558,7 +1437,7 @@ pub fn main() !void {
     if (!shim.bw_ax_is_trusted()) {
         log.warn("accessibility not trusted — prompting user", .{});
         log.warn("after granting access, restart with: bobrwm service restart", .{});
-        shim.bw_ax_prompt();
+        axPrompt();
     }
 
     // -- SkyLight (optional) --
@@ -572,6 +1451,30 @@ pub fn main() !void {
     clearLayoutRoots();
     g_tab_groups = tabgroup.TabGroupManager.init(g_allocator);
     defer g_tab_groups.deinit();
+    g_pending_role_windows = PendingRoleWindowMap.init(g_allocator);
+    errdefer g_pending_role_windows.deinit();
+    g_pending_role_windows.ensureTotalCapacity(pending_role_window_capacity) catch |err| {
+        log.err("pending-role map reserve failed: {}", .{err});
+        return err;
+    };
+    g_deferred_window_candidates = DeferredWindowCandidateMap.init(g_allocator);
+    errdefer g_deferred_window_candidates.deinit();
+    g_deferred_window_candidates.ensureTotalCapacity(deferred_window_candidate_capacity) catch |err| {
+        log.err("deferred-window map reserve failed: {}", .{err});
+        return err;
+    };
+    g_app_launch_retries = AppLaunchRetryMap.init(g_allocator);
+    errdefer g_app_launch_retries.deinit();
+    g_app_launch_retries.ensureTotalCapacity(app_launch_retry_capacity) catch |err| {
+        log.err("app-launch-retry map reserve failed: {}", .{err});
+        return err;
+    };
+    defer {
+        setRolePolling(false);
+        g_app_launch_retries.deinit();
+        g_deferred_window_candidates.deinit();
+        g_pending_role_windows.deinit();
+    }
     refreshDisplays();
 
     // -- Apply workspace names from config --
@@ -594,14 +1497,21 @@ pub fn main() !void {
         log.err("IPC init failed: {}", .{err});
         return err;
     };
+    defer cancelIpcSource();
     defer g_ipc.deinit(g_allocator);
     ipc.g_dispatch = ipcDispatch;
 
     // -- NSApp (zig-objc) --
     const NSApp = initApp();
+    initWorkspaceObservers();
 
     // -- Sources (observers, CGEventTap, waker, IPC) --
-    shim.bw_setup_sources(g_ipc.fd);
+    ax_observer.init();
+    defer ax_observer.deinit();
+    setupHotkeyEventTap();
+    initWakerSource();
+    initIpcSource(@intCast(g_ipc.fd));
+    refreshRolePolling();
     observeDiscoveredApps();
 
     // -- Status bar (zig-objc) --
@@ -686,7 +1596,7 @@ fn insertIntoLayout(workspace_id: u8, display_id: u32, wid: u32) void {
 
 fn clearDragPreview() void {
     if (g_drag_preview.visible) {
-        shim.bw_hide_tile_preview();
+        tile_preview.hide();
     }
     g_drag_preview = .{};
 }
@@ -812,7 +1722,7 @@ fn updateWindowMovePreview(wid: u32) void {
         const target_changed = g_drag_preview.target_wid == null or g_drag_preview.target_wid.? != entry.wid;
         g_drag_preview.target_wid = entry.wid;
         if (!g_drag_preview.visible or target_changed) {
-            shim.bw_show_tile_preview(entry.frame.x, entry.frame.y, entry.frame.width, entry.frame.height);
+            tile_preview.show(entry.frame.x, entry.frame.y, entry.frame.width, entry.frame.height);
             g_drag_preview.visible = true;
         }
         return;
@@ -820,7 +1730,7 @@ fn updateWindowMovePreview(wid: u32) void {
 
     g_drag_preview.target_wid = null;
     if (g_drag_preview.visible) {
-        shim.bw_hide_tile_preview();
+        tile_preview.hide();
         g_drag_preview.visible = false;
     }
 }
@@ -870,22 +1780,25 @@ fn handleEvent(ev: *const event_mod.Event) void {
         .app_launched => {
             log.info("app launched pid={}", .{ev.pid});
             discoverWindows();
-            shim.bw_observe_app(ev.pid);
+            ax_observer.observeApp(ev.pid);
+            trackAppLaunchRetry(ev.pid);
             retile();
         },
         .app_terminated => {
             log.info("app terminated pid={}", .{ev.pid});
-            shim.bw_unobserve_app(ev.pid);
+            untrackAppLaunchRetry(ev.pid);
+            ax_observer.unobserveApp(ev.pid);
             removeAppWindows(ev.pid);
             retile();
         },
         .window_focused => {
             log.info("window focused pid={}", .{ev.pid});
             const removed_stale = cleanupWorkspaceWindowsForPid(ev.pid);
+            const removed_offscreen = cleanupOffscreenManagedWindows();
             const wid = shim.bw_ax_get_focused_window(ev.pid);
             if (wid != 0) {
                 if (g_store.get(wid) == null) {
-                    shim.bw_observe_app(ev.pid);
+                    ax_observer.observeApp(ev.pid);
                     discoverWindows();
                     retile();
                 }
@@ -898,15 +1811,16 @@ fn handleEvent(ev: *const event_mod.Event) void {
                     }
                 }
             }
-            if (removed_stale) {
+            if (removed_stale or removed_offscreen) {
                 retile();
             }
         },
         .focused_window_changed => {
             log.info("focused window changed pid={}", .{ev.pid});
             const removed_stale = cleanupWorkspaceWindowsForPid(ev.pid);
+            const removed_offscreen = cleanupOffscreenManagedWindows();
             reconcileAppTabs(ev.pid);
-            if (removed_stale) {
+            if (removed_stale or removed_offscreen) {
                 retile();
             }
         },
@@ -931,12 +1845,24 @@ fn handleEvent(ev: *const event_mod.Event) void {
             retile();
         },
         .display_changed => {
+            if (!shouldHandleWorkspaceEvent(&g_last_display_changed_at_s)) return;
             log.info("display changed", .{});
             reconcileDisplayChange();
             discoverWindows();
             retile();
         },
-        .space_changed => log.info("space changed", .{}),
+        .space_changed => {
+            if (!shouldHandleWorkspaceEvent(&g_last_space_changed_at_s)) return;
+            log.info("space changed", .{});
+        },
+        .role_poll_tick => {
+            const promoted_pending = processPendingRoleWindows();
+            const promoted_deferred = processDeferredWindowCandidates();
+            const retried_launch = processAppLaunchRetries();
+            if (promoted_pending or promoted_deferred or retried_launch) {
+                retile();
+            }
+        },
         .mouse_down => {
             g_mouse_left_down = true;
         },
@@ -1047,6 +1973,384 @@ fn setWindowMode(wid: u32, target: window_mod.WindowMode) void {
 // Window management helpers
 // ---------------------------------------------------------------------------
 
+fn windowRoleState(pid: i32, wid: u32) WindowRoleState {
+    std.debug.assert(wid != 0);
+    const raw_state = shim.bw_window_manage_state(pid, wid);
+    return switch (raw_state) {
+        shim.BW_MANAGE_REJECT => .reject,
+        shim.BW_MANAGE_READY => .ready,
+        shim.BW_MANAGE_PENDING => .pending,
+        else => {
+            log.warn("pending-role: unknown manage state pid={d} wid={d} state={d}", .{ pid, wid, raw_state });
+            return .pending;
+        },
+    };
+}
+
+fn refreshRolePolling() void {
+    const has_pending = g_pending_role_windows.count() > 0 or
+        g_deferred_window_candidates.count() > 0 or
+        g_app_launch_retries.count() > 0;
+    setRolePolling(has_pending);
+}
+
+fn trackAppLaunchRetry(pid: i32) void {
+    std.debug.assert(pid > 0);
+
+    if (g_app_launch_retries.getPtr(pid)) |attempts_remaining| {
+        attempts_remaining.* = app_launch_retry_attempts_max;
+    } else {
+        g_app_launch_retries.put(pid, app_launch_retry_attempts_max) catch {
+            log.err("app-launch-retry: failed to track pid={d}", .{pid});
+            return;
+        };
+    }
+
+    refreshRolePolling();
+}
+
+fn untrackAppLaunchRetry(pid: i32) void {
+    std.debug.assert(pid > 0);
+    if (g_app_launch_retries.remove(pid)) {
+        refreshRolePolling();
+    }
+}
+
+fn processAppLaunchRetries() bool {
+    if (g_app_launch_retries.count() == 0) {
+        refreshRolePolling();
+        return false;
+    }
+
+    var retry_pids: [64]i32 = undefined;
+    var retry_count: usize = 0;
+    var truncated = false;
+
+    var it = g_app_launch_retries.iterator();
+    while (it.next()) |entry| {
+        const pid = entry.key_ptr.*;
+        std.debug.assert(pid > 0);
+
+        if (entry.value_ptr.* == 0) {
+            if (retry_count == retry_pids.len) {
+                truncated = true;
+                break;
+            }
+            retry_pids[retry_count] = pid;
+            retry_count += 1;
+        } else {
+            entry.value_ptr.* -= 1;
+        }
+    }
+
+    for (retry_pids[0..retry_count]) |pid| {
+        _ = g_app_launch_retries.remove(pid);
+    }
+    refreshRolePolling();
+
+    if (truncated) {
+        log.warn("app-launch-retry: batch truncated remaining={d}", .{g_app_launch_retries.count()});
+    }
+
+    if (retry_count == 0) return false;
+
+    for (retry_pids[0..retry_count]) |pid| {
+        log.info("app-launch-retry: retrying discovery for pid={d}", .{pid});
+        ax_observer.observeApp(pid);
+    }
+    discoverWindows();
+    return true;
+}
+
+fn trackPendingRoleWindow(pid: i32, wid: u32) void {
+    std.debug.assert(wid != 0);
+    if (g_store.get(wid) != null) return;
+
+    if (g_pending_role_windows.getPtr(wid)) |pending| {
+        pending.pid = pid;
+        pending.attempts_remaining = role_poll_attempts_max;
+    } else {
+        g_pending_role_windows.put(wid, .{
+            .pid = pid,
+            .attempts_remaining = role_poll_attempts_max,
+        }) catch {
+            log.err("pending-role: failed to track pid={d} wid={d}", .{ pid, wid });
+            return;
+        };
+    }
+
+    refreshRolePolling();
+}
+
+fn untrackPendingRoleWindow(wid: u32) void {
+    std.debug.assert(wid != 0);
+    if (g_pending_role_windows.remove(wid)) {
+        refreshRolePolling();
+    }
+}
+
+/// Remove all entries matching `pid` from a wid-keyed map whose values
+/// carry a `.pid` field. Batched to avoid iterator invalidation.
+fn removeEntriesForPid(comptime V: type, map: *std.AutoHashMap(u32, V), pid: i32) bool {
+    var removed_any = false;
+
+    while (true) {
+        var remove_batch: [64]u32 = undefined;
+        var remove_count: usize = 0;
+
+        var it = map.iterator();
+        while (it.next()) |entry| {
+            if (entry.value_ptr.pid != pid) continue;
+            if (remove_count == remove_batch.len) break;
+            remove_batch[remove_count] = entry.key_ptr.*;
+            remove_count += 1;
+        }
+
+        if (remove_count == 0) break;
+
+        for (remove_batch[0..remove_count]) |wid| {
+            if (map.remove(wid)) {
+                removed_any = true;
+            }
+        }
+
+        if (remove_count < remove_batch.len) break;
+    }
+
+    return removed_any;
+}
+
+fn untrackPendingRoleWindowsForPid(pid: i32) void {
+    if (removeEntriesForPid(PendingRoleWindow, &g_pending_role_windows, pid)) {
+        refreshRolePolling();
+    }
+}
+
+fn trackDeferredWindowCandidate(pid: i32, wid: u32) void {
+    std.debug.assert(wid != 0);
+    if (g_store.get(wid) != null) {
+        if (g_deferred_window_candidates.remove(wid)) {
+            refreshRolePolling();
+        }
+        return;
+    }
+
+    if (g_deferred_window_candidates.getPtr(wid)) |candidate| {
+        candidate.pid = pid;
+        candidate.attempts_remaining = role_poll_attempts_max;
+    } else {
+        g_deferred_window_candidates.put(wid, .{
+            .pid = pid,
+            .attempts_remaining = role_poll_attempts_max,
+        }) catch {
+            log.err("deferred-window: failed to track pid={d} wid={d}", .{ pid, wid });
+            return;
+        };
+    }
+
+    refreshRolePolling();
+}
+
+fn untrackDeferredWindowCandidate(wid: u32) void {
+    std.debug.assert(wid != 0);
+    if (g_deferred_window_candidates.remove(wid)) {
+        refreshRolePolling();
+    }
+}
+
+fn untrackDeferredWindowCandidatesForPid(pid: i32) void {
+    if (removeEntriesForPid(DeferredWindowCandidate, &g_deferred_window_candidates, pid)) {
+        refreshRolePolling();
+    }
+}
+
+fn addNewWindowLegacyPendingFallback(pid: i32, wid: u32) bool {
+    std.debug.assert(wid != 0);
+    if (g_store.get(wid) != null) return false;
+    if (!shim.bw_should_manage_window(pid, wid)) {
+        log.debug("pending-role: fallback rejected pid={d} wid={d}", .{ pid, wid });
+        return false;
+    }
+    return addNewWindowManaged(pid, wid);
+}
+
+fn processPendingRoleWindows() bool {
+    if (g_pending_role_windows.count() == 0) {
+        refreshRolePolling();
+        return false;
+    }
+
+    var remove_wids: [128]u32 = undefined;
+    var remove_count: usize = 0;
+    var candidates: [128]PendingRoleCandidate = undefined;
+    var candidate_count: usize = 0;
+    var truncated = false;
+
+    var it = g_pending_role_windows.iterator();
+    while (it.next()) |entry| {
+        const wid = entry.key_ptr.*;
+        const pid = entry.value_ptr.pid;
+
+        const state = windowRoleState(pid, wid);
+        switch (state) {
+            .reject => {
+                if (remove_count == remove_wids.len) {
+                    truncated = true;
+                    break;
+                }
+                remove_wids[remove_count] = wid;
+                remove_count += 1;
+            },
+            .ready => {
+                if (remove_count == remove_wids.len or candidate_count == candidates.len) {
+                    truncated = true;
+                    break;
+                }
+                remove_wids[remove_count] = wid;
+                remove_count += 1;
+                candidates[candidate_count] = .{ .pid = pid, .wid = wid, .from_timeout = false };
+                candidate_count += 1;
+            },
+            .pending => {
+                if (entry.value_ptr.attempts_remaining == 0) {
+                    if (remove_count == remove_wids.len or candidate_count == candidates.len) {
+                        truncated = true;
+                        break;
+                    }
+                    remove_wids[remove_count] = wid;
+                    remove_count += 1;
+                    candidates[candidate_count] = .{ .pid = pid, .wid = wid, .from_timeout = true };
+                    candidate_count += 1;
+                } else {
+                    entry.value_ptr.attempts_remaining -= 1;
+                }
+            },
+        }
+    }
+
+    for (remove_wids[0..remove_count]) |wid| {
+        _ = g_pending_role_windows.remove(wid);
+    }
+    refreshRolePolling();
+
+    if (truncated) {
+        log.warn("pending-role: batch truncated remaining={d}", .{g_pending_role_windows.count()});
+    }
+
+    var added_any = false;
+    for (candidates[0..candidate_count]) |candidate| {
+        if (candidate.from_timeout) {
+            const timeout_ms = @as(u64, role_poll_attempts_max) * role_poll_interval_ms;
+            log.info("pending-role: timeout pid={d} wid={d} after {d}ms, applying legacy fallback", .{ candidate.pid, candidate.wid, timeout_ms });
+            if (addNewWindowLegacyPendingFallback(candidate.pid, candidate.wid)) {
+                added_any = true;
+            }
+            continue;
+        }
+
+        if (addNewWindowManaged(candidate.pid, candidate.wid)) {
+            added_any = true;
+        }
+    }
+
+    return added_any;
+}
+
+fn processDeferredWindowCandidates() bool {
+    if (g_deferred_window_candidates.count() == 0) {
+        refreshRolePolling();
+        return false;
+    }
+
+    var remove_wids: [128]u32 = undefined;
+    var remove_count: usize = 0;
+    var promote_candidates: [128]DeferredWindowPromotion = undefined;
+    var promote_count: usize = 0;
+    var truncated = false;
+    const timeout_ms = @as(u64, role_poll_attempts_max) * role_poll_interval_ms;
+
+    var it = g_deferred_window_candidates.iterator();
+    while (it.next()) |entry| {
+        const wid = entry.key_ptr.*;
+        const pid = entry.value_ptr.pid;
+
+        if (g_store.get(wid) != null) {
+            if (remove_count == remove_wids.len) {
+                truncated = true;
+                break;
+            }
+            remove_wids[remove_count] = wid;
+            remove_count += 1;
+            continue;
+        }
+
+        switch (windowRoleState(pid, wid)) {
+            .reject => {
+                if (remove_count == remove_wids.len) {
+                    truncated = true;
+                    break;
+                }
+                remove_wids[remove_count] = wid;
+                remove_count += 1;
+            },
+            .pending => {
+                if (entry.value_ptr.attempts_remaining == 0) {
+                    if (remove_count == remove_wids.len) {
+                        truncated = true;
+                        break;
+                    }
+                    remove_wids[remove_count] = wid;
+                    remove_count += 1;
+                    log.info("deferred-window: timeout pid={d} wid={d} after {d}ms while role is pending", .{ pid, wid, timeout_ms });
+                } else {
+                    entry.value_ptr.attempts_remaining -= 1;
+                }
+            },
+            .ready => {
+                if (isVisibleOnScreen(wid)) {
+                    if (remove_count == remove_wids.len or promote_count == promote_candidates.len) {
+                        truncated = true;
+                        break;
+                    }
+                    remove_wids[remove_count] = wid;
+                    remove_count += 1;
+                    promote_candidates[promote_count] = .{ .pid = pid, .wid = wid };
+                    promote_count += 1;
+                } else {
+                    if (entry.value_ptr.attempts_remaining == 0) {
+                        if (remove_count == remove_wids.len) {
+                            truncated = true;
+                            break;
+                        }
+                        remove_wids[remove_count] = wid;
+                        remove_count += 1;
+                        log.info("deferred-window: timeout pid={d} wid={d} after {d}ms while still off-screen", .{ pid, wid, timeout_ms });
+                    } else {
+                        entry.value_ptr.attempts_remaining -= 1;
+                    }
+                }
+            },
+        }
+    }
+
+    for (remove_wids[0..remove_count]) |wid| {
+        _ = g_deferred_window_candidates.remove(wid);
+    }
+    refreshRolePolling();
+
+    if (truncated) {
+        log.warn("deferred-window: batch truncated remaining={d}", .{g_deferred_window_candidates.count()});
+    }
+
+    var added_any = false;
+    for (promote_candidates[0..promote_count]) |candidate| {
+        if (addNewWindowManaged(candidate.pid, candidate.wid)) {
+            added_any = true;
+        }
+    }
+    return added_any;
+}
+
 fn discoverWindows() void {
     var buf: [256]shim.bw_window_info = undefined;
     const count = shim.bw_discover_windows(&buf, 256);
@@ -1062,8 +2366,27 @@ fn discoverWindows() void {
     }.lessThan);
 
     for (slice) |info| {
+        // Observe the owning app even if this specific window is not yet
+        // manageable (for example AX role/subrole is still pending).
+        ax_observer.observeApp(info.pid);
+
         if (g_store.get(info.wid) != null) continue;
-        if (!shim.bw_should_manage_window(info.pid, info.wid)) continue;
+
+        switch (windowRoleState(info.pid, info.wid)) {
+            .reject => {
+                untrackPendingRoleWindow(info.wid);
+                continue;
+            },
+            .pending => {
+                trackPendingRoleWindow(info.pid, info.wid);
+                continue;
+            },
+            .ready => {
+                untrackPendingRoleWindow(info.wid);
+                untrackDeferredWindowCandidate(info.wid);
+            },
+        }
+
         const frame: window_mod.Window.Frame = .{ .x = info.x, .y = info.y, .width = info.w, .height = info.h };
         const display_id = displayIdForFrame(frame);
         const target_ws = resolveWorkspace(info.pid, display_id);
@@ -1096,48 +2419,73 @@ fn discoverWindows() void {
     }
 }
 
-fn addNewWindow(pid: i32, wid: u32) void {
+/// Guards tab inference against standalone window creation races.
+/// If another managed on-screen sibling already occupies the same frame,
+/// the focused/created window should be treated as a standalone window.
+fn hasOnScreenMatchingManagedSibling(
+    pid: i32,
+    exclude_wid: u32,
+    target_frame: window_mod.Window.Frame,
+    sky: skylight.SkyLight,
+    conn: c_int,
+) bool {
+    var store_it = g_store.windows.iterator();
+    while (store_it.next()) |entry| {
+        const candidate_wid = entry.key_ptr.*;
+        const candidate = entry.value_ptr.*;
+        if (candidate_wid == exclude_wid) continue;
+        if (candidate.pid != pid) continue;
+        if (!isVisibleOnScreen(candidate_wid)) continue;
+
+        var rect: skylight.CGRect = undefined;
+        if (sky.getWindowBounds(conn, candidate_wid, &rect) != 0) continue;
+
+        const candidate_frame = window_mod.Window.Frame{
+            .x = rect.origin.x,
+            .y = rect.origin.y,
+            .width = rect.size.width,
+            .height = rect.size.height,
+        };
+        const matches = tabgroup.TabGroupManager.framesMatch(candidate_frame, target_frame);
+        log.debug("tab-match-guard: candidate wid={d} frame=({d:.0},{d:.0},{d:.0},{d:.0}) match={}", .{
+            candidate_wid,
+            candidate_frame.x,
+            candidate_frame.y,
+            candidate_frame.width,
+            candidate_frame.height,
+            matches,
+        });
+
+        if (matches) return true;
+    }
+
+    return false;
+}
+
+fn addNewWindowManaged(pid: i32, wid: u32) bool {
     log.debug("addNewWindow: pid={d} wid={d}", .{ pid, wid });
     if (g_store.get(wid) != null) {
         log.debug("addNewWindow: already in store, skipping", .{});
-        return;
-    }
-    if (!shim.bw_should_manage_window(pid, wid)) {
-        log.debug("addNewWindow: bw_should_manage_window=false, skipping", .{});
-        return;
+        return false;
     }
 
     const on_screen = isVisibleOnScreen(wid);
     log.debug("addNewWindow: on_screen={}", .{on_screen});
 
-    // Background tabs in native tab groups are not on screen — skip them.
-    // However, brand-new windows from just-launched apps (Discord, Electron)
-    // may not appear in the CG window list yet. Distinguish the two cases
-    // by checking whether this app already has any tiled windows.
+    // New windows from Electron-family apps can be created before WindowServer
+    // reports them as on-screen. Queue them for bounded re-evaluation rather
+    // than dropping them on a one-shot check.
     if (!on_screen) {
-        var app_has_tiled = false;
-        for (&g_workspaces.workspaces) |*ws| {
-            for (ws.windows.items) |existing_wid| {
-                if (g_store.get(existing_wid)) |existing| {
-                    if (existing.pid == pid) {
-                        app_has_tiled = true;
-                        break;
-                    }
-                }
-            }
-            if (app_has_tiled) break;
-        }
-        if (app_has_tiled) {
-            log.info("addNewWindow: off-screen wid={d} with existing windows → background tab, skipping", .{wid});
-            return;
-        }
-        log.debug("addNewWindow: off-screen wid={d}, first window for pid → CG timing, accepting", .{wid});
+        trackDeferredWindowCandidate(pid, wid);
+        log.info("addNewWindow: deferred pid={d} wid={d} while off-screen", .{ pid, wid });
+        return false;
     }
+    defer untrackDeferredWindowCandidate(wid);
 
     // Check if this new on-screen window replaces an existing same-PID window
     // that just went off-screen (i.e. a new tab was created and became active,
     // pushing the old tab to background). If so, form a tab group.
-    if (tryFormTabGroupOnCreate(pid, wid)) return;
+    if (tryFormTabGroupOnCreate(pid, wid)) return false;
 
     var window_frame: window_mod.Window.Frame = .{ .x = 0, .y = 0, .width = 0, .height = 0 };
     var display_id = focusedDisplayId();
@@ -1153,7 +2501,20 @@ fn addNewWindow(pid: i32, wid: u32) void {
             display_id = displayIdForFrame(window_frame);
         }
     }
+    // Non-resizable windows that are undersized (≤500px in either dimension)
+    // are floated instead of tiled. This catches transient splash screens and
+    // updater dialogs (e.g. Discord Updater at 300x300) that have standard
+    // AX roles but are not real application windows.
+    const should_float = blk: {
+        if (window_frame.width > 500 and window_frame.height > 500) break :blk false;
+        const ax_win = findAxWindow(pid, wid) orelse break :blk false;
+        defer c.CFRelease(@ptrCast(ax_win));
+        const ax = ensureAxStrings() orelse break :blk false;
+        break :blk !axCanResize(ax_win, ax);
+    };
+
     const ws = resolveWorkspace(pid, display_id);
+    const mode: window_mod.WindowMode = if (should_float) .floating else .tiled;
 
     const win = window_mod.Window{
         .wid = wid,
@@ -1161,14 +2522,16 @@ fn addNewWindow(pid: i32, wid: u32) void {
         .title = null,
         .frame = window_frame,
         .is_minimized = false,
-        .mode = .tiled,
+        .mode = mode,
         .workspace_id = ws.id,
         .display_id = display_id,
     };
 
-    g_store.put(win) catch return;
-    ws.addWindow(wid) catch return;
-    insertIntoLayout(ws.id, display_id, wid);
+    g_store.put(win) catch return false;
+    ws.addWindow(wid) catch return false;
+    if (mode == .tiled) {
+        insertIntoLayout(ws.id, display_id, wid);
+    }
     ws.focused_wid = wid;
 
     // If assigned to a non-visible workspace, hide immediately
@@ -1176,7 +2539,34 @@ fn addNewWindow(pid: i32, wid: u32) void {
         hideWindow(pid, wid);
     }
 
-    log.info("addNewWindow: tiled wid={d} on workspace {d}", .{ wid, ws.id });
+    log.info("addNewWindow: {s} wid={d} on workspace {d}", .{
+        if (mode == .tiled) "tiled" else "floated (undersized+non-resizable)",
+        wid,
+        ws.id,
+    });
+    return true;
+}
+
+fn addNewWindow(pid: i32, wid: u32) void {
+    std.debug.assert(wid != 0);
+    if (g_store.get(wid) != null) return;
+
+    switch (windowRoleState(pid, wid)) {
+        .reject => {
+            untrackPendingRoleWindow(wid);
+            untrackDeferredWindowCandidate(wid);
+            log.debug("addNewWindow: role gate rejected pid={d} wid={d}", .{ pid, wid });
+        },
+        .ready => {
+            untrackPendingRoleWindow(wid);
+            _ = addNewWindowManaged(pid, wid);
+        },
+        .pending => {
+            trackPendingRoleWindow(pid, wid);
+            trackDeferredWindowCandidate(pid, wid);
+            log.debug("addNewWindow: role gate pending pid={d} wid={d}", .{ pid, wid });
+        },
+    }
 }
 
 /// When a new on-screen window appears, check if an existing managed window
@@ -1200,6 +2590,11 @@ fn tryFormTabGroupOnCreate(pid: i32, new_wid: u32) bool {
     log.debug("tryFormTabGroup: new wid={d} bounds=({d:.0},{d:.0},{d:.0},{d:.0})", .{
         new_wid, new_frame.x, new_frame.y, new_frame.width, new_frame.height,
     });
+
+    if (hasOnScreenMatchingManagedSibling(pid, new_wid, new_frame, sky, conn)) {
+        log.debug("tryFormTabGroup: on-screen sibling matches new wid={d}, treating as standalone", .{new_wid});
+        return false;
+    }
 
     // Collect stale windows for deferred cleanup — can't call removeWindow
     // while iterating workspace window lists (swapRemove invalidates indices).
@@ -1333,6 +2728,8 @@ fn tryFormTabGroupOnCreate(pid: i32, new_wid: u32) bool {
 }
 
 fn removeWindow(wid: u32) void {
+    untrackPendingRoleWindow(wid);
+    untrackDeferredWindowCandidate(wid);
     if (g_drag_preview.source_wid == wid or g_drag_preview.target_wid == wid) {
         clearDragPreview();
     }
@@ -1366,6 +2763,8 @@ fn removeWindow(wid: u32) void {
 }
 
 fn removeAppWindows(pid: i32) void {
+    untrackPendingRoleWindowsForPid(pid);
+    untrackDeferredWindowCandidatesForPid(pid);
     clearDragPreview();
     var wids: [128]u32 = undefined;
     var ws_ids: [128]u8 = undefined;
@@ -1453,6 +2852,48 @@ fn cleanupWorkspaceWindowsForPid(pid: i32) bool {
             }
             if (already_queued) continue;
 
+            if (stale_count < stale_wids.len) {
+                stale_wids[stale_count] = wid;
+                stale_count += 1;
+            }
+        }
+    }
+
+    for (stale_wids[0..stale_count]) |wid| {
+        removeWindow(wid);
+    }
+
+    return stale_count > 0;
+}
+
+/// Remove managed windows that are no longer physically on-screen.
+///
+/// Some Electron apps (Discord) close-to-background without emitting AX
+/// destroy/minimize notifications. This catches those ghost entries.
+fn cleanupOffscreenManagedWindows() bool {
+    var stale_wids: [128]u32 = undefined;
+    var stale_count: usize = 0;
+
+    for (&g_workspaces.workspaces) |*ws| {
+        for (ws.windows.items) |wid| {
+            const win = g_store.get(wid) orelse continue;
+
+            // Tab-group members can be intentionally off-screen when a sibling
+            // tab is active; treating them as ghosts causes layout churn.
+            if (g_tab_groups.groupOf(wid) != null) continue;
+
+            if (shim.bw_is_window_on_screen(wid)) continue;
+
+            var already_queued = false;
+            for (stale_wids[0..stale_count]) |existing| {
+                if (existing == wid) {
+                    already_queued = true;
+                    break;
+                }
+            }
+            if (already_queued) continue;
+
+            log.info("cleanup: removing wid={d} pid={d} reason=offscreen", .{ wid, win.pid });
             if (stale_count < stale_wids.len) {
                 stale_wids[stale_count] = wid;
                 stale_count += 1;
@@ -1655,7 +3096,7 @@ fn observeDiscoveredApps() void {
     for (&g_workspaces.workspaces) |*ws| {
         for (ws.windows.items) |wid| {
             if (g_store.get(wid)) |win| {
-                shim.bw_observe_app(win.pid);
+                ax_observer.observeApp(win.pid);
             }
         }
     }
@@ -1796,7 +3237,17 @@ fn reconcileAppTabs(pid: i32) void {
     const on_screen = isVisibleOnScreen(focused_wid);
     log.debug("reconcile: on_screen={}", .{on_screen});
 
-    // Look for a managed window (in any workspace) with same PID and matching bounds
+    if (hasOnScreenMatchingManagedSibling(pid, focused_wid, focused_frame, sky, conn)) {
+        log.debug("reconcile: on-screen sibling matches focused wid={d}, treating as new window", .{focused_wid});
+        addNewWindow(pid, focused_wid);
+        retile();
+        return;
+    }
+
+    // Look for a managed off-screen window (in any workspace) with the same
+    // PID and matching bounds. Matching an on-screen sibling is not a native
+    // tab transition signal because standalone windows can share the same
+    // tiled frame during focus/create event races.
     var matching_wid: ?u32 = null;
     var matching_ws_id: u8 = 0;
     var matching_display_id: u32 = 0;
@@ -1804,11 +3255,19 @@ fn reconcileAppTabs(pid: i32) void {
         for (ws.windows.items) |wid| {
             if (g_store.get(wid)) |win| {
                 if (win.pid == pid) {
+                    const candidate_on_screen = isVisibleOnScreen(wid);
                     const matches = tabgroup.TabGroupManager.framesMatch(win.frame, focused_frame);
-                    log.debug("reconcile: candidate wid={d} ws={d} frame=({d:.0},{d:.0},{d:.0},{d:.0}) match={}", .{
-                        wid, ws.id, win.frame.x, win.frame.y, win.frame.width, win.frame.height, matches,
+                    log.debug("reconcile: candidate wid={d} ws={d} frame=({d:.0},{d:.0},{d:.0},{d:.0}) on_screen={} match={}", .{
+                        wid,
+                        ws.id,
+                        win.frame.x,
+                        win.frame.y,
+                        win.frame.width,
+                        win.frame.height,
+                        candidate_on_screen,
+                        matches,
                     });
-                    if (matches) {
+                    if (matches and !candidate_on_screen) {
                         matching_wid = wid;
                         matching_ws_id = ws.id;
                         matching_display_id = win.display_id;
