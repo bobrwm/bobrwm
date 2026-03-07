@@ -981,6 +981,7 @@ fn handleEvent(ev: *const event_mod.Event) void {
         .window_focused => {
             log.info("window focused pid={}", .{ev.pid});
             const removed_stale = cleanupWorkspaceWindowsForPid(ev.pid);
+            const removed_offscreen = cleanupOffscreenManagedWindows();
             const wid = shim.bw_ax_get_focused_window(ev.pid);
             if (wid != 0) {
                 if (g_store.get(wid) == null) {
@@ -997,15 +998,16 @@ fn handleEvent(ev: *const event_mod.Event) void {
                     }
                 }
             }
-            if (removed_stale) {
+            if (removed_stale or removed_offscreen) {
                 retile();
             }
         },
         .focused_window_changed => {
             log.info("focused window changed pid={}", .{ev.pid});
             const removed_stale = cleanupWorkspaceWindowsForPid(ev.pid);
+            const removed_offscreen = cleanupOffscreenManagedWindows();
             reconcileAppTabs(ev.pid);
-            if (removed_stale) {
+            if (removed_stale or removed_offscreen) {
                 retile();
             }
         },
@@ -1896,6 +1898,43 @@ fn cleanupWorkspaceWindowsForPid(pid: i32) bool {
             }
             if (already_queued) continue;
 
+            if (stale_count < stale_wids.len) {
+                stale_wids[stale_count] = wid;
+                stale_count += 1;
+            }
+        }
+    }
+
+    for (stale_wids[0..stale_count]) |wid| {
+        removeWindow(wid);
+    }
+
+    return stale_count > 0;
+}
+
+/// Remove managed windows that are no longer physically on-screen.
+///
+/// Some Electron apps (Discord) close-to-background without emitting AX
+/// destroy/minimize notifications. This catches those ghost entries.
+fn cleanupOffscreenManagedWindows() bool {
+    var stale_wids: [128]u32 = undefined;
+    var stale_count: usize = 0;
+
+    for (&g_workspaces.workspaces) |*ws| {
+        for (ws.windows.items) |wid| {
+            const win = g_store.get(wid) orelse continue;
+            if (shim.bw_is_window_on_screen(wid)) continue;
+
+            var already_queued = false;
+            for (stale_wids[0..stale_count]) |existing| {
+                if (existing == wid) {
+                    already_queued = true;
+                    break;
+                }
+            }
+            if (already_queued) continue;
+
+            log.info("cleanup: removing wid={d} pid={d} reason=offscreen", .{ wid, win.pid });
             if (stale_count < stale_wids.len) {
                 stale_wids[stale_count] = wid;
                 stale_count += 1;
