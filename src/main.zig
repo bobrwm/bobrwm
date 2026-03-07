@@ -2766,6 +2766,11 @@ fn cleanupOffscreenManagedWindows() bool {
     for (&g_workspaces.workspaces) |*ws| {
         for (ws.windows.items) |wid| {
             const win = g_store.get(wid) orelse continue;
+
+            // Tab-group members can be intentionally off-screen when a sibling
+            // tab is active; treating them as ghosts causes layout churn.
+            if (g_tab_groups.groupOf(wid) != null) continue;
+
             if (shim.bw_is_window_on_screen(wid)) continue;
 
             var already_queued = false;
