@@ -1,0 +1,38 @@
+name: Release
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: macos-15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install Zig
+        run: brew install zig
+
+      - name: Build
+        run: zig build -Doptimize=ReleaseFast --prefix /tmp/bobrwm
+
+      - name: Upload binary to release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          tar -czf /tmp/bobrwm-${TAG}-aarch64-macos.tar.gz -C /tmp/bobrwm .
+          gh release upload "$TAG" "/tmp/bobrwm-${TAG}-aarch64-macos.tar.gz"
+
+      - name: Dispatch to homebrew-tap
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_TOKEN }}
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          gh api repos/bobrwm/homebrew-tap/dispatches \
+            -f event_type=bottle \
+            -f "client_payload[tag]=$TAG"
