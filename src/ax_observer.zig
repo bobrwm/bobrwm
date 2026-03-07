@@ -9,12 +9,9 @@ const c = @cImport({
     @cInclude("ApplicationServices/ApplicationServices.h");
     @cInclude("dispatch/dispatch.h");
 });
-const shim = @cImport({
-    @cInclude("shim.h");
-});
+const shim = @import("shim_api.zig");
 
 extern fn _AXUIElementGetWindow(element: c.AXUIElementRef, wid: *u32) c.AXError;
-extern fn bw_emit_event(kind: u8, pid: i32, wid: u32) void;
 
 const max_observed_apps: usize = 128;
 const max_known_windows_per_app: usize = 256;
@@ -450,7 +447,7 @@ fn scanAppWindowsForNewEntries(pid: i32, observer: c.AXObserverRef) bool {
 
         found_new = true;
         registerWindowAXNotifications(observer, win, pid);
-        bw_emit_event(shim.BW_EVENT_WINDOW_CREATED, pid, wid);
+        shim.bw_emit_event(shim.BW_EVENT_WINDOW_CREATED, pid, wid);
     }
 
     return found_new;
@@ -537,7 +534,7 @@ fn retryResolveWid(context: ?*anyopaque) callconv(.c) void {
             return;
         };
         registerWindowAXNotifications(observer, element, ctx.pid);
-        bw_emit_event(shim.BW_EVENT_WINDOW_CREATED, ctx.pid, wid);
+        shim.bw_emit_event(shim.BW_EVENT_WINDOW_CREATED, ctx.pid, wid);
         releaseWidRetryCtx(ctx);
         return;
     }
@@ -602,7 +599,7 @@ fn axNotificationHandler(
         if (wid != 0) {
             if (!appTrackWindow(pid, wid)) return;
             registerWindowAXNotifications(observer, element, pid);
-            bw_emit_event(shim.BW_EVENT_WINDOW_CREATED, pid, wid);
+            shim.bw_emit_event(shim.BW_EVENT_WINDOW_CREATED, pid, wid);
             return;
         }
         // CGWindowID not assigned yet — schedule retries.
@@ -612,7 +609,7 @@ fn axNotificationHandler(
 
     if (isNotification(notification, strings.focused_window_changed_notification)) {
         // App-level (wid=0 in refcon): emit so Zig can reconcile tab groups.
-        bw_emit_event(shim.BW_EVENT_FOCUSED_WINDOW_CHANGED, pid, 0);
+        shim.bw_emit_event(shim.BW_EVENT_FOCUSED_WINDOW_CHANGED, pid, 0);
         return;
     }
 
@@ -620,15 +617,15 @@ fn axNotificationHandler(
 
     if (isNotification(notification, strings.destroyed_notification)) {
         appUntrackWindow(pid, wid);
-        bw_emit_event(shim.BW_EVENT_WINDOW_DESTROYED, pid, wid);
+        shim.bw_emit_event(shim.BW_EVENT_WINDOW_DESTROYED, pid, wid);
     } else if (isNotification(notification, strings.moved_notification)) {
-        bw_emit_event(shim.BW_EVENT_WINDOW_MOVED, pid, wid);
+        shim.bw_emit_event(shim.BW_EVENT_WINDOW_MOVED, pid, wid);
     } else if (isNotification(notification, strings.resized_notification)) {
-        bw_emit_event(shim.BW_EVENT_WINDOW_RESIZED, pid, wid);
+        shim.bw_emit_event(shim.BW_EVENT_WINDOW_RESIZED, pid, wid);
     } else if (isNotification(notification, strings.miniaturized_notification)) {
-        bw_emit_event(shim.BW_EVENT_WINDOW_MINIMIZED, pid, wid);
+        shim.bw_emit_event(shim.BW_EVENT_WINDOW_MINIMIZED, pid, wid);
     } else if (isNotification(notification, strings.deminiaturized_notification)) {
-        bw_emit_event(shim.BW_EVENT_WINDOW_DEMINIMIZED, pid, wid);
+        shim.bw_emit_event(shim.BW_EVENT_WINDOW_DEMINIMIZED, pid, wid);
     }
 }
 
@@ -664,7 +661,7 @@ fn primeObservedAppWindows(pid: i32, observer: c.AXObserverRef, app: c.AXUIEleme
         if (wid != 0) {
             if (!appTrackWindow(pid, wid)) continue;
             registerWindowAXNotifications(observer, win, pid);
-            bw_emit_event(shim.BW_EVENT_WINDOW_CREATED, pid, wid);
+            shim.bw_emit_event(shim.BW_EVENT_WINDOW_CREATED, pid, wid);
             continue;
         }
 
