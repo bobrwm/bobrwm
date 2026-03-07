@@ -98,9 +98,6 @@ bool bw_ax_is_trusted(void);
 
 // --- Source setup ---
 
-/// Set up shim-side runtime state after NSApp/workspace observer init.
-void bw_setup_sources(void);
-
 /// Signal the main run loop to drain the event ring.
 void bw_signal_waker(void);
 
@@ -148,14 +145,6 @@ bool bw_is_window_on_screen(uint32_t wid);
 /// Get all AX window IDs for a given PID (includes background tabs).
 /// Returns the number of entries written to `out`.
 uint32_t bw_get_app_window_ids(int32_t pid, uint32_t *out, uint32_t max_count);
-
-// --- Per-app AX observers ---
-
-/// Start watching a specific app for window events (move, resize, create, destroy).
-void bw_observe_app(int32_t pid);
-
-/// Stop watching a specific app (call on app termination).
-void bw_unobserve_app(int32_t pid);
 
 // --- Configurable keybinds ---
 

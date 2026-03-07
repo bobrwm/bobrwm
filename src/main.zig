@@ -20,6 +20,7 @@ const tabgroup = @import("tabgroup.zig");
 const config_mod = @import("config.zig");
 const statusbar = @import("statusbar.zig");
 const tile_preview = @import("tile_preview.zig");
+const ax_observer = @import("ax_observer.zig");
 const launchd = @import("launchd.zig");
 
 extern fn _AXUIElementGetWindow(element: c.AXUIElementRef, wid: *u32) c.AXError;
@@ -1464,7 +1465,8 @@ pub fn main() !void {
     initWorkspaceObservers();
 
     // -- Sources (observers, CGEventTap, waker, IPC) --
-    shim.bw_setup_sources();
+    ax_observer.init();
+    defer ax_observer.deinit();
     setupHotkeyEventTap();
     initWakerSource();
     initIpcSource(@intCast(g_ipc.fd));
@@ -1737,14 +1739,14 @@ fn handleEvent(ev: *const event_mod.Event) void {
         .app_launched => {
             log.info("app launched pid={}", .{ev.pid});
             discoverWindows();
-            shim.bw_observe_app(ev.pid);
+            ax_observer.observeApp(ev.pid);
             trackAppLaunchRetry(ev.pid);
             retile();
         },
         .app_terminated => {
             log.info("app terminated pid={}", .{ev.pid});
             untrackAppLaunchRetry(ev.pid);
-            shim.bw_unobserve_app(ev.pid);
+            ax_observer.unobserveApp(ev.pid);
             removeAppWindows(ev.pid);
             retile();
         },
@@ -1755,7 +1757,7 @@ fn handleEvent(ev: *const event_mod.Event) void {
             const wid = shim.bw_ax_get_focused_window(ev.pid);
             if (wid != 0) {
                 if (g_store.get(wid) == null) {
-                    shim.bw_observe_app(ev.pid);
+                    ax_observer.observeApp(ev.pid);
                     discoverWindows();
                     retile();
                 }
@@ -2013,7 +2015,7 @@ fn processAppLaunchRetries() bool {
 
     for (retry_pids[0..retry_count]) |pid| {
         log.info("app-launch-retry: retrying discovery for pid={d}", .{pid});
-        shim.bw_observe_app(pid);
+        ax_observer.observeApp(pid);
     }
     discoverWindows();
     return true;
@@ -2325,7 +2327,7 @@ fn discoverWindows() void {
     for (slice) |info| {
         // Observe the owning app even if this specific window is not yet
         // manageable (for example AX role/subrole is still pending).
-        shim.bw_observe_app(info.pid);
+        ax_observer.observeApp(info.pid);
 
         if (g_store.get(info.wid) != null) continue;
 
@@ -3034,7 +3036,7 @@ fn observeDiscoveredApps() void {
     for (&g_workspaces.workspaces) |*ws| {
         for (ws.windows.items) |wid| {
             if (g_store.get(wid)) |win| {
-                shim.bw_observe_app(win.pid);
+                ax_observer.observeApp(win.pid);
             }
         }
     }
