@@ -197,12 +197,17 @@ fn installPlist(path: []const u8, home: []const u8) Error!void {
         return error.PathTooLong;
     std.fs.cwd().makePath(agents_dir) catch {};
 
-    const plist = generatePlist() orelse return error.PlistWrite;
+    const alloc = std.heap.page_allocator;
+    const plist = generatePlist(alloc) orelse return error.PlistWrite;
+    defer alloc.free(plist);
     writeFile(path, plist) catch return error.PlistWrite;
 }
 
 fn ensurePlistUpToDate(path: []const u8) void {
-    const desired = generatePlist() orelse return;
+    const alloc = std.heap.page_allocator;
+    const desired = generatePlist(alloc) orelse return;
+    defer alloc.free(desired);
+
     const file = std.fs.cwd().openFile(path, .{}) catch return;
     defer file.close();
 
@@ -213,32 +218,32 @@ fn ensurePlistUpToDate(path: []const u8) void {
     }
 
     // Read existing and compare
-    const existing = file.readToEndAlloc(std.heap.page_allocator, 1024 * 64) catch return;
+    const existing = file.readToEndAlloc(alloc, 1024 * 64) catch return;
+    defer alloc.free(existing);
     if (!std.mem.eql(u8, existing, desired)) {
         writeFile(path, desired) catch {};
     }
 }
 
-fn generatePlist() ?[]const u8 {
-    const alloc = std.heap.page_allocator;
+fn generatePlist(alloc: std.mem.Allocator) ?[]u8 {
     const exe_path = std.fs.selfExePathAlloc(alloc) catch return null;
+    defer alloc.free(exe_path);
+
     const env_path = std.posix.getenv("PATH") orelse "/usr/local/bin:/usr/bin:/bin";
     const user = std.posix.getenv("USER") orelse "unknown";
 
-    var result: []const u8 = plist_template;
-    result = replaceAll(alloc, result, "{exe_path}", exe_path) orelse return null;
-    result = replaceAll(alloc, result, "{env_path}", env_path) orelse return null;
-    result = replaceAll(alloc, result, "{user}", user) orelse return null;
-    return result;
-}
+    var result = std.mem.replaceOwned(u8, alloc, plist_template, "{exe_path}", exe_path) catch return null;
+    errdefer alloc.free(result);
 
-fn replaceAll(alloc: std.mem.Allocator, haystack: []const u8, needle: []const u8, replacement: []const u8) ?[]const u8 {
-    var result = haystack;
-    while (std.mem.indexOf(u8, result, needle)) |idx| {
-        const before = result[0..idx];
-        const after = result[idx + needle.len ..];
-        result = std.mem.concat(alloc, u8, &.{ before, replacement, after }) catch return null;
-    }
+    const with_env = std.mem.replaceOwned(u8, alloc, result, "{env_path}", env_path) catch return null;
+    alloc.free(result);
+    result = with_env;
+
+    const with_user = std.mem.replaceOwned(u8, alloc, result, "{user}", user) catch return null;
+    alloc.free(result);
+    result = with_user;
+
+    std.debug.assert(result.len > 0);
     return result;
 }
 
