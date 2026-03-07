@@ -3039,36 +3039,36 @@ fn retileDisplay(display_id: u32) void {
         .height = display.h - @as(f64, @floatFromInt(@as(u32, outer.top) + @as(u32, outer.bottom))),
     };
 
+    const leaf_count = layoutLeafCount(root);
+    std.debug.assert(leaf_count > 0);
+
     var stack_buf: [256 * @sizeOf(layout.LayoutEntry)]u8 = undefined;
     var fba = std.heap.FixedBufferAllocator.init(&stack_buf);
     var entries: std.ArrayList(layout.LayoutEntry) = .{};
-    var entries_allocator = fba.allocator();
-    var using_heap_entries = false;
-    defer if (using_heap_entries) {
-        entries.deinit(g_allocator);
-    };
 
-    layout.applyLayout(root, frame, @floatFromInt(g_config.gaps.inner), &entries, entries_allocator) catch |err| {
-        if (err != error.OutOfMemory) return;
-
-        const leaf_count = layoutLeafCount(root);
-        std.debug.assert(leaf_count > 0);
-
-        entries = .{};
+    if (leaf_count <= 256) {
+        const allocator = fba.allocator();
+        entries.ensureTotalCapacity(allocator, leaf_count) catch {
+            log.err("retile: stack reserve failed display={d} leaves={d}", .{ display_id, leaf_count });
+            return;
+        };
+        layout.applyLayout(root, frame, @floatFromInt(g_config.gaps.inner), &entries, allocator) catch {
+            log.err("retile: stack apply failed display={d} leaves={d}", .{ display_id, leaf_count });
+            return;
+        };
+    } else {
         entries.ensureTotalCapacity(g_allocator, leaf_count) catch {
-            log.err("retile: fallback reserve failed display={d} leaves={d}", .{ display_id, leaf_count });
+            log.err("retile: heap reserve failed display={d} leaves={d}", .{ display_id, leaf_count });
             return;
         };
-        using_heap_entries = true;
-        entries_allocator = g_allocator;
-
-        layout.applyLayout(root, frame, @floatFromInt(g_config.gaps.inner), &entries, entries_allocator) catch {
-            log.err("retile: fallback apply failed display={d} leaves={d}", .{ display_id, leaf_count });
+        defer entries.deinit(g_allocator);
+        layout.applyLayout(root, frame, @floatFromInt(g_config.gaps.inner), &entries, g_allocator) catch {
+            log.err("retile: heap apply failed display={d} leaves={d}", .{ display_id, leaf_count });
             return;
         };
-
-        log.warn("retile: stack layout buffer overflowed display={d} leaves={d}", .{ display_id, leaf_count });
-    };
+        log.warn("retile: using heap layout buffer display={d} leaves={d}", .{ display_id, leaf_count });
+    }
+    std.debug.assert(entries.items.len == leaf_count);
 
     for (entries.items) |entry| {
         const win = g_store.get(entry.wid) orelse continue;
