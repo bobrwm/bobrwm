@@ -989,6 +989,36 @@ fn manageStateForWindow(pid: i32, wid: u32) u8 {
     return if (is_standard) shim.BW_MANAGE_READY else shim.BW_MANAGE_REJECT;
 }
 
+/// Returns true when a still-pending window has AXUnknown role/subrole metadata.
+/// These windows are often transient host placeholders that should not be tiled
+/// by the timeout fallback path.
+fn isUnknownPendingRoleWindow(pid: i32, wid: u32) bool {
+    std.debug.assert(pid > 0);
+    std.debug.assert(wid > 0);
+
+    const win = findAxWindow(pid, wid) orelse return false;
+    defer c.CFRelease(@ptrCast(win));
+
+    const ax = ensureAxStrings() orelse return false;
+    var role_any: c.CFTypeRef = null;
+    const role_err = c.AXUIElementCopyAttributeValue(win, ax.role_attr, @ptrCast(&role_any));
+    if (role_err != c.kAXErrorSuccess or role_any == null) return false;
+    defer c.CFRelease(role_any.?);
+
+    const role_is_unknown = c.CFEqual(role_any.?, @ptrCast(ax.unknown_role)) != 0;
+    if (role_is_unknown) return true;
+
+    const role_is_window = c.CFEqual(role_any.?, @ptrCast(ax.window_role)) != 0;
+    if (!role_is_window) return false;
+
+    var subrole_any: c.CFTypeRef = null;
+    const subrole_err = c.AXUIElementCopyAttributeValue(win, ax.subrole_attr, @ptrCast(&subrole_any));
+    if (subrole_err != c.kAXErrorSuccess or subrole_any == null) return false;
+    defer c.CFRelease(subrole_any.?);
+
+    return c.CFEqual(subrole_any.?, @ptrCast(ax.unknown_subrole)) != 0;
+}
+
 /// Legacy management predicate: true for READY or PENDING states.
 export fn bw_should_manage_window(pid: i32, wid: u32) bool {
     const state = manageStateForWindow(pid, wid);
@@ -2241,6 +2271,10 @@ fn processPendingRoleWindows() bool {
     for (candidates[0..candidate_count]) |candidate| {
         if (candidate.from_timeout) {
             const timeout_ms = @as(u64, role_poll_attempts_max) * role_poll_interval_ms;
+            if (isUnknownPendingRoleWindow(candidate.pid, candidate.wid)) {
+                log.info("pending-role: timeout pid={d} wid={d} after {d}ms with AXUnknown metadata, skipping legacy fallback", .{ candidate.pid, candidate.wid, timeout_ms });
+                continue;
+            }
             log.info("pending-role: timeout pid={d} wid={d} after {d}ms, applying legacy fallback", .{ candidate.pid, candidate.wid, timeout_ms });
             if (addNewWindowLegacyPendingFallback(candidate.pid, candidate.wid)) {
                 added_any = true;
@@ -2354,6 +2388,8 @@ fn processDeferredWindowCandidates() bool {
 fn discoverWindows() void {
     var buf: [256]shim.bw_window_info = undefined;
     const count = shim.bw_discover_windows(&buf, 256);
+    var observed_pids: [128]i32 = undefined;
+    var observed_pid_count: usize = 0;
 
     // Sort windows by current x-position so the BSP tree order matches
     // their on-screen placement. Without this, windows discovered in
@@ -2366,9 +2402,25 @@ fn discoverWindows() void {
     }.lessThan);
 
     for (slice) |info| {
+        std.debug.assert(info.pid > 0);
+
+        var already_observed = false;
+        for (observed_pids[0..observed_pid_count]) |observed_pid| {
+            if (observed_pid == info.pid) {
+                already_observed = true;
+                break;
+            }
+        }
+
         // Observe the owning app even if this specific window is not yet
         // manageable (for example AX role/subrole is still pending).
-        ax_observer.observeApp(info.pid);
+        if (!already_observed) {
+            ax_observer.observeApp(info.pid);
+            if (observed_pid_count < observed_pids.len) {
+                observed_pids[observed_pid_count] = info.pid;
+                observed_pid_count += 1;
+            }
+        }
 
         if (g_store.get(info.wid) != null) continue;
 
@@ -2788,21 +2840,15 @@ fn removeAppWindows(pid: i32) void {
     // Also collect suppressed tab members from the store
     var store_it = g_store.windows.iterator();
     while (store_it.next()) |entry| {
-        if (entry.value_ptr.pid == pid and n < wids.len) {
-            var already = false;
-            for (wids[0..n]) |existing| {
-                if (existing == entry.key_ptr.*) {
-                    already = true;
-                    break;
-                }
-            }
-            if (!already) {
-                wids[n] = entry.key_ptr.*;
-                ws_ids[n] = entry.value_ptr.workspace_id;
-                display_ids[n] = entry.value_ptr.display_id;
-                n += 1;
-            }
-        }
+        const wid = entry.key_ptr.*;
+        if (entry.value_ptr.pid != pid) continue;
+        if (!g_tab_groups.isSuppressed(wid)) continue;
+        if (n >= wids.len) continue;
+
+        wids[n] = wid;
+        ws_ids[n] = entry.value_ptr.workspace_id;
+        display_ids[n] = entry.value_ptr.display_id;
+        n += 1;
     }
 
     for (wids[0..n], ws_ids[0..n], display_ids[0..n]) |wid, ws_id, display_id| {
@@ -2825,6 +2871,7 @@ fn cleanupWorkspaceWindowsForPid(pid: i32) bool {
 
     var stale_wids: [128]u32 = undefined;
     var stale_count: usize = 0;
+    var truncated = false;
 
     for (&g_workspaces.workspaces) |*ws| {
         for (ws.windows.items) |wid| {
@@ -2843,20 +2890,17 @@ fn cleanupWorkspaceWindowsForPid(pid: i32) bool {
 
             if (!should_remove) continue;
 
-            var already_queued = false;
-            for (stale_wids[0..stale_count]) |existing| {
-                if (existing == wid) {
-                    already_queued = true;
-                    break;
-                }
-            }
-            if (already_queued) continue;
-
             if (stale_count < stale_wids.len) {
                 stale_wids[stale_count] = wid;
                 stale_count += 1;
+            } else {
+                truncated = true;
             }
         }
+    }
+
+    if (truncated) {
+        log.warn("cleanup: stale-wid batch truncated pid={d} queued={d}", .{ pid, stale_count });
     }
 
     for (stale_wids[0..stale_count]) |wid| {
@@ -2873,6 +2917,7 @@ fn cleanupWorkspaceWindowsForPid(pid: i32) bool {
 fn cleanupOffscreenManagedWindows() bool {
     var stale_wids: [128]u32 = undefined;
     var stale_count: usize = 0;
+    var truncated = false;
 
     for (&g_workspaces.workspaces) |*ws| {
         for (ws.windows.items) |wid| {
@@ -2884,21 +2929,18 @@ fn cleanupOffscreenManagedWindows() bool {
 
             if (shim.bw_is_window_on_screen(wid)) continue;
 
-            var already_queued = false;
-            for (stale_wids[0..stale_count]) |existing| {
-                if (existing == wid) {
-                    already_queued = true;
-                    break;
-                }
-            }
-            if (already_queued) continue;
-
             log.info("cleanup: removing wid={d} pid={d} reason=offscreen", .{ wid, win.pid });
             if (stale_count < stale_wids.len) {
                 stale_wids[stale_count] = wid;
                 stale_count += 1;
+            } else {
+                truncated = true;
             }
         }
+    }
+
+    if (truncated) {
+        log.warn("cleanup: offscreen batch truncated queued={d}", .{stale_count});
     }
 
     for (stale_wids[0..stale_count]) |wid| {
@@ -3009,6 +3051,13 @@ fn reconcileDisplayChange() void {
     }
 }
 
+fn layoutLeafCount(node: layout.Node) usize {
+    return switch (node) {
+        .leaf => 1,
+        .split => |split| layoutLeafCount(split.left) + layoutLeafCount(split.right),
+    };
+}
+
 fn retileDisplay(display_id: u32) void {
     const ws_id = activeWorkspaceIdForDisplay(display_id);
     const root_ptr = layoutRootPtr(ws_id, display_id) orelse return;
@@ -3024,11 +3073,36 @@ fn retileDisplay(display_id: u32) void {
         .height = display.h - @as(f64, @floatFromInt(@as(u32, outer.top) + @as(u32, outer.bottom))),
     };
 
-    var buf: [256 * @sizeOf(layout.LayoutEntry)]u8 = undefined;
-    var fba = std.heap.FixedBufferAllocator.init(&buf);
+    const leaf_count = layoutLeafCount(root);
+    std.debug.assert(leaf_count > 0);
+
+    var stack_buf: [256 * @sizeOf(layout.LayoutEntry)]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&stack_buf);
     var entries: std.ArrayList(layout.LayoutEntry) = .{};
 
-    layout.applyLayout(root, frame, @floatFromInt(g_config.gaps.inner), &entries, fba.allocator()) catch return;
+    if (leaf_count <= 256) {
+        const allocator = fba.allocator();
+        entries.ensureTotalCapacity(allocator, leaf_count) catch {
+            log.err("retile: stack reserve failed display={d} leaves={d}", .{ display_id, leaf_count });
+            return;
+        };
+        layout.applyLayout(root, frame, @floatFromInt(g_config.gaps.inner), &entries, allocator) catch {
+            log.err("retile: stack apply failed display={d} leaves={d}", .{ display_id, leaf_count });
+            return;
+        };
+    } else {
+        entries.ensureTotalCapacity(g_allocator, leaf_count) catch {
+            log.err("retile: heap reserve failed display={d} leaves={d}", .{ display_id, leaf_count });
+            return;
+        };
+        defer entries.deinit(g_allocator);
+        layout.applyLayout(root, frame, @floatFromInt(g_config.gaps.inner), &entries, g_allocator) catch {
+            log.err("retile: heap apply failed display={d} leaves={d}", .{ display_id, leaf_count });
+            return;
+        };
+        log.warn("retile: using heap layout buffer display={d} leaves={d}", .{ display_id, leaf_count });
+    }
+    std.debug.assert(entries.items.len == leaf_count);
 
     for (entries.items) |entry| {
         const win = g_store.get(entry.wid) orelse continue;
