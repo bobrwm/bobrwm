@@ -989,6 +989,36 @@ fn manageStateForWindow(pid: i32, wid: u32) u8 {
     return if (is_standard) shim.BW_MANAGE_READY else shim.BW_MANAGE_REJECT;
 }
 
+/// Returns true when a still-pending window has AXUnknown role/subrole metadata.
+/// These windows are often transient host placeholders that should not be tiled
+/// by the timeout fallback path.
+fn isUnknownPendingRoleWindow(pid: i32, wid: u32) bool {
+    std.debug.assert(pid > 0);
+    std.debug.assert(wid > 0);
+
+    const win = findAxWindow(pid, wid) orelse return false;
+    defer c.CFRelease(@ptrCast(win));
+
+    const ax = ensureAxStrings() orelse return false;
+    var role_any: c.CFTypeRef = null;
+    const role_err = c.AXUIElementCopyAttributeValue(win, ax.role_attr, @ptrCast(&role_any));
+    if (role_err != c.kAXErrorSuccess or role_any == null) return false;
+    defer c.CFRelease(role_any.?);
+
+    const role_is_unknown = c.CFEqual(role_any.?, @ptrCast(ax.unknown_role)) != 0;
+    if (role_is_unknown) return true;
+
+    const role_is_window = c.CFEqual(role_any.?, @ptrCast(ax.window_role)) != 0;
+    if (!role_is_window) return false;
+
+    var subrole_any: c.CFTypeRef = null;
+    const subrole_err = c.AXUIElementCopyAttributeValue(win, ax.subrole_attr, @ptrCast(&subrole_any));
+    if (subrole_err != c.kAXErrorSuccess or subrole_any == null) return false;
+    defer c.CFRelease(subrole_any.?);
+
+    return c.CFEqual(subrole_any.?, @ptrCast(ax.unknown_subrole)) != 0;
+}
+
 /// Legacy management predicate: true for READY or PENDING states.
 export fn bw_should_manage_window(pid: i32, wid: u32) bool {
     const state = manageStateForWindow(pid, wid);
@@ -2241,6 +2271,10 @@ fn processPendingRoleWindows() bool {
     for (candidates[0..candidate_count]) |candidate| {
         if (candidate.from_timeout) {
             const timeout_ms = @as(u64, role_poll_attempts_max) * role_poll_interval_ms;
+            if (isUnknownPendingRoleWindow(candidate.pid, candidate.wid)) {
+                log.info("pending-role: timeout pid={d} wid={d} after {d}ms with AXUnknown metadata, skipping legacy fallback", .{ candidate.pid, candidate.wid, timeout_ms });
+                continue;
+            }
             log.info("pending-role: timeout pid={d} wid={d} after {d}ms, applying legacy fallback", .{ candidate.pid, candidate.wid, timeout_ms });
             if (addNewWindowLegacyPendingFallback(candidate.pid, candidate.wid)) {
                 added_any = true;
