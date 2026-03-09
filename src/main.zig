@@ -130,22 +130,30 @@ const WindowRoleState = enum {
 const PendingRoleWindow = struct {
     pid: i32,
     attempts_remaining: u8,
+    workspace_id: u8,
+    display_id: u32,
 };
 
 const PendingRoleCandidate = struct {
     pid: i32,
     wid: u32,
     from_timeout: bool,
+    workspace_id: u8,
+    display_id: u32,
 };
 
 const DeferredWindowCandidate = struct {
     pid: i32,
     attempts_remaining: u8,
+    workspace_id: u8,
+    display_id: u32,
 };
 
 const DeferredWindowPromotion = struct {
     pid: i32,
     wid: u32,
+    workspace_id: u8,
+    display_id: u32,
 };
 
 const PendingRoleWindowMap = std.AutoHashMap(u32, PendingRoleWindow);
@@ -2092,17 +2100,23 @@ fn processAppLaunchRetries() bool {
     return true;
 }
 
-fn trackPendingRoleWindow(pid: i32, wid: u32) void {
+fn trackPendingRoleWindow(pid: i32, wid: u32, workspace_id: u8, display_id: u32) void {
     std.debug.assert(wid != 0);
+    std.debug.assert(workspace_id > 0 and workspace_id <= workspace_mod.max_workspaces);
+    std.debug.assert(display_id != 0);
     if (g_store.get(wid) != null) return;
 
     if (g_pending_role_windows.getPtr(wid)) |pending| {
         pending.pid = pid;
         pending.attempts_remaining = role_poll_attempts_max;
+        pending.workspace_id = workspace_id;
+        pending.display_id = display_id;
     } else {
         g_pending_role_windows.put(wid, .{
             .pid = pid,
             .attempts_remaining = role_poll_attempts_max,
+            .workspace_id = workspace_id,
+            .display_id = display_id,
         }) catch {
             log.err("pending-role: failed to track pid={d} wid={d}", .{ pid, wid });
             return;
@@ -2156,8 +2170,10 @@ fn untrackPendingRoleWindowsForPid(pid: i32) void {
     }
 }
 
-fn trackDeferredWindowCandidate(pid: i32, wid: u32) void {
+fn trackDeferredWindowCandidate(pid: i32, wid: u32, workspace_id: u8, display_id: u32) void {
     std.debug.assert(wid != 0);
+    std.debug.assert(workspace_id > 0 and workspace_id <= workspace_mod.max_workspaces);
+    std.debug.assert(display_id != 0);
     if (g_store.get(wid) != null) {
         if (g_deferred_window_candidates.remove(wid)) {
             refreshRolePolling();
@@ -2168,10 +2184,14 @@ fn trackDeferredWindowCandidate(pid: i32, wid: u32) void {
     if (g_deferred_window_candidates.getPtr(wid)) |candidate| {
         candidate.pid = pid;
         candidate.attempts_remaining = role_poll_attempts_max;
+        candidate.workspace_id = workspace_id;
+        candidate.display_id = display_id;
     } else {
         g_deferred_window_candidates.put(wid, .{
             .pid = pid,
             .attempts_remaining = role_poll_attempts_max,
+            .workspace_id = workspace_id,
+            .display_id = display_id,
         }) catch {
             log.err("deferred-window: failed to track pid={d} wid={d}", .{ pid, wid });
             return;
@@ -2194,14 +2214,14 @@ fn untrackDeferredWindowCandidatesForPid(pid: i32) void {
     }
 }
 
-fn addNewWindowLegacyPendingFallback(pid: i32, wid: u32) bool {
+fn addNewWindowLegacyPendingFallback(pid: i32, wid: u32, workspace_id: u8, display_id: u32) bool {
     std.debug.assert(wid != 0);
     if (g_store.get(wid) != null) return false;
     if (!shim.bw_should_manage_window(pid, wid)) {
         log.debug("pending-role: fallback rejected pid={d} wid={d}", .{ pid, wid });
         return false;
     }
-    return addNewWindowManaged(pid, wid);
+    return addNewWindowManagedWithAssignment(pid, wid, workspace_id, display_id);
 }
 
 fn processPendingRoleWindows() bool {
@@ -2238,7 +2258,13 @@ fn processPendingRoleWindows() bool {
                 }
                 remove_wids[remove_count] = wid;
                 remove_count += 1;
-                candidates[candidate_count] = .{ .pid = pid, .wid = wid, .from_timeout = false };
+                candidates[candidate_count] = .{
+                    .pid = pid,
+                    .wid = wid,
+                    .from_timeout = false,
+                    .workspace_id = entry.value_ptr.workspace_id,
+                    .display_id = entry.value_ptr.display_id,
+                };
                 candidate_count += 1;
             },
             .pending => {
@@ -2249,7 +2275,13 @@ fn processPendingRoleWindows() bool {
                     }
                     remove_wids[remove_count] = wid;
                     remove_count += 1;
-                    candidates[candidate_count] = .{ .pid = pid, .wid = wid, .from_timeout = true };
+                    candidates[candidate_count] = .{
+                        .pid = pid,
+                        .wid = wid,
+                        .from_timeout = true,
+                        .workspace_id = entry.value_ptr.workspace_id,
+                        .display_id = entry.value_ptr.display_id,
+                    };
                     candidate_count += 1;
                 } else {
                     entry.value_ptr.attempts_remaining -= 1;
@@ -2276,13 +2308,13 @@ fn processPendingRoleWindows() bool {
                 continue;
             }
             log.info("pending-role: timeout pid={d} wid={d} after {d}ms, applying legacy fallback", .{ candidate.pid, candidate.wid, timeout_ms });
-            if (addNewWindowLegacyPendingFallback(candidate.pid, candidate.wid)) {
+            if (addNewWindowLegacyPendingFallback(candidate.pid, candidate.wid, candidate.workspace_id, candidate.display_id)) {
                 added_any = true;
             }
             continue;
         }
 
-        if (addNewWindowManaged(candidate.pid, candidate.wid)) {
+        if (addNewWindowManagedWithAssignment(candidate.pid, candidate.wid, candidate.workspace_id, candidate.display_id)) {
             added_any = true;
         }
     }
@@ -2348,7 +2380,12 @@ fn processDeferredWindowCandidates() bool {
                     }
                     remove_wids[remove_count] = wid;
                     remove_count += 1;
-                    promote_candidates[promote_count] = .{ .pid = pid, .wid = wid };
+                    promote_candidates[promote_count] = .{
+                        .pid = pid,
+                        .wid = wid,
+                        .workspace_id = entry.value_ptr.workspace_id,
+                        .display_id = entry.value_ptr.display_id,
+                    };
                     promote_count += 1;
                 } else {
                     if (entry.value_ptr.attempts_remaining == 0) {
@@ -2378,7 +2415,7 @@ fn processDeferredWindowCandidates() bool {
 
     var added_any = false;
     for (promote_candidates[0..promote_count]) |candidate| {
-        if (addNewWindowManaged(candidate.pid, candidate.wid)) {
+        if (addNewWindowManagedWithAssignment(candidate.pid, candidate.wid, candidate.workspace_id, candidate.display_id)) {
             added_any = true;
         }
     }
@@ -2424,13 +2461,17 @@ fn discoverWindows() void {
 
         if (g_store.get(info.wid) != null) continue;
 
+        const frame: window_mod.Window.Frame = .{ .x = info.x, .y = info.y, .width = info.w, .height = info.h };
+        const display_id = displayIdForFrame(frame);
+        const target_ws = resolveWorkspace(info.pid, display_id);
+
         switch (windowRoleState(info.pid, info.wid)) {
             .reject => {
                 untrackPendingRoleWindow(info.wid);
                 continue;
             },
             .pending => {
-                trackPendingRoleWindow(info.pid, info.wid);
+                trackPendingRoleWindow(info.pid, info.wid, target_ws.id, display_id);
                 continue;
             },
             .ready => {
@@ -2438,10 +2479,6 @@ fn discoverWindows() void {
                 untrackDeferredWindowCandidate(info.wid);
             },
         }
-
-        const frame: window_mod.Window.Frame = .{ .x = info.x, .y = info.y, .width = info.w, .height = info.h };
-        const display_id = displayIdForFrame(frame);
-        const target_ws = resolveWorkspace(info.pid, display_id);
 
         const win = window_mod.Window{
             .wid = info.wid,
@@ -2514,8 +2551,10 @@ fn hasOnScreenMatchingManagedSibling(
     return false;
 }
 
-fn addNewWindowManaged(pid: i32, wid: u32) bool {
+fn addNewWindowManagedWithAssignment(pid: i32, wid: u32, workspace_id: u8, assigned_display_id: u32) bool {
     log.debug("addNewWindow: pid={d} wid={d}", .{ pid, wid });
+    std.debug.assert(workspace_id > 0 and workspace_id <= workspace_mod.max_workspaces);
+    std.debug.assert(assigned_display_id != 0);
     if (g_store.get(wid) != null) {
         log.debug("addNewWindow: already in store, skipping", .{});
         return false;
@@ -2528,7 +2567,7 @@ fn addNewWindowManaged(pid: i32, wid: u32) bool {
     // reports them as on-screen. Queue them for bounded re-evaluation rather
     // than dropping them on a one-shot check.
     if (!on_screen) {
-        trackDeferredWindowCandidate(pid, wid);
+        trackDeferredWindowCandidate(pid, wid, workspace_id, assigned_display_id);
         log.info("addNewWindow: deferred pid={d} wid={d} while off-screen", .{ pid, wid });
         return false;
     }
@@ -2540,7 +2579,7 @@ fn addNewWindowManaged(pid: i32, wid: u32) bool {
     if (tryFormTabGroupOnCreate(pid, wid)) return false;
 
     var window_frame: window_mod.Window.Frame = .{ .x = 0, .y = 0, .width = 0, .height = 0 };
-    var display_id = focusedDisplayId();
+    var display_id = assigned_display_id;
     if (g_sky) |sky| {
         var rect: skylight.CGRect = undefined;
         if (sky.getWindowBounds(sky.mainConnectionID(), wid, &rect) == 0) {
@@ -2565,7 +2604,7 @@ fn addNewWindowManaged(pid: i32, wid: u32) bool {
         break :blk !axCanResize(ax_win, ax);
     };
 
-    const ws = resolveWorkspace(pid, display_id);
+    const ws = g_workspaces.get(workspace_id) orelse resolveWorkspace(pid, display_id);
     const mode: window_mod.WindowMode = if (should_float) .floating else .tiled;
 
     const win = window_mod.Window{
@@ -2599,6 +2638,12 @@ fn addNewWindowManaged(pid: i32, wid: u32) bool {
     return true;
 }
 
+fn addNewWindowManaged(pid: i32, wid: u32) bool {
+    const display_id = focusedDisplayId();
+    const ws = resolveWorkspace(pid, display_id);
+    return addNewWindowManagedWithAssignment(pid, wid, ws.id, display_id);
+}
+
 fn addNewWindow(pid: i32, wid: u32) void {
     std.debug.assert(wid != 0);
     if (g_store.get(wid) != null) return;
@@ -2614,8 +2659,10 @@ fn addNewWindow(pid: i32, wid: u32) void {
             _ = addNewWindowManaged(pid, wid);
         },
         .pending => {
-            trackPendingRoleWindow(pid, wid);
-            trackDeferredWindowCandidate(pid, wid);
+            const display_id = focusedDisplayId();
+            const ws = resolveWorkspace(pid, display_id);
+            trackPendingRoleWindow(pid, wid, ws.id, display_id);
+            trackDeferredWindowCandidate(pid, wid, ws.id, display_id);
             log.debug("addNewWindow: role gate pending pid={d} wid={d}", .{ pid, wid });
         },
     }
@@ -3531,10 +3578,21 @@ fn switchWorkspace(target_id: u8) void {
     // Hide current workspace windows (move to safe bottom corner, keep size)
     const hctx = HideCtx.init(display_id);
     for (old_ws.windows.items) |wid| {
-        if (g_store.get(wid)) |win| {
+        // Workspace lists track tab-group leaders; hide the currently visible
+        // tab so apps like Ghostty do not remain visible across workspaces.
+        const visible_wid = g_tab_groups.resolveActive(wid);
+        const hide_wid = if (g_store.get(visible_wid) != null) visible_wid else wid;
+        if (g_store.get(hide_wid)) |win| {
             if (win.display_id != display_id) continue;
-            hctx.hide(win.pid, wid);
+            hctx.hide(win.pid, hide_wid);
         }
+    }
+    var pending_it = g_pending_role_windows.iterator();
+    while (pending_it.next()) |entry| {
+        const pending = entry.value_ptr.*;
+        if (pending.workspace_id != current_id) continue;
+        if (pending.display_id != display_id) continue;
+        hctx.hide(pending.pid, entry.key_ptr.*);
     }
 
     // Activate target
