@@ -7,6 +7,11 @@ pub const Direction = enum {
     vertical,
 };
 
+pub const LayoutKind = enum {
+    bsp,
+    monocle,
+};
+
 pub const Node = union(enum) {
     leaf: Leaf,
     split: *Split,
@@ -136,7 +141,15 @@ fn removeFrom(node: Node, wid: WindowId, allocator: std.mem.Allocator) ?Node {
 
 /// Walk the BSP tree and compute a frame for each leaf window within the given
 /// bounding frame. `inner_gap` is the pixel spacing inserted between adjacent windows.
-pub fn applyLayout(node: Node, frame: Frame, inner_gap: f64, output: *std.ArrayList(LayoutEntry), allocator: std.mem.Allocator) !void {
+pub fn applyLayout(kind: LayoutKind, node: Node, frame: Frame, inner_gap: f64, output: *std.ArrayList(LayoutEntry), allocator: std.mem.Allocator) !void {
+    std.debug.assert(inner_gap >= 0);
+    switch (kind) {
+        .bsp => try applyBsp(node, frame, inner_gap, output, allocator),
+        .monocle => try applyMonocle(node, frame, output, allocator),
+    }
+}
+
+fn applyBsp(node: Node, frame: Frame, inner_gap: f64, output: *std.ArrayList(LayoutEntry), allocator: std.mem.Allocator) !void {
     switch (node) {
         .leaf => |leaf| {
             try output.append(allocator, .{ .wid = leaf.wid, .frame = frame });
@@ -161,8 +174,20 @@ pub fn applyLayout(node: Node, frame: Frame, inner_gap: f64, output: *std.ArrayL
                 },
             }
 
-            try applyLayout(split.left, left_frame, inner_gap, output, allocator);
-            try applyLayout(split.right, right_frame, inner_gap, output, allocator);
+            try applyBsp(split.left, left_frame, inner_gap, output, allocator);
+            try applyBsp(split.right, right_frame, inner_gap, output, allocator);
+        },
+    }
+}
+
+fn applyMonocle(node: Node, frame: Frame, output: *std.ArrayList(LayoutEntry), allocator: std.mem.Allocator) !void {
+    switch (node) {
+        .leaf => |leaf| {
+            try output.append(allocator, .{ .wid = leaf.wid, .frame = frame });
+        },
+        .split => |split| {
+            try applyMonocle(split.left, frame, output, allocator);
+            try applyMonocle(split.right, frame, output, allocator);
         },
     }
 }

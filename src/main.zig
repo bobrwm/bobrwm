@@ -1714,6 +1714,11 @@ fn findDropTargetInLayout(
 }
 
 fn updateWindowMovePreview(wid: u32) void {
+    if (g_config.layout != .bsp) {
+        clearDragPreview();
+        return;
+    }
+
     const win = g_store.get(wid) orelse {
         clearDragPreview();
         return;
@@ -3133,7 +3138,7 @@ fn retileDisplay(display_id: u32) void {
             log.err("retile: stack reserve failed display={d} leaves={d}", .{ display_id, leaf_count });
             return;
         };
-        layout.applyLayout(root, frame, @floatFromInt(g_config.gaps.inner), &entries, allocator) catch {
+        layout.applyLayout(g_config.layout, root, frame, @floatFromInt(g_config.gaps.inner), &entries, allocator) catch {
             log.err("retile: stack apply failed display={d} leaves={d}", .{ display_id, leaf_count });
             return;
         };
@@ -3143,7 +3148,7 @@ fn retileDisplay(display_id: u32) void {
             return;
         };
         defer entries.deinit(g_allocator);
-        layout.applyLayout(root, frame, @floatFromInt(g_config.gaps.inner), &entries, g_allocator) catch {
+        layout.applyLayout(g_config.layout, root, frame, @floatFromInt(g_config.gaps.inner), &entries, g_allocator) catch {
             log.err("retile: heap apply failed display={d} leaves={d}", .{ display_id, leaf_count });
             return;
         };

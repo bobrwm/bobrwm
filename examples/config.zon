@@ -1,6 +1,11 @@
 // bobrwm config — place at ~/.config/bobrwm/config.zon
 // or pass via: bobrwm -c /path/to/config.zon
 .{
+    // Layout algorithm.
+    // .layout = .bsp,
+    // Or fullscreen-per-window tiling:
+    // .layout = .monocle,
+
     // Gaps between windows (pixels). Omit or set to 0 for no gaps.
     // .gaps = .{
     //     .inner = 4,

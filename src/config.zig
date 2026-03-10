@@ -4,6 +4,7 @@
 
 const std = @import("std");
 const shim = @import("shim_api.zig");
+const layout_mod = @import("layout.zig");
 
 const log = std.log.scoped(.config);
 
@@ -16,6 +17,7 @@ pub const Config = struct {
     workspace_assignments: []const WorkspaceAssignment = &.{},
     workspace_names: []const []const u8 = &.{},
     gaps: Gaps = .{},
+    layout: layout_mod.LayoutKind = .bsp,
 
     /// Look up the assigned workspace for a given bundle identifier.
     pub fn workspaceForApp(self: *const Config, bundle_id: []const u8) ?u8 {
@@ -321,6 +323,7 @@ test "default config" {
     try t.expectEqual(@as(usize, 0), cfg.workspace_names.len);
     try t.expectEqual(@as(u16, 0), cfg.gaps.inner);
     try t.expectEqual(@as(u16, 0), cfg.gaps.outer.left);
+    try t.expectEqual(layout_mod.LayoutKind.bsp, cfg.layout);
 }
 
 test "default_keybinds" {
@@ -378,6 +381,7 @@ test "loadFromPath: examples/config.zon" {
 
     try t.expectEqual(@as(usize, 0), cfg.workspace_assignments.len);
     try t.expectEqual(@as(u16, 0), cfg.gaps.inner);
+    try t.expectEqual(layout_mod.LayoutKind.bsp, cfg.layout);
 }
 
 test "loadFromPath: custom zon" {
@@ -398,6 +402,7 @@ test "loadFromPath: custom zon" {
         \\        .{ .app_id = "com.test.App", .workspace = 3 },
         \\    },
         \\    .gaps = .{ .inner = 8, .outer = .{ .left = 4, .right = 4, .top = 4, .bottom = 4 } },
+        \\    .layout = .monocle,
         \\}
     ;
 
@@ -422,4 +427,5 @@ test "loadFromPath: custom zon" {
     try t.expectEqual(@as(u16, 4), cfg.gaps.outer.right);
     try t.expectEqual(@as(u16, 4), cfg.gaps.outer.top);
     try t.expectEqual(@as(u16, 4), cfg.gaps.outer.bottom);
+    try t.expectEqual(layout_mod.LayoutKind.monocle, cfg.layout);
 }

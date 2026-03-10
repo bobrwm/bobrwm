@@ -81,6 +81,14 @@ Pixel spacing between and around windows:
 },
 ```
 
+### Layout
+
+Choose the tiling algorithm:
+
+```zon
+.layout = .bsp, // .bsp | .monocle
+```
+
 ### Workspace Assignments
 
 Pin apps to specific workspaces by bundle ID:
