@@ -20,6 +20,9 @@ bobrwm query workspaces   # IPC: list workspaces
 bobrwm query displays     # IPC: list connected displays
 bobrwm query apps         # IPC: list observed apps
 bobrwm move-to-display 2  # IPC: move focused window to display slot 2
+bobrwm bsp ratio rel 0.05 # IPC: grow focused parent split ratio
+bobrwm bsp mirror horizontal
+bobrwm bsp rotate 90
 ```
 
 ### Logging
