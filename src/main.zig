@@ -1669,6 +1669,27 @@ fn parseAxis(arg: []const u8) ?layout.Direction {
     return null;
 }
 
+const FocusedLayoutContext = struct {
+    focused_wid: u32,
+    focused_win: window_mod.Window,
+    root: *layout.Node,
+};
+
+fn focusedLayoutContext() ?FocusedLayoutContext {
+    const ws = g_workspaces.active();
+    const focused_wid = ws.focused_wid orelse return null;
+    const focused_win = g_store.get(focused_wid) orelse return null;
+    const root_ptr = layoutRootPtr(focused_win.workspace_id, focused_win.display_id) orelse return null;
+    if (root_ptr.*) |*root| {
+        return .{
+            .focused_wid = focused_wid,
+            .focused_win = focused_win,
+            .root = root,
+        };
+    }
+    return null;
+}
+
 fn clearDragPreview() void {
     if (g_drag_preview.visible) {
         tile_preview.hide();
@@ -3158,36 +3179,36 @@ fn retileDisplay(display_id: u32) void {
         .height = display.h - @as(f64, @floatFromInt(@as(u32, outer.top) + @as(u32, outer.bottom))),
     };
 
-    const leaf_count = layoutLeafCount(root);
-    std.debug.assert(leaf_count > 0);
+    const window_count = layout.windowCount(root);
+    std.debug.assert(window_count > 0);
 
     var stack_buf: [256 * @sizeOf(layout.LayoutEntry)]u8 = undefined;
     var fba = std.heap.FixedBufferAllocator.init(&stack_buf);
     var entries: std.ArrayList(layout.LayoutEntry) = .{};
 
-    if (leaf_count <= 256) {
+    if (window_count <= 256) {
         const allocator = fba.allocator();
-        entries.ensureTotalCapacity(allocator, leaf_count) catch {
-            log.err("retile: stack reserve failed display={d} leaves={d}", .{ display_id, leaf_count });
+        entries.ensureTotalCapacity(allocator, window_count) catch {
+            log.err("retile: stack reserve failed display={d} windows={d}", .{ display_id, window_count });
             return;
         };
         layout.applyLayout(g_config.layout, root, frame, @floatFromInt(g_config.gaps.inner), &entries, allocator) catch {
-            log.err("retile: stack apply failed display={d} leaves={d}", .{ display_id, leaf_count });
+            log.err("retile: stack apply failed display={d} windows={d}", .{ display_id, window_count });
             return;
         };
     } else {
-        entries.ensureTotalCapacity(g_allocator, leaf_count) catch {
-            log.err("retile: heap reserve failed display={d} leaves={d}", .{ display_id, leaf_count });
+        entries.ensureTotalCapacity(g_allocator, window_count) catch {
+            log.err("retile: heap reserve failed display={d} windows={d}", .{ display_id, window_count });
             return;
         };
         defer entries.deinit(g_allocator);
         layout.applyLayout(g_config.layout, root, frame, @floatFromInt(g_config.gaps.inner), &entries, g_allocator) catch {
-            log.err("retile: heap apply failed display={d} leaves={d}", .{ display_id, leaf_count });
+            log.err("retile: heap apply failed display={d} windows={d}", .{ display_id, window_count });
             return;
         };
-        log.warn("retile: using heap layout buffer display={d} leaves={d}", .{ display_id, leaf_count });
+        log.warn("retile: using heap layout buffer display={d} windows={d}", .{ display_id, window_count });
     }
-    std.debug.assert(entries.items.len == leaf_count);
+    std.debug.assert(entries.items.len == window_count);
 
     for (entries.items) |entry| {
         const win = g_store.get(entry.wid) orelse continue;
@@ -3884,29 +3905,16 @@ fn ipcDispatch(cmd: []const u8, client_fd: posix.socket_t) void {
             ipc.writeResponse(client_fd, "err: invalid ratio delta\n");
             return;
         };
-        const ws = g_workspaces.active();
-        const wid = ws.focused_wid orelse {
-            ipc.writeResponse(client_fd, "err: no focused window\n");
+        const ctx = focusedLayoutContext() orelse {
+            ipc.writeResponse(client_fd, "err: no focused managed window\n");
             return;
         };
-        const win = g_store.get(wid) orelse {
-            ipc.writeResponse(client_fd, "err: focused window not managed\n");
+        if (!layout.adjustParentRatio(ctx.root, ctx.focused_wid, delta)) {
+            ipc.writeResponse(client_fd, "err: no parent split\n");
             return;
-        };
-        const root_ptr = layoutRootPtr(win.workspace_id, win.display_id) orelse {
-            ipc.writeResponse(client_fd, "err: no layout root\n");
-            return;
-        };
-        if (root_ptr.*) |*root| {
-            if (!layout.adjustParentRatio(root, wid, delta)) {
-                ipc.writeResponse(client_fd, "err: no parent split\n");
-                return;
-            }
-            retileDisplay(win.display_id);
-            ipc.writeResponse(client_fd, "ok\n");
-        } else {
-            ipc.writeResponse(client_fd, "err: no layout root\n");
         }
+        retileDisplay(ctx.focused_win.display_id);
+        ipc.writeResponse(client_fd, "ok\n");
     } else if (std.mem.startsWith(u8, cmd, "bsp insert-mode ")) {
         const arg = cmd["bsp insert-mode ".len..];
         if (std.mem.eql(u8, arg, "split")) {
@@ -3939,29 +3947,16 @@ fn ipcDispatch(cmd: []const u8, client_fd: posix.socket_t) void {
             ipc.writeResponse(client_fd, "err: invalid ratio\n");
             return;
         };
-        const ws = g_workspaces.active();
-        const wid = ws.focused_wid orelse {
-            ipc.writeResponse(client_fd, "err: no focused window\n");
+        const ctx = focusedLayoutContext() orelse {
+            ipc.writeResponse(client_fd, "err: no focused managed window\n");
             return;
         };
-        const win = g_store.get(wid) orelse {
-            ipc.writeResponse(client_fd, "err: focused window not managed\n");
+        if (!layout.setParentRatio(ctx.root, ctx.focused_wid, ratio)) {
+            ipc.writeResponse(client_fd, "err: no parent split\n");
             return;
-        };
-        const root_ptr = layoutRootPtr(win.workspace_id, win.display_id) orelse {
-            ipc.writeResponse(client_fd, "err: no layout root\n");
-            return;
-        };
-        if (root_ptr.*) |*root| {
-            if (!layout.setParentRatio(root, wid, ratio)) {
-                ipc.writeResponse(client_fd, "err: no parent split\n");
-                return;
-            }
-            retileDisplay(win.display_id);
-            ipc.writeResponse(client_fd, "ok\n");
-        } else {
-            ipc.writeResponse(client_fd, "err: no layout root\n");
         }
+        retileDisplay(ctx.focused_win.display_id);
+        ipc.writeResponse(client_fd, "ok\n");
     } else if (std.mem.startsWith(u8, cmd, "bsp mirror ")) {
         const axis = parseAxis(cmd["bsp mirror ".len..]) orelse {
             ipc.writeResponse(client_fd, "err: expected horizontal|vertical\n");

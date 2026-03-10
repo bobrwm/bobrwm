@@ -12,12 +12,113 @@ pub const LayoutKind = enum {
     monocle,
 };
 
+pub const SplitMode = enum {
+    auto,
+    horizontal,
+    vertical,
+};
+
+pub const InsertChild = enum {
+    first,
+    second,
+};
+
+pub const InsertMode = enum {
+    split,
+    stack,
+};
+
+pub const InsertionPointPolicy = enum {
+    focused,
+    first,
+    last,
+    min_depth,
+};
+
+pub const InsertOptions = struct {
+    mode: InsertMode = .split,
+    split_mode: SplitMode,
+    child: InsertChild,
+    anchor_wid: ?WindowId = null,
+    root_frame: ?Frame = null,
+    inner_gap: f64 = 0,
+    split_ratio: f64 = 0.5,
+};
+
+const min_split_ratio: f64 = 0.1;
+const max_split_ratio: f64 = 0.9;
+
 pub const Node = union(enum) {
     leaf: Leaf,
     split: *Split,
 
     pub const Leaf = struct {
-        wid: WindowId,
+        windows: std.ArrayListUnmanaged(WindowId) = .empty,
+
+        pub fn initSingle(allocator: std.mem.Allocator, wid: WindowId) !Leaf {
+            var leaf: Leaf = .{};
+            try leaf.windows.append(allocator, wid);
+            return leaf;
+        }
+
+        pub fn deinit(self: *Leaf, allocator: std.mem.Allocator) void {
+            self.windows.deinit(allocator);
+            self.* = .{};
+        }
+
+        pub fn activeWid(self: *const Leaf) WindowId {
+            std.debug.assert(self.windows.items.len > 0);
+            return self.windows.items[0];
+        }
+
+        pub fn contains(self: *const Leaf, wid: WindowId) bool {
+            for (self.windows.items) |existing| {
+                if (existing == wid) return true;
+            }
+            return false;
+        }
+
+        pub fn appendOnTop(self: *Leaf, allocator: std.mem.Allocator, wid: WindowId) !void {
+            if (self.contains(wid)) return;
+            try self.windows.ensureUnusedCapacity(allocator, 1);
+            const len = self.windows.items.len;
+            self.windows.items.len = len + 1;
+            var index = len;
+            while (index > 0) : (index -= 1) {
+                self.windows.items[index] = self.windows.items[index - 1];
+            }
+            self.windows.items[0] = wid;
+        }
+
+        pub fn removeWid(self: *Leaf, wid: WindowId) bool {
+            for (self.windows.items, 0..) |existing, index| {
+                if (existing == wid) {
+                    _ = self.windows.orderedRemove(index);
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        pub fn promoteWid(self: *Leaf, wid: WindowId) bool {
+            for (self.windows.items, 0..) |existing, index| {
+                if (existing != wid) continue;
+                if (index == 0) return true;
+
+                const target = self.windows.items[index];
+                var shift = index;
+                while (shift > 0) : (shift -= 1) {
+                    self.windows.items[shift] = self.windows.items[shift - 1];
+                }
+                self.windows.items[0] = target;
+                return true;
+            }
+            return false;
+        }
+
+        pub fn count(self: *const Leaf) usize {
+            return self.windows.items.len;
+        }
     };
 };
 
@@ -444,7 +545,11 @@ pub fn applyLayout(kind: LayoutKind, node: Node, frame: Frame, inner_gap: f64, o
 fn applyBsp(node: Node, frame: Frame, inner_gap: f64, output: *std.ArrayList(LayoutEntry), allocator: std.mem.Allocator) !void {
     switch (node) {
         .leaf => |leaf| {
-            try output.append(allocator, .{ .wid = leaf.wid, .frame = frame });
+            var idx = leaf.windows.items.len;
+            while (idx > 0) : (idx -= 1) {
+                const wid = leaf.windows.items[idx - 1];
+                try output.append(allocator, .{ .wid = wid, .frame = frame });
+            }
         },
         .split => |split| {
             const half_gap = inner_gap / 2.0;
@@ -475,7 +580,11 @@ fn applyBsp(node: Node, frame: Frame, inner_gap: f64, output: *std.ArrayList(Lay
 fn applyMonocle(node: Node, frame: Frame, output: *std.ArrayList(LayoutEntry), allocator: std.mem.Allocator) !void {
     switch (node) {
         .leaf => |leaf| {
-            try output.append(allocator, .{ .wid = leaf.wid, .frame = frame });
+            var idx = leaf.windows.items.len;
+            while (idx > 0) : (idx -= 1) {
+                const wid = leaf.windows.items[idx - 1];
+                try output.append(allocator, .{ .wid = wid, .frame = frame });
+            }
         },
         .split => |split| {
             try applyMonocle(split.left, frame, output, allocator);
