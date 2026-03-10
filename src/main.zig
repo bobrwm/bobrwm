@@ -520,7 +520,7 @@ var g_workspaces: workspace_mod.WorkspaceManager = undefined;
 var g_layout_roots: [workspace_mod.max_workspaces][workspace_mod.max_displays]?layout.Node = undefined;
 var g_displays: [workspace_mod.max_displays]DisplayInfo = undefined;
 var g_display_count: usize = 0;
-var g_next_split_dir: layout.Direction = .horizontal;
+var g_bsp_split_mode: layout.SplitMode = .auto;
 var g_tab_groups: tabgroup.TabGroupManager = undefined;
 var g_pending_role_windows: PendingRoleWindowMap = undefined;
 var g_deferred_window_candidates: DeferredWindowCandidateMap = undefined;
@@ -1469,6 +1469,7 @@ pub fn main() !void {
 
     // -- Config --
     g_config = config_mod.load(g_allocator, args.config_path);
+    g_bsp_split_mode = g_config.bsp_split;
     g_config.applyKeybinds();
 
     // -- Accessibility check --
@@ -1628,8 +1629,44 @@ fn removeFromLayout(workspace_id: u8, display_id: u32, wid: u32) void {
 
 fn insertIntoLayout(workspace_id: u8, display_id: u32, wid: u32) void {
     const root_ptr = layoutRootPtr(workspace_id, display_id) orelse return;
-    const updated = layout.insertWindow(root_ptr.*, wid, g_next_split_dir, g_allocator) catch return;
+    const anchor_wid = blk: {
+        const root = root_ptr.* orelse break :blk null;
+        switch (g_config.bsp_insert_point) {
+            .focused => {
+                const ws = g_workspaces.get(workspace_id) orelse break :blk null;
+                const focused_wid = ws.focused_wid orelse break :blk null;
+                if (focused_wid == wid) break :blk null;
+                break :blk focused_wid;
+            },
+            .first => break :blk layout.firstLeafWid(root),
+            .last => break :blk layout.lastLeafWid(root),
+            .min_depth => break :blk null,
+        }
+    };
+    const options: layout.InsertOptions = .{
+        .mode = g_config.bsp_insert_mode,
+        .split_mode = g_bsp_split_mode,
+        .child = g_config.new_window_split,
+        .anchor_wid = anchor_wid,
+        .root_frame = displayContentFrame(display_id),
+        .inner_gap = @floatFromInt(g_config.gaps.inner),
+        .split_ratio = g_config.bsp_split_ratio,
+    };
+    const updated = layout.insertWindow(root_ptr.*, wid, options, g_allocator) catch return;
     root_ptr.* = updated;
+}
+
+fn setLayoutLeafActive(workspace_id: u8, display_id: u32, wid: u32) void {
+    const root_ptr = layoutRootPtr(workspace_id, display_id) orelse return;
+    if (root_ptr.*) |*root| {
+        _ = layout.setLeafActive(root, wid);
+    }
+}
+
+fn parseAxis(arg: []const u8) ?layout.Direction {
+    if (std.mem.eql(u8, arg, "horizontal")) return .horizontal;
+    if (std.mem.eql(u8, arg, "vertical")) return .vertical;
+    return null;
 }
 
 fn clearDragPreview() void {
@@ -1671,12 +1708,13 @@ fn findDropTargetInLayout(
     std.debug.assert(inner_gap >= 0);
     switch (node) {
         .leaf => |leaf| {
-            if (leaf.wid == dragged_wid) return null;
+            if (leaf.contains(dragged_wid)) return null;
             if (!frameContainsPoint(frame, center_x, center_y)) return null;
-            const target = g_store.get(leaf.wid) orelse return null;
+            const active_wid = leaf.activeWid();
+            const target = g_store.get(active_wid) orelse return null;
             if (target.mode != .tiled or target.is_fullscreen) return null;
             if (target.workspace_id != workspace_id or target.display_id != display_id) return null;
-            return .{ .wid = leaf.wid, .frame = frame };
+            return .{ .wid = active_wid, .frame = frame };
         },
         .split => |split| {
             const half_gap = inner_gap / 2.0;
@@ -1852,6 +1890,7 @@ fn handleEvent(ev: *const event_mod.Event) void {
                     if (g_workspaces.get(win.workspace_id)) |ws| {
                         ws.focused_wid = leader;
                     }
+                    setLayoutLeafActive(win.workspace_id, win.display_id, wid);
                 }
             }
             if (removed_stale or removed_offscreen) {
@@ -1960,11 +1999,12 @@ fn handleEvent(ev: *const event_mod.Event) void {
         .hk_focus_up => focusDirection(.up),
         .hk_focus_down => focusDirection(.down),
         .hk_toggle_split => {
-            g_next_split_dir = switch (g_next_split_dir) {
+            g_bsp_split_mode = switch (g_bsp_split_mode) {
+                .auto => .horizontal,
                 .horizontal => .vertical,
                 .vertical => .horizontal,
             };
-            log.info("split direction: {s}", .{@tagName(g_next_split_dir)});
+            log.info("split mode: {s}", .{@tagName(g_bsp_split_mode)});
         },
         .hk_toggle_fullscreen => {
             const ws = g_workspaces.active();
@@ -3103,13 +3143,6 @@ fn reconcileDisplayChange() void {
     }
 }
 
-fn layoutLeafCount(node: layout.Node) usize {
-    return switch (node) {
-        .leaf => 1,
-        .split => |split| layoutLeafCount(split.left) + layoutLeafCount(split.right),
-    };
-}
-
 fn retileDisplay(display_id: u32) void {
     const ws_id = activeWorkspaceIdForDisplay(display_id);
     const root_ptr = layoutRootPtr(ws_id, display_id) orelse return;
@@ -3792,6 +3825,23 @@ fn focusDirection(dir: FocusDir) void {
             _ = shim.bw_ax_focus_window(win.pid, actual_wid);
             ws.focused_wid = wid; // track the leader
             setFocusedDisplay(win.display_id);
+            setLayoutLeafActive(win.workspace_id, win.display_id, actual_wid);
+        }
+        return;
+    }
+
+    const root_ptr = layoutRootPtr(focused.workspace_id, focused.display_id) orelse return;
+    const root = root_ptr.* orelse return;
+    const stack_forward = switch (dir) {
+        .left, .up => false,
+        .right, .down => true,
+    };
+    if (layout.stackNeighbor(root, focused_wid, stack_forward)) |stack_wid| {
+        if (g_store.get(stack_wid)) |win| {
+            _ = shim.bw_ax_focus_window(win.pid, stack_wid);
+            ws.focused_wid = stack_wid;
+            setFocusedDisplay(win.display_id);
+            setLayoutLeafActive(win.workspace_id, win.display_id, stack_wid);
         }
     }
 }
@@ -3822,11 +3872,193 @@ fn ipcDispatch(cmd: []const u8, client_fd: posix.socket_t) void {
         retile();
         ipc.writeResponse(client_fd, "ok\n");
     } else if (std.mem.eql(u8, cmd, "toggle-split")) {
-        g_next_split_dir = switch (g_next_split_dir) {
+        g_bsp_split_mode = switch (g_bsp_split_mode) {
+            .auto => .horizontal,
             .horizontal => .vertical,
             .vertical => .horizontal,
         };
         ipc.writeResponse(client_fd, "ok\n");
+    } else if (std.mem.startsWith(u8, cmd, "bsp ratio rel ")) {
+        const arg = cmd["bsp ratio rel ".len..];
+        const delta = std.fmt.parseFloat(f64, arg) catch {
+            ipc.writeResponse(client_fd, "err: invalid ratio delta\n");
+            return;
+        };
+        const ws = g_workspaces.active();
+        const wid = ws.focused_wid orelse {
+            ipc.writeResponse(client_fd, "err: no focused window\n");
+            return;
+        };
+        const win = g_store.get(wid) orelse {
+            ipc.writeResponse(client_fd, "err: focused window not managed\n");
+            return;
+        };
+        const root_ptr = layoutRootPtr(win.workspace_id, win.display_id) orelse {
+            ipc.writeResponse(client_fd, "err: no layout root\n");
+            return;
+        };
+        if (root_ptr.*) |*root| {
+            if (!layout.adjustParentRatio(root, wid, delta)) {
+                ipc.writeResponse(client_fd, "err: no parent split\n");
+                return;
+            }
+            retileDisplay(win.display_id);
+            ipc.writeResponse(client_fd, "ok\n");
+        } else {
+            ipc.writeResponse(client_fd, "err: no layout root\n");
+        }
+    } else if (std.mem.startsWith(u8, cmd, "bsp insert-mode ")) {
+        const arg = cmd["bsp insert-mode ".len..];
+        if (std.mem.eql(u8, arg, "split")) {
+            g_config.bsp_insert_mode = .split;
+        } else if (std.mem.eql(u8, arg, "stack")) {
+            g_config.bsp_insert_mode = .stack;
+        } else {
+            ipc.writeResponse(client_fd, "err: expected split|stack\n");
+            return;
+        }
+        ipc.writeResponse(client_fd, "ok\n");
+    } else if (std.mem.startsWith(u8, cmd, "bsp insert-point ")) {
+        const arg = cmd["bsp insert-point ".len..];
+        if (std.mem.eql(u8, arg, "focused")) {
+            g_config.bsp_insert_point = .focused;
+        } else if (std.mem.eql(u8, arg, "first")) {
+            g_config.bsp_insert_point = .first;
+        } else if (std.mem.eql(u8, arg, "last")) {
+            g_config.bsp_insert_point = .last;
+        } else if (std.mem.eql(u8, arg, "min_depth")) {
+            g_config.bsp_insert_point = .min_depth;
+        } else {
+            ipc.writeResponse(client_fd, "err: expected focused|first|last|min_depth\n");
+            return;
+        }
+        ipc.writeResponse(client_fd, "ok\n");
+    } else if (std.mem.startsWith(u8, cmd, "bsp ratio abs ")) {
+        const arg = cmd["bsp ratio abs ".len..];
+        const ratio = std.fmt.parseFloat(f64, arg) catch {
+            ipc.writeResponse(client_fd, "err: invalid ratio\n");
+            return;
+        };
+        const ws = g_workspaces.active();
+        const wid = ws.focused_wid orelse {
+            ipc.writeResponse(client_fd, "err: no focused window\n");
+            return;
+        };
+        const win = g_store.get(wid) orelse {
+            ipc.writeResponse(client_fd, "err: focused window not managed\n");
+            return;
+        };
+        const root_ptr = layoutRootPtr(win.workspace_id, win.display_id) orelse {
+            ipc.writeResponse(client_fd, "err: no layout root\n");
+            return;
+        };
+        if (root_ptr.*) |*root| {
+            if (!layout.setParentRatio(root, wid, ratio)) {
+                ipc.writeResponse(client_fd, "err: no parent split\n");
+                return;
+            }
+            retileDisplay(win.display_id);
+            ipc.writeResponse(client_fd, "ok\n");
+        } else {
+            ipc.writeResponse(client_fd, "err: no layout root\n");
+        }
+    } else if (std.mem.startsWith(u8, cmd, "bsp mirror ")) {
+        const axis = parseAxis(cmd["bsp mirror ".len..]) orelse {
+            ipc.writeResponse(client_fd, "err: expected horizontal|vertical\n");
+            return;
+        };
+        const ws = g_workspaces.active();
+        const wid = ws.focused_wid orelse {
+            ipc.writeResponse(client_fd, "err: no focused window\n");
+            return;
+        };
+        const win = g_store.get(wid) orelse {
+            ipc.writeResponse(client_fd, "err: focused window not managed\n");
+            return;
+        };
+        const root_ptr = layoutRootPtr(win.workspace_id, win.display_id) orelse {
+            ipc.writeResponse(client_fd, "err: no layout root\n");
+            return;
+        };
+        if (root_ptr.*) |*root| {
+            layout.mirror(root, axis);
+            retileDisplay(win.display_id);
+            ipc.writeResponse(client_fd, "ok\n");
+        } else {
+            ipc.writeResponse(client_fd, "err: no layout root\n");
+        }
+    } else if (std.mem.eql(u8, cmd, "bsp equalize")) {
+        const ws = g_workspaces.active();
+        const wid = ws.focused_wid orelse {
+            ipc.writeResponse(client_fd, "err: no focused window\n");
+            return;
+        };
+        const win = g_store.get(wid) orelse {
+            ipc.writeResponse(client_fd, "err: focused window not managed\n");
+            return;
+        };
+        const root_ptr = layoutRootPtr(win.workspace_id, win.display_id) orelse {
+            ipc.writeResponse(client_fd, "err: no layout root\n");
+            return;
+        };
+        if (root_ptr.*) |*root| {
+            layout.equalize(root, null, g_config.bsp_split_ratio);
+            retileDisplay(win.display_id);
+            ipc.writeResponse(client_fd, "ok\n");
+        } else {
+            ipc.writeResponse(client_fd, "err: no layout root\n");
+        }
+    } else if (std.mem.eql(u8, cmd, "bsp balance")) {
+        const ws = g_workspaces.active();
+        const wid = ws.focused_wid orelse {
+            ipc.writeResponse(client_fd, "err: no focused window\n");
+            return;
+        };
+        const win = g_store.get(wid) orelse {
+            ipc.writeResponse(client_fd, "err: focused window not managed\n");
+            return;
+        };
+        const root_ptr = layoutRootPtr(win.workspace_id, win.display_id) orelse {
+            ipc.writeResponse(client_fd, "err: no layout root\n");
+            return;
+        };
+        if (root_ptr.*) |*root| {
+            _ = layout.balance(root, null);
+            retileDisplay(win.display_id);
+            ipc.writeResponse(client_fd, "ok\n");
+        } else {
+            ipc.writeResponse(client_fd, "err: no layout root\n");
+        }
+    } else if (std.mem.startsWith(u8, cmd, "bsp rotate ")) {
+        const arg = cmd["bsp rotate ".len..];
+        const degrees = std.fmt.parseInt(i32, arg, 10) catch {
+            ipc.writeResponse(client_fd, "err: invalid degrees\n");
+            return;
+        };
+        if (!(degrees == 90 or degrees == 180 or degrees == 270)) {
+            ipc.writeResponse(client_fd, "err: expected 90|180|270\n");
+            return;
+        }
+        const ws = g_workspaces.active();
+        const wid = ws.focused_wid orelse {
+            ipc.writeResponse(client_fd, "err: no focused window\n");
+            return;
+        };
+        const win = g_store.get(wid) orelse {
+            ipc.writeResponse(client_fd, "err: focused window not managed\n");
+            return;
+        };
+        const root_ptr = layoutRootPtr(win.workspace_id, win.display_id) orelse {
+            ipc.writeResponse(client_fd, "err: no layout root\n");
+            return;
+        };
+        if (root_ptr.*) |*root| {
+            layout.rotate(root, degrees);
+            retileDisplay(win.display_id);
+            ipc.writeResponse(client_fd, "ok\n");
+        } else {
+            ipc.writeResponse(client_fd, "err: no layout root\n");
+        }
     } else if (std.mem.startsWith(u8, cmd, "focus-workspace ")) {
         const arg = cmd["focus-workspace ".len..];
         const n = std.fmt.parseInt(u8, arg, 10) catch {

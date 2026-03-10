@@ -33,38 +33,315 @@ pub const LayoutEntry = struct {
     frame: Frame,
 };
 
-/// Insert a window into the BSP tree by splitting the first matching leaf (or the
-/// rightmost leaf if no specific target). The existing leaf becomes the left child
-/// of a new split; the new window becomes the right child.
+/// Insert a window into the BSP tree by splitting a selected leaf. If
+/// `anchor_wid` is present, that matching leaf is split. Otherwise the
+/// shallowest leaf is split (yabai-style minimum-depth insertion).
+///
+/// `InsertChild.second` keeps existing content as first child and places the
+/// new window in second child (right/bottom). `InsertChild.first` does the
+/// inverse (left/top).
 /// If root is null, returns a new leaf node.
-pub fn insertWindow(root: ?Node, wid: WindowId, dir: Direction, allocator: std.mem.Allocator) !Node {
+pub fn insertWindow(root: ?Node, wid: WindowId, options: InsertOptions, allocator: std.mem.Allocator) !Node {
     if (root) |r| {
-        return insertInto(r, wid, dir, allocator);
+        var updated = r;
+        var target_leaf: ?*Node = null;
+        if (options.anchor_wid) |target_wid| {
+            target_leaf = findLeafNode(&updated, target_wid);
+        }
+
+        if (target_leaf == null) {
+            var shallowest_depth: usize = std.math.maxInt(usize);
+            findShallowestLeaf(&updated, 0, &target_leaf, &shallowest_depth);
+        }
+        std.debug.assert(target_leaf != null);
+        if (options.mode == .stack) {
+            switch (target_leaf.?.*) {
+                .leaf => |*leaf| {
+                    try leaf.appendOnTop(allocator, wid);
+                    return updated;
+                },
+                .split => unreachable,
+            }
+        }
+
+        const split_direction = resolveSplitDirection(updated, target_leaf.?, options);
+        const split_ratio = clampedSplitRatio(options.split_ratio);
+        try splitLeafNode(target_leaf.?, wid, split_direction, options.child, split_ratio, allocator);
+        return updated;
     }
-    return .{ .leaf = .{ .wid = wid } };
+    return .{ .leaf = try Node.Leaf.initSingle(allocator, wid) };
 }
 
-fn insertInto(node: Node, wid: WindowId, dir: Direction, allocator: std.mem.Allocator) !Node {
-    switch (node) {
+fn findLeafNode(node: *Node, target_wid: WindowId) ?*Node {
+    switch (node.*) {
         .leaf => |leaf| {
-            const split = try allocator.create(Split);
-            split.* = .{
-                .direction = dir,
-                .ratio = 0.5,
-                .left = .{ .leaf = leaf },
-                .right = .{ .leaf = .{ .wid = wid } },
-            };
-            return .{ .split = split };
+            if (leaf.contains(target_wid)) return node;
+            return null;
         },
         .split => |split| {
-            const next_dir: Direction = switch (split.direction) {
-                .horizontal => .vertical,
-                .vertical => .horizontal,
-            };
-            split.right = try insertInto(split.right, wid, next_dir, allocator);
-            return node;
+            if (findLeafNode(&split.left, target_wid)) |leaf| return leaf;
+            return findLeafNode(&split.right, target_wid);
         },
     }
+}
+
+fn resolveSplitDirection(root: Node, target_leaf: *Node, options: InsertOptions) Direction {
+    const target_wid = switch (target_leaf.*) {
+        .leaf => |leaf| leaf.activeWid(),
+        .split => unreachable,
+    };
+    switch (options.split_mode) {
+        .horizontal => return .horizontal,
+        .vertical => return .vertical,
+        .auto => {
+            std.debug.assert(options.inner_gap >= 0);
+            const root_frame = options.root_frame orelse return .horizontal;
+            const target_frame = findLeafFrameByWindowId(root, root_frame, options.inner_gap, target_wid) orelse return .horizontal;
+            return if (target_frame.width >= target_frame.height) .horizontal else .vertical;
+        },
+    }
+}
+
+fn findLeafFrameByWindowId(node: Node, frame: Frame, inner_gap: f64, target_wid: WindowId) ?Frame {
+    return switch (node) {
+        .leaf => |leaf| if (leaf.contains(target_wid)) frame else null,
+        .split => |split| {
+            const half_gap = inner_gap / 2.0;
+            var left_frame = frame;
+            var right_frame = frame;
+
+            switch (split.direction) {
+                .horizontal => {
+                    const left_width = frame.width * split.ratio;
+                    left_frame.width = left_width - half_gap;
+                    right_frame.x = frame.x + left_width + half_gap;
+                    right_frame.width = frame.width - left_width - half_gap;
+                },
+                .vertical => {
+                    const top_height = frame.height * split.ratio;
+                    left_frame.height = top_height - half_gap;
+                    right_frame.y = frame.y + top_height + half_gap;
+                    right_frame.height = frame.height - top_height - half_gap;
+                },
+            }
+
+            if (findLeafFrameByWindowId(split.left, left_frame, inner_gap, target_wid)) |found| return found;
+            return findLeafFrameByWindowId(split.right, right_frame, inner_gap, target_wid);
+        },
+    };
+}
+
+fn findShallowestLeaf(node: *Node, depth: usize, out_leaf: *?*Node, out_depth: *usize) void {
+    switch (node.*) {
+        .leaf => {
+            if (depth < out_depth.*) {
+                out_leaf.* = node;
+                out_depth.* = depth;
+            }
+        },
+        .split => |split| {
+            findShallowestLeaf(&split.left, depth + 1, out_leaf, out_depth);
+            findShallowestLeaf(&split.right, depth + 1, out_leaf, out_depth);
+        },
+    }
+}
+
+fn splitLeafNode(node: *Node, wid: WindowId, split_direction: Direction, child: InsertChild, split_ratio: f64, allocator: std.mem.Allocator) !void {
+    std.debug.assert(split_ratio >= min_split_ratio and split_ratio <= max_split_ratio);
+    switch (node.*) {
+        .leaf => |leaf| {
+            var left_child: Node = undefined;
+            var right_child: Node = undefined;
+            switch (child) {
+                .first => {
+                    left_child = .{ .leaf = try Node.Leaf.initSingle(allocator, wid) };
+                    right_child = .{ .leaf = leaf };
+                },
+                .second => {
+                    left_child = .{ .leaf = leaf };
+                    right_child = .{ .leaf = try Node.Leaf.initSingle(allocator, wid) };
+                },
+            }
+            const split = try allocator.create(Split);
+            split.* = .{
+                .direction = split_direction,
+                .ratio = split_ratio,
+                .left = left_child,
+                .right = right_child,
+            };
+            node.* = .{ .split = split };
+        },
+        .split => unreachable,
+    }
+}
+
+fn clampedSplitRatio(value: f64) f64 {
+    return std.math.clamp(value, min_split_ratio, max_split_ratio);
+}
+
+pub fn firstLeafWid(root: Node) WindowId {
+    return switch (root) {
+        .leaf => |leaf| leaf.activeWid(),
+        .split => |split| firstLeafWid(split.left),
+    };
+}
+
+pub fn lastLeafWid(root: Node) WindowId {
+    return switch (root) {
+        .leaf => |leaf| leaf.activeWid(),
+        .split => |split| lastLeafWid(split.right),
+    };
+}
+
+pub fn setLeafActive(root: *Node, wid: WindowId) bool {
+    switch (root.*) {
+        .leaf => |*leaf| return leaf.promoteWid(wid),
+        .split => |split| {
+            if (setLeafActive(&split.left, wid)) return true;
+            return setLeafActive(&split.right, wid);
+        },
+    }
+}
+
+pub fn stackNeighbor(root: Node, wid: WindowId, forward: bool) ?WindowId {
+    return switch (root) {
+        .leaf => |leaf| {
+            if (!leaf.contains(wid)) return null;
+            const count = leaf.count();
+            if (count <= 1) return null;
+            for (leaf.windows.items, 0..) |existing, index| {
+                if (existing != wid) continue;
+                const next_index = if (forward)
+                    (index + 1) % count
+                else
+                    if (index == 0) count - 1 else index - 1;
+                return leaf.windows.items[next_index];
+            }
+            return null;
+        },
+        .split => |split| stackNeighbor(split.left, wid, forward) orelse stackNeighbor(split.right, wid, forward),
+    };
+}
+
+pub fn adjustParentRatio(root: *Node, wid: WindowId, delta: f64) bool {
+    const split = findParentSplit(root, wid) orelse return false;
+    split.ratio = clampedSplitRatio(split.ratio + delta);
+    return true;
+}
+
+pub fn setParentRatio(root: *Node, wid: WindowId, ratio: f64) bool {
+    const split = findParentSplit(root, wid) orelse return false;
+    split.ratio = clampedSplitRatio(ratio);
+    return true;
+}
+
+pub fn mirror(root: *Node, axis: Direction) void {
+    switch (root.*) {
+        .leaf => {},
+        .split => |split| {
+            mirror(&split.left, axis);
+            mirror(&split.right, axis);
+            if (split.direction == axis) {
+                const tmp = split.left;
+                split.left = split.right;
+                split.right = tmp;
+            }
+        },
+    }
+}
+
+pub fn equalize(root: *Node, axis: ?Direction, ratio: f64) void {
+    const clamped = clampedSplitRatio(ratio);
+    switch (root.*) {
+        .leaf => {},
+        .split => |split| {
+            equalize(&split.left, axis, clamped);
+            equalize(&split.right, axis, clamped);
+            if (axis == null or split.direction == axis.?) {
+                split.ratio = clamped;
+            }
+        },
+    }
+}
+
+pub fn balance(root: *Node, axis: ?Direction) usize {
+    switch (root.*) {
+        .leaf => |leaf| return leaf.count(),
+        .split => |split| {
+            const left_count = balance(&split.left, axis);
+            const right_count = balance(&split.right, axis);
+            const total = left_count + right_count;
+            if (total > 0 and (axis == null or split.direction == axis.?)) {
+                split.ratio = clampedSplitRatio(@as(f64, @floatFromInt(left_count)) / @as(f64, @floatFromInt(total)));
+            }
+            return total;
+        },
+    }
+}
+
+pub fn rotate(root: *Node, degrees: i32) void {
+    switch (root.*) {
+        .leaf => {},
+        .split => |split| {
+            rotate(&split.left, degrees);
+            rotate(&split.right, degrees);
+            switch (degrees) {
+                90 => {
+                    split.direction = toggleDirection(split.direction);
+                    const tmp = split.left;
+                    split.left = split.right;
+                    split.right = tmp;
+                    split.ratio = 1.0 - split.ratio;
+                },
+                180 => {
+                    const tmp = split.left;
+                    split.left = split.right;
+                    split.right = tmp;
+                    split.ratio = 1.0 - split.ratio;
+                },
+                270 => {
+                    split.direction = toggleDirection(split.direction);
+                },
+                else => {},
+            }
+        },
+    }
+}
+
+fn toggleDirection(direction: Direction) Direction {
+    return switch (direction) {
+        .horizontal => .vertical,
+        .vertical => .horizontal,
+    };
+}
+
+fn findParentSplit(node: *Node, wid: WindowId) ?*Split {
+    switch (node.*) {
+        .leaf => return null,
+        .split => |split| {
+            if (nodeContainsWid(split.left, wid)) {
+                return findParentSplit(&split.left, wid) orelse split;
+            }
+            if (nodeContainsWid(split.right, wid)) {
+                return findParentSplit(&split.right, wid) orelse split;
+            }
+            return null;
+        },
+    }
+}
+
+fn nodeContainsWid(node: Node, wid: WindowId) bool {
+    return switch (node) {
+        .leaf => |leaf| leaf.contains(wid),
+        .split => |split| nodeContainsWid(split.left, wid) or nodeContainsWid(split.right, wid),
+    };
+}
+
+pub fn windowCount(node: Node) usize {
+    return switch (node) {
+        .leaf => |leaf| leaf.count(),
+        .split => |split| windowCount(split.left) + windowCount(split.right),
+    };
 }
 
 /// Remove a window from the BSP tree. Returns the collapsed tree, or null if the
@@ -78,29 +355,39 @@ pub fn removeWindow(root: Node, wid: WindowId, allocator: std.mem.Allocator) ?No
 /// Returns true when both windows were present and swapped.
 pub fn swapWindowIds(root: *Node, first_wid: WindowId, second_wid: WindowId) bool {
     if (first_wid == second_wid) return false;
-    var first_leaf: ?*Node.Leaf = null;
-    var second_leaf: ?*Node.Leaf = null;
-    findLeaf(root, first_wid, &first_leaf);
-    findLeaf(root, second_wid, &second_leaf);
-    if (first_leaf == null or second_leaf == null) return false;
+    var first_slot: ?LeafSlot = null;
+    var second_slot: ?LeafSlot = null;
+    findLeafSlot(root, first_wid, &first_slot);
+    findLeafSlot(root, second_wid, &second_slot);
+    if (first_slot == null or second_slot == null) return false;
 
-    const first = first_leaf.?;
-    const second = second_leaf.?;
-    const first_id = first.wid;
-    first.wid = second.wid;
-    second.wid = first_id;
+    const first = first_slot.?;
+    const second = second_slot.?;
+    const first_id = first.leaf.windows.items[first.index];
+    first.leaf.windows.items[first.index] = second.leaf.windows.items[second.index];
+    second.leaf.windows.items[second.index] = first_id;
     return true;
 }
 
-fn findLeaf(node: *Node, wid: WindowId, out: *?*Node.Leaf) void {
+const LeafSlot = struct {
+    leaf: *Node.Leaf,
+    index: usize,
+};
+
+fn findLeafSlot(node: *Node, wid: WindowId, out: *?LeafSlot) void {
     if (out.* != null) return;
     switch (node.*) {
         .leaf => |*leaf| {
-            if (leaf.wid == wid) out.* = leaf;
+            for (leaf.windows.items, 0..) |existing, index| {
+                if (existing == wid) {
+                    out.* = .{ .leaf = leaf, .index = index };
+                    return;
+                }
+            }
         },
         .split => |split| {
-            findLeaf(&split.left, wid, out);
-            findLeaf(&split.right, wid, out);
+            findLeafSlot(&split.left, wid, out);
+            findLeafSlot(&split.right, wid, out);
         },
     }
 }
@@ -108,8 +395,13 @@ fn findLeaf(node: *Node, wid: WindowId, out: *?*Node.Leaf) void {
 fn removeFrom(node: Node, wid: WindowId, allocator: std.mem.Allocator) ?Node {
     switch (node) {
         .leaf => |leaf| {
-            if (leaf.wid == wid) return null;
-            return node;
+            var updated_leaf = leaf;
+            if (!updated_leaf.removeWid(wid)) return node;
+            if (updated_leaf.count() == 0) {
+                updated_leaf.deinit(allocator);
+                return null;
+            }
+            return .{ .leaf = updated_leaf };
         },
         .split => |split| {
             const left_result = removeFrom(split.left, wid, allocator);
@@ -195,7 +487,10 @@ fn applyMonocle(node: Node, frame: Frame, output: *std.ArrayList(LayoutEntry), a
 /// Recursively free all Split nodes in the tree.
 pub fn destroyTree(node: Node, allocator: std.mem.Allocator) void {
     switch (node) {
-        .leaf => {},
+        .leaf => |leaf| {
+            var mutable_leaf = leaf;
+            mutable_leaf.deinit(allocator);
+        },
         .split => |split| {
             destroyTree(split.left, allocator);
             destroyTree(split.right, allocator);
