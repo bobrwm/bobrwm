@@ -130,22 +130,30 @@ const WindowRoleState = enum {
 const PendingRoleWindow = struct {
     pid: i32,
     attempts_remaining: u8,
+    workspace_id: u8,
+    display_id: u32,
 };
 
 const PendingRoleCandidate = struct {
     pid: i32,
     wid: u32,
     from_timeout: bool,
+    workspace_id: u8,
+    display_id: u32,
 };
 
 const DeferredWindowCandidate = struct {
     pid: i32,
     attempts_remaining: u8,
+    workspace_id: u8,
+    display_id: u32,
 };
 
 const DeferredWindowPromotion = struct {
     pid: i32,
     wid: u32,
+    workspace_id: u8,
+    display_id: u32,
 };
 
 const PendingRoleWindowMap = std.AutoHashMap(u32, PendingRoleWindow);
@@ -512,7 +520,7 @@ var g_workspaces: workspace_mod.WorkspaceManager = undefined;
 var g_layout_roots: [workspace_mod.max_workspaces][workspace_mod.max_displays]?layout.Node = undefined;
 var g_displays: [workspace_mod.max_displays]DisplayInfo = undefined;
 var g_display_count: usize = 0;
-var g_next_split_dir: layout.Direction = .horizontal;
+var g_bsp_split_mode: layout.SplitMode = .auto;
 var g_tab_groups: tabgroup.TabGroupManager = undefined;
 var g_pending_role_windows: PendingRoleWindowMap = undefined;
 var g_deferred_window_candidates: DeferredWindowCandidateMap = undefined;
@@ -989,6 +997,36 @@ fn manageStateForWindow(pid: i32, wid: u32) u8 {
     return if (is_standard) shim.BW_MANAGE_READY else shim.BW_MANAGE_REJECT;
 }
 
+/// Returns true when a still-pending window has AXUnknown role/subrole metadata.
+/// These windows are often transient host placeholders that should not be tiled
+/// by the timeout fallback path.
+fn isUnknownPendingRoleWindow(pid: i32, wid: u32) bool {
+    std.debug.assert(pid > 0);
+    std.debug.assert(wid > 0);
+
+    const win = findAxWindow(pid, wid) orelse return false;
+    defer c.CFRelease(@ptrCast(win));
+
+    const ax = ensureAxStrings() orelse return false;
+    var role_any: c.CFTypeRef = null;
+    const role_err = c.AXUIElementCopyAttributeValue(win, ax.role_attr, @ptrCast(&role_any));
+    if (role_err != c.kAXErrorSuccess or role_any == null) return false;
+    defer c.CFRelease(role_any.?);
+
+    const role_is_unknown = c.CFEqual(role_any.?, @ptrCast(ax.unknown_role)) != 0;
+    if (role_is_unknown) return true;
+
+    const role_is_window = c.CFEqual(role_any.?, @ptrCast(ax.window_role)) != 0;
+    if (!role_is_window) return false;
+
+    var subrole_any: c.CFTypeRef = null;
+    const subrole_err = c.AXUIElementCopyAttributeValue(win, ax.subrole_attr, @ptrCast(&subrole_any));
+    if (subrole_err != c.kAXErrorSuccess or subrole_any == null) return false;
+    defer c.CFRelease(subrole_any.?);
+
+    return c.CFEqual(subrole_any.?, @ptrCast(ax.unknown_subrole)) != 0;
+}
+
 /// Legacy management predicate: true for READY or PENDING states.
 export fn bw_should_manage_window(pid: i32, wid: u32) bool {
     const state = manageStateForWindow(pid, wid);
@@ -1431,6 +1469,7 @@ pub fn main() !void {
 
     // -- Config --
     g_config = config_mod.load(g_allocator, args.config_path);
+    g_bsp_split_mode = g_config.bsp_split;
     g_config.applyKeybinds();
 
     // -- Accessibility check --
@@ -1590,8 +1629,65 @@ fn removeFromLayout(workspace_id: u8, display_id: u32, wid: u32) void {
 
 fn insertIntoLayout(workspace_id: u8, display_id: u32, wid: u32) void {
     const root_ptr = layoutRootPtr(workspace_id, display_id) orelse return;
-    const updated = layout.insertWindow(root_ptr.*, wid, g_next_split_dir, g_allocator) catch return;
+    const anchor_wid = blk: {
+        const root = root_ptr.* orelse break :blk null;
+        switch (g_config.bsp_insert_point) {
+            .focused => {
+                const ws = g_workspaces.get(workspace_id) orelse break :blk null;
+                const focused_wid = ws.focused_wid orelse break :blk null;
+                if (focused_wid == wid) break :blk null;
+                break :blk focused_wid;
+            },
+            .first => break :blk layout.firstLeafWid(root),
+            .last => break :blk layout.lastLeafWid(root),
+            .min_depth => break :blk null,
+        }
+    };
+    const options: layout.InsertOptions = .{
+        .mode = g_config.bsp_insert_mode,
+        .split_mode = g_bsp_split_mode,
+        .child = g_config.new_window_split,
+        .anchor_wid = anchor_wid,
+        .root_frame = displayContentFrame(display_id),
+        .inner_gap = @floatFromInt(g_config.gaps.inner),
+        .split_ratio = g_config.bsp_split_ratio,
+    };
+    const updated = layout.insertWindow(root_ptr.*, wid, options, g_allocator) catch return;
     root_ptr.* = updated;
+}
+
+fn setLayoutLeafActive(workspace_id: u8, display_id: u32, wid: u32) void {
+    const root_ptr = layoutRootPtr(workspace_id, display_id) orelse return;
+    if (root_ptr.*) |*root| {
+        _ = layout.setLeafActive(root, wid);
+    }
+}
+
+fn parseAxis(arg: []const u8) ?layout.Direction {
+    if (std.mem.eql(u8, arg, "horizontal")) return .horizontal;
+    if (std.mem.eql(u8, arg, "vertical")) return .vertical;
+    return null;
+}
+
+const FocusedLayoutContext = struct {
+    focused_wid: u32,
+    focused_win: window_mod.Window,
+    root: *layout.Node,
+};
+
+fn focusedLayoutContext() ?FocusedLayoutContext {
+    const ws = g_workspaces.active();
+    const focused_wid = ws.focused_wid orelse return null;
+    const focused_win = g_store.get(focused_wid) orelse return null;
+    const root_ptr = layoutRootPtr(focused_win.workspace_id, focused_win.display_id) orelse return null;
+    if (root_ptr.*) |*root| {
+        return .{
+            .focused_wid = focused_wid,
+            .focused_win = focused_win,
+            .root = root,
+        };
+    }
+    return null;
 }
 
 fn clearDragPreview() void {
@@ -1633,12 +1729,13 @@ fn findDropTargetInLayout(
     std.debug.assert(inner_gap >= 0);
     switch (node) {
         .leaf => |leaf| {
-            if (leaf.wid == dragged_wid) return null;
+            if (leaf.contains(dragged_wid)) return null;
             if (!frameContainsPoint(frame, center_x, center_y)) return null;
-            const target = g_store.get(leaf.wid) orelse return null;
+            const active_wid = leaf.activeWid();
+            const target = g_store.get(active_wid) orelse return null;
             if (target.mode != .tiled or target.is_fullscreen) return null;
             if (target.workspace_id != workspace_id or target.display_id != display_id) return null;
-            return .{ .wid = leaf.wid, .frame = frame };
+            return .{ .wid = active_wid, .frame = frame };
         },
         .split => |split| {
             const half_gap = inner_gap / 2.0;
@@ -1676,6 +1773,11 @@ fn findDropTargetInLayout(
 }
 
 fn updateWindowMovePreview(wid: u32) void {
+    if (g_config.layout != .bsp) {
+        clearDragPreview();
+        return;
+    }
+
     const win = g_store.get(wid) orelse {
         clearDragPreview();
         return;
@@ -1809,6 +1911,7 @@ fn handleEvent(ev: *const event_mod.Event) void {
                     if (g_workspaces.get(win.workspace_id)) |ws| {
                         ws.focused_wid = leader;
                     }
+                    setLayoutLeafActive(win.workspace_id, win.display_id, wid);
                 }
             }
             if (removed_stale or removed_offscreen) {
@@ -1917,11 +2020,12 @@ fn handleEvent(ev: *const event_mod.Event) void {
         .hk_focus_up => focusDirection(.up),
         .hk_focus_down => focusDirection(.down),
         .hk_toggle_split => {
-            g_next_split_dir = switch (g_next_split_dir) {
+            g_bsp_split_mode = switch (g_bsp_split_mode) {
+                .auto => .horizontal,
                 .horizontal => .vertical,
                 .vertical => .horizontal,
             };
-            log.info("split direction: {s}", .{@tagName(g_next_split_dir)});
+            log.info("split mode: {s}", .{@tagName(g_bsp_split_mode)});
         },
         .hk_toggle_fullscreen => {
             const ws = g_workspaces.active();
@@ -2062,17 +2166,23 @@ fn processAppLaunchRetries() bool {
     return true;
 }
 
-fn trackPendingRoleWindow(pid: i32, wid: u32) void {
+fn trackPendingRoleWindow(pid: i32, wid: u32, workspace_id: u8, display_id: u32) void {
     std.debug.assert(wid != 0);
+    std.debug.assert(workspace_id > 0 and workspace_id <= workspace_mod.max_workspaces);
+    std.debug.assert(display_id != 0);
     if (g_store.get(wid) != null) return;
 
     if (g_pending_role_windows.getPtr(wid)) |pending| {
         pending.pid = pid;
         pending.attempts_remaining = role_poll_attempts_max;
+        pending.workspace_id = workspace_id;
+        pending.display_id = display_id;
     } else {
         g_pending_role_windows.put(wid, .{
             .pid = pid,
             .attempts_remaining = role_poll_attempts_max,
+            .workspace_id = workspace_id,
+            .display_id = display_id,
         }) catch {
             log.err("pending-role: failed to track pid={d} wid={d}", .{ pid, wid });
             return;
@@ -2126,8 +2236,10 @@ fn untrackPendingRoleWindowsForPid(pid: i32) void {
     }
 }
 
-fn trackDeferredWindowCandidate(pid: i32, wid: u32) void {
+fn trackDeferredWindowCandidate(pid: i32, wid: u32, workspace_id: u8, display_id: u32) void {
     std.debug.assert(wid != 0);
+    std.debug.assert(workspace_id > 0 and workspace_id <= workspace_mod.max_workspaces);
+    std.debug.assert(display_id != 0);
     if (g_store.get(wid) != null) {
         if (g_deferred_window_candidates.remove(wid)) {
             refreshRolePolling();
@@ -2138,10 +2250,14 @@ fn trackDeferredWindowCandidate(pid: i32, wid: u32) void {
     if (g_deferred_window_candidates.getPtr(wid)) |candidate| {
         candidate.pid = pid;
         candidate.attempts_remaining = role_poll_attempts_max;
+        candidate.workspace_id = workspace_id;
+        candidate.display_id = display_id;
     } else {
         g_deferred_window_candidates.put(wid, .{
             .pid = pid,
             .attempts_remaining = role_poll_attempts_max,
+            .workspace_id = workspace_id,
+            .display_id = display_id,
         }) catch {
             log.err("deferred-window: failed to track pid={d} wid={d}", .{ pid, wid });
             return;
@@ -2164,14 +2280,14 @@ fn untrackDeferredWindowCandidatesForPid(pid: i32) void {
     }
 }
 
-fn addNewWindowLegacyPendingFallback(pid: i32, wid: u32) bool {
+fn addNewWindowLegacyPendingFallback(pid: i32, wid: u32, workspace_id: u8, display_id: u32) bool {
     std.debug.assert(wid != 0);
     if (g_store.get(wid) != null) return false;
     if (!shim.bw_should_manage_window(pid, wid)) {
         log.debug("pending-role: fallback rejected pid={d} wid={d}", .{ pid, wid });
         return false;
     }
-    return addNewWindowManaged(pid, wid);
+    return addNewWindowManagedWithAssignment(pid, wid, workspace_id, display_id);
 }
 
 fn processPendingRoleWindows() bool {
@@ -2208,7 +2324,13 @@ fn processPendingRoleWindows() bool {
                 }
                 remove_wids[remove_count] = wid;
                 remove_count += 1;
-                candidates[candidate_count] = .{ .pid = pid, .wid = wid, .from_timeout = false };
+                candidates[candidate_count] = .{
+                    .pid = pid,
+                    .wid = wid,
+                    .from_timeout = false,
+                    .workspace_id = entry.value_ptr.workspace_id,
+                    .display_id = entry.value_ptr.display_id,
+                };
                 candidate_count += 1;
             },
             .pending => {
@@ -2219,7 +2341,13 @@ fn processPendingRoleWindows() bool {
                     }
                     remove_wids[remove_count] = wid;
                     remove_count += 1;
-                    candidates[candidate_count] = .{ .pid = pid, .wid = wid, .from_timeout = true };
+                    candidates[candidate_count] = .{
+                        .pid = pid,
+                        .wid = wid,
+                        .from_timeout = true,
+                        .workspace_id = entry.value_ptr.workspace_id,
+                        .display_id = entry.value_ptr.display_id,
+                    };
                     candidate_count += 1;
                 } else {
                     entry.value_ptr.attempts_remaining -= 1;
@@ -2241,14 +2369,18 @@ fn processPendingRoleWindows() bool {
     for (candidates[0..candidate_count]) |candidate| {
         if (candidate.from_timeout) {
             const timeout_ms = @as(u64, role_poll_attempts_max) * role_poll_interval_ms;
+            if (isUnknownPendingRoleWindow(candidate.pid, candidate.wid)) {
+                log.info("pending-role: timeout pid={d} wid={d} after {d}ms with AXUnknown metadata, skipping legacy fallback", .{ candidate.pid, candidate.wid, timeout_ms });
+                continue;
+            }
             log.info("pending-role: timeout pid={d} wid={d} after {d}ms, applying legacy fallback", .{ candidate.pid, candidate.wid, timeout_ms });
-            if (addNewWindowLegacyPendingFallback(candidate.pid, candidate.wid)) {
+            if (addNewWindowLegacyPendingFallback(candidate.pid, candidate.wid, candidate.workspace_id, candidate.display_id)) {
                 added_any = true;
             }
             continue;
         }
 
-        if (addNewWindowManaged(candidate.pid, candidate.wid)) {
+        if (addNewWindowManagedWithAssignment(candidate.pid, candidate.wid, candidate.workspace_id, candidate.display_id)) {
             added_any = true;
         }
     }
@@ -2314,7 +2446,12 @@ fn processDeferredWindowCandidates() bool {
                     }
                     remove_wids[remove_count] = wid;
                     remove_count += 1;
-                    promote_candidates[promote_count] = .{ .pid = pid, .wid = wid };
+                    promote_candidates[promote_count] = .{
+                        .pid = pid,
+                        .wid = wid,
+                        .workspace_id = entry.value_ptr.workspace_id,
+                        .display_id = entry.value_ptr.display_id,
+                    };
                     promote_count += 1;
                 } else {
                     if (entry.value_ptr.attempts_remaining == 0) {
@@ -2344,7 +2481,7 @@ fn processDeferredWindowCandidates() bool {
 
     var added_any = false;
     for (promote_candidates[0..promote_count]) |candidate| {
-        if (addNewWindowManaged(candidate.pid, candidate.wid)) {
+        if (addNewWindowManagedWithAssignment(candidate.pid, candidate.wid, candidate.workspace_id, candidate.display_id)) {
             added_any = true;
         }
     }
@@ -2354,6 +2491,8 @@ fn processDeferredWindowCandidates() bool {
 fn discoverWindows() void {
     var buf: [256]shim.bw_window_info = undefined;
     const count = shim.bw_discover_windows(&buf, 256);
+    var observed_pids: [128]i32 = undefined;
+    var observed_pid_count: usize = 0;
 
     // Sort windows by current x-position so the BSP tree order matches
     // their on-screen placement. Without this, windows discovered in
@@ -2366,11 +2505,31 @@ fn discoverWindows() void {
     }.lessThan);
 
     for (slice) |info| {
+        std.debug.assert(info.pid > 0);
+
+        var already_observed = false;
+        for (observed_pids[0..observed_pid_count]) |observed_pid| {
+            if (observed_pid == info.pid) {
+                already_observed = true;
+                break;
+            }
+        }
+
         // Observe the owning app even if this specific window is not yet
         // manageable (for example AX role/subrole is still pending).
-        ax_observer.observeApp(info.pid);
+        if (!already_observed) {
+            ax_observer.observeApp(info.pid);
+            if (observed_pid_count < observed_pids.len) {
+                observed_pids[observed_pid_count] = info.pid;
+                observed_pid_count += 1;
+            }
+        }
 
         if (g_store.get(info.wid) != null) continue;
+
+        const frame: window_mod.Window.Frame = .{ .x = info.x, .y = info.y, .width = info.w, .height = info.h };
+        const display_id = displayIdForFrame(frame);
+        const target_ws = resolveWorkspace(info.pid, display_id);
 
         switch (windowRoleState(info.pid, info.wid)) {
             .reject => {
@@ -2378,7 +2537,7 @@ fn discoverWindows() void {
                 continue;
             },
             .pending => {
-                trackPendingRoleWindow(info.pid, info.wid);
+                trackPendingRoleWindow(info.pid, info.wid, target_ws.id, display_id);
                 continue;
             },
             .ready => {
@@ -2386,10 +2545,6 @@ fn discoverWindows() void {
                 untrackDeferredWindowCandidate(info.wid);
             },
         }
-
-        const frame: window_mod.Window.Frame = .{ .x = info.x, .y = info.y, .width = info.w, .height = info.h };
-        const display_id = displayIdForFrame(frame);
-        const target_ws = resolveWorkspace(info.pid, display_id);
 
         const win = window_mod.Window{
             .wid = info.wid,
@@ -2462,8 +2617,10 @@ fn hasOnScreenMatchingManagedSibling(
     return false;
 }
 
-fn addNewWindowManaged(pid: i32, wid: u32) bool {
+fn addNewWindowManagedWithAssignment(pid: i32, wid: u32, workspace_id: u8, assigned_display_id: u32) bool {
     log.debug("addNewWindow: pid={d} wid={d}", .{ pid, wid });
+    std.debug.assert(workspace_id > 0 and workspace_id <= workspace_mod.max_workspaces);
+    std.debug.assert(assigned_display_id != 0);
     if (g_store.get(wid) != null) {
         log.debug("addNewWindow: already in store, skipping", .{});
         return false;
@@ -2476,7 +2633,7 @@ fn addNewWindowManaged(pid: i32, wid: u32) bool {
     // reports them as on-screen. Queue them for bounded re-evaluation rather
     // than dropping them on a one-shot check.
     if (!on_screen) {
-        trackDeferredWindowCandidate(pid, wid);
+        trackDeferredWindowCandidate(pid, wid, workspace_id, assigned_display_id);
         log.info("addNewWindow: deferred pid={d} wid={d} while off-screen", .{ pid, wid });
         return false;
     }
@@ -2488,7 +2645,7 @@ fn addNewWindowManaged(pid: i32, wid: u32) bool {
     if (tryFormTabGroupOnCreate(pid, wid)) return false;
 
     var window_frame: window_mod.Window.Frame = .{ .x = 0, .y = 0, .width = 0, .height = 0 };
-    var display_id = focusedDisplayId();
+    var display_id = assigned_display_id;
     if (g_sky) |sky| {
         var rect: skylight.CGRect = undefined;
         if (sky.getWindowBounds(sky.mainConnectionID(), wid, &rect) == 0) {
@@ -2513,7 +2670,7 @@ fn addNewWindowManaged(pid: i32, wid: u32) bool {
         break :blk !axCanResize(ax_win, ax);
     };
 
-    const ws = resolveWorkspace(pid, display_id);
+    const ws = g_workspaces.get(workspace_id) orelse resolveWorkspace(pid, display_id);
     const mode: window_mod.WindowMode = if (should_float) .floating else .tiled;
 
     const win = window_mod.Window{
@@ -2547,6 +2704,12 @@ fn addNewWindowManaged(pid: i32, wid: u32) bool {
     return true;
 }
 
+fn addNewWindowManaged(pid: i32, wid: u32) bool {
+    const display_id = focusedDisplayId();
+    const ws = resolveWorkspace(pid, display_id);
+    return addNewWindowManagedWithAssignment(pid, wid, ws.id, display_id);
+}
+
 fn addNewWindow(pid: i32, wid: u32) void {
     std.debug.assert(wid != 0);
     if (g_store.get(wid) != null) return;
@@ -2562,8 +2725,10 @@ fn addNewWindow(pid: i32, wid: u32) void {
             _ = addNewWindowManaged(pid, wid);
         },
         .pending => {
-            trackPendingRoleWindow(pid, wid);
-            trackDeferredWindowCandidate(pid, wid);
+            const display_id = focusedDisplayId();
+            const ws = resolveWorkspace(pid, display_id);
+            trackPendingRoleWindow(pid, wid, ws.id, display_id);
+            trackDeferredWindowCandidate(pid, wid, ws.id, display_id);
             log.debug("addNewWindow: role gate pending pid={d} wid={d}", .{ pid, wid });
         },
     }
@@ -2788,21 +2953,15 @@ fn removeAppWindows(pid: i32) void {
     // Also collect suppressed tab members from the store
     var store_it = g_store.windows.iterator();
     while (store_it.next()) |entry| {
-        if (entry.value_ptr.pid == pid and n < wids.len) {
-            var already = false;
-            for (wids[0..n]) |existing| {
-                if (existing == entry.key_ptr.*) {
-                    already = true;
-                    break;
-                }
-            }
-            if (!already) {
-                wids[n] = entry.key_ptr.*;
-                ws_ids[n] = entry.value_ptr.workspace_id;
-                display_ids[n] = entry.value_ptr.display_id;
-                n += 1;
-            }
-        }
+        const wid = entry.key_ptr.*;
+        if (entry.value_ptr.pid != pid) continue;
+        if (!g_tab_groups.isSuppressed(wid)) continue;
+        if (n >= wids.len) continue;
+
+        wids[n] = wid;
+        ws_ids[n] = entry.value_ptr.workspace_id;
+        display_ids[n] = entry.value_ptr.display_id;
+        n += 1;
     }
 
     for (wids[0..n], ws_ids[0..n], display_ids[0..n]) |wid, ws_id, display_id| {
@@ -2825,6 +2984,7 @@ fn cleanupWorkspaceWindowsForPid(pid: i32) bool {
 
     var stale_wids: [128]u32 = undefined;
     var stale_count: usize = 0;
+    var truncated = false;
 
     for (&g_workspaces.workspaces) |*ws| {
         for (ws.windows.items) |wid| {
@@ -2843,20 +3003,17 @@ fn cleanupWorkspaceWindowsForPid(pid: i32) bool {
 
             if (!should_remove) continue;
 
-            var already_queued = false;
-            for (stale_wids[0..stale_count]) |existing| {
-                if (existing == wid) {
-                    already_queued = true;
-                    break;
-                }
-            }
-            if (already_queued) continue;
-
             if (stale_count < stale_wids.len) {
                 stale_wids[stale_count] = wid;
                 stale_count += 1;
+            } else {
+                truncated = true;
             }
         }
+    }
+
+    if (truncated) {
+        log.warn("cleanup: stale-wid batch truncated pid={d} queued={d}", .{ pid, stale_count });
     }
 
     for (stale_wids[0..stale_count]) |wid| {
@@ -2873,6 +3030,7 @@ fn cleanupWorkspaceWindowsForPid(pid: i32) bool {
 fn cleanupOffscreenManagedWindows() bool {
     var stale_wids: [128]u32 = undefined;
     var stale_count: usize = 0;
+    var truncated = false;
 
     for (&g_workspaces.workspaces) |*ws| {
         for (ws.windows.items) |wid| {
@@ -2884,21 +3042,18 @@ fn cleanupOffscreenManagedWindows() bool {
 
             if (shim.bw_is_window_on_screen(wid)) continue;
 
-            var already_queued = false;
-            for (stale_wids[0..stale_count]) |existing| {
-                if (existing == wid) {
-                    already_queued = true;
-                    break;
-                }
-            }
-            if (already_queued) continue;
-
             log.info("cleanup: removing wid={d} pid={d} reason=offscreen", .{ wid, win.pid });
             if (stale_count < stale_wids.len) {
                 stale_wids[stale_count] = wid;
                 stale_count += 1;
+            } else {
+                truncated = true;
             }
         }
+    }
+
+    if (truncated) {
+        log.warn("cleanup: offscreen batch truncated queued={d}", .{stale_count});
     }
 
     for (stale_wids[0..stale_count]) |wid| {
@@ -3024,11 +3179,36 @@ fn retileDisplay(display_id: u32) void {
         .height = display.h - @as(f64, @floatFromInt(@as(u32, outer.top) + @as(u32, outer.bottom))),
     };
 
-    var buf: [256 * @sizeOf(layout.LayoutEntry)]u8 = undefined;
-    var fba = std.heap.FixedBufferAllocator.init(&buf);
+    const window_count = layout.windowCount(root);
+    std.debug.assert(window_count > 0);
+
+    var stack_buf: [256 * @sizeOf(layout.LayoutEntry)]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&stack_buf);
     var entries: std.ArrayList(layout.LayoutEntry) = .{};
 
-    layout.applyLayout(root, frame, @floatFromInt(g_config.gaps.inner), &entries, fba.allocator()) catch return;
+    if (window_count <= 256) {
+        const allocator = fba.allocator();
+        entries.ensureTotalCapacity(allocator, window_count) catch {
+            log.err("retile: stack reserve failed display={d} windows={d}", .{ display_id, window_count });
+            return;
+        };
+        layout.applyLayout(g_config.layout, root, frame, @floatFromInt(g_config.gaps.inner), &entries, allocator) catch {
+            log.err("retile: stack apply failed display={d} windows={d}", .{ display_id, window_count });
+            return;
+        };
+    } else {
+        entries.ensureTotalCapacity(g_allocator, window_count) catch {
+            log.err("retile: heap reserve failed display={d} windows={d}", .{ display_id, window_count });
+            return;
+        };
+        defer entries.deinit(g_allocator);
+        layout.applyLayout(g_config.layout, root, frame, @floatFromInt(g_config.gaps.inner), &entries, g_allocator) catch {
+            log.err("retile: heap apply failed display={d} windows={d}", .{ display_id, window_count });
+            return;
+        };
+        log.warn("retile: using heap layout buffer display={d} windows={d}", .{ display_id, window_count });
+    }
+    std.debug.assert(entries.items.len == window_count);
 
     for (entries.items) |entry| {
         const win = g_store.get(entry.wid) orelse continue;
@@ -3457,10 +3637,21 @@ fn switchWorkspace(target_id: u8) void {
     // Hide current workspace windows (move to safe bottom corner, keep size)
     const hctx = HideCtx.init(display_id);
     for (old_ws.windows.items) |wid| {
-        if (g_store.get(wid)) |win| {
+        // Workspace lists track tab-group leaders; hide the currently visible
+        // tab so apps like Ghostty do not remain visible across workspaces.
+        const visible_wid = g_tab_groups.resolveActive(wid);
+        const hide_wid = if (g_store.get(visible_wid) != null) visible_wid else wid;
+        if (g_store.get(hide_wid)) |win| {
             if (win.display_id != display_id) continue;
-            hctx.hide(win.pid, wid);
+            hctx.hide(win.pid, hide_wid);
         }
+    }
+    var pending_it = g_pending_role_windows.iterator();
+    while (pending_it.next()) |entry| {
+        const pending = entry.value_ptr.*;
+        if (pending.workspace_id != current_id) continue;
+        if (pending.display_id != display_id) continue;
+        hctx.hide(pending.pid, entry.key_ptr.*);
     }
 
     // Activate target
@@ -3655,6 +3846,23 @@ fn focusDirection(dir: FocusDir) void {
             _ = shim.bw_ax_focus_window(win.pid, actual_wid);
             ws.focused_wid = wid; // track the leader
             setFocusedDisplay(win.display_id);
+            setLayoutLeafActive(win.workspace_id, win.display_id, actual_wid);
+        }
+        return;
+    }
+
+    const root_ptr = layoutRootPtr(focused.workspace_id, focused.display_id) orelse return;
+    const root = root_ptr.* orelse return;
+    const stack_forward = switch (dir) {
+        .left, .up => false,
+        .right, .down => true,
+    };
+    if (layout.stackNeighbor(root, focused_wid, stack_forward)) |stack_wid| {
+        if (g_store.get(stack_wid)) |win| {
+            _ = shim.bw_ax_focus_window(win.pid, stack_wid);
+            ws.focused_wid = stack_wid;
+            setFocusedDisplay(win.display_id);
+            setLayoutLeafActive(win.workspace_id, win.display_id, stack_wid);
         }
     }
 }
@@ -3685,11 +3893,167 @@ fn ipcDispatch(cmd: []const u8, client_fd: posix.socket_t) void {
         retile();
         ipc.writeResponse(client_fd, "ok\n");
     } else if (std.mem.eql(u8, cmd, "toggle-split")) {
-        g_next_split_dir = switch (g_next_split_dir) {
+        g_bsp_split_mode = switch (g_bsp_split_mode) {
+            .auto => .horizontal,
             .horizontal => .vertical,
             .vertical => .horizontal,
         };
         ipc.writeResponse(client_fd, "ok\n");
+    } else if (std.mem.startsWith(u8, cmd, "bsp ratio rel ")) {
+        const arg = cmd["bsp ratio rel ".len..];
+        const delta = std.fmt.parseFloat(f64, arg) catch {
+            ipc.writeResponse(client_fd, "err: invalid ratio delta\n");
+            return;
+        };
+        const ctx = focusedLayoutContext() orelse {
+            ipc.writeResponse(client_fd, "err: no focused managed window\n");
+            return;
+        };
+        if (!layout.adjustParentRatio(ctx.root, ctx.focused_wid, delta)) {
+            ipc.writeResponse(client_fd, "err: no parent split\n");
+            return;
+        }
+        retileDisplay(ctx.focused_win.display_id);
+        ipc.writeResponse(client_fd, "ok\n");
+    } else if (std.mem.startsWith(u8, cmd, "bsp insert-mode ")) {
+        const arg = cmd["bsp insert-mode ".len..];
+        if (std.mem.eql(u8, arg, "split")) {
+            g_config.bsp_insert_mode = .split;
+        } else if (std.mem.eql(u8, arg, "stack")) {
+            g_config.bsp_insert_mode = .stack;
+        } else {
+            ipc.writeResponse(client_fd, "err: expected split|stack\n");
+            return;
+        }
+        ipc.writeResponse(client_fd, "ok\n");
+    } else if (std.mem.startsWith(u8, cmd, "bsp insert-point ")) {
+        const arg = cmd["bsp insert-point ".len..];
+        if (std.mem.eql(u8, arg, "focused")) {
+            g_config.bsp_insert_point = .focused;
+        } else if (std.mem.eql(u8, arg, "first")) {
+            g_config.bsp_insert_point = .first;
+        } else if (std.mem.eql(u8, arg, "last")) {
+            g_config.bsp_insert_point = .last;
+        } else if (std.mem.eql(u8, arg, "min_depth")) {
+            g_config.bsp_insert_point = .min_depth;
+        } else {
+            ipc.writeResponse(client_fd, "err: expected focused|first|last|min_depth\n");
+            return;
+        }
+        ipc.writeResponse(client_fd, "ok\n");
+    } else if (std.mem.startsWith(u8, cmd, "bsp ratio abs ")) {
+        const arg = cmd["bsp ratio abs ".len..];
+        const ratio = std.fmt.parseFloat(f64, arg) catch {
+            ipc.writeResponse(client_fd, "err: invalid ratio\n");
+            return;
+        };
+        const ctx = focusedLayoutContext() orelse {
+            ipc.writeResponse(client_fd, "err: no focused managed window\n");
+            return;
+        };
+        if (!layout.setParentRatio(ctx.root, ctx.focused_wid, ratio)) {
+            ipc.writeResponse(client_fd, "err: no parent split\n");
+            return;
+        }
+        retileDisplay(ctx.focused_win.display_id);
+        ipc.writeResponse(client_fd, "ok\n");
+    } else if (std.mem.startsWith(u8, cmd, "bsp mirror ")) {
+        const axis = parseAxis(cmd["bsp mirror ".len..]) orelse {
+            ipc.writeResponse(client_fd, "err: expected horizontal|vertical\n");
+            return;
+        };
+        const ws = g_workspaces.active();
+        const wid = ws.focused_wid orelse {
+            ipc.writeResponse(client_fd, "err: no focused window\n");
+            return;
+        };
+        const win = g_store.get(wid) orelse {
+            ipc.writeResponse(client_fd, "err: focused window not managed\n");
+            return;
+        };
+        const root_ptr = layoutRootPtr(win.workspace_id, win.display_id) orelse {
+            ipc.writeResponse(client_fd, "err: no layout root\n");
+            return;
+        };
+        if (root_ptr.*) |*root| {
+            layout.mirror(root, axis);
+            retileDisplay(win.display_id);
+            ipc.writeResponse(client_fd, "ok\n");
+        } else {
+            ipc.writeResponse(client_fd, "err: no layout root\n");
+        }
+    } else if (std.mem.eql(u8, cmd, "bsp equalize")) {
+        const ws = g_workspaces.active();
+        const wid = ws.focused_wid orelse {
+            ipc.writeResponse(client_fd, "err: no focused window\n");
+            return;
+        };
+        const win = g_store.get(wid) orelse {
+            ipc.writeResponse(client_fd, "err: focused window not managed\n");
+            return;
+        };
+        const root_ptr = layoutRootPtr(win.workspace_id, win.display_id) orelse {
+            ipc.writeResponse(client_fd, "err: no layout root\n");
+            return;
+        };
+        if (root_ptr.*) |*root| {
+            layout.equalize(root, null, g_config.bsp_split_ratio);
+            retileDisplay(win.display_id);
+            ipc.writeResponse(client_fd, "ok\n");
+        } else {
+            ipc.writeResponse(client_fd, "err: no layout root\n");
+        }
+    } else if (std.mem.eql(u8, cmd, "bsp balance")) {
+        const ws = g_workspaces.active();
+        const wid = ws.focused_wid orelse {
+            ipc.writeResponse(client_fd, "err: no focused window\n");
+            return;
+        };
+        const win = g_store.get(wid) orelse {
+            ipc.writeResponse(client_fd, "err: focused window not managed\n");
+            return;
+        };
+        const root_ptr = layoutRootPtr(win.workspace_id, win.display_id) orelse {
+            ipc.writeResponse(client_fd, "err: no layout root\n");
+            return;
+        };
+        if (root_ptr.*) |*root| {
+            _ = layout.balance(root, null);
+            retileDisplay(win.display_id);
+            ipc.writeResponse(client_fd, "ok\n");
+        } else {
+            ipc.writeResponse(client_fd, "err: no layout root\n");
+        }
+    } else if (std.mem.startsWith(u8, cmd, "bsp rotate ")) {
+        const arg = cmd["bsp rotate ".len..];
+        const degrees = std.fmt.parseInt(i32, arg, 10) catch {
+            ipc.writeResponse(client_fd, "err: invalid degrees\n");
+            return;
+        };
+        if (!(degrees == 90 or degrees == 180 or degrees == 270)) {
+            ipc.writeResponse(client_fd, "err: expected 90|180|270\n");
+            return;
+        }
+        const ws = g_workspaces.active();
+        const wid = ws.focused_wid orelse {
+            ipc.writeResponse(client_fd, "err: no focused window\n");
+            return;
+        };
+        const win = g_store.get(wid) orelse {
+            ipc.writeResponse(client_fd, "err: focused window not managed\n");
+            return;
+        };
+        const root_ptr = layoutRootPtr(win.workspace_id, win.display_id) orelse {
+            ipc.writeResponse(client_fd, "err: no layout root\n");
+            return;
+        };
+        if (root_ptr.*) |*root| {
+            layout.rotate(root, degrees);
+            retileDisplay(win.display_id);
+            ipc.writeResponse(client_fd, "ok\n");
+        } else {
+            ipc.writeResponse(client_fd, "err: no layout root\n");
+        }
     } else if (std.mem.startsWith(u8, cmd, "focus-workspace ")) {
         const arg = cmd["focus-workspace ".len..];
         const n = std.fmt.parseInt(u8, arg, 10) catch {

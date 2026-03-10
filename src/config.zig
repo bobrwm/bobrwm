@@ -4,6 +4,7 @@
 
 const std = @import("std");
 const shim = @import("shim_api.zig");
+const layout_mod = @import("layout.zig");
 
 const log = std.log.scoped(.config);
 
@@ -16,6 +17,12 @@ pub const Config = struct {
     workspace_assignments: []const WorkspaceAssignment = &.{},
     workspace_names: []const []const u8 = &.{},
     gaps: Gaps = .{},
+    layout: layout_mod.LayoutKind = .bsp,
+    bsp_split: layout_mod.SplitMode = .auto,
+    bsp_insert_mode: layout_mod.InsertMode = .split,
+    bsp_insert_point: layout_mod.InsertionPointPolicy = .focused,
+    bsp_split_ratio: f64 = 0.5,
+    new_window_split: layout_mod.InsertChild = .second,
 
     /// Look up the assigned workspace for a given bundle identifier.
     pub fn workspaceForApp(self: *const Config, bundle_id: []const u8) ?u8 {
@@ -147,12 +154,17 @@ pub fn load(allocator: std.mem.Allocator, explicit_path: ?[]const u8) Config {
     }
 
     // XDG_CONFIG_HOME / ~/.config
-    const config_home = std.posix.getenv("XDG_CONFIG_HOME") orelse blk: {
-        const home = std.posix.getenv("HOME") orelse return .{};
-        break :blk std.fmt.allocPrint(allocator, "{s}/.config", .{home}) catch return .{};
-    };
+    var path_buf: [2048]u8 = undefined;
+    const path = blk: {
+        if (std.posix.getenv("XDG_CONFIG_HOME")) |config_home| {
+            break :blk std.fmt.bufPrint(&path_buf, "{s}/bobrwm/config.zon", .{config_home}) catch return .{};
+        }
 
-    const path = std.fmt.allocPrint(allocator, "{s}/bobrwm/config.zon", .{config_home}) catch return .{};
+        const home = std.posix.getenv("HOME") orelse return .{};
+        break :blk std.fmt.bufPrint(&path_buf, "{s}/.config/bobrwm/config.zon", .{home}) catch return .{};
+    };
+    std.debug.assert(path.len > 0);
+
     return loadFromPath(allocator, path) orelse {
         log.info("no config file found, using defaults", .{});
         return .{};
@@ -316,6 +328,12 @@ test "default config" {
     try t.expectEqual(@as(usize, 0), cfg.workspace_names.len);
     try t.expectEqual(@as(u16, 0), cfg.gaps.inner);
     try t.expectEqual(@as(u16, 0), cfg.gaps.outer.left);
+    try t.expectEqual(layout_mod.LayoutKind.bsp, cfg.layout);
+    try t.expectEqual(layout_mod.SplitMode.auto, cfg.bsp_split);
+    try t.expectEqual(layout_mod.InsertMode.split, cfg.bsp_insert_mode);
+    try t.expectEqual(layout_mod.InsertionPointPolicy.focused, cfg.bsp_insert_point);
+    try t.expectApproxEqAbs(@as(f64, 0.5), cfg.bsp_split_ratio, 0.0001);
+    try t.expectEqual(layout_mod.InsertChild.second, cfg.new_window_split);
 }
 
 test "default_keybinds" {
@@ -373,6 +391,12 @@ test "loadFromPath: examples/config.zon" {
 
     try t.expectEqual(@as(usize, 0), cfg.workspace_assignments.len);
     try t.expectEqual(@as(u16, 0), cfg.gaps.inner);
+    try t.expectEqual(layout_mod.LayoutKind.bsp, cfg.layout);
+    try t.expectEqual(layout_mod.SplitMode.auto, cfg.bsp_split);
+    try t.expectEqual(layout_mod.InsertMode.split, cfg.bsp_insert_mode);
+    try t.expectEqual(layout_mod.InsertionPointPolicy.focused, cfg.bsp_insert_point);
+    try t.expectApproxEqAbs(@as(f64, 0.5), cfg.bsp_split_ratio, 0.0001);
+    try t.expectEqual(layout_mod.InsertChild.second, cfg.new_window_split);
 }
 
 test "loadFromPath: custom zon" {
@@ -393,6 +417,12 @@ test "loadFromPath: custom zon" {
         \\        .{ .app_id = "com.test.App", .workspace = 3 },
         \\    },
         \\    .gaps = .{ .inner = 8, .outer = .{ .left = 4, .right = 4, .top = 4, .bottom = 4 } },
+        \\    .layout = .monocle,
+        \\    .bsp_split = .vertical,
+        \\    .bsp_insert_mode = .stack,
+        \\    .bsp_insert_point = .last,
+        \\    .bsp_split_ratio = 0.6,
+        \\    .new_window_split = .first,
         \\}
     ;
 
@@ -417,4 +447,10 @@ test "loadFromPath: custom zon" {
     try t.expectEqual(@as(u16, 4), cfg.gaps.outer.right);
     try t.expectEqual(@as(u16, 4), cfg.gaps.outer.top);
     try t.expectEqual(@as(u16, 4), cfg.gaps.outer.bottom);
+    try t.expectEqual(layout_mod.LayoutKind.monocle, cfg.layout);
+    try t.expectEqual(layout_mod.SplitMode.vertical, cfg.bsp_split);
+    try t.expectEqual(layout_mod.InsertMode.stack, cfg.bsp_insert_mode);
+    try t.expectEqual(layout_mod.InsertionPointPolicy.last, cfg.bsp_insert_point);
+    try t.expectApproxEqAbs(@as(f64, 0.6), cfg.bsp_split_ratio, 0.0001);
+    try t.expectEqual(layout_mod.InsertChild.first, cfg.new_window_split);
 }
