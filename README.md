@@ -20,9 +20,14 @@ bobrwm query workspaces   # IPC: list workspaces
 bobrwm query displays     # IPC: list connected displays
 bobrwm query apps         # IPC: list observed apps
 bobrwm move-to-display 2  # IPC: move focused window to display slot 2
-bobrwm bsp ratio rel 0.05 # IPC: grow focused parent split ratio
-bobrwm bsp mirror horizontal
-bobrwm bsp rotate 90
+bobrwm bsp insert-mode stack          # IPC: split | stack
+bobrwm bsp insert-point min_depth     # IPC: focused | first | last | min_depth
+bobrwm bsp ratio rel 0.05             # IPC: adjust focused parent split ratio
+bobrwm bsp ratio abs 0.6              # IPC: set focused parent split ratio
+bobrwm bsp mirror horizontal          # IPC: horizontal | vertical
+bobrwm bsp equalize                   # IPC: set all split ratios to config ratio
+bobrwm bsp balance                    # IPC: proportional balance by subtree size
+bobrwm bsp rotate 90                  # IPC: 90 | 180 | 270
 ```
 
 ### Logging
