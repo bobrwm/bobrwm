@@ -43,6 +43,10 @@ pub const WindowStore = struct {
     }
 
     pub fn put(self: *WindowStore, window: Window) !void {
+        std.debug.assert(window.wid > 0);
+        std.debug.assert(window.pid > 0);
+        std.debug.assert(window.workspace_id > 0);
+        std.debug.assert(window.display_id > 0);
         try self.windows.put(window.wid, window);
     }
 

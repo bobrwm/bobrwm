@@ -283,7 +283,8 @@ fn activeWorkspaceIdForDisplay(display_id: u32) u8 {
 }
 
 fn workspaceVisibleOnDisplay(workspace_id: u8, display_id: u32) bool {
-    return activeWorkspaceIdForDisplay(display_id) == workspace_id;
+    const slot = displayIndexById(display_id) orelse return false;
+    return g_workspaces.activeIdForDisplaySlot(slot) == workspace_id;
 }
 
 fn workspaceVisibleAnywhere(workspace_id: u8) bool {
@@ -305,11 +306,39 @@ fn setFocusedDisplay(display_id: u32) void {
     g_workspaces.focused_display_slot = slot;
 }
 
+/// Debug-only: verify every display slot has a valid active workspace
+/// and no two slots share the same workspace.
+fn assertDisplayCoverage() void {
+    if (@import("builtin").mode != .Debug) return;
+    for (0..g_display_count) |slot| {
+        const ws_id = g_workspaces.activeIdForDisplaySlot(slot);
+        std.debug.assert(g_workspaces.get(ws_id) != null);
+        // No duplicate active workspace across displays
+        for (0..g_display_count) |other| {
+            if (other == slot) continue;
+            std.debug.assert(g_workspaces.activeIdForDisplaySlot(other) != ws_id);
+        }
+    }
+}
+
+fn updateStatusBar() void {
+    const focused_slot = g_workspaces.focused_display_slot;
+    var entries: [workspace_mod.max_displays]statusbar.DisplayWorkspace = undefined;
+    for (0..g_display_count) |slot| {
+        const ws_id = g_workspaces.activeIdForDisplaySlot(slot);
+        const ws = g_workspaces.get(ws_id) orelse continue;
+        entries[slot] = .{
+            .name = ws.name,
+            .id = ws.id,
+            .focused = slot == focused_slot,
+        };
+    }
+    statusbar.setTitleMulti(entries[0..g_display_count]);
+}
+
 fn clearLayoutRoots() void {
     for (0..workspace_mod.max_workspaces) |ws_idx| {
-        for (0..workspace_mod.max_displays) |slot| {
-            g_layout_roots[ws_idx][slot] = null;
-        }
+        g_layout_roots[ws_idx] = null;
     }
 }
 
@@ -517,7 +546,7 @@ var g_sky: ?skylight.SkyLight = null;
 var g_allocator: std.mem.Allocator = undefined;
 var g_store: window_mod.WindowStore = undefined;
 var g_workspaces: workspace_mod.WorkspaceManager = undefined;
-var g_layout_roots: [workspace_mod.max_workspaces][workspace_mod.max_displays]?layout.Node = undefined;
+var g_layout_roots: [workspace_mod.max_workspaces]?layout.Node = undefined;
 var g_displays: [workspace_mod.max_displays]DisplayInfo = undefined;
 var g_display_count: usize = 0;
 var g_bsp_split_mode: layout.SplitMode = .auto;
@@ -1485,7 +1514,11 @@ pub fn main() !void {
     // -- Core state --
     g_store = window_mod.WindowStore.init(g_allocator);
     defer g_store.deinit();
-    g_workspaces = workspace_mod.WorkspaceManager.init(g_allocator);
+    const ws_count: u8 = if (g_config.workspace_names.len > 0)
+        @intCast(g_config.workspace_names.len)
+    else
+        workspace_mod.max_workspaces;
+    g_workspaces = workspace_mod.WorkspaceManager.init(g_allocator, ws_count);
     defer g_workspaces.deinit();
     clearLayoutRoots();
     g_tab_groups = tabgroup.TabGroupManager.init(g_allocator);
@@ -1516,9 +1549,30 @@ pub fn main() !void {
     }
     refreshDisplays();
 
+    // Assign all workspaces to primary; pull last N onto extra displays.
+    const primary_id = primaryDisplayId();
+    const wsc = g_workspaces.workspace_count;
+    for (g_workspaces.workspaces[0..wsc]) |*ws| {
+        ws.display_id = primary_id;
+    }
+    const primary_slot = displayIndexById(primary_id) orelse 0;
+    g_workspaces.setActiveForDisplaySlot(primary_slot, 1);
+    if (g_display_count > 1) {
+        var extra: usize = 0;
+        for (0..g_display_count) |slot| {
+            if (slot == primary_slot) continue;
+            const ws_id: u8 = @intCast(wsc - extra);
+            g_workspaces.setActiveForDisplaySlot(slot, ws_id);
+            if (g_workspaces.get(ws_id)) |ws| {
+                ws.display_id = g_displays[slot].id;
+            }
+            extra += 1;
+        }
+    }
+
     // -- Apply workspace names from config --
     for (g_config.workspace_names, 0..) |name, i| {
-        if (i >= workspace_mod.max_workspaces) break;
+        if (i >= g_workspaces.workspace_count) break;
         g_workspaces.workspaces[i].name = name;
     }
 
@@ -1555,8 +1609,7 @@ pub fn main() !void {
 
     // -- Status bar (zig-objc) --
     statusbar.init();
-    const active = g_workspaces.active();
-    statusbar.setTitle(active.name, active.id);
+    updateStatusBar();
 
     // -- Enter NSApp run loop (never returns) --
     log.info("entering run loop", .{});
@@ -1614,26 +1667,25 @@ export fn bw_retile() void {
     retile();
 }
 
-fn layoutRootPtr(workspace_id: u8, display_id: u32) ?*?layout.Node {
+fn layoutRootPtr(workspace_id: u8) *?layout.Node {
     std.debug.assert(workspace_id > 0 and workspace_id <= workspace_mod.max_workspaces);
-    const slot = displayIndexById(display_id) orelse return null;
     const ws_idx: usize = workspace_id - 1;
-    return &g_layout_roots[ws_idx][slot];
+    return &g_layout_roots[ws_idx];
 }
 
-fn removeFromLayout(workspace_id: u8, display_id: u32, wid: u32) void {
-    const root_ptr = layoutRootPtr(workspace_id, display_id) orelse return;
+fn removeFromLayout(workspace_id: u8, wid: u32) void {
+    const root_ptr = layoutRootPtr(workspace_id);
     const root = root_ptr.* orelse return;
     root_ptr.* = layout.removeWindow(root, wid, g_allocator);
 }
 
-fn insertIntoLayout(workspace_id: u8, display_id: u32, wid: u32) void {
-    const root_ptr = layoutRootPtr(workspace_id, display_id) orelse return;
+fn insertIntoLayout(workspace_id: u8, wid: u32) void {
+    const root_ptr = layoutRootPtr(workspace_id);
+    const ws = g_workspaces.get(workspace_id) orelse return;
     const anchor_wid = blk: {
         const root = root_ptr.* orelse break :blk null;
         switch (g_config.bsp_insert_point) {
             .focused => {
-                const ws = g_workspaces.get(workspace_id) orelse break :blk null;
                 const focused_wid = ws.focused_wid orelse break :blk null;
                 if (focused_wid == wid) break :blk null;
                 break :blk focused_wid;
@@ -1648,7 +1700,7 @@ fn insertIntoLayout(workspace_id: u8, display_id: u32, wid: u32) void {
         .split_mode = g_bsp_split_mode,
         .child = g_config.new_window_split,
         .anchor_wid = anchor_wid,
-        .root_frame = displayContentFrame(display_id),
+        .root_frame = if (ws.display_id) |did| displayContentFrame(did) else null,
         .inner_gap = @floatFromInt(g_config.gaps.inner),
         .split_ratio = g_config.bsp_split_ratio,
     };
@@ -1656,8 +1708,8 @@ fn insertIntoLayout(workspace_id: u8, display_id: u32, wid: u32) void {
     root_ptr.* = updated;
 }
 
-fn setLayoutLeafActive(workspace_id: u8, display_id: u32, wid: u32) void {
-    const root_ptr = layoutRootPtr(workspace_id, display_id) orelse return;
+fn setLayoutLeafActive(workspace_id: u8, wid: u32) void {
+    const root_ptr = layoutRootPtr(workspace_id);
     if (root_ptr.*) |*root| {
         _ = layout.setLeafActive(root, wid);
     }
@@ -1679,7 +1731,7 @@ fn focusedLayoutContext() ?FocusedLayoutContext {
     const ws = g_workspaces.active();
     const focused_wid = ws.focused_wid orelse return null;
     const focused_win = g_store.get(focused_wid) orelse return null;
-    const root_ptr = layoutRootPtr(focused_win.workspace_id, focused_win.display_id) orelse return null;
+    const root_ptr = layoutRootPtr(focused_win.workspace_id);
     if (root_ptr.*) |*root| {
         return .{
             .focused_wid = focused_wid,
@@ -1792,11 +1844,7 @@ fn updateWindowMovePreview(wid: u32) void {
         return;
     }
 
-    const root_ptr = layoutRootPtr(win.workspace_id, win.display_id) orelse {
-        clearDragPreview();
-        return;
-    };
-    const root = root_ptr.* orelse {
+    const root = layoutRootPtr(win.workspace_id).* orelse {
         clearDragPreview();
         return;
     };
@@ -1858,7 +1906,7 @@ fn commitWindowMovePreview(wid: u32) void {
     if (source.workspace_id != target.workspace_id) return;
     if (source.display_id != target.display_id) return;
 
-    const root_ptr = layoutRootPtr(source.workspace_id, source.display_id) orelse return;
+    const root_ptr = layoutRootPtr(source.workspace_id);
     if (root_ptr.*) |*root| {
         if (layout.swapWindowIds(root, wid, target_wid)) {
             log.info("window move swap wid={d} target={d}", .{ wid, target_wid });
@@ -1911,7 +1959,7 @@ fn handleEvent(ev: *const event_mod.Event) void {
                     if (g_workspaces.get(win.workspace_id)) |ws| {
                         ws.focused_wid = leader;
                     }
-                    setLayoutLeafActive(win.workspace_id, win.display_id, wid);
+                    setLayoutLeafActive(win.workspace_id, wid);
                 }
             }
             if (removed_stale or removed_offscreen) {
@@ -2038,6 +2086,19 @@ fn handleEvent(ev: *const event_mod.Event) void {
             });
             retile();
         },
+        .hk_move_workspace_to_display => {
+            const arg: u8 = @intCast(ev.wid);
+            if (arg == 0) {
+                log.info("hotkey: move workspace to display next", .{});
+                moveWorkspaceToDisplayNext();
+            } else if (arg == 255) {
+                log.info("hotkey: move workspace to display prev", .{});
+                moveWorkspaceToDisplayPrev();
+            } else {
+                log.info("hotkey: move workspace to display {}", .{arg});
+                moveWorkspaceToDisplay(@as(usize, arg) - 1);
+            }
+        },
         .hk_toggle_float => {
             const ws = g_workspaces.active();
             const focused = ws.focused_wid orelse return;
@@ -2059,12 +2120,12 @@ fn setWindowMode(wid: u32, target: window_mod.WindowMode) void {
 
     // Leaving tiled → remove from BSP so remaining windows fill the space
     if (old == .tiled) {
-        removeFromLayout(win.workspace_id, win.display_id, wid);
+        removeFromLayout(win.workspace_id, wid);
     }
 
     // Entering tiled → re-insert into BSP
     if (target == .tiled) {
-        insertIntoLayout(win.workspace_id, win.display_id, wid);
+        insertIntoLayout(win.workspace_id, wid);
     }
 
     win.mode = target;
@@ -2528,8 +2589,9 @@ fn discoverWindows() void {
         if (g_store.get(info.wid) != null) continue;
 
         const frame: window_mod.Window.Frame = .{ .x = info.x, .y = info.y, .width = info.w, .height = info.h };
-        const display_id = displayIdForFrame(frame);
-        const target_ws = resolveWorkspace(info.pid, display_id);
+        const discovered_display = displayIdForFrame(frame);
+        const target_ws = resolveWorkspace(info.pid, discovered_display);
+        const managed_display = target_ws.display_id orelse discovered_display;
 
         switch (windowRoleState(info.pid, info.wid)) {
             .reject => {
@@ -2537,7 +2599,7 @@ fn discoverWindows() void {
                 continue;
             },
             .pending => {
-                trackPendingRoleWindow(info.pid, info.wid, target_ws.id, display_id);
+                trackPendingRoleWindow(info.pid, info.wid, target_ws.id, managed_display);
                 continue;
             },
             .ready => {
@@ -2554,15 +2616,15 @@ fn discoverWindows() void {
             .is_minimized = false,
             .mode = .tiled,
             .workspace_id = target_ws.id,
-            .display_id = display_id,
+            .display_id = managed_display,
         };
 
         g_store.put(win) catch continue;
         target_ws.addWindow(info.wid) catch continue;
-        insertIntoLayout(target_ws.id, display_id, info.wid);
+        insertIntoLayout(target_ws.id, info.wid);
 
         // If assigned to a non-visible workspace, hide immediately
-        if (!workspaceVisibleOnDisplay(target_ws.id, display_id)) {
+        if (!workspaceVisibleOnDisplay(target_ws.id, managed_display)) {
             hideWindow(info.pid, info.wid);
         }
     }
@@ -2687,7 +2749,7 @@ fn addNewWindowManagedWithAssignment(pid: i32, wid: u32, workspace_id: u8, assig
     g_store.put(win) catch return false;
     ws.addWindow(wid) catch return false;
     if (mode == .tiled) {
-        insertIntoLayout(ws.id, display_id, wid);
+        insertIntoLayout(ws.id, wid);
     }
     ws.focused_wid = wid;
 
@@ -2906,7 +2968,7 @@ fn removeWindow(wid: u32) void {
     if (g_workspaces.get(win.workspace_id)) |ws| {
         ws.removeWindow(wid);
     }
-    removeFromLayout(win.workspace_id, win.display_id, wid);
+    removeFromLayout(win.workspace_id, wid);
 
     // If the group dissolved, restore the survivor to workspace and layout
     if (survivor) |solo_wid| {
@@ -2921,7 +2983,7 @@ fn removeWindow(wid: u32) void {
             if (!in_ws) {
                 log.info("removeWindow: restoring tab survivor wid={d} to workspace", .{solo_wid});
                 ws.addWindow(solo_wid) catch {};
-                insertIntoLayout(win.workspace_id, win.display_id, solo_wid);
+                insertIntoLayout(win.workspace_id, solo_wid);
             }
         }
     }
@@ -2933,7 +2995,6 @@ fn removeAppWindows(pid: i32) void {
     clearDragPreview();
     var wids: [128]u32 = undefined;
     var ws_ids: [128]u8 = undefined;
-    var display_ids: [128]u32 = undefined;
     var n: usize = 0;
 
     // Collect managed windows across all workspaces
@@ -2943,7 +3004,6 @@ fn removeAppWindows(pid: i32) void {
                 if (win.pid == pid and n < wids.len) {
                     wids[n] = wid;
                     ws_ids[n] = ws.id;
-                    display_ids[n] = win.display_id;
                     n += 1;
                 }
             }
@@ -2960,17 +3020,16 @@ fn removeAppWindows(pid: i32) void {
 
         wids[n] = wid;
         ws_ids[n] = entry.value_ptr.workspace_id;
-        display_ids[n] = entry.value_ptr.display_id;
         n += 1;
     }
 
-    for (wids[0..n], ws_ids[0..n], display_ids[0..n]) |wid, ws_id, display_id| {
+    for (wids[0..n], ws_ids[0..n]) |wid, ws_id| {
         _ = g_tab_groups.removeMember(wid);
         g_store.remove(wid);
         if (g_workspaces.get(ws_id)) |ws| {
             ws.removeWindow(wid);
         }
-        removeFromLayout(ws_id, display_id, wid);
+        removeFromLayout(ws_id, wid);
     }
 }
 
@@ -3033,6 +3092,9 @@ fn cleanupOffscreenManagedWindows() bool {
     var truncated = false;
 
     for (&g_workspaces.workspaces) |*ws| {
+        // Windows on hidden workspaces are intentionally parked off-screen.
+        if (!workspaceVisibleAnywhere(ws.id)) continue;
+
         for (ws.windows.items) |wid| {
             const win = g_store.get(wid) orelse continue;
 
@@ -3085,12 +3147,12 @@ fn updateWindowDisplayAssignment(wid: u32) bool {
         return false;
     }
 
-    removeFromLayout(win.workspace_id, win.display_id, wid);
+    removeFromLayout(win.workspace_id, wid);
     win.frame = frame;
     win.display_id = next_display_id;
     g_store.put(win) catch return false;
     if (win.mode == .tiled) {
-        insertIntoLayout(win.workspace_id, win.display_id, wid);
+        insertIntoLayout(win.workspace_id, wid);
     }
 
     if (!workspaceVisibleOnDisplay(win.workspace_id, win.display_id)) {
@@ -3110,11 +3172,10 @@ fn reconcileDisplayChange() void {
     const old_displays = g_displays;
     const old_display_count = g_display_count;
     const old_active_ids = g_workspaces.active_ids_by_display;
-    const old_layout_roots = g_layout_roots;
 
     refreshDisplays();
-    clearLayoutRoots();
 
+    // Restore workspace-to-display bindings for surviving displays
     for (g_displays[0..g_display_count], 0..) |display, new_slot| {
         var active_id: u8 = 1;
         var found = false;
@@ -3127,14 +3188,15 @@ fn reconcileDisplayChange() void {
         }
         if (!found) active_id = 1;
         g_workspaces.setActiveForDisplaySlot(new_slot, active_id);
+        if (g_workspaces.get(active_id)) |ws| {
+            ws.display_id = display.id;
+        }
     }
 
-    for (old_displays[0..old_display_count], 0..) |old_display, old_slot| {
-        const new_slot = displayIndexById(old_display.id) orelse continue;
-        for (0..workspace_mod.max_workspaces) |ws_idx| {
-            if (old_layout_roots[ws_idx][old_slot]) |root| {
-                g_layout_roots[ws_idx][new_slot] = root;
-            }
+    // Clear display_id for workspaces not active on any surviving display
+    for (&g_workspaces.workspaces) |*ws| {
+        if (ws.display_id) |did| {
+            if (displayIndexById(did) == null) ws.display_id = null;
         }
     }
 
@@ -3146,7 +3208,7 @@ fn reconcileDisplayChange() void {
         if (g_workspaces.get(win.workspace_id)) |old_ws| {
             old_ws.removeWindow(win.wid);
         }
-        removeFromLayout(win.workspace_id, win.display_id, win.wid);
+        removeFromLayout(win.workspace_id, win.wid);
 
         const target_display_id = primaryDisplayId();
         const target_workspace_id = activeWorkspaceIdForDisplay(target_display_id);
@@ -3159,15 +3221,14 @@ fn reconcileDisplayChange() void {
             if (target_ws.focused_wid == null) target_ws.focused_wid = win.wid;
         }
         if (win.mode == .tiled) {
-            insertIntoLayout(target_workspace_id, target_display_id, win.wid);
+            insertIntoLayout(target_workspace_id, win.wid);
         }
     }
 }
 
 fn retileDisplay(display_id: u32) void {
     const ws_id = activeWorkspaceIdForDisplay(display_id);
-    const root_ptr = layoutRootPtr(ws_id, display_id) orelse return;
-    const root = root_ptr.* orelse return;
+    const root = layoutRootPtr(ws_id).* orelse return;
     const display_slot = displayIndexById(display_id) orelse return;
     const display = g_displays[display_slot].visible;
 
@@ -3578,7 +3639,7 @@ fn checkTabDragOut(_: i32, wid: u32) void {
     const win = g_store.get(wid) orelse return;
     const ws = g_workspaces.get(win.workspace_id) orelse return;
     ws.addWindow(wid) catch return;
-    insertIntoLayout(win.workspace_id, win.display_id, wid);
+    insertIntoLayout(win.workspace_id, wid);
     ws.focused_wid = wid;
     setFocusedDisplay(win.display_id);
 
@@ -3594,7 +3655,7 @@ fn checkTabDragOut(_: i32, wid: u32) void {
         if (!in_ws) {
             log.info("drag-out: restoring survivor wid={d} to workspace", .{solo_wid});
             ws.addWindow(solo_wid) catch {};
-            insertIntoLayout(win.workspace_id, win.display_id, solo_wid);
+            insertIntoLayout(win.workspace_id, solo_wid);
         }
     }
 
@@ -3626,23 +3687,32 @@ fn resolveWorkspace(pid: i32, display_id: u32) *workspace_mod.Workspace {
 // ---------------------------------------------------------------------------
 
 fn switchWorkspace(target_id: u8) void {
-    const display_id = focusedDisplayId();
-    const display_slot = displayIndexById(display_id) orelse return;
+    const target_ws = g_workspaces.get(target_id) orelse return;
+
+    // If target is already visible on some display, just focus there.
+    if (workspaceVisibleAnywhere(target_id)) {
+        const target_display = target_ws.display_id orelse return;
+        setFocusedDisplay(target_display);
+        updateStatusBar();
+        focusWorkspaceWindow(target_ws);
+        return;
+    }
+
+    // Hidden workspace — show it on its assigned display.
+    const target_display = target_ws.display_id orelse focusedDisplayId();
+    const display_slot = displayIndexById(target_display) orelse return;
     const current_id = g_workspaces.activeIdForDisplaySlot(display_slot);
     if (target_id == current_id) return;
 
-    const target_ws = g_workspaces.get(target_id) orelse return;
     const old_ws = g_workspaces.get(current_id) orelse return;
 
-    // Hide current workspace windows (move to safe bottom corner, keep size)
-    const hctx = HideCtx.init(display_id);
+    // Hide current workspace windows (only those on target_display)
+    const hctx = HideCtx.init(target_display);
     for (old_ws.windows.items) |wid| {
-        // Workspace lists track tab-group leaders; hide the currently visible
-        // tab so apps like Ghostty do not remain visible across workspaces.
         const visible_wid = g_tab_groups.resolveActive(wid);
         const hide_wid = if (g_store.get(visible_wid) != null) visible_wid else wid;
         if (g_store.get(hide_wid)) |win| {
-            if (win.display_id != display_id) continue;
+            if (win.display_id != target_display) continue;
             hctx.hide(win.pid, hide_wid);
         }
     }
@@ -3650,39 +3720,40 @@ fn switchWorkspace(target_id: u8) void {
     while (pending_it.next()) |entry| {
         const pending = entry.value_ptr.*;
         if (pending.workspace_id != current_id) continue;
-        if (pending.display_id != display_id) continue;
+        if (pending.display_id != target_display) continue;
         hctx.hide(pending.pid, entry.key_ptr.*);
     }
 
-    // Activate target
+    // Activate target; old workspace keeps its display_id (just hidden).
     g_workspaces.setActiveForDisplaySlot(display_slot, target_id);
+    target_ws.display_id = target_display;
+    assertDisplayCoverage();
 
     retile();
-    statusbar.setTitle(target_ws.name, target_ws.id);
+    setFocusedDisplay(target_display);
+    updateStatusBar();
 
-    // Focus the remembered window on the target workspace
-    var focus_wid = target_ws.focused_wid;
+    focusWorkspaceWindow(target_ws);
+}
+
+/// Focus the remembered (or first available) window on a workspace.
+fn focusWorkspaceWindow(ws: *workspace_mod.Workspace) void {
+    var focus_wid = ws.focused_wid;
     if (focus_wid) |fwid| {
-        if (g_store.get(fwid)) |win| {
-            if (win.display_id != display_id) focus_wid = null;
-        } else {
-            focus_wid = null;
-        }
+        if (g_store.get(fwid) == null) focus_wid = null;
     }
     if (focus_wid == null) {
-        for (target_ws.windows.items) |wid| {
-            const win = g_store.get(wid) orelse continue;
-            if (win.display_id == display_id) {
-                focus_wid = wid;
-                break;
-            }
+        for (ws.windows.items) |wid| {
+            if (g_store.get(wid) == null) continue;
+            focus_wid = wid;
+            break;
         }
     }
     if (focus_wid) |fwid| {
         const actual_wid = g_tab_groups.resolveActive(fwid);
         if (g_store.get(actual_wid)) |win| {
             _ = shim.bw_ax_focus_window(win.pid, actual_wid);
-            target_ws.focused_wid = fwid;
+            ws.focused_wid = fwid;
         }
     }
 }
@@ -3716,14 +3787,14 @@ fn moveWindowToWorkspace(target_id: u8) void {
 
     // Remove from current workspace BSP + list
     ws.removeWindow(wid);
-    removeFromLayout(ws.id, display_id, wid);
+    removeFromLayout(ws.id, wid);
 
     var updated = g_store.get(wid) orelse return;
 
     // Add to target workspace BSP + list
     target_ws.addWindow(wid) catch return;
     if (updated.mode == .tiled) {
-        insertIntoLayout(target_id, display_id, wid);
+        insertIntoLayout(target_id, wid);
     }
     if (target_ws.focused_wid == null) {
         target_ws.focused_wid = wid;
@@ -3781,11 +3852,11 @@ fn moveWindowToDisplay(target_display_slot: u8) void {
     if (win.workspace_id != ws_id) return;
     if (win.display_id != source_display_id) return;
 
-    removeFromLayout(win.workspace_id, win.display_id, wid);
+    removeFromLayout(win.workspace_id, wid);
     win.display_id = target_display_id;
     g_store.put(win) catch return;
     if (win.mode == .tiled) {
-        insertIntoLayout(win.workspace_id, win.display_id, wid);
+        insertIntoLayout(win.workspace_id, wid);
     }
 
     if (!workspaceVisibleOnDisplay(win.workspace_id, target_display_id)) {
@@ -3794,6 +3865,78 @@ fn moveWindowToDisplay(target_display_slot: u8) void {
 
     setFocusedDisplay(target_display_id);
     retile();
+}
+
+fn moveWorkspaceToDisplay(target_display_slot: usize) void {
+    if (target_display_slot >= g_display_count) return;
+
+    const source_display_id = focusedDisplayId();
+    const source_slot = displayIndexById(source_display_id) orelse return;
+    const target_display_id = g_displays[target_display_slot].id;
+    if (source_display_id == target_display_id) return;
+
+    const moving_ws_id = g_workspaces.activeIdForDisplaySlot(source_slot);
+    const displaced_ws_id = g_workspaces.activeIdForDisplaySlot(target_display_slot);
+    const moving_ws = g_workspaces.get(moving_ws_id) orelse return;
+    const displaced_ws = g_workspaces.get(displaced_ws_id) orelse return;
+
+    // Hide displaced workspace's windows on target display
+    const hctx = HideCtx.init(target_display_id);
+    for (displaced_ws.windows.items) |wid| {
+        const visible_wid = g_tab_groups.resolveActive(wid);
+        const hide_wid = if (g_store.get(visible_wid) != null) visible_wid else wid;
+        if (g_store.get(hide_wid)) |win| {
+            if (win.display_id != target_display_id) continue;
+            hctx.hide(win.pid, hide_wid);
+        }
+    }
+
+    // Migrate moving workspace's windows to the target display
+    for (moving_ws.windows.items) |wid| {
+        if (g_store.get(wid)) |w| {
+            var updated = w;
+            updated.display_id = target_display_id;
+            g_store.put(updated) catch {};
+        }
+    }
+
+    // Moving workspace takes the target display
+    g_workspaces.setActiveForDisplaySlot(target_display_slot, moving_ws_id);
+    moving_ws.display_id = target_display_id;
+
+    // Source display needs a new active workspace; pick first hidden one
+    // assigned to it, or fall back to the displaced workspace.
+    var fallback_id: u8 = displaced_ws_id;
+    for (g_workspaces.workspaces[0..g_workspaces.workspace_count]) |ws| {
+        if (ws.id == moving_ws_id) continue;
+        if (ws.display_id != source_display_id) continue;
+        if (workspaceVisibleAnywhere(ws.id)) continue;
+        fallback_id = ws.id;
+        break;
+    }
+    g_workspaces.setActiveForDisplaySlot(source_slot, fallback_id);
+    if (g_workspaces.get(fallback_id)) |fb_ws| {
+        fb_ws.display_id = source_display_id;
+    }
+    assertDisplayCoverage();
+
+    retile();
+    setFocusedDisplay(target_display_id);
+    updateStatusBar();
+}
+
+fn moveWorkspaceToDisplayNext() void {
+    if (g_display_count <= 1) return;
+    const source_slot = displayIndexById(focusedDisplayId()) orelse return;
+    const target_slot = (source_slot + 1) % g_display_count;
+    moveWorkspaceToDisplay(target_slot);
+}
+
+fn moveWorkspaceToDisplayPrev() void {
+    if (g_display_count <= 1) return;
+    const source_slot = displayIndexById(focusedDisplayId()) orelse return;
+    const target_slot = if (source_slot == 0) g_display_count - 1 else source_slot - 1;
+    moveWorkspaceToDisplay(target_slot);
 }
 
 // ---------------------------------------------------------------------------
@@ -3846,12 +3989,12 @@ fn focusDirection(dir: FocusDir) void {
             _ = shim.bw_ax_focus_window(win.pid, actual_wid);
             ws.focused_wid = wid; // track the leader
             setFocusedDisplay(win.display_id);
-            setLayoutLeafActive(win.workspace_id, win.display_id, actual_wid);
+            setLayoutLeafActive(win.workspace_id, actual_wid);
         }
         return;
     }
 
-    const root_ptr = layoutRootPtr(focused.workspace_id, focused.display_id) orelse return;
+    const root_ptr = layoutRootPtr(focused.workspace_id);
     const root = root_ptr.* orelse return;
     const stack_forward = switch (dir) {
         .left, .up => false,
@@ -3862,7 +4005,7 @@ fn focusDirection(dir: FocusDir) void {
             _ = shim.bw_ax_focus_window(win.pid, stack_wid);
             ws.focused_wid = stack_wid;
             setFocusedDisplay(win.display_id);
-            setLayoutLeafActive(win.workspace_id, win.display_id, stack_wid);
+            setLayoutLeafActive(win.workspace_id, stack_wid);
         }
     }
 }
@@ -3971,10 +4114,7 @@ fn ipcDispatch(cmd: []const u8, client_fd: posix.socket_t) void {
             ipc.writeResponse(client_fd, "err: focused window not managed\n");
             return;
         };
-        const root_ptr = layoutRootPtr(win.workspace_id, win.display_id) orelse {
-            ipc.writeResponse(client_fd, "err: no layout root\n");
-            return;
-        };
+        const root_ptr = layoutRootPtr(win.workspace_id);
         if (root_ptr.*) |*root| {
             layout.mirror(root, axis);
             retileDisplay(win.display_id);
@@ -3992,10 +4132,7 @@ fn ipcDispatch(cmd: []const u8, client_fd: posix.socket_t) void {
             ipc.writeResponse(client_fd, "err: focused window not managed\n");
             return;
         };
-        const root_ptr = layoutRootPtr(win.workspace_id, win.display_id) orelse {
-            ipc.writeResponse(client_fd, "err: no layout root\n");
-            return;
-        };
+        const root_ptr = layoutRootPtr(win.workspace_id);
         if (root_ptr.*) |*root| {
             layout.equalize(root, null, g_config.bsp_split_ratio);
             retileDisplay(win.display_id);
@@ -4013,10 +4150,7 @@ fn ipcDispatch(cmd: []const u8, client_fd: posix.socket_t) void {
             ipc.writeResponse(client_fd, "err: focused window not managed\n");
             return;
         };
-        const root_ptr = layoutRootPtr(win.workspace_id, win.display_id) orelse {
-            ipc.writeResponse(client_fd, "err: no layout root\n");
-            return;
-        };
+        const root_ptr = layoutRootPtr(win.workspace_id);
         if (root_ptr.*) |*root| {
             _ = layout.balance(root, null);
             retileDisplay(win.display_id);
@@ -4043,10 +4177,7 @@ fn ipcDispatch(cmd: []const u8, client_fd: posix.socket_t) void {
             ipc.writeResponse(client_fd, "err: focused window not managed\n");
             return;
         };
-        const root_ptr = layoutRootPtr(win.workspace_id, win.display_id) orelse {
-            ipc.writeResponse(client_fd, "err: no layout root\n");
-            return;
-        };
+        const root_ptr = layoutRootPtr(win.workspace_id);
         if (root_ptr.*) |*root| {
             layout.rotate(root, degrees);
             retileDisplay(win.display_id);
@@ -4078,6 +4209,26 @@ fn ipcDispatch(cmd: []const u8, client_fd: posix.socket_t) void {
         };
         moveWindowToDisplay(n);
         ipc.writeResponse(client_fd, "ok\n");
+    } else if (std.mem.startsWith(u8, cmd, "move-workspace-to-display ")) {
+        const arg = cmd["move-workspace-to-display ".len..];
+        if (std.mem.eql(u8, arg, "next")) {
+            moveWorkspaceToDisplayNext();
+            ipc.writeResponse(client_fd, "ok\n");
+        } else if (std.mem.eql(u8, arg, "prev")) {
+            moveWorkspaceToDisplayPrev();
+            ipc.writeResponse(client_fd, "ok\n");
+        } else {
+            const n = std.fmt.parseInt(u8, arg, 10) catch {
+                ipc.writeResponse(client_fd, "err: invalid display number, expected next|prev|<number>\n");
+                return;
+            };
+            if (n == 0) {
+                ipc.writeResponse(client_fd, "err: display number starts at 1\n");
+                return;
+            }
+            moveWorkspaceToDisplay(@as(usize, n) - 1);
+            ipc.writeResponse(client_fd, "ok\n");
+        }
     } else if (std.mem.startsWith(u8, cmd, "focus ")) {
         const dir_str = cmd["focus ".len..];
         if (std.mem.eql(u8, dir_str, "left")) {

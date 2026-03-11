@@ -8,6 +8,7 @@ pub const max_displays = 8;
 pub const Workspace = struct {
     id: WorkspaceId,
     name: []const u8 = "",
+    display_id: ?u32 = null,
     windows: std.ArrayList(Window.WindowId),
     focused_wid: ?Window.WindowId,
     allocator: std.mem.Allocator,
@@ -58,13 +59,22 @@ pub const WorkspaceManager = struct {
     workspaces: [max_workspaces]Workspace,
     active_ids_by_display: [max_displays]WorkspaceId,
     focused_display_slot: usize,
+    workspace_count: u8,
     allocator: std.mem.Allocator,
 
-    pub fn init(allocator: std.mem.Allocator) WorkspaceManager {
+    pub fn init(allocator: std.mem.Allocator, count: u8) WorkspaceManager {
+        const clamped: u8 = if (count == 0) max_workspaces else @min(count, max_workspaces);
         var wm: WorkspaceManager = .{
             .workspaces = undefined,
-            .active_ids_by_display = [1]WorkspaceId{1} ** max_displays,
+            .active_ids_by_display = blk: {
+                var ids: [max_displays]WorkspaceId = undefined;
+                for (0..max_displays) |i| {
+                    ids[i] = @intCast(i + 1);
+                }
+                break :blk ids;
+            },
             .focused_display_slot = 0,
+            .workspace_count = clamped,
             .allocator = allocator,
         };
         for (0..max_workspaces) |i| {
@@ -88,18 +98,18 @@ pub const WorkspaceManager = struct {
     pub fn activeIdForDisplaySlot(self: *const WorkspaceManager, display_slot: usize) WorkspaceId {
         std.debug.assert(display_slot < max_displays);
         const active_id = self.active_ids_by_display[display_slot];
-        std.debug.assert(active_id > 0 and active_id <= max_workspaces);
+        std.debug.assert(active_id > 0 and active_id <= self.workspace_count);
         return active_id;
     }
 
     pub fn setActiveForDisplaySlot(self: *WorkspaceManager, display_slot: usize, workspace_id: WorkspaceId) void {
         std.debug.assert(display_slot < max_displays);
-        std.debug.assert(workspace_id > 0 and workspace_id <= max_workspaces);
+        std.debug.assert(workspace_id > 0 and workspace_id <= self.workspace_count);
         self.active_ids_by_display[display_slot] = workspace_id;
     }
 
     pub fn get(self: *WorkspaceManager, id: WorkspaceId) ?*Workspace {
-        if (id == 0 or id > max_workspaces) return null;
+        if (id == 0 or id > self.workspace_count) return null;
         return &self.workspaces[id - 1];
     }
 };

@@ -55,20 +55,66 @@ pub fn init() void {
     log.info("status bar created", .{});
 }
 
-/// Update the status bar title to reflect the active workspace.
-pub fn setTitle(name: []const u8, id: u8) void {
-    var buf: [64]u8 = undefined;
-    const title: []const u8 = if (name.len > 0) name else std.fmt.bufPrint(&buf, "{d}", .{id}) catch return;
+pub const DisplayWorkspace = struct {
+    name: []const u8,
+    id: u8,
+    focused: bool,
+};
 
-    // Null-terminate for stringWithUTF8String:
-    var z: [65]u8 = undefined;
-    const n = @min(title.len, z.len - 1);
-    @memcpy(z[0..n], title[0..n]);
-    z[n] = 0;
+/// Update the status bar title to show all active workspaces across displays.
+/// Format: "ws1 | ws2 | ..." with the focused one marked with [brackets].
+pub fn setTitleMulti(workspaces: []const DisplayWorkspace) void {
+    var buf: [256]u8 = undefined;
+    var pos: usize = 0;
+
+    for (workspaces, 0..) |ws, i| {
+        if (i > 0) {
+            if (pos + 3 <= buf.len) {
+                @memcpy(buf[pos..][0..3], " | ");
+                pos += 3;
+            }
+        }
+
+        const label = if (ws.name.len > 0) ws.name else blk: {
+            const s = std.fmt.bufPrint(buf[pos..], "{d}", .{ws.id}) catch break :blk "";
+            break :blk s;
+        };
+
+        if (ws.focused) {
+            if (pos + 1 <= buf.len) {
+                buf[pos] = '[';
+                pos += 1;
+            }
+        }
+
+        const n = @min(label.len, buf.len - pos);
+        // label might alias buf (from the bufPrint fallback), so use
+        // a forward copy that is always safe when src >= dst.
+        if (label.ptr != buf[pos..].ptr) {
+            @memcpy(buf[pos..][0..n], label[0..n]);
+        }
+        pos += n;
+
+        if (ws.focused) {
+            if (pos + 1 <= buf.len) {
+                buf[pos] = ']';
+                pos += 1;
+            }
+        }
+    }
+
+    if (pos == 0) return;
+    if (pos >= buf.len) pos = buf.len - 1;
+    buf[pos] = 0;
 
     g_button.msgSend(void, "setTitle:", .{
-        nsString(@ptrCast(z[0..n :0])),
+        nsString(@ptrCast(buf[0..pos :0])),
     });
+}
+
+/// Update the status bar title to reflect the active workspace.
+pub fn setTitle(name: []const u8, id: u8) void {
+    setTitleMulti(&.{.{ .name = name, .id = id, .focused = true }});
 }
 
 fn nsString(str: [*:0]const u8) objc.Object {

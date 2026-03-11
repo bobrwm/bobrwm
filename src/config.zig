@@ -82,6 +82,15 @@ pub const Action = enum(u8) {
     toggle_split = 26,
     toggle_fullscreen = 27,
     toggle_float = 28,
+    move_workspace_to_display = 29,
+
+    // Every Action must map 1:1 to an EventKind (hk_ prefixed).
+    comptime {
+        const event = @import("event.zig").EventKind;
+        for (@typeInfo(Action).@"enum".fields) |f| {
+            _ = std.enums.nameCast(event, "hk_" ++ f.name);
+        }
+    }
 };
 
 pub const Keybind = struct {
