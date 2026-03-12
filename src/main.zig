@@ -306,6 +306,33 @@ fn setFocusedDisplay(display_id: u32) void {
     g_workspaces.focused_display_slot = slot;
 }
 
+/// I'm sorry God (and Uzaaft) for what I have done. Basically when calling
+/// setFocusedDisplay, a stale focus event from a previous workspace switch has
+/// the possibility to fuck up the currently focused display.
+///
+/// So the solution was to basically just add a guard that's important for
+/// events that handle multiple displays.
+fn maybeSetFocusedDisplayForWindow(win: window_mod.Window) void {
+    if (!workspaceVisibleOnDisplay(win.workspace_id, win.display_id)) return;
+    setFocusedDisplay(win.display_id);
+}
+
+/// Another thing that's super jank and probably needs to be removed, but we
+/// need to give AX time to settle down after workspace transitions since many
+/// rapidly successive switches can fire several destructive events or do some
+/// unintended display reassignment.
+///
+/// TODO: Actually remove this or figure out a better workaround
+var g_workspace_transition_until_s: f64 = 0;
+
+fn markWorkspaceTransition() void {
+    g_workspace_transition_until_s = c.CFAbsoluteTimeGetCurrent() + 0.15;
+}
+
+fn inWorkspaceTransition() bool {
+    return c.CFAbsoluteTimeGetCurrent() < g_workspace_transition_until_s;
+}
+
 /// Debug-only: verify every display slot has a valid active workspace
 /// and no two slots share the same workspace.
 fn assertDisplayCoverage() void {
@@ -1943,8 +1970,8 @@ fn handleEvent(ev: *const event_mod.Event) void {
         },
         .window_focused => {
             log.info("window focused pid={}", .{ev.pid});
-            const removed_stale = cleanupWorkspaceWindowsForPid(ev.pid);
-            const removed_offscreen = cleanupOffscreenManagedWindows();
+            const removed_stale = if (!inWorkspaceTransition()) cleanupWorkspaceWindowsForPid(ev.pid) else false;
+            const removed_offscreen = if (!inWorkspaceTransition()) cleanupOffscreenManagedWindows() else false;
             const wid = shim.bw_ax_get_focused_window(ev.pid);
             if (wid != 0) {
                 if (g_store.get(wid) == null) {
@@ -1955,7 +1982,7 @@ fn handleEvent(ev: *const event_mod.Event) void {
                 // Track leader in workspace, not raw active tab
                 const leader = g_tab_groups.resolveLeader(wid);
                 if (g_store.get(leader)) |win| {
-                    setFocusedDisplay(win.display_id);
+                    maybeSetFocusedDisplayForWindow(win);
                     if (g_workspaces.get(win.workspace_id)) |ws| {
                         ws.focused_wid = leader;
                     }
@@ -1968,8 +1995,8 @@ fn handleEvent(ev: *const event_mod.Event) void {
         },
         .focused_window_changed => {
             log.info("focused window changed pid={}", .{ev.pid});
-            const removed_stale = cleanupWorkspaceWindowsForPid(ev.pid);
-            const removed_offscreen = cleanupOffscreenManagedWindows();
+            const removed_stale = if (!inWorkspaceTransition()) cleanupWorkspaceWindowsForPid(ev.pid) else false;
+            const removed_offscreen = if (!inWorkspaceTransition()) cleanupOffscreenManagedWindows() else false;
             reconcileAppTabs(ev.pid);
             if (removed_stale or removed_offscreen) {
                 retile();
@@ -2707,7 +2734,7 @@ fn addNewWindowManagedWithAssignment(pid: i32, wid: u32, workspace_id: u8, assig
     if (tryFormTabGroupOnCreate(pid, wid)) return false;
 
     var window_frame: window_mod.Window.Frame = .{ .x = 0, .y = 0, .width = 0, .height = 0 };
-    var display_id = assigned_display_id;
+    const display_id = assigned_display_id;
     if (g_sky) |sky| {
         var rect: skylight.CGRect = undefined;
         if (sky.getWindowBounds(sky.mainConnectionID(), wid, &rect) == 0) {
@@ -2717,7 +2744,6 @@ fn addNewWindowManagedWithAssignment(pid: i32, wid: u32, workspace_id: u8, assig
                 .width = rect.size.width,
                 .height = rect.size.height,
             };
-            display_id = displayIdForFrame(window_frame);
         }
     }
     // Non-resizable windows that are undersized (≤500px in either dimension)
@@ -3125,7 +3151,7 @@ fn cleanupOffscreenManagedWindows() bool {
     return stale_count > 0;
 }
 
-/// Updates `display_id` when a moved/resized window crosses monitors.
+/// Updates `display_id` when a user-dragged window crosses monitors.
 /// Returns true when display ownership changed and callers should retile.
 fn updateWindowDisplayAssignment(wid: u32) bool {
     var win = g_store.get(wid) orelse return false;
@@ -3142,6 +3168,19 @@ fn updateWindowDisplayAssignment(wid: u32) bool {
     };
     const next_display_id = displayIdForFrame(frame);
     if (next_display_id == win.display_id) {
+        win.frame = frame;
+        g_store.put(win) catch {};
+        return false;
+    }
+
+    // Only reassign display when the user is actively dragging and the
+    // workspace is visible. Stops our retile from triggering this.
+    if (!g_mouse_left_down) {
+        win.frame = frame;
+        g_store.put(win) catch {};
+        return false;
+    }
+    if (!workspaceVisibleOnDisplay(win.workspace_id, win.display_id)) {
         win.frame = frame;
         g_store.put(win) catch {};
         return false;
@@ -3423,7 +3462,7 @@ fn reconcileAppTabs(pid: i32) void {
         g_tab_groups.setActive(focused_wid);
         const leader = g_tab_groups.resolveLeader(focused_wid);
         if (g_store.get(leader)) |win| {
-            setFocusedDisplay(win.display_id);
+            maybeSetFocusedDisplayForWindow(win);
             if (g_workspaces.get(win.workspace_id)) |ws| {
                 ws.focused_wid = leader;
             }
@@ -3437,7 +3476,7 @@ fn reconcileAppTabs(pid: i32) void {
         g_tab_groups.setActive(focused_wid);
         const leader = g_tab_groups.resolveLeader(focused_wid);
         if (g_store.get(leader)) |win| {
-            setFocusedDisplay(win.display_id);
+            maybeSetFocusedDisplayForWindow(win);
             if (g_workspaces.get(win.workspace_id)) |ws| {
                 ws.focused_wid = leader;
             }
@@ -3587,7 +3626,9 @@ fn reconcileAppTabs(pid: i32) void {
         if (g_workspaces.get(matching_ws_id)) |ws| {
             ws.focused_wid = leader;
         }
-        setFocusedDisplay(matching_display_id);
+        if (workspaceVisibleOnDisplay(matching_ws_id, matching_display_id)) {
+            setFocusedDisplay(matching_display_id);
+        }
 
         log.info("reconcile: tab group formed leader={d} active={d} members={d}", .{
             leader,
@@ -3729,6 +3770,7 @@ fn switchWorkspace(target_id: u8) void {
     target_ws.display_id = target_display;
     assertDisplayCoverage();
 
+    markWorkspaceTransition();
     retile();
     setFocusedDisplay(target_display);
     updateStatusBar();
@@ -3920,6 +3962,7 @@ fn moveWorkspaceToDisplay(target_display_slot: usize) void {
     }
     assertDisplayCoverage();
 
+    markWorkspaceTransition();
     retile();
     setFocusedDisplay(target_display_id);
     updateStatusBar();
