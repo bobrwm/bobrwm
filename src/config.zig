@@ -87,6 +87,10 @@ pub const Action = enum(u8) {
     move_up = 31,
     move_down = 32,
     move_to_display = 33,
+    warp_left = 34,
+    warp_right = 35,
+    warp_up = 36,
+    warp_down = 37,
 };
 
 pub const Keybind = struct {

@@ -31,6 +31,10 @@ pub const EventKind = enum(u8) {
     hk_move_up = 31,
     hk_move_down = 32,
     hk_move_to_display = 33,
+    hk_warp_left = 34,
+    hk_warp_right = 35,
+    hk_warp_up = 36,
+    hk_warp_down = 37,
 };
 
 pub const Event = extern struct {

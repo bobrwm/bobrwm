@@ -2067,6 +2067,10 @@ fn handleEvent(ev: *const event_mod.Event) void {
             log.info("hotkey: move to display {}", .{target});
             moveWindowToDisplay(target);
         },
+        .hk_warp_left => warpDirection(.left),
+        .hk_warp_right => warpDirection(.right),
+        .hk_warp_up => warpDirection(.up),
+        .hk_warp_down => warpDirection(.down),
     }
 }
 
@@ -3947,6 +3951,74 @@ fn swapDirection(dir: FocusDir) void {
             retile();
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Warp direction (re-insert focused window next to target in BSP tree)
+// ---------------------------------------------------------------------------
+
+fn warpDirection(dir: FocusDir) void {
+    const ws = g_workspaces.active();
+    const focused_wid = ws.focused_wid orelse return;
+    const focused = g_store.get(focused_wid) orelse return;
+    if (focused.mode != .tiled) return;
+
+    const fc_x = focused.frame.x + focused.frame.width / 2.0;
+    const fc_y = focused.frame.y + focused.frame.height / 2.0;
+
+    var best_wid: ?u32 = null;
+    var best_dist: f64 = std.math.inf(f64);
+
+    for (ws.windows.items) |wid| {
+        if (wid == focused_wid) continue;
+        const win = g_store.get(wid) orelse continue;
+        if (win.display_id != focused.display_id) continue;
+
+        const wc_x = win.frame.x + win.frame.width / 2.0;
+        const wc_y = win.frame.y + win.frame.height / 2.0;
+
+        const dx = wc_x - fc_x;
+        const dy = wc_y - fc_y;
+
+        const in_direction = switch (dir) {
+            .left => dx < 0,
+            .right => dx > 0,
+            .up => dy < 0,
+            .down => dy > 0,
+        };
+        if (!in_direction) continue;
+
+        const dist = @abs(dx) + @abs(dy);
+        if (dist < best_dist) {
+            best_dist = dist;
+            best_wid = wid;
+        }
+    }
+
+    const target_wid = best_wid orelse return;
+
+    // Remove focused window from tree, then re-insert next to target.
+    // Child selection mirrors the warp direction so the window lands on
+    // the side the user expects (left/up → first child, right/down → second).
+    removeFromLayout(focused.workspace_id, focused.display_id, focused_wid);
+
+    const root_ptr = layoutRootPtr(focused.workspace_id, focused.display_id) orelse return;
+    const child: layout.InsertChild = switch (dir) {
+        .left, .up => .first,
+        .right, .down => .second,
+    };
+    const options: layout.InsertOptions = .{
+        .mode = .split,
+        .split_mode = g_bsp_split_mode,
+        .child = child,
+        .anchor_wid = target_wid,
+        .root_frame = displayContentFrame(focused.display_id),
+        .inner_gap = @floatFromInt(g_config.gaps.inner),
+        .split_ratio = g_config.bsp_split_ratio,
+    };
+    const updated = layout.insertWindow(root_ptr.*, focused_wid, options, g_allocator) catch return;
+    root_ptr.* = updated;
+    retile();
 }
 
 // ---------------------------------------------------------------------------
