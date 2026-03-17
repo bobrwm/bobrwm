@@ -2058,6 +2058,15 @@ fn handleEvent(ev: *const event_mod.Event) void {
             const target: window_mod.WindowMode = if (win.mode != .tiled) .tiled else .floating;
             setWindowMode(focused, target);
         },
+        .hk_move_left => swapDirection(.left),
+        .hk_move_right => swapDirection(.right),
+        .hk_move_up => swapDirection(.up),
+        .hk_move_down => swapDirection(.down),
+        .hk_move_to_display => {
+            const target: u8 = @intCast(ev.wid);
+            log.info("hotkey: move to display {}", .{target});
+            moveWindowToDisplay(target);
+        },
     }
 }
 
@@ -3876,6 +3885,66 @@ fn focusDirection(dir: FocusDir) void {
             ws.focused_wid = stack_wid;
             setFocusedDisplay(win.display_id);
             setLayoutLeafActive(win.workspace_id, win.display_id, stack_wid);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Swap direction (move focused window in a direction)
+// ---------------------------------------------------------------------------
+
+fn swapDirection(dir: FocusDir) void {
+    const ws = g_workspaces.active();
+    const focused_wid = ws.focused_wid orelse return;
+    const focused = g_store.get(focused_wid) orelse return;
+
+    const fc_x = focused.frame.x + focused.frame.width / 2.0;
+    const fc_y = focused.frame.y + focused.frame.height / 2.0;
+
+    var best_wid: ?u32 = null;
+    var best_dist: f64 = std.math.inf(f64);
+
+    for (ws.windows.items) |wid| {
+        if (wid == focused_wid) continue;
+        const win = g_store.get(wid) orelse continue;
+        if (win.display_id != focused.display_id) continue;
+
+        const wc_x = win.frame.x + win.frame.width / 2.0;
+        const wc_y = win.frame.y + win.frame.height / 2.0;
+
+        const dx = wc_x - fc_x;
+        const dy = wc_y - fc_y;
+
+        const in_direction = switch (dir) {
+            .left => dx < 0,
+            .right => dx > 0,
+            .up => dy < 0,
+            .down => dy > 0,
+        };
+        if (!in_direction) continue;
+
+        const dist = @abs(dx) + @abs(dy);
+        if (dist < best_dist) {
+            best_dist = dist;
+            best_wid = wid;
+        }
+    }
+
+    const target_wid = best_wid orelse blk: {
+        // Fall back to stack neighbor (for stacked windows)
+        const root_ptr = layoutRootPtr(focused.workspace_id, focused.display_id) orelse return;
+        const root = root_ptr.* orelse return;
+        const stack_forward = switch (dir) {
+            .left, .up => false,
+            .right, .down => true,
+        };
+        break :blk layout.stackNeighbor(root, focused_wid, stack_forward) orelse return;
+    };
+
+    const root_ptr = layoutRootPtr(focused.workspace_id, focused.display_id) orelse return;
+    if (root_ptr.*) |*root| {
+        if (layout.swapWindowIds(root, focused_wid, target_wid)) {
+            retile();
         }
     }
 }

@@ -74,6 +74,11 @@ Map a key + modifiers to an action:
 | `focus_right` | Focus window to the right | — |
 | `focus_up` | Focus window above | — |
 | `focus_down` | Focus window below | — |
+| `move_left` | Swap focused window with neighbor to the left | — |
+| `move_right` | Swap focused window with neighbor to the right | — |
+| `move_up` | Swap focused window with neighbor above | — |
+| `move_down` | Swap focused window with neighbor below | — |
+| `move_to_display` | Move focused window to display N | display slot |
 | `toggle_split` | Toggle next split direction | — |
 | `toggle_fullscreen` | Toggle focused window fullscreen | — |
 | `toggle_float` | Toggle focused window floating | — |

@@ -82,6 +82,11 @@ pub const Action = enum(u8) {
     toggle_split = 26,
     toggle_fullscreen = 27,
     toggle_float = 28,
+    move_left = 29,
+    move_right = 30,
+    move_up = 31,
+    move_down = 32,
+    move_to_display = 33,
 };
 
 pub const Keybind = struct {
