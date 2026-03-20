@@ -4166,6 +4166,10 @@ fn moveWorkspaceToDisplay(target_display_slot: usize) void {
     setFocusedDisplay(target_display_id);
     updateStatusBar();
 
+    if (g_workspace_transition.isActive()) {
+        g_pending_focus_count = 0;
+    }
+
     if (g_workspace_transition.isActive() and g_workspaces.get(moving_ws_id)) |ws| {
         focusWorkspaceWindow(ws);
     }
