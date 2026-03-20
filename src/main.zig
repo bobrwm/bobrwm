@@ -776,6 +776,7 @@ var g_workspace_transition: WorkspaceTransitionState = .{};
 var g_pending_focus_entries: [pending_focus_capacity_per_epoch]PendingFocusEntry = undefined;
 var g_pending_focus_count: usize = 0;
 var g_pending_focus_sequence: u64 = 0;
+var g_layout_entries: std.ArrayList(layout.LayoutEntry) = .empty;
 
 fn shouldHandleWorkspaceEvent(last_event_at_s: *f64) bool {
     std.debug.assert(last_event_at_s.* >= 0);
@@ -1754,6 +1755,7 @@ pub fn main() !void {
         g_app_launch_retries.deinit();
         g_deferred_window_candidates.deinit();
         g_pending_role_windows.deinit();
+        g_layout_entries.deinit(g_allocator);
     }
     refreshDisplays();
 
@@ -3467,35 +3469,18 @@ fn retileDisplay(display_id: u32) void {
     const window_count = layout.windowCount(root);
     std.debug.assert(window_count > 0);
 
-    var stack_buf: [256 * @sizeOf(layout.LayoutEntry)]u8 = undefined;
-    var fba = std.heap.FixedBufferAllocator.init(&stack_buf);
-    var entries: std.ArrayList(layout.LayoutEntry) = .{};
+    g_layout_entries.clearRetainingCapacity();
+    g_layout_entries.ensureTotalCapacity(g_allocator, window_count) catch {
+        log.err("retile: layout buffer reserve failed display={d} windows={d}", .{ display_id, window_count });
+        return;
+    };
+    layout.applyLayout(g_config.layout, root, frame, @floatFromInt(g_config.gaps.inner), &g_layout_entries, g_allocator) catch {
+        log.err("retile: layout apply failed display={d} windows={d}", .{ display_id, window_count });
+        return;
+    };
+    std.debug.assert(g_layout_entries.items.len == window_count);
 
-    if (window_count <= 256) {
-        const allocator = fba.allocator();
-        entries.ensureTotalCapacity(allocator, window_count) catch {
-            log.err("retile: stack reserve failed display={d} windows={d}", .{ display_id, window_count });
-            return;
-        };
-        layout.applyLayout(g_config.layout, root, frame, @floatFromInt(g_config.gaps.inner), &entries, allocator) catch {
-            log.err("retile: stack apply failed display={d} windows={d}", .{ display_id, window_count });
-            return;
-        };
-    } else {
-        entries.ensureTotalCapacity(g_allocator, window_count) catch {
-            log.err("retile: heap reserve failed display={d} windows={d}", .{ display_id, window_count });
-            return;
-        };
-        defer entries.deinit(g_allocator);
-        layout.applyLayout(g_config.layout, root, frame, @floatFromInt(g_config.gaps.inner), &entries, g_allocator) catch {
-            log.err("retile: heap apply failed display={d} windows={d}", .{ display_id, window_count });
-            return;
-        };
-        log.warn("retile: using heap layout buffer display={d} windows={d}", .{ display_id, window_count });
-    }
-    std.debug.assert(entries.items.len == window_count);
-
-    for (entries.items) |entry| {
+    for (g_layout_entries.items) |entry| {
         const win = g_store.get(entry.wid) orelse continue;
         if (win.display_id != display_id) continue;
         if (win.workspace_id != ws_id) continue;
