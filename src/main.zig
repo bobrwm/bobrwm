@@ -100,6 +100,8 @@ const deferred_window_candidate_capacity: usize = 256;
 const app_launch_retry_capacity: usize = 64;
 /// Debounce workspace/display notifications that can fire in short bursts.
 const workspace_event_debounce_interval_s: f64 = 0.05;
+/// Hard cap for workspace transition convergence before we fail closed.
+const workspace_transition_watchdog_interval_s: f64 = 0.4;
 
 const DisplayInfo = struct {
     id: u32,
@@ -125,6 +127,31 @@ const WindowRoleState = enum {
     reject,
     ready,
     pending,
+};
+
+const FocusEventSource = enum {
+    keyboard,
+    drag,
+    ax,
+};
+
+const WorkspaceTransitionKind = enum {
+    idle,
+    switch_workspace,
+    move_workspace_to_display,
+};
+
+const WorkspaceTransitionState = struct {
+    kind: WorkspaceTransitionKind = .idle,
+    epoch: u64 = 0,
+    started_at_s: f64 = 0,
+    deadline_at_s: f64 = 0,
+    target_workspace_id: u8 = 0,
+    target_display_id: u32 = 0,
+
+    fn isActive(self: WorkspaceTransitionState) bool {
+        return self.kind != .idle;
+    }
 };
 
 const PendingRoleWindow = struct {
@@ -306,31 +333,72 @@ fn setFocusedDisplay(display_id: u32) void {
     g_workspaces.focused_display_slot = slot;
 }
 
-/// I'm sorry God (and Uzaaft) for what I have done. Basically when calling
-/// setFocusedDisplay, a stale focus event from a previous workspace switch has
-/// the possibility to fuck up the currently focused display.
-///
-/// So the solution was to basically just add a guard that's important for
-/// events that handle multiple displays.
-fn maybeSetFocusedDisplayForWindow(win: window_mod.Window) void {
-    if (!workspaceVisibleOnDisplay(win.workspace_id, win.display_id)) return;
+fn clearWorkspaceTransition() void {
+    g_workspace_transition = .{
+        .epoch = g_workspace_transition.epoch,
+    };
+}
+
+fn startWorkspaceTransition(kind: WorkspaceTransitionKind, target_workspace_id: u8, target_display_id: u32) void {
+    std.debug.assert(kind != .idle);
+    std.debug.assert(target_workspace_id > 0 and target_workspace_id <= g_workspaces.workspace_count);
+    std.debug.assert(target_display_id != 0);
+
+    const now_s = c.CFAbsoluteTimeGetCurrent();
+    const next_epoch = g_workspace_transition.epoch + 1;
+    g_workspace_transition = .{
+        .kind = kind,
+        .epoch = next_epoch,
+        .started_at_s = now_s,
+        .deadline_at_s = now_s + workspace_transition_watchdog_interval_s,
+        .target_workspace_id = target_workspace_id,
+        .target_display_id = target_display_id,
+    };
+}
+
+fn workspaceTransitionTimedOut() bool {
+    if (!g_workspace_transition.isActive()) return false;
+    return c.CFAbsoluteTimeGetCurrent() >= g_workspace_transition.deadline_at_s;
+}
+
+fn shouldAcceptFocusForWindow(win: window_mod.Window, source: FocusEventSource) bool {
+    if (!workspaceVisibleOnDisplay(win.workspace_id, win.display_id)) return false;
+    if (source == .keyboard) return true;
+
+    if (!g_workspace_transition.isActive()) return true;
+
+    const transition = g_workspace_transition;
+    if (win.workspace_id != transition.target_workspace_id) return false;
+    if (win.display_id != transition.target_display_id) return false;
+    return true;
+}
+
+fn maybeSetFocusedDisplayForWindow(win: window_mod.Window, source: FocusEventSource) bool {
+    if (!shouldAcceptFocusForWindow(win, source)) {
+        return false;
+    }
+
     setFocusedDisplay(win.display_id);
+
+    if (g_workspace_transition.isActive() and
+        win.workspace_id == g_workspace_transition.target_workspace_id and
+        win.display_id == g_workspace_transition.target_display_id)
+    {
+        clearWorkspaceTransition();
+    }
+
+    return true;
 }
 
-/// Another thing that's super jank and probably needs to be removed, but we
-/// need to give AX time to settle down after workspace transitions since many
-/// rapidly successive switches can fire several destructive events or do some
-/// unintended display reassignment.
-///
-/// TODO: Actually remove this or figure out a better workaround
-var g_workspace_transition_until_s: f64 = 0;
+fn tickWorkspaceTransitionState() void {
+    if (!workspaceTransitionTimedOut()) return;
 
-fn markWorkspaceTransition() void {
-    g_workspace_transition_until_s = c.CFAbsoluteTimeGetCurrent() + 0.15;
-}
-
-fn inWorkspaceTransition() bool {
-    return c.CFAbsoluteTimeGetCurrent() < g_workspace_transition_until_s;
+    const transition = g_workspace_transition;
+    log.warn(
+        "workspace transition watchdog expired epoch={d} kind={s} workspace={d} display={d}",
+        .{ transition.epoch, @tagName(transition.kind), transition.target_workspace_id, transition.target_display_id },
+    );
+    clearWorkspaceTransition();
 }
 
 /// Debug-only: verify every display slot has a valid active workspace
@@ -595,6 +663,7 @@ var g_role_poll_source: c.dispatch_source_t = null;
 var g_ipc_source: c.dispatch_source_t = null;
 var g_tap_port: c.CFMachPortRef = null;
 var g_ax_strings: ?AxStrings = null;
+var g_workspace_transition: WorkspaceTransitionState = .{};
 
 fn shouldHandleWorkspaceEvent(last_event_at_s: *f64) bool {
     std.debug.assert(last_event_at_s.* >= 0);
@@ -1952,6 +2021,8 @@ fn retile() void {
 // ---------------------------------------------------------------------------
 
 fn handleEvent(ev: *const event_mod.Event) void {
+    tickWorkspaceTransitionState();
+
     switch (ev.kind) {
         // -- Window / app events --
         .app_launched => {
@@ -1970,8 +2041,8 @@ fn handleEvent(ev: *const event_mod.Event) void {
         },
         .window_focused => {
             log.info("window focused pid={}", .{ev.pid});
-            const removed_stale = if (!inWorkspaceTransition()) cleanupWorkspaceWindowsForPid(ev.pid) else false;
-            const removed_offscreen = if (!inWorkspaceTransition()) cleanupOffscreenManagedWindows() else false;
+            const removed_stale = if (!g_workspace_transition.isActive()) cleanupWorkspaceWindowsForPid(ev.pid) else false;
+            const removed_offscreen = if (!g_workspace_transition.isActive()) cleanupOffscreenManagedWindows() else false;
             const wid = shim.bw_ax_get_focused_window(ev.pid);
             if (wid != 0) {
                 if (g_store.get(wid) == null) {
@@ -1982,7 +2053,7 @@ fn handleEvent(ev: *const event_mod.Event) void {
                 // Track leader in workspace, not raw active tab
                 const leader = g_tab_groups.resolveLeader(wid);
                 if (g_store.get(leader)) |win| {
-                    maybeSetFocusedDisplayForWindow(win);
+                    _ = maybeSetFocusedDisplayForWindow(win, .ax);
                     if (g_workspaces.get(win.workspace_id)) |ws| {
                         ws.focused_wid = leader;
                     }
@@ -1995,8 +2066,8 @@ fn handleEvent(ev: *const event_mod.Event) void {
         },
         .focused_window_changed => {
             log.info("focused window changed pid={}", .{ev.pid});
-            const removed_stale = if (!inWorkspaceTransition()) cleanupWorkspaceWindowsForPid(ev.pid) else false;
-            const removed_offscreen = if (!inWorkspaceTransition()) cleanupOffscreenManagedWindows() else false;
+            const removed_stale = if (!g_workspace_transition.isActive()) cleanupWorkspaceWindowsForPid(ev.pid) else false;
+            const removed_offscreen = if (!g_workspace_transition.isActive()) cleanupOffscreenManagedWindows() else false;
             reconcileAppTabs(ev.pid);
             if (removed_stale or removed_offscreen) {
                 retile();
@@ -3197,7 +3268,7 @@ fn updateWindowDisplayAssignment(wid: u32) bool {
     if (!workspaceVisibleOnDisplay(win.workspace_id, win.display_id)) {
         hideWindow(win.pid, wid);
     }
-    setFocusedDisplay(win.display_id);
+    _ = maybeSetFocusedDisplayForWindow(win, .drag);
     log.info("window moved to display wid={d} display={d}", .{ wid, win.display_id });
     return true;
 }
@@ -3462,7 +3533,7 @@ fn reconcileAppTabs(pid: i32) void {
         g_tab_groups.setActive(focused_wid);
         const leader = g_tab_groups.resolveLeader(focused_wid);
         if (g_store.get(leader)) |win| {
-            maybeSetFocusedDisplayForWindow(win);
+            _ = maybeSetFocusedDisplayForWindow(win, .ax);
             if (g_workspaces.get(win.workspace_id)) |ws| {
                 ws.focused_wid = leader;
             }
@@ -3476,7 +3547,7 @@ fn reconcileAppTabs(pid: i32) void {
         g_tab_groups.setActive(focused_wid);
         const leader = g_tab_groups.resolveLeader(focused_wid);
         if (g_store.get(leader)) |win| {
-            maybeSetFocusedDisplayForWindow(win);
+            _ = maybeSetFocusedDisplayForWindow(win, .ax);
             if (g_workspaces.get(win.workspace_id)) |ws| {
                 ws.focused_wid = leader;
             }
@@ -3627,7 +3698,9 @@ fn reconcileAppTabs(pid: i32) void {
             ws.focused_wid = leader;
         }
         if (workspaceVisibleOnDisplay(matching_ws_id, matching_display_id)) {
-            setFocusedDisplay(matching_display_id);
+            if (g_store.get(leader)) |leader_win| {
+                _ = maybeSetFocusedDisplayForWindow(leader_win, .ax);
+            }
         }
 
         log.info("reconcile: tab group formed leader={d} active={d} members={d}", .{
@@ -3682,7 +3755,7 @@ fn checkTabDragOut(_: i32, wid: u32) void {
     ws.addWindow(wid) catch return;
     insertIntoLayout(win.workspace_id, wid);
     ws.focused_wid = wid;
-    setFocusedDisplay(win.display_id);
+    _ = maybeSetFocusedDisplayForWindow(win, .drag);
 
     // If the group dissolved, verify the survivor is still managed
     if (survivor) |solo_wid| {
@@ -3733,9 +3806,13 @@ fn switchWorkspace(target_id: u8) void {
     // If target is already visible on some display, just focus there.
     if (workspaceVisibleAnywhere(target_id)) {
         const target_display = target_ws.display_id orelse return;
+        startWorkspaceTransition(.switch_workspace, target_id, target_display);
         setFocusedDisplay(target_display);
         updateStatusBar();
         focusWorkspaceWindow(target_ws);
+        if (g_workspace_transition.isActive()) {
+            clearWorkspaceTransition();
+        }
         return;
     }
 
@@ -3770,12 +3847,15 @@ fn switchWorkspace(target_id: u8) void {
     target_ws.display_id = target_display;
     assertDisplayCoverage();
 
-    markWorkspaceTransition();
+    startWorkspaceTransition(.switch_workspace, target_id, target_display);
     retile();
     setFocusedDisplay(target_display);
     updateStatusBar();
 
     focusWorkspaceWindow(target_ws);
+    if (g_workspace_transition.isActive()) {
+        clearWorkspaceTransition();
+    }
 }
 
 /// Focus the remembered (or first available) window on a workspace.
@@ -3796,6 +3876,7 @@ fn focusWorkspaceWindow(ws: *workspace_mod.Workspace) void {
         if (g_store.get(actual_wid)) |win| {
             _ = shim.bw_ax_focus_window(win.pid, actual_wid);
             ws.focused_wid = fwid;
+            _ = maybeSetFocusedDisplayForWindow(win, .keyboard);
         }
     }
 }
@@ -3905,7 +3986,7 @@ fn moveWindowToDisplay(target_display_slot: u8) void {
         hideWindow(win.pid, win.wid);
     }
 
-    setFocusedDisplay(target_display_id);
+    _ = maybeSetFocusedDisplayForWindow(win, .keyboard);
     retile();
 }
 
@@ -3962,10 +4043,17 @@ fn moveWorkspaceToDisplay(target_display_slot: usize) void {
     }
     assertDisplayCoverage();
 
-    markWorkspaceTransition();
+    startWorkspaceTransition(.move_workspace_to_display, moving_ws_id, target_display_id);
     retile();
     setFocusedDisplay(target_display_id);
     updateStatusBar();
+
+    if (g_workspace_transition.isActive() and g_workspaces.get(moving_ws_id)) |ws| {
+        focusWorkspaceWindow(ws);
+    }
+    if (g_workspace_transition.isActive()) {
+        clearWorkspaceTransition();
+    }
 }
 
 fn moveWorkspaceToDisplayNext() void {
@@ -4031,7 +4119,7 @@ fn focusDirection(dir: FocusDir) void {
         if (g_store.get(actual_wid)) |win| {
             _ = shim.bw_ax_focus_window(win.pid, actual_wid);
             ws.focused_wid = wid; // track the leader
-            setFocusedDisplay(win.display_id);
+            _ = maybeSetFocusedDisplayForWindow(win, .keyboard);
             setLayoutLeafActive(win.workspace_id, actual_wid);
         }
         return;
@@ -4047,7 +4135,7 @@ fn focusDirection(dir: FocusDir) void {
         if (g_store.get(stack_wid)) |win| {
             _ = shim.bw_ax_focus_window(win.pid, stack_wid);
             ws.focused_wid = stack_wid;
-            setFocusedDisplay(win.display_id);
+            _ = maybeSetFocusedDisplayForWindow(win, .keyboard);
             setLayoutLeafActive(win.workspace_id, stack_wid);
         }
     }
