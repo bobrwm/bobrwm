@@ -2240,6 +2240,13 @@ fn handleEvent(ev: *const event_mod.Event) void {
             }
         },
         .window_moved, .window_resized => {
+            if (inWorkspaceTransition() and !g_mouse_left_down) {
+                if (ev.kind == .window_resized) {
+                    clearDragPreview();
+                }
+                return;
+            }
+
             log.info("window {s} wid={}", .{
                 if (ev.kind == .window_moved) "moved" else "resized",
                 ev.wid,
