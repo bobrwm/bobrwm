@@ -488,10 +488,9 @@ fn maybeSetFocusedDisplayForWindow(win: window_mod.Window, source: FocusEventSou
 
     setFocusedDisplay(win.display_id);
 
-    if (g_workspace_transition.isActive() and
-        win.workspace_id == g_workspace_transition.target_workspace_id and
-        win.display_id == g_workspace_transition.target_display_id)
-    {
+    // Keyboard intent always wins. Once keyboard focus lands, stale queued focus
+    // from AX/drag must not replay against the old transition.
+    if (source == .keyboard and g_workspace_transition.isActive()) {
         clearWorkspaceTransition();
     }
 
