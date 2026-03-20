@@ -374,6 +374,10 @@ fn workspaceTransitionTimedOut() bool {
     return c.CFAbsoluteTimeGetCurrent() >= g_workspace_transition.deadline_at_s;
 }
 
+fn inWorkspaceTransition() bool {
+    return g_workspace_transition.isActive();
+}
+
 fn shouldAcceptFocusForWindow(win: window_mod.Window, source: FocusEventSource) bool {
     if (!workspaceVisibleOnDisplay(win.workspace_id, win.display_id)) return false;
     if (source == .keyboard) return true;
