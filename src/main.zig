@@ -154,6 +154,17 @@ const WorkspaceTransitionState = struct {
     }
 };
 
+const PendingFocusEntry = struct {
+    pid: i32,
+    wid: u32,
+    source: FocusEventSource,
+    sequence: u64,
+    workspace_id: u8,
+    display_id: u32,
+};
+
+const pending_focus_capacity_per_epoch: usize = 16;
+
 const PendingRoleWindow = struct {
     pid: i32,
     attempts_remaining: u8,
@@ -337,6 +348,7 @@ fn clearWorkspaceTransition() void {
     g_workspace_transition = .{
         .epoch = g_workspace_transition.epoch,
     };
+    g_pending_focus_count = 0;
 }
 
 fn startWorkspaceTransition(kind: WorkspaceTransitionKind, target_workspace_id: u8, target_display_id: u32) void {
@@ -354,6 +366,7 @@ fn startWorkspaceTransition(kind: WorkspaceTransitionKind, target_workspace_id: 
         .target_workspace_id = target_workspace_id,
         .target_display_id = target_display_id,
     };
+    g_pending_focus_count = 0;
 }
 
 fn workspaceTransitionTimedOut() bool {
@@ -373,8 +386,103 @@ fn shouldAcceptFocusForWindow(win: window_mod.Window, source: FocusEventSource) 
     return true;
 }
 
+fn pendingFocusInsertOrReplace(entry: PendingFocusEntry) void {
+    std.debug.assert(entry.pid > 0);
+    std.debug.assert(entry.workspace_id > 0 and entry.workspace_id <= g_workspaces.workspace_count);
+    std.debug.assert(entry.display_id != 0);
+
+    var existing_idx: ?usize = null;
+    var oldest_idx: usize = 0;
+    var oldest_sequence: u64 = std.math.maxInt(u64);
+
+    var i: usize = 0;
+    while (i < g_pending_focus_count) : (i += 1) {
+        const existing = g_pending_focus_entries[i];
+        if (existing.pid == entry.pid) {
+            existing_idx = i;
+            break;
+        }
+        if (existing.sequence < oldest_sequence) {
+            oldest_sequence = existing.sequence;
+            oldest_idx = i;
+        }
+    }
+
+    if (existing_idx) |idx| {
+        g_pending_focus_entries[idx] = entry;
+        return;
+    }
+
+    if (g_pending_focus_count < g_pending_focus_entries.len) {
+        g_pending_focus_entries[g_pending_focus_count] = entry;
+        g_pending_focus_count += 1;
+        return;
+    }
+
+    g_pending_focus_entries[oldest_idx] = entry;
+}
+
+fn queuePendingFocus(win: window_mod.Window, source: FocusEventSource) void {
+    if (!g_workspace_transition.isActive()) return;
+    if (source == .keyboard) return;
+    if (win.pid <= 0) return;
+
+    g_pending_focus_sequence += 1;
+    pendingFocusInsertOrReplace(.{
+        .pid = win.pid,
+        .wid = win.wid,
+        .source = source,
+        .sequence = g_pending_focus_sequence,
+        .workspace_id = win.workspace_id,
+        .display_id = win.display_id,
+    });
+}
+
+fn applyPendingFocusEntry(entry: PendingFocusEntry) bool {
+    if (!g_workspace_transition.isActive()) return false;
+    if (entry.workspace_id != g_workspace_transition.target_workspace_id) return false;
+    if (entry.display_id != g_workspace_transition.target_display_id) return false;
+
+    const win = g_store.get(entry.wid) orelse return false;
+    if (win.pid != entry.pid) return false;
+    if (win.workspace_id != entry.workspace_id) return false;
+    if (win.display_id != entry.display_id) return false;
+
+    return maybeSetFocusedDisplayForWindow(win, entry.source);
+}
+
+fn processPendingFocusQueue() bool {
+    if (!g_workspace_transition.isActive()) return false;
+    if (g_pending_focus_count == 0) return false;
+
+    var best_idx: ?usize = null;
+    var best_sequence: u64 = 0;
+
+    var i: usize = 0;
+    while (i < g_pending_focus_count) : (i += 1) {
+        const entry = g_pending_focus_entries[i];
+        if (entry.sequence > best_sequence) {
+            best_sequence = entry.sequence;
+            best_idx = i;
+        }
+    }
+
+    if (best_idx) |idx| {
+        const entry = g_pending_focus_entries[idx];
+        g_pending_focus_count -= 1;
+        g_pending_focus_entries[idx] = g_pending_focus_entries[g_pending_focus_count];
+        if (applyPendingFocusEntry(entry)) {
+            g_pending_focus_count = 0;
+            return true;
+        }
+    }
+
+    return false;
+}
+
 fn maybeSetFocusedDisplayForWindow(win: window_mod.Window, source: FocusEventSource) bool {
     if (!shouldAcceptFocusForWindow(win, source)) {
+        queuePendingFocus(win, source);
         return false;
     }
 
@@ -391,6 +499,8 @@ fn maybeSetFocusedDisplayForWindow(win: window_mod.Window, source: FocusEventSou
 }
 
 fn tickWorkspaceTransitionState() void {
+    if (processPendingFocusQueue()) return;
+
     if (!workspaceTransitionTimedOut()) return;
 
     const transition = g_workspace_transition;
@@ -664,6 +774,9 @@ var g_ipc_source: c.dispatch_source_t = null;
 var g_tap_port: c.CFMachPortRef = null;
 var g_ax_strings: ?AxStrings = null;
 var g_workspace_transition: WorkspaceTransitionState = .{};
+var g_pending_focus_entries: [pending_focus_capacity_per_epoch]PendingFocusEntry = undefined;
+var g_pending_focus_count: usize = 0;
+var g_pending_focus_sequence: u64 = 0;
 
 fn shouldHandleWorkspaceEvent(last_event_at_s: *f64) bool {
     std.debug.assert(last_event_at_s.* >= 0);
@@ -2021,6 +2134,7 @@ fn retile() void {
 // ---------------------------------------------------------------------------
 
 fn handleEvent(ev: *const event_mod.Event) void {
+    _ = processPendingFocusQueue();
     tickWorkspaceTransitionState();
 
     switch (ev.kind) {
@@ -2108,6 +2222,7 @@ fn handleEvent(ev: *const event_mod.Event) void {
             const promoted_pending = processPendingRoleWindows();
             const promoted_deferred = processDeferredWindowCandidates();
             const retried_launch = processAppLaunchRetries();
+            _ = processPendingFocusQueue();
             if (promoted_pending or promoted_deferred or retried_launch) {
                 retile();
             }
@@ -3878,6 +3993,10 @@ fn focusWorkspaceWindow(ws: *workspace_mod.Workspace) void {
             ws.focused_wid = fwid;
             _ = maybeSetFocusedDisplayForWindow(win, .keyboard);
         }
+    }
+
+    if (g_workspace_transition.isActive()) {
+        g_pending_focus_count = 0;
     }
 }
 
