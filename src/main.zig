@@ -164,6 +164,7 @@ const PendingFocusEntry = struct {
 };
 
 const pending_focus_capacity_per_epoch: usize = 16;
+const cleanup_pid_capacity_per_drain: usize = 16;
 
 const PendingRoleWindow = struct {
     pid: i32,
@@ -795,6 +796,9 @@ var g_retile_requested_all_displays = false;
 var g_retile_dirty_display_ids: [workspace_mod.max_displays]u32 = [_]u32{0} ** workspace_mod.max_displays;
 var g_retile_dirty_display_count: usize = 0;
 var g_event_drain_active = false;
+var g_cleanup_pending_offscreen = false;
+var g_cleanup_pending_pids: [cleanup_pid_capacity_per_drain]i32 = undefined;
+var g_cleanup_pending_pid_count: usize = 0;
 
 fn shouldHandleWorkspaceEvent(last_event_at_s: *f64) bool {
     std.debug.assert(last_event_at_s.* >= 0);
@@ -809,6 +813,59 @@ fn shouldHandleWorkspaceEvent(last_event_at_s: *f64) bool {
     last_event_at_s.* = now_s;
     std.debug.assert(last_event_at_s.* == now_s);
     return true;
+}
+
+fn clearCleanupRequests() void {
+    g_cleanup_pending_offscreen = false;
+    g_cleanup_pending_pid_count = 0;
+}
+
+fn requestCleanupForPid(pid: i32) void {
+    std.debug.assert(pid > 0);
+
+    var i: usize = 0;
+    while (i < g_cleanup_pending_pid_count) : (i += 1) {
+        if (g_cleanup_pending_pids[i] == pid) return;
+    }
+
+    if (g_cleanup_pending_pid_count >= g_cleanup_pending_pids.len) {
+        log.warn("cleanup: pid queue saturated, skipping pid={d}", .{pid});
+        return;
+    }
+
+    g_cleanup_pending_pids[g_cleanup_pending_pid_count] = pid;
+    g_cleanup_pending_pid_count += 1;
+    std.debug.assert(g_cleanup_pending_pid_count <= g_cleanup_pending_pids.len);
+}
+
+fn requestOffscreenCleanup() void {
+    g_cleanup_pending_offscreen = true;
+}
+
+fn flushCleanupRequests() bool {
+    if (g_workspace_transition.isActive()) {
+        clearCleanupRequests();
+        return false;
+    }
+
+    var removed_any = false;
+
+    var i: usize = 0;
+    while (i < g_cleanup_pending_pid_count) : (i += 1) {
+        const pid = g_cleanup_pending_pids[i];
+        if (cleanupWorkspaceWindowsForPid(pid)) {
+            removed_any = true;
+        }
+    }
+
+    if (g_cleanup_pending_offscreen) {
+        if (cleanupOffscreenManagedWindows()) {
+            removed_any = true;
+        }
+    }
+
+    clearCleanupRequests();
+    return removed_any;
 }
 
 // ---------------------------------------------------------------------------
@@ -1861,6 +1918,10 @@ export fn bw_drain_events() void {
     while (g_ring.pop()) |ev| {
         handleEvent(&ev);
     }
+
+    if (flushCleanupRequests()) {
+        retile();
+    }
 }
 
 /// Accept and handle one IPC client connection — called by dispatch_source.
@@ -2233,8 +2294,10 @@ fn handleEvent(ev: *const event_mod.Event) void {
         },
         .window_focused => {
             log.info("window focused pid={}", .{ev.pid});
-            const removed_stale = if (!g_workspace_transition.isActive()) cleanupWorkspaceWindowsForPid(ev.pid) else false;
-            const removed_offscreen = if (!g_workspace_transition.isActive()) cleanupOffscreenManagedWindows() else false;
+            if (!g_workspace_transition.isActive()) {
+                requestCleanupForPid(ev.pid);
+                requestOffscreenCleanup();
+            }
             const wid = shim.bw_ax_get_focused_window(ev.pid);
             if (wid != 0) {
                 if (g_store.get(wid) == null) {
@@ -2252,18 +2315,14 @@ fn handleEvent(ev: *const event_mod.Event) void {
                     setLayoutLeafActive(win.workspace_id, wid);
                 }
             }
-            if (removed_stale or removed_offscreen) {
-                retile();
-            }
         },
         .focused_window_changed => {
             log.info("focused window changed pid={}", .{ev.pid});
-            const removed_stale = if (!g_workspace_transition.isActive()) cleanupWorkspaceWindowsForPid(ev.pid) else false;
-            const removed_offscreen = if (!g_workspace_transition.isActive()) cleanupOffscreenManagedWindows() else false;
-            reconcileAppTabs(ev.pid);
-            if (removed_stale or removed_offscreen) {
-                retile();
+            if (!g_workspace_transition.isActive()) {
+                requestCleanupForPid(ev.pid);
+                requestOffscreenCleanup();
             }
+            reconcileAppTabs(ev.pid);
         },
         .window_created => {
             log.info("window created pid={} wid={}", .{ ev.pid, ev.wid });
