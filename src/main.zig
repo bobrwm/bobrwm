@@ -345,6 +345,30 @@ fn setFocusedDisplay(display_id: u32) void {
     g_workspaces.focused_display_slot = slot;
 }
 
+fn frontmostApplicationPid() ?i32 {
+    const NSWorkspace = objc.getClass("NSWorkspace") orelse return null;
+    const workspace = NSWorkspace.msgSend(objc.Object, "sharedWorkspace", .{});
+    if (workspace.value == null) return null;
+
+    const app = workspace.msgSend(objc.Object, "frontmostApplication", .{});
+    if (app.value == null) return null;
+
+    const pid = app.msgSend(i32, "processIdentifier", .{});
+    if (pid <= 0) return null;
+    return pid;
+}
+
+fn focusedManagedLeaderWindow() ?window_mod.Window {
+    const pid = frontmostApplicationPid() orelse return null;
+    const focused_wid = bw_ax_get_focused_window(pid);
+    if (focused_wid == 0) return null;
+
+    const leader_wid = g_tab_groups.resolveLeader(focused_wid);
+    const leader = g_store.get(leader_wid) orelse return null;
+    if (leader.pid != pid) return null;
+    return leader;
+}
+
 fn clearWorkspaceTransition() void {
     g_workspace_transition = .{
         .epoch = g_workspace_transition.epoch,
@@ -4189,15 +4213,78 @@ fn moveWindowToWorkspace(target_id: u8) void {
     retile();
 }
 
-/// Moves the focused tiled/floating window to another display slot while
-/// preserving its workspace assignment.
+/// Move a managed window to a target display and map it onto the target
+/// display's active workspace so it stays visible after the move.
+fn moveManagedWindowToDisplay(wid: u32, target_display_id: u32) bool {
+    std.debug.assert(wid != 0);
+    std.debug.assert(target_display_id != 0);
+
+    var win = g_store.get(wid) orelse return false;
+    if (win.display_id == target_display_id) return false;
+
+    const target_workspace_id = activeWorkspaceIdForDisplay(target_display_id);
+    std.debug.assert(target_workspace_id > 0 and target_workspace_id <= g_workspaces.workspace_count);
+
+    const source_workspace_id = win.workspace_id;
+    if (source_workspace_id != target_workspace_id) {
+        const source_ws = g_workspaces.get(source_workspace_id) orelse return false;
+        const target_ws = g_workspaces.get(target_workspace_id) orelse return false;
+
+        var target_had_window = false;
+        for (target_ws.windows.items) |existing_wid| {
+            if (existing_wid == wid) {
+                target_had_window = true;
+                break;
+            }
+        }
+
+        target_ws.addWindow(wid) catch return false;
+
+        var updated = win;
+        updated.workspace_id = target_workspace_id;
+        updated.display_id = target_display_id;
+        g_store.put(updated) catch {
+            if (!target_had_window) {
+                target_ws.removeWindow(wid);
+            }
+            return false;
+        };
+
+        removeFromLayout(source_workspace_id, wid);
+        source_ws.removeWindow(wid);
+        target_ws.focused_wid = wid;
+        if (updated.mode == .tiled) {
+            insertIntoLayout(target_workspace_id, wid);
+        }
+
+        win = updated;
+    } else {
+        removeFromLayout(source_workspace_id, wid);
+        win.display_id = target_display_id;
+        g_store.put(win) catch return false;
+        if (win.mode == .tiled) {
+            insertIntoLayout(source_workspace_id, wid);
+        }
+    }
+
+    _ = maybeSetFocusedDisplayForWindow(win, .keyboard);
+    retile();
+    return true;
+}
+
+/// Moves the currently focused managed window to another display slot.
 fn moveWindowToDisplay(target_display_slot: u8) void {
     if (target_display_slot == 0) return;
     const slot: usize = @intCast(target_display_slot - 1);
     if (slot >= g_display_count) return;
 
-    const source_display_id = focusedDisplayId();
     const target_display_id = g_displays[slot].id;
+    if (focusedManagedLeaderWindow()) |focused_win| {
+        _ = moveManagedWindowToDisplay(focused_win.wid, target_display_id);
+        return;
+    }
+
+    const source_display_id = focusedDisplayId();
     if (source_display_id == target_display_id) return;
 
     const ws_id = activeWorkspaceIdForDisplay(source_display_id);
@@ -4222,23 +4309,7 @@ fn moveWindowToDisplay(target_display_slot: u8) void {
         }
     }
     const wid = wid_opt orelse return;
-    var win = g_store.get(wid) orelse return;
-    if (win.workspace_id != ws_id) return;
-    if (win.display_id != source_display_id) return;
-
-    removeFromLayout(win.workspace_id, wid);
-    win.display_id = target_display_id;
-    g_store.put(win) catch return;
-    if (win.mode == .tiled) {
-        insertIntoLayout(win.workspace_id, wid);
-    }
-
-    if (!workspaceVisibleOnDisplay(win.workspace_id, target_display_id)) {
-        hideWindow(win.pid, win.wid);
-    }
-
-    _ = maybeSetFocusedDisplayForWindow(win, .keyboard);
-    retile();
+    _ = moveManagedWindowToDisplay(wid, target_display_id);
 }
 
 fn moveWorkspaceToDisplay(target_display_slot: usize) void {
