@@ -745,6 +745,16 @@ fn isVisibleOnScreen(wid: u32) bool {
     return shim.bw_is_window_on_screen(wid);
 }
 
+fn framesEqual(lhs: window_mod.Window.Frame, rhs: window_mod.Window.Frame) bool {
+    std.debug.assert(lhs.width >= 0 and lhs.height >= 0);
+    std.debug.assert(rhs.width >= 0 and rhs.height >= 0);
+
+    return lhs.x == rhs.x and
+        lhs.y == rhs.y and
+        lhs.width == rhs.width and
+        lhs.height == rhs.height;
+}
+
 // ---------------------------------------------------------------------------
 // Globals
 // ---------------------------------------------------------------------------
@@ -781,6 +791,10 @@ var g_pending_focus_entries: [pending_focus_capacity_per_epoch]PendingFocusEntry
 var g_pending_focus_count: usize = 0;
 var g_pending_focus_sequence: u64 = 0;
 var g_layout_entries: std.ArrayList(layout.LayoutEntry) = .empty;
+var g_retile_requested_all_displays = false;
+var g_retile_dirty_display_ids: [workspace_mod.max_displays]u32 = [_]u32{0} ** workspace_mod.max_displays;
+var g_retile_dirty_display_count: usize = 0;
+var g_event_drain_active = false;
 
 fn shouldHandleWorkspaceEvent(last_event_at_s: *f64) bool {
     std.debug.assert(last_event_at_s.* >= 0);
@@ -1837,6 +1851,13 @@ pub fn main() !void {
 
 /// Drain the event ring buffer — called by the CFRunLoopSource waker.
 export fn bw_drain_events() void {
+    std.debug.assert(!g_event_drain_active);
+    g_event_drain_active = true;
+    defer {
+        g_event_drain_active = false;
+        flushRetileRequests();
+    }
+
     while (g_ring.pop()) |ev| {
         handleEvent(&ev);
     }
@@ -2129,9 +2150,61 @@ fn commitWindowMovePreview(wid: u32) void {
     }
 }
 
+fn resetRetileRequestState() void {
+    g_retile_requested_all_displays = false;
+    g_retile_dirty_display_count = 0;
+    std.debug.assert(g_retile_dirty_display_count == 0);
+}
+
+fn requestRetileDisplay(display_id: u32) void {
+    std.debug.assert(display_id != 0);
+    if (g_retile_requested_all_displays) return;
+
+    const display_slot = displayIndexById(display_id) orelse return;
+    const normalized_display_id = g_displays[display_slot].id;
+
+    var i: usize = 0;
+    while (i < g_retile_dirty_display_count) : (i += 1) {
+        if (g_retile_dirty_display_ids[i] == normalized_display_id) return;
+    }
+
+    if (g_retile_dirty_display_count == g_retile_dirty_display_ids.len) {
+        requestRetileAllDisplays();
+        return;
+    }
+
+    g_retile_dirty_display_ids[g_retile_dirty_display_count] = normalized_display_id;
+    g_retile_dirty_display_count += 1;
+    std.debug.assert(g_retile_dirty_display_count <= g_retile_dirty_display_ids.len);
+}
+
+fn requestRetileAllDisplays() void {
+    g_retile_requested_all_displays = true;
+    g_retile_dirty_display_count = 0;
+}
+
+fn flushRetileRequests() void {
+    if (g_retile_requested_all_displays) {
+        retileAllDisplays();
+        resetRetileRequestState();
+        return;
+    }
+
+    if (g_retile_dirty_display_count == 0) return;
+
+    var i: usize = 0;
+    while (i < g_retile_dirty_display_count) : (i += 1) {
+        retileDisplay(g_retile_dirty_display_ids[i]);
+    }
+    resetRetileRequestState();
+}
+
 fn retile() void {
     clearDragPreview();
-    retileAllDisplays();
+    requestRetileAllDisplays();
+    if (!g_event_drain_active) {
+        flushRetileRequests();
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -3499,16 +3572,7 @@ fn retileDisplay(display_id: u32) void {
         // Fullscreen windows fill the outer-gap-inset frame, skipping BSP splits and inner gaps
         const target_frame = if (win.is_fullscreen) frame else entry.frame;
 
-        _ = shim.bw_ax_set_window_frame(
-            win.pid,
-            entry.wid,
-            target_frame.x,
-            target_frame.y,
-            target_frame.width,
-            target_frame.height,
-        );
-        // Two-pass for fullscreen to handle macOS size clamping
-        if (win.is_fullscreen) {
+        if (!framesEqual(win.frame, target_frame)) {
             _ = shim.bw_ax_set_window_frame(
                 win.pid,
                 entry.wid,
@@ -3517,10 +3581,22 @@ fn retileDisplay(display_id: u32) void {
                 target_frame.width,
                 target_frame.height,
             );
+            // Two-pass for fullscreen to handle macOS size clamping
+            if (win.is_fullscreen) {
+                _ = shim.bw_ax_set_window_frame(
+                    win.pid,
+                    entry.wid,
+                    target_frame.x,
+                    target_frame.y,
+                    target_frame.width,
+                    target_frame.height,
+                );
+            }
+
+            var updated = win;
+            updated.frame = target_frame;
+            g_store.put(updated) catch {};
         }
-        var updated = win;
-        updated.frame = target_frame;
-        g_store.put(updated) catch {};
 
         // If this is a tab group leader, apply the same frame to all members
         if (g_tab_groups.groupOfMut(entry.wid)) |g| {
@@ -3529,6 +3605,8 @@ fn retileDisplay(display_id: u32) void {
                 for (g.members.items) |member_wid| {
                     if (member_wid == entry.wid) continue;
                     if (g_store.get(member_wid)) |member| {
+                        if (framesEqual(member.frame, entry.frame)) continue;
+
                         _ = shim.bw_ax_set_window_frame(
                             member.pid,
                             member_wid,
