@@ -29,41 +29,28 @@
     packages = forAllSystems ({
       pkgs,
       system,
-    }: let
-      zig = zig-overlay.packages.${system}."0.15.1";
-    in {
-      default = pkgs.stdenv.mkDerivation {
-        name = "bobrwm";
-        src = ./.;
-        nativeBuildInputs = [zig];
-
-        buildPhase = ''
-          export ZIG_GLOBAL_CACHE_DIR=$TMPDIR/zig-cache
-          export ZIG_LOCAL_CACHE_DIR=$TMPDIR/zig-cache
-          zig build -Doptimize=ReleaseSafe --prefix $out
-        '';
-
-        dontInstall = true;
+    }: {
+      default = pkgs.callPackage ./nix/package.nix {
+        zig = zig-overlay.packages.${system}."0.15.1";
       };
     });
+
+    overlays.default = final: _prev: {
+      bobrwm = self.packages.${final.system}.default;
+    };
+
+    darwinModules.default = import ./nix/darwin-module.nix self;
 
     devShells = forAllSystems ({
       pkgs,
       system,
-    }: let
-      zig = zig-overlay.packages.${system}."0.15.1";
-      zls = zls-overlay.packages.${system}.zls;
-      zigdoc = zigdoc-nix.packages.${system}.default;
-      ziglint = ziglint-nix.packages.${system}.default;
-    in {
-      default = pkgs.mkShell {
-        buildInputs = [
-          zig
-          zls
-          zigdoc
-          ziglint
-          pkgs.nushell
-        ];
+    }: {
+      default = pkgs.callPackage ./nix/devShell.nix {
+        zig = zig-overlay.packages.${system}."0.15.1";
+        zls = zls-overlay.packages.${system}.zls;
+        zigdoc = zigdoc-nix.packages.${system}.default;
+        ziglint = ziglint-nix.packages.${system}.default;
+        inherit (pkgs) nushell;
       };
     });
   };
