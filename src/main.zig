@@ -2472,7 +2472,7 @@ fn handleEvent(ev: *const event_mod.Event) void {
             g_bsp_split_mode = switch (g_bsp_split_mode) {
                 .auto => .horizontal,
                 .horizontal => .vertical,
-                .vertical => .horizontal,
+                .vertical => .auto,
             };
             log.info("split mode: {s}", .{@tagName(g_bsp_split_mode)});
         },
@@ -4534,7 +4534,7 @@ fn ipcDispatch(cmd: []const u8, client_fd: posix.socket_t) void {
         g_bsp_split_mode = switch (g_bsp_split_mode) {
             .auto => .horizontal,
             .horizontal => .vertical,
-            .vertical => .horizontal,
+            .vertical => .auto,
         };
         ipc.writeResponse(client_fd, "ok\n");
     } else if (std.mem.startsWith(u8, cmd, "bsp ratio rel ")) {
