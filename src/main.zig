@@ -4129,6 +4129,18 @@ fn switchWorkspace(target_id: u8) void {
     // Activate target; old workspace keeps its display_id (just hidden).
     g_workspaces.setActiveForDisplaySlot(display_slot, target_id);
     target_ws.display_id = target_display;
+
+    // Reconcile window display_ids: windows moved here while the workspace
+    // was hidden may carry a stale source display_id. Update them so
+    // retileDisplay (which filters on display_id) includes every window.
+    for (target_ws.windows.items) |wid| {
+        var win = g_store.get(wid) orelse continue;
+        if (win.display_id != target_display) {
+            win.display_id = target_display;
+            g_store.put(win) catch {};
+        }
+    }
+
     assertDisplayCoverage();
 
     startWorkspaceTransition(.switch_workspace, target_id, target_display);
@@ -4211,9 +4223,13 @@ fn moveWindowToWorkspace(target_id: u8) void {
         target_ws.focused_wid = wid;
     }
 
-    // Update window's workspace_id
+    // Update window metadata. Use the target workspace's display so that
+    // retileDisplay (which filters on display_id) will include this window
+    // when the target workspace becomes visible. Fall back to the source
+    // display for hidden workspaces with no assigned display yet —
+    // switchWorkspace will correct it when the workspace is activated.
     updated.workspace_id = target_id;
-    updated.display_id = display_id;
+    updated.display_id = target_ws.display_id orelse display_id;
     g_store.put(updated) catch {};
 
     // If target is not visible, hide the window
