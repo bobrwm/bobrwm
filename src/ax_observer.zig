@@ -4,6 +4,7 @@
 //! CGWindowID resolution while keeping Objective-C class callbacks in shim.m.
 
 const std = @import("std");
+const log = std.log.scoped(.ax_observer);
 const objc = @import("objc");
 const c = @cImport({
     @cInclude("ApplicationServices/ApplicationServices.h");
@@ -227,9 +228,13 @@ fn appTrackWindow(pid: i32, wid: u32) bool {
         return true;
     }
 
-    // Preserve progress when an app has unusually many windows.
-    entry.known_windows[entry.known_window_count - 1] = wid;
-    return true;
+    // At capacity — refuse tracking rather than silently overwriting the
+    // last entry, which would untrack it and cause duplicate WINDOW_CREATED
+    // emissions on the next scan.
+    log.warn("appTrackWindow: capacity exhausted pid={d} wid={d} limit={d}", .{
+        pid, wid, max_known_windows_per_app,
+    });
+    return false;
 }
 
 fn appUntrackWindow(pid: i32, wid: u32) void {
