@@ -1931,7 +1931,9 @@ pub fn main() !void {
     statusbar.init();
     updateStatusBar();
 
-    // -- Enter NSApp run loop (never returns) --
+    // -- Enter NSApp run loop --
+    // Returns when CFRunLoopStop is called (e.g. graceful signal handler).
+    // The defer chain then runs restoreAllWindows() safely on the main thread.
     log.info("entering run loop", .{});
     defer restoreAllWindows();
     NSApp.msgSend(void, "run", .{});
@@ -3769,6 +3771,24 @@ fn restoreAllWindows() void {
     }
 }
 
+var g_shutdown_requested: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
+
+/// Graceful signal handler for INT/TERM/HUP/QUIT. Sets a flag and wakes the
+/// run loop so restoreAllWindows() runs on the main thread where AX calls and
+/// hash table access are safe. Only uses async-signal-safe operations.
+fn gracefulSignalHandler(sig: c_int) callconv(.c) void {
+    _ = sig;
+    g_shutdown_requested.store(true, .release);
+    // CFRunLoopStop is documented as safe to call from a signal handler.
+    const run_loop = c.CFRunLoopGetMain();
+    if (run_loop != null) {
+        c.CFRunLoopStop(run_loop);
+    }
+}
+
+/// Crash signal handler for SEGV/BUS/TRAP/ABRT. Best-effort restore using
+/// async-signal-unsafe functions. May deadlock if the crash occurs mid-
+/// allocation or mid-hash-table-mutation, but leaving windows hidden is worse.
 fn crashSignalHandler(sig: c_int) callconv(.c) void {
     restoreAllWindows();
 
@@ -3784,14 +3804,26 @@ fn crashSignalHandler(sig: c_int) callconv(.c) void {
 }
 
 fn installCrashHandlers() void {
-    const signals = [_]u8{
-        posix.SIG.INT,  posix.SIG.TERM,
-        posix.SIG.HUP,  posix.SIG.QUIT,
-        posix.SIG.ABRT, posix.SIG.SEGV,
-        posix.SIG.BUS,  posix.SIG.TRAP,
+    // Graceful signals: handled safely via run loop stop + main-thread cleanup
+    const graceful_signals = [_]u8{
+        posix.SIG.INT, posix.SIG.TERM,
+        posix.SIG.HUP, posix.SIG.QUIT,
     };
+    for (graceful_signals) |sig| {
+        var sa: posix.Sigaction = .{
+            .handler = .{ .handler = gracefulSignalHandler },
+            .mask = posix.sigemptyset(),
+            .flags = 0,
+        };
+        posix.sigaction(sig, &sa, null);
+    }
 
-    for (signals) |sig| {
+    // Crash signals: best-effort restore, then re-raise for core dump
+    const crash_signals = [_]u8{
+        posix.SIG.ABRT, posix.SIG.SEGV,
+        posix.SIG.BUS, posix.SIG.TRAP,
+    };
+    for (crash_signals) |sig| {
         var sa: posix.Sigaction = .{
             .handler = .{ .handler = crashSignalHandler },
             .mask = posix.sigemptyset(),
