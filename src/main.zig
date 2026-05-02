@@ -781,10 +781,13 @@ fn framesEqual(lhs: window_mod.Window.Frame, rhs: window_mod.Window.Frame) bool 
     std.debug.assert(lhs.width >= 0 and lhs.height >= 0);
     std.debug.assert(rhs.width >= 0 and rhs.height >= 0);
 
-    return lhs.x == rhs.x and
-        lhs.y == rhs.y and
-        lhs.width == rhs.width and
-        lhs.height == rhs.height;
+    // Use 1px tolerance to absorb sub-pixel rounding from CG/AX,
+    // avoiding redundant AX SetAttributeValue calls on every retile.
+    const tol: f64 = 1.0;
+    return @abs(lhs.x - rhs.x) <= tol and
+        @abs(lhs.y - rhs.y) <= tol and
+        @abs(lhs.width - rhs.width) <= tol and
+        @abs(lhs.height - rhs.height) <= tol;
 }
 
 // ---------------------------------------------------------------------------
