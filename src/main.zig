@@ -1953,17 +1953,21 @@ pub fn main() !void {
 export fn bw_drain_events() void {
     std.debug.assert(!g_event_drain_active);
     g_event_drain_active = true;
-    defer {
-        g_event_drain_active = false;
-        flushRetileRequests();
-    }
+    defer g_event_drain_active = false;
 
     while (g_ring.pop()) |ev| {
         handleEvent(&ev);
     }
 
+    // Flush retile BEFORE cleanup so windows are at their layout positions
+    // when cleanup checks on-screen status. Without this, cleanup sees
+    // corner-parked windows and incorrectly removes them as ghosts.
+    flushRetileRequests();
+
     if (flushCleanupRequests()) {
-        retile();
+        // Cleanup removed windows — retile again to fill the gaps.
+        requestRetileAllDisplays();
+        flushRetileRequests();
     }
 }
 
