@@ -524,10 +524,10 @@ fn maybeSetFocusedDisplayForWindow(win: window_mod.Window, source: FocusEventSou
 
     setFocusedDisplay(win.display_id);
 
-    // Keyboard intent always wins. Once keyboard focus lands, stale queued focus
-    // from AX/drag must not replay against the old transition.
+    // Keyboard intent always wins — flush stale queued focus from AX/drag
+    // so they don't replay against an old transition epoch.
     if (source == .keyboard and g_workspace_transition.isActive()) {
-        clearWorkspaceTransition();
+        g_pending_focus_count = 0;
     }
 
     return true;
@@ -4142,9 +4142,6 @@ fn switchWorkspace(target_id: u8) void {
         setFocusedDisplay(target_display);
         updateStatusBar();
         focusWorkspaceWindow(target_ws);
-        if (g_workspace_transition.isActive()) {
-            clearWorkspaceTransition();
-        }
         return;
     }
 
@@ -4197,9 +4194,6 @@ fn switchWorkspace(target_id: u8) void {
     updateStatusBar();
 
     focusWorkspaceWindow(target_ws);
-    if (g_workspace_transition.isActive()) {
-        clearWorkspaceTransition();
-    }
 }
 
 /// Focus the remembered (or first available) window on a workspace.
@@ -4455,9 +4449,6 @@ fn moveWorkspaceToDisplay(target_display_slot: usize) void {
         if (g_workspaces.get(moving_ws_id)) |ws| {
             focusWorkspaceWindow(ws);
         }
-    }
-    if (g_workspace_transition.isActive()) {
-        clearWorkspaceTransition();
     }
 }
 
