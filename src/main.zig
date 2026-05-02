@@ -15,6 +15,7 @@ const workspace_mod = @import("workspace.zig");
 const layout = @import("layout.zig");
 const ipc = @import("ipc.zig");
 const tabgroup = @import("tabgroup.zig");
+const cli = @import("cli.zig");
 const config_mod = @import("config.zig");
 const statusbar = @import("statusbar.zig");
 const tile_preview = @import("tile_preview.zig");
@@ -1719,99 +1720,14 @@ export fn bw_hotkey_handle_keydown(keycode: u16, mods: u8) bool {
 }
 
 // ---------------------------------------------------------------------------
-// CLI client (sends command to running daemon)
-// ---------------------------------------------------------------------------
-
-fn runClient(cmd: []const u8) void {
-    const stdout = std.fs.File.stdout();
-    const stderr = std.fs.File.stderr();
-    const started_ns = std.time.nanoTimestamp();
-    var response_bytes: usize = 0;
-
-    var path_buf: [128]u8 = undefined;
-    const path = std.fmt.bufPrintZ(&path_buf, "/tmp/bobrwm_{d}.sock", .{std.c.getuid()}) catch {
-        stderr.writeAll("error: socket path too long\n") catch {};
-        return;
-    };
-
-    const fd = posix.socket(posix.AF.UNIX, posix.SOCK.STREAM, 0) catch {
-        stderr.writeAll("error: could not create socket\n") catch {};
-        return;
-    };
-    defer posix.close(fd);
-
-    var addr: posix.sockaddr.un = .{ .path = undefined, .family = posix.AF.UNIX };
-    @memcpy(addr.path[0..path.len], path[0..path.len]);
-    if (path.len < addr.path.len) addr.path[path.len] = 0;
-
-    log.debug("[trace] ipc client connecting path={s} cmd={s}", .{ path, cmd });
-
-    posix.connect(fd, @ptrCast(&addr), @sizeOf(posix.sockaddr.un)) catch {
-        stderr.writeAll("error: bobrwm is not running\n") catch {};
-        return;
-    };
-
-    _ = posix.write(fd, cmd) catch {
-        stderr.writeAll("error: write failed\n") catch {};
-        return;
-    };
-    posix.shutdown(fd, .send) catch {};
-
-    while (true) {
-        var poll_fds = [_]posix.pollfd{.{
-            .fd = fd,
-            .events = posix.POLL.IN,
-            .revents = 0,
-        }};
-        const ready = posix.poll(&poll_fds, 2000) catch {
-            stderr.writeAll("error: IPC poll failed\n") catch {};
-            break;
-        };
-        if (ready == 0) {
-            stderr.writeAll("error: IPC response timeout\n") catch {};
-            log.warn("ipc client timeout waiting for response cmd={s}", .{cmd});
-            break;
-        }
-
-        var buf: [4096]u8 = undefined;
-        const n = posix.read(fd, &buf) catch break;
-        if (n == 0) break;
-        response_bytes += n;
-        stdout.writeAll(buf[0..n]) catch break;
-    }
-
-    const elapsed_ms = @divTrunc(std.time.nanoTimestamp() - started_ns, std.time.ns_per_ms);
-    log.debug("[trace] ipc client completed bytes={} elapsed_ms={}", .{ response_bytes, elapsed_ms });
-}
-
-// ---------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------
 
 pub fn main() !void {
-    // -- Arg parsing (before anything else) --
+    // -- CLI dispatch (help, version, service, IPC client) --
     var cmd_buf: [512]u8 = undefined;
-    const args = config_mod.parseArgs(&cmd_buf);
-
-    // Service management: handle locally (not via IPC)
-    if (args.command) |cmd| {
-        if (std.mem.eql(u8, cmd, "service") or std.mem.startsWith(u8, cmd, "service ")) {
-            if (parseServiceCommand(cmd)) |service_cmd| {
-                launchd.run(service_cmd);
-            } else {
-                std.fs.File.stderr().writeAll(
-                    "usage: bobrwm service <install|uninstall|start|stop|restart>\n",
-                ) catch {};
-            }
-            return;
-        }
-    }
-
-    // Client mode: forward command to running daemon via IPC
-    if (args.command) |cmd| {
-        runClient(cmd);
-        return;
-    }
+    const result = cli.parse(&cmd_buf);
+    if (cli.run(result)) return;
 
     // -- Daemon mode --
     log.info("bobrwm starting (log_level={s})...", .{@tagName(std_options.log_level)});
@@ -1822,7 +1738,7 @@ pub fn main() !void {
     defer deinitAxStrings();
 
     // -- Config --
-    g_config = config_mod.load(g_allocator, args.config_path);
+    g_config = config_mod.load(g_allocator, cli.configPath(result));
     g_bsp_split_mode = g_config.bsp_split;
     g_config.applyKeybinds();
 
@@ -4541,17 +4457,6 @@ fn focusDirection(dir: FocusDir) void {
             setLayoutLeafActive(win.workspace_id, stack_wid);
         }
     }
-}
-
-// ---------------------------------------------------------------------------
-// Service command parsing
-// ---------------------------------------------------------------------------
-
-fn parseServiceCommand(cmd: []const u8) ?launchd.Command {
-    const prefix = "service ";
-    if (!std.mem.startsWith(u8, cmd, prefix)) return null;
-    const sub = cmd[prefix.len..];
-    return std.meta.stringToEnum(launchd.Command, sub);
 }
 
 // ---------------------------------------------------------------------------

@@ -13,6 +13,8 @@ fn parseLogLevelEnv(raw: []const u8) ?std.log.Level {
     return null;
 }
 
+const version = "0.1.0";
+
 pub fn build(b: *std.Build) void {
     const target = b.resolveTargetQuery(.{
         .cpu_arch = .aarch64,
@@ -41,6 +43,7 @@ pub fn build(b: *std.Build) void {
     // std.log.Level can't be serialized directly — pass as backing int
     const log_level_int: ?u3 = if (log_level) |l| @intFromEnum(l) else null;
     build_options.addOption(?u3, "log_level_int", log_level_int);
+    build_options.addOption([]const u8, "version", version);
     exe_mod.addImport("build_options", build_options.createModule());
 
     const objc_dep = b.dependency("zig_objc", .{ .target = target, .optimize = optimize });

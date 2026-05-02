@@ -212,46 +212,6 @@ fn loadFromPath(allocator: std.mem.Allocator, path: []const u8) ?Config {
 }
 
 // ---------------------------------------------------------------------------
-// CLI argument parsing
-// ---------------------------------------------------------------------------
-
-pub const Args = struct {
-    config_path: ?[]const u8 = null,
-    /// IPC command assembled from positional args (written into caller buffer).
-    command: ?[]const u8 = null,
-};
-
-/// Parse process arguments.
-/// Positional args (anything that isn't `-c`/`--config` and its value) are
-/// joined with spaces into `cmd_buf` and returned as `command`.
-pub fn parseArgs(cmd_buf: []u8) Args {
-    var result: Args = .{};
-    var args = std.process.args();
-    _ = args.skip(); // program name
-    var pos: usize = 0;
-
-    while (args.next()) |arg| {
-        if (std.mem.eql(u8, arg, "-c") or std.mem.eql(u8, arg, "--config")) {
-            result.config_path = args.next();
-            continue;
-        }
-        // Positional arg → part of the IPC command
-        if (pos > 0 and pos < cmd_buf.len) {
-            cmd_buf[pos] = ' ';
-            pos += 1;
-        }
-        const copy_len = @min(arg.len, cmd_buf.len - pos);
-        @memcpy(cmd_buf[pos..][0..copy_len], arg[0..copy_len]);
-        pos += copy_len;
-    }
-
-    if (pos > 0) {
-        result.command = cmd_buf[0..pos];
-    }
-    return result;
-}
-
-// ---------------------------------------------------------------------------
 // Bundle ID helper
 // ---------------------------------------------------------------------------
 
