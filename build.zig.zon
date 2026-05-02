@@ -4,7 +4,7 @@
     .fingerprint = 0x7abb9e0caf1b4364,
     .dependencies = .{
         .zig_objc = .{
-            .url = "https://github.com/mitchellh/zig-objc/archive/main.tar.gz",
+            .url = "https://github.com/mitchellh/zig-objc/archive/27d0e03242e7ee6842bf8a86d2e0bb1f586a9847.tar.gz",
             .hash = "zig_objc-0.0.0-Ir_Sp7oUAQC3JpeR9EGUFGcHRSx_33IehitnjBCy-CwD",
         },
     },
