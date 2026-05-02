@@ -739,6 +739,8 @@ const HideCtx = struct {
 
     /// Move a single window to the chosen bottom corner, preserving its
     /// stored frame size so there is no layout shift on workspace switch.
+    /// Updates the stored position so retileDisplay detects the move
+    /// and won't skip the window via framesEqual on workspace re-activation.
     fn hide(self: HideCtx, pid: i32, wid: u32) void {
         const pos_y = self.display.y + self.display.h - hide_peek;
 
@@ -749,6 +751,10 @@ const HideCtx = struct {
                     .bottom_left => self.display.x - win.frame.width + hide_peek,
                 };
                 _ = shim.bw_ax_set_window_frame(pid, wid, pos_x, pos_y, win.frame.width, win.frame.height);
+                var updated = win;
+                updated.frame.x = pos_x;
+                updated.frame.y = pos_y;
+                g_store.put(updated) catch {};
                 return;
             }
         }
