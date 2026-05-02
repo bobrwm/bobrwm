@@ -1971,12 +1971,6 @@ fn setLayoutLeafActive(workspace_id: u8, wid: u32) void {
     }
 }
 
-fn parseAxis(arg: []const u8) ?layout.Direction {
-    if (std.mem.eql(u8, arg, "horizontal")) return .horizontal;
-    if (std.mem.eql(u8, arg, "vertical")) return .vertical;
-    return null;
-}
-
 const FocusedLayoutContext = struct {
     focused_wid: u32,
     focused_win: window_mod.Window,
@@ -4392,7 +4386,7 @@ fn moveWorkspaceToDisplayPrev() void {
 // Focus direction
 // ---------------------------------------------------------------------------
 
-const FocusDir = enum { left, right, up, down };
+const FocusDir = ipc.IpcCommand.FocusDir;
 
 fn focusDirection(dir: FocusDir) void {
     const ws = g_workspaces.active();
@@ -4470,228 +4464,154 @@ fn ipcDispatch(cmd: []const u8, client_fd: posix.socket_t) void {
         log.debug("[trace] ipc dispatch cmd={s} elapsed_ms={}", .{ cmd, elapsed_ms });
     }
 
-    if (std.mem.eql(u8, cmd, "retile")) {
-        retile();
-        ipc.writeResponse(client_fd, "ok\n");
-    } else if (std.mem.eql(u8, cmd, "toggle-split")) {
-        g_bsp_split_mode = switch (g_bsp_split_mode) {
-            .auto => .horizontal,
-            .horizontal => .vertical,
-            .vertical => .auto,
-        };
-        ipc.writeResponse(client_fd, "ok\n");
-    } else if (std.mem.startsWith(u8, cmd, "bsp ratio rel ")) {
-        const arg = cmd["bsp ratio rel ".len..];
-        const delta = std.fmt.parseFloat(f64, arg) catch {
-            ipc.writeResponse(client_fd, "err: invalid ratio delta\n");
-            return;
-        };
-        const ctx = focusedLayoutContext() orelse {
-            ipc.writeResponse(client_fd, "err: no focused managed window\n");
-            return;
-        };
-        if (!layout.adjustParentRatio(ctx.root, ctx.focused_wid, delta)) {
-            ipc.writeResponse(client_fd, "err: no parent split\n");
-            return;
-        }
-        retileDisplay(ctx.focused_win.display_id);
-        ipc.writeResponse(client_fd, "ok\n");
-    } else if (std.mem.startsWith(u8, cmd, "bsp insert-mode ")) {
-        const arg = cmd["bsp insert-mode ".len..];
-        if (std.mem.eql(u8, arg, "split")) {
-            g_config.bsp_insert_mode = .split;
-        } else if (std.mem.eql(u8, arg, "stack")) {
-            g_config.bsp_insert_mode = .stack;
-        } else {
-            ipc.writeResponse(client_fd, "err: expected split|stack\n");
-            return;
-        }
-        ipc.writeResponse(client_fd, "ok\n");
-    } else if (std.mem.startsWith(u8, cmd, "bsp insert-point ")) {
-        const arg = cmd["bsp insert-point ".len..];
-        if (std.mem.eql(u8, arg, "focused")) {
-            g_config.bsp_insert_point = .focused;
-        } else if (std.mem.eql(u8, arg, "first")) {
-            g_config.bsp_insert_point = .first;
-        } else if (std.mem.eql(u8, arg, "last")) {
-            g_config.bsp_insert_point = .last;
-        } else if (std.mem.eql(u8, arg, "min_depth")) {
-            g_config.bsp_insert_point = .min_depth;
-        } else {
-            ipc.writeResponse(client_fd, "err: expected focused|first|last|min_depth\n");
-            return;
-        }
-        ipc.writeResponse(client_fd, "ok\n");
-    } else if (std.mem.startsWith(u8, cmd, "bsp ratio abs ")) {
-        const arg = cmd["bsp ratio abs ".len..];
-        const ratio = std.fmt.parseFloat(f64, arg) catch {
-            ipc.writeResponse(client_fd, "err: invalid ratio\n");
-            return;
-        };
-        const ctx = focusedLayoutContext() orelse {
-            ipc.writeResponse(client_fd, "err: no focused managed window\n");
-            return;
-        };
-        if (!layout.setParentRatio(ctx.root, ctx.focused_wid, ratio)) {
-            ipc.writeResponse(client_fd, "err: no parent split\n");
-            return;
-        }
-        retileDisplay(ctx.focused_win.display_id);
-        ipc.writeResponse(client_fd, "ok\n");
-    } else if (std.mem.startsWith(u8, cmd, "bsp mirror ")) {
-        const axis = parseAxis(cmd["bsp mirror ".len..]) orelse {
-            ipc.writeResponse(client_fd, "err: expected horizontal|vertical\n");
-            return;
-        };
-        const ws = g_workspaces.active();
-        const wid = ws.focused_wid orelse {
-            ipc.writeResponse(client_fd, "err: no focused window\n");
-            return;
-        };
-        const win = g_store.get(wid) orelse {
-            ipc.writeResponse(client_fd, "err: focused window not managed\n");
-            return;
-        };
-        const root_ptr = layoutRootPtr(win.workspace_id);
-        if (root_ptr.*) |*root| {
-            layout.mirror(root, axis);
-            retileDisplay(win.display_id);
+    const command = ipc.IpcCommand.parse(cmd) orelse {
+        ipc.writeResponse(client_fd, "err: unknown or invalid command\n");
+        return;
+    };
+
+    switch (command) {
+        .retile => {
+            retile();
             ipc.writeResponse(client_fd, "ok\n");
-        } else {
-            ipc.writeResponse(client_fd, "err: no layout root\n");
-        }
-    } else if (std.mem.eql(u8, cmd, "bsp equalize")) {
-        const ws = g_workspaces.active();
-        const wid = ws.focused_wid orelse {
-            ipc.writeResponse(client_fd, "err: no focused window\n");
-            return;
-        };
-        const win = g_store.get(wid) orelse {
-            ipc.writeResponse(client_fd, "err: focused window not managed\n");
-            return;
-        };
-        const root_ptr = layoutRootPtr(win.workspace_id);
-        if (root_ptr.*) |*root| {
-            layout.equalize(root, null, g_config.bsp_split_ratio);
-            retileDisplay(win.display_id);
+        },
+        .toggle_split => {
+            g_bsp_split_mode = switch (g_bsp_split_mode) {
+                .auto => .horizontal,
+                .horizontal => .vertical,
+                .vertical => .auto,
+            };
             ipc.writeResponse(client_fd, "ok\n");
-        } else {
-            ipc.writeResponse(client_fd, "err: no layout root\n");
-        }
-    } else if (std.mem.eql(u8, cmd, "bsp balance")) {
-        const ws = g_workspaces.active();
-        const wid = ws.focused_wid orelse {
-            ipc.writeResponse(client_fd, "err: no focused window\n");
-            return;
-        };
-        const win = g_store.get(wid) orelse {
-            ipc.writeResponse(client_fd, "err: focused window not managed\n");
-            return;
-        };
-        const root_ptr = layoutRootPtr(win.workspace_id);
-        if (root_ptr.*) |*root| {
-            _ = layout.balance(root, null);
-            retileDisplay(win.display_id);
+        },
+        .focus => |dir| {
+            focusDirection(dir);
             ipc.writeResponse(client_fd, "ok\n");
-        } else {
-            ipc.writeResponse(client_fd, "err: no layout root\n");
-        }
-    } else if (std.mem.startsWith(u8, cmd, "bsp rotate ")) {
-        const arg = cmd["bsp rotate ".len..];
-        const degrees = std.fmt.parseInt(i32, arg, 10) catch {
-            ipc.writeResponse(client_fd, "err: invalid degrees\n");
-            return;
-        };
-        if (!(degrees == 90 or degrees == 180 or degrees == 270)) {
-            ipc.writeResponse(client_fd, "err: expected 90|180|270\n");
-            return;
-        }
-        const ws = g_workspaces.active();
-        const wid = ws.focused_wid orelse {
-            ipc.writeResponse(client_fd, "err: no focused window\n");
-            return;
-        };
-        const win = g_store.get(wid) orelse {
-            ipc.writeResponse(client_fd, "err: focused window not managed\n");
-            return;
-        };
-        const root_ptr = layoutRootPtr(win.workspace_id);
-        if (root_ptr.*) |*root| {
-            layout.rotate(root, degrees);
-            retileDisplay(win.display_id);
+        },
+        .focus_workspace => |n| {
+            switchWorkspace(n);
             ipc.writeResponse(client_fd, "ok\n");
-        } else {
-            ipc.writeResponse(client_fd, "err: no layout root\n");
-        }
-    } else if (std.mem.startsWith(u8, cmd, "focus-workspace ")) {
-        const arg = cmd["focus-workspace ".len..];
-        const n = std.fmt.parseInt(u8, arg, 10) catch {
-            ipc.writeResponse(client_fd, "err: invalid workspace number\n");
-            return;
-        };
-        switchWorkspace(n);
-        ipc.writeResponse(client_fd, "ok\n");
-    } else if (std.mem.startsWith(u8, cmd, "move-to-workspace ")) {
-        const arg = cmd["move-to-workspace ".len..];
-        const n = std.fmt.parseInt(u8, arg, 10) catch {
-            ipc.writeResponse(client_fd, "err: invalid workspace number\n");
-            return;
-        };
-        moveWindowToWorkspace(n);
-        ipc.writeResponse(client_fd, "ok\n");
-    } else if (std.mem.startsWith(u8, cmd, "move-to-display ")) {
-        const arg = cmd["move-to-display ".len..];
-        const n = std.fmt.parseInt(u8, arg, 10) catch {
-            ipc.writeResponse(client_fd, "err: invalid display number\n");
-            return;
-        };
-        moveWindowToDisplay(n);
-        ipc.writeResponse(client_fd, "ok\n");
-    } else if (std.mem.startsWith(u8, cmd, "move-workspace-to-display ")) {
-        const arg = cmd["move-workspace-to-display ".len..];
-        if (std.mem.eql(u8, arg, "next")) {
-            moveWorkspaceToDisplayNext();
+        },
+        .move_to_workspace => |n| {
+            moveWindowToWorkspace(n);
             ipc.writeResponse(client_fd, "ok\n");
-        } else if (std.mem.eql(u8, arg, "prev")) {
-            moveWorkspaceToDisplayPrev();
+        },
+        .move_to_display => |n| {
+            moveWindowToDisplay(n);
             ipc.writeResponse(client_fd, "ok\n");
-        } else {
-            const n = std.fmt.parseInt(u8, arg, 10) catch {
-                ipc.writeResponse(client_fd, "err: invalid display number, expected next|prev|<number>\n");
+        },
+        .move_workspace_to_display => |target| switch (target) {
+            .next => {
+                moveWorkspaceToDisplayNext();
+                ipc.writeResponse(client_fd, "ok\n");
+            },
+            .prev => {
+                moveWorkspaceToDisplayPrev();
+                ipc.writeResponse(client_fd, "ok\n");
+            },
+            .index => |n| {
+                if (n == 0) {
+                    ipc.writeResponse(client_fd, "err: display number starts at 1\n");
+                    return;
+                }
+                moveWorkspaceToDisplay(@as(usize, n) - 1);
+                ipc.writeResponse(client_fd, "ok\n");
+            },
+        },
+        .bsp_ratio_rel => |delta| {
+            const ctx = focusedLayoutContext() orelse {
+                ipc.writeResponse(client_fd, "err: no focused managed window\n");
                 return;
             };
-            if (n == 0) {
-                ipc.writeResponse(client_fd, "err: display number starts at 1\n");
+            if (!layout.adjustParentRatio(ctx.root, ctx.focused_wid, delta)) {
+                ipc.writeResponse(client_fd, "err: no parent split\n");
                 return;
             }
-            moveWorkspaceToDisplay(@as(usize, n) - 1);
+            retileDisplay(ctx.focused_win.display_id);
             ipc.writeResponse(client_fd, "ok\n");
-        }
-    } else if (std.mem.startsWith(u8, cmd, "focus ")) {
-        const dir_str = cmd["focus ".len..];
-        if (std.mem.eql(u8, dir_str, "left")) {
-            focusDirection(.left);
-        } else if (std.mem.eql(u8, dir_str, "right")) {
-            focusDirection(.right);
-        } else if (std.mem.eql(u8, dir_str, "up")) {
-            focusDirection(.up);
-        } else if (std.mem.eql(u8, dir_str, "down")) {
-            focusDirection(.down);
-        } else {
-            ipc.writeResponse(client_fd, "err: expected left|right|up|down\n");
-            return;
-        }
-        ipc.writeResponse(client_fd, "ok\n");
-    } else if (std.mem.eql(u8, cmd, "query windows")) {
-        ipcQueryWindows(client_fd);
-    } else if (std.mem.eql(u8, cmd, "query workspaces")) {
-        ipcQueryWorkspaces(client_fd);
-    } else if (std.mem.eql(u8, cmd, "query displays")) {
-        ipcQueryDisplays(client_fd);
-    } else if (std.mem.eql(u8, cmd, "query apps")) {
-        ipcQueryApps(client_fd);
-    } else {
-        ipc.writeResponse(client_fd, "err: unknown command\n");
+        },
+        .bsp_ratio_abs => |ratio| {
+            const ctx = focusedLayoutContext() orelse {
+                ipc.writeResponse(client_fd, "err: no focused managed window\n");
+                return;
+            };
+            if (!layout.setParentRatio(ctx.root, ctx.focused_wid, ratio)) {
+                ipc.writeResponse(client_fd, "err: no parent split\n");
+                return;
+            }
+            retileDisplay(ctx.focused_win.display_id);
+            ipc.writeResponse(client_fd, "ok\n");
+        },
+        .bsp_insert_mode => |mode| {
+            g_config.bsp_insert_mode = mode;
+            ipc.writeResponse(client_fd, "ok\n");
+        },
+        .bsp_insert_point => |point| {
+            g_config.bsp_insert_point = point;
+            ipc.writeResponse(client_fd, "ok\n");
+        },
+        .bsp_mirror => |axis| {
+            const ctx = focusedLayoutContext() orelse {
+                ipc.writeResponse(client_fd, "err: no focused managed window\n");
+                return;
+            };
+            const root_ptr = layoutRootPtr(ctx.focused_win.workspace_id);
+            if (root_ptr.*) |*root| {
+                layout.mirror(root, axis);
+                retileDisplay(ctx.focused_win.display_id);
+                ipc.writeResponse(client_fd, "ok\n");
+            } else {
+                ipc.writeResponse(client_fd, "err: no layout root\n");
+            }
+        },
+        .bsp_equalize => {
+            const ctx = focusedLayoutContext() orelse {
+                ipc.writeResponse(client_fd, "err: no focused managed window\n");
+                return;
+            };
+            const root_ptr = layoutRootPtr(ctx.focused_win.workspace_id);
+            if (root_ptr.*) |*root| {
+                layout.equalize(root, null, g_config.bsp_split_ratio);
+                retileDisplay(ctx.focused_win.display_id);
+                ipc.writeResponse(client_fd, "ok\n");
+            } else {
+                ipc.writeResponse(client_fd, "err: no layout root\n");
+            }
+        },
+        .bsp_balance => {
+            const ctx = focusedLayoutContext() orelse {
+                ipc.writeResponse(client_fd, "err: no focused managed window\n");
+                return;
+            };
+            const root_ptr = layoutRootPtr(ctx.focused_win.workspace_id);
+            if (root_ptr.*) |*root| {
+                _ = layout.balance(root, null);
+                retileDisplay(ctx.focused_win.display_id);
+                ipc.writeResponse(client_fd, "ok\n");
+            } else {
+                ipc.writeResponse(client_fd, "err: no layout root\n");
+            }
+        },
+        .bsp_rotate => |degrees| {
+            if (!(degrees == 90 or degrees == 180 or degrees == 270)) {
+                ipc.writeResponse(client_fd, "err: expected 90|180|270\n");
+                return;
+            }
+            const ctx = focusedLayoutContext() orelse {
+                ipc.writeResponse(client_fd, "err: no focused managed window\n");
+                return;
+            };
+            const root_ptr = layoutRootPtr(ctx.focused_win.workspace_id);
+            if (root_ptr.*) |*root| {
+                layout.rotate(root, degrees);
+                retileDisplay(ctx.focused_win.display_id);
+                ipc.writeResponse(client_fd, "ok\n");
+            } else {
+                ipc.writeResponse(client_fd, "err: no layout root\n");
+            }
+        },
+        .query_windows => ipcQueryWindows(client_fd),
+        .query_workspaces => ipcQueryWorkspaces(client_fd),
+        .query_displays => ipcQueryDisplays(client_fd),
+        .query_apps => ipcQueryApps(client_fd),
     }
 }
 
