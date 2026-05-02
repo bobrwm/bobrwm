@@ -388,11 +388,15 @@ pub fn rotate(root: *Node, degrees: i32) void {
             rotate(&split.right, degrees);
             switch (degrees) {
                 90 => {
+                    // Swap children + invert ratio only for vertical splits.
+                    // Horizontal splits just need the axis flip.
+                    if (split.direction == .vertical) {
+                        const tmp = split.left;
+                        split.left = split.right;
+                        split.right = tmp;
+                        split.ratio = 1.0 - split.ratio;
+                    }
                     split.direction = toggleDirection(split.direction);
-                    const tmp = split.left;
-                    split.left = split.right;
-                    split.right = tmp;
-                    split.ratio = 1.0 - split.ratio;
                 },
                 180 => {
                     const tmp = split.left;
@@ -401,6 +405,14 @@ pub fn rotate(root: *Node, degrees: i32) void {
                     split.ratio = 1.0 - split.ratio;
                 },
                 270 => {
+                    // Swap children + invert ratio only for horizontal splits.
+                    // Vertical splits just need the axis flip.
+                    if (split.direction == .horizontal) {
+                        const tmp = split.left;
+                        split.left = split.right;
+                        split.right = tmp;
+                        split.ratio = 1.0 - split.ratio;
+                    }
                     split.direction = toggleDirection(split.direction);
                 },
                 else => {},
