@@ -18,6 +18,28 @@ pub const Server = struct {
         const path = try std.fmt.allocPrintSentinel(allocator, "/tmp/bobrwm_{d}.sock", .{std.c.getuid()}, 0);
         errdefer allocator.free(path);
 
+        // Check if another daemon is already running by probing the socket.
+        // If a connection succeeds, abort to prevent two instances from
+        // racing on the same socket and window state.
+        if (std.fs.cwd().access(path, .{})) |_| {
+            const probe_fd = posix.socket(posix.AF.UNIX, posix.SOCK.STREAM, 0) catch |err| {
+                log.err("single-instance check: socket() failed: {}", .{err});
+                return err;
+            };
+            defer posix.close(probe_fd);
+
+            var addr: posix.sockaddr.un = .{ .path = undefined, .family = posix.AF.UNIX };
+            @memcpy(addr.path[0..path.len], path[0..path.len]);
+            if (path.len < addr.path.len) addr.path[path.len] = 0;
+
+            if (posix.connect(probe_fd, @ptrCast(&addr), @sizeOf(posix.sockaddr.un))) |_| {
+                log.err("another bobrwm instance is already running on {s}", .{path});
+                return error.AddressInUse;
+            } else |_| {
+                // Connection refused — stale socket from a crashed instance.
+            }
+        } else |_| {}
+
         // Remove stale socket
         std.fs.cwd().deleteFile(path) catch |err| switch (err) {
             error.FileNotFound => {},
