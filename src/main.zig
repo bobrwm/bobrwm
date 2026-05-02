@@ -4283,8 +4283,8 @@ fn moveWindowToWorkspace(target_id: u8) void {
     updated.display_id = target_ws.display_id orelse display_id;
     g_store.put(updated) catch {};
 
-    // If target is not visible, hide the window
-    if (!workspaceVisibleOnDisplay(target_id, display_id)) {
+    // If target is not visible on the window's new display, hide it.
+    if (!workspaceVisibleOnDisplay(target_id, updated.display_id)) {
         if (g_store.get(wid)) |win| {
             hideWindow(win.pid, wid);
         }
