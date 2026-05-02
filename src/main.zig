@@ -57,16 +57,23 @@ const log = std.log.scoped(.bobrwm);
 // the main run-loop.
 
 const EventRing = struct {
-    const capacity = 256;
+    const capacity = 1024;
 
     buf: [capacity]event_mod.Event = undefined,
     head: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
     tail: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
+    dropped: usize = 0,
 
     fn push(self: *EventRing, ev: event_mod.Event) void {
         const t = self.tail.load(.acquire);
         const next = (t + 1) % capacity;
-        if (next == self.head.load(.acquire)) return; // full, drop
+        if (next == self.head.load(.acquire)) {
+            self.dropped += 1;
+            log.err("event ring full, dropped event kind={s} pid={d} wid={d} total_dropped={d}", .{
+                @tagName(ev.kind), ev.pid, ev.wid, self.dropped,
+            });
+            return;
+        }
         self.buf[t] = ev;
         self.tail.store(next, .release);
     }
