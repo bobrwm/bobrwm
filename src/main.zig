@@ -1849,28 +1849,25 @@ pub fn main() !void {
     g_tab_groups = tabgroup.TabGroupManager.init(g_allocator);
     defer g_tab_groups.deinit();
     g_pending_role_windows = PendingRoleWindowMap.init(g_allocator);
-    errdefer g_pending_role_windows.deinit();
+    defer g_pending_role_windows.deinit();
     g_pending_role_windows.ensureTotalCapacity(pending_role_window_capacity) catch |err| {
         log.err("pending-role map reserve failed: {}", .{err});
         return err;
     };
     g_deferred_window_candidates = DeferredWindowCandidateMap.init(g_allocator);
-    errdefer g_deferred_window_candidates.deinit();
+    defer g_deferred_window_candidates.deinit();
     g_deferred_window_candidates.ensureTotalCapacity(deferred_window_candidate_capacity) catch |err| {
         log.err("deferred-window map reserve failed: {}", .{err});
         return err;
     };
     g_app_launch_retries = AppLaunchRetryMap.init(g_allocator);
-    errdefer g_app_launch_retries.deinit();
+    defer g_app_launch_retries.deinit();
     g_app_launch_retries.ensureTotalCapacity(app_launch_retry_capacity) catch |err| {
         log.err("app-launch-retry map reserve failed: {}", .{err});
         return err;
     };
     defer {
         setRolePolling(false);
-        g_app_launch_retries.deinit();
-        g_deferred_window_candidates.deinit();
-        g_pending_role_windows.deinit();
         g_layout_entries.deinit(g_allocator);
     }
     refreshDisplays();
