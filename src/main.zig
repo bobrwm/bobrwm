@@ -3461,6 +3461,11 @@ fn cleanupWorkspaceWindowsForPid(pid: i32) bool {
     var truncated = false;
 
     for (&g_workspaces.workspaces) |*ws| {
+        // Windows on hidden workspaces are intentionally parked off-screen.
+        // AX role queries can be flaky for windows at corner positions,
+        // so skip hidden workspaces to avoid false positives.
+        if (!workspaceVisibleAnywhere(ws.id)) continue;
+
         for (ws.windows.items) |wid| {
             const win = g_store.get(wid) orelse continue;
             if (win.pid != pid) continue;
