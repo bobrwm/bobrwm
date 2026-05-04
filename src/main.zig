@@ -225,6 +225,8 @@ const AxStrings = struct {
     unknown_role: c.CFStringRef,
     subrole_attr: c.CFStringRef,
     standard_window_subrole: c.CFStringRef,
+    floating_window_subrole: c.CFStringRef,
+    dialog_subrole: c.CFStringRef,
     unknown_subrole: c.CFStringRef,
     enhanced_ui_attr: c.CFStringRef,
 };
@@ -252,6 +254,8 @@ fn ensureAxStrings() ?*const AxStrings {
         "AXUnknown",
         "AXSubrole",
         "AXStandardWindow",
+        "AXFloatingWindow",
+        "AXDialog",
         "AXUnknown",
         "AXEnhancedUserInterface",
     };
@@ -279,8 +283,10 @@ fn ensureAxStrings() ?*const AxStrings {
         .unknown_role = refs[8],
         .subrole_attr = refs[9],
         .standard_window_subrole = refs[10],
-        .unknown_subrole = refs[11],
-        .enhanced_ui_attr = refs[12],
+        .floating_window_subrole = refs[11],
+        .dialog_subrole = refs[12],
+        .unknown_subrole = refs[13],
+        .enhanced_ui_attr = refs[14],
     };
     return &g_ax_strings.?;
 }
@@ -290,6 +296,8 @@ fn deinitAxStrings() void {
         const refs = [_]c.CFStringRef{
             strings.enhanced_ui_attr,
             strings.unknown_subrole,
+            strings.dialog_subrole,
+            strings.floating_window_subrole,
             strings.standard_window_subrole,
             strings.subrole_attr,
             strings.unknown_role,
@@ -1342,14 +1350,18 @@ fn manageStateForWindow(pid: i32, wid: u32) u8 {
     const subrole_ref: c.CFStringRef = @ptrCast(subrole_any orelse return shim.BW_MANAGE_PENDING);
     defer c.CFRelease(@ptrCast(subrole_ref));
 
-    const standard_subrole = ax.standard_window_subrole;
     const unknown_subrole = ax.unknown_subrole;
-
-    const is_standard = c.CFEqual(@ptrCast(subrole_ref), @ptrCast(standard_subrole)) != 0;
     const is_unknown_subrole = c.CFEqual(@ptrCast(subrole_ref), @ptrCast(unknown_subrole)) != 0;
-    if (!is_standard and is_unknown_subrole) return shim.BW_MANAGE_PENDING;
+    if (is_unknown_subrole) return shim.BW_MANAGE_PENDING;
 
-    return if (is_standard) shim.BW_MANAGE_READY else shim.BW_MANAGE_REJECT;
+    // Accept AXStandardWindow, AXFloatingWindow, and AXDialog as manageable.
+    // Some Electron apps and IDEs report AXDialog or AXFloatingWindow for
+    // their main windows. Yabai also accepts all three subroles.
+    const is_manageable = c.CFEqual(@ptrCast(subrole_ref), @ptrCast(ax.standard_window_subrole)) != 0 or
+        c.CFEqual(@ptrCast(subrole_ref), @ptrCast(ax.floating_window_subrole)) != 0 or
+        c.CFEqual(@ptrCast(subrole_ref), @ptrCast(ax.dialog_subrole)) != 0;
+
+    return if (is_manageable) shim.BW_MANAGE_READY else shim.BW_MANAGE_REJECT;
 }
 
 /// Returns true when a still-pending window has AXUnknown role/subrole metadata.
