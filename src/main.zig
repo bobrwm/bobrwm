@@ -1427,6 +1427,12 @@ export fn bw_window_manage_state(pid: i32, wid: u32) u8 {
 }
 
 /// Enumerate on-screen layer-0 windows for regular applications.
+///
+/// Uses a per-call PID cache to avoid redundant isRegularActivationApp calls.
+/// Electron apps spawn many XPC helper processes (renderers, GPU process) that
+/// share the CGWindowList but have Prohibited activation policy. Caching the
+/// accept/reject decision per PID avoids an ObjC message send for every window
+/// belonging to the same rejected process.
 export fn bw_discover_windows(out: ?[*]shim.bw_window_info, max_count: u32) u32 {
     const out_ptr = out orelse return 0;
     if (max_count == 0) return 0;
@@ -1441,6 +1447,13 @@ export fn bw_discover_windows(out: ?[*]shim.bw_window_info, max_count: u32) u32 
 
     const total = c.CFArrayGetCount(window_list);
     std.debug.assert(total >= 0);
+
+    // Per-call PID caches to fast-path repeated lookups.
+    const pid_cache_capacity = 64;
+    var accepted_pids: [pid_cache_capacity]i32 = undefined;
+    var accepted_pid_count: usize = 0;
+    var rejected_pids: [pid_cache_capacity]i32 = undefined;
+    var rejected_pid_count: usize = 0;
 
     var count: usize = 0;
     var i: c.CFIndex = 0;
@@ -1465,7 +1478,22 @@ export fn bw_discover_windows(out: ?[*]shim.bw_window_info, max_count: u32) u32 
         var pid: i32 = 0;
         _ = c.CFNumberGetValue(pid_ref, c.kCFNumberSInt32Type, &pid);
         if (pid <= 0) continue;
-        if (!isRegularActivationApp(pid)) continue;
+
+        // Fast-path: check per-call caches before the ObjC message send.
+        if (pidInCache(pid, &rejected_pids, rejected_pid_count)) continue;
+        if (!pidInCache(pid, &accepted_pids, accepted_pid_count)) {
+            if (!isRegularActivationApp(pid)) {
+                if (rejected_pid_count < pid_cache_capacity) {
+                    rejected_pids[rejected_pid_count] = pid;
+                    rejected_pid_count += 1;
+                }
+                continue;
+            }
+            if (accepted_pid_count < pid_cache_capacity) {
+                accepted_pids[accepted_pid_count] = pid;
+                accepted_pid_count += 1;
+            }
+        }
 
         var bounds: c.CGRect = std.mem.zeroes(c.CGRect);
         if (c.CFDictionaryGetValue(info, c.kCGWindowBounds)) |bounds_ref_any| {
@@ -1487,6 +1515,13 @@ export fn bw_discover_windows(out: ?[*]shim.bw_window_info, max_count: u32) u32 
 
     std.debug.assert(count <= out_buf.len);
     return @intCast(count);
+}
+
+fn pidInCache(pid: i32, cache: []const i32, count: usize) bool {
+    for (cache[0..count]) |cached| {
+        if (cached == pid) return true;
+    }
+    return false;
 }
 
 fn wakerPerform(info: ?*anyopaque) callconv(.c) void {
