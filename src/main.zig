@@ -2280,6 +2280,21 @@ fn handleEvent(ev: *const event_mod.Event) void {
         },
         .window_created => {
             log.info("window created pid={} wid={}", .{ ev.pid, ev.wid });
+
+            // Electron browsers (Chrome, Edge, Brave) fire kAXWindowCreatedNotification
+            // mid-drag during tab tear-out, before the window has settled. Defer these
+            // into the existing deferred-candidate pipeline so they are picked up after
+            // mouse-up, preventing a layout flash from tiling a half-positioned window.
+            if (g_mouse_left_down) {
+                if (g_store.get(ev.wid) == null) {
+                    const display_id = focusedDisplayId();
+                    const ws = resolveWorkspace(ev.pid, display_id);
+                    trackDeferredWindowCandidate(ev.pid, ev.wid, ws.id, display_id);
+                    log.info("window created: deferred pid={} wid={} while mouse is down (tab tear-off guard)", .{ ev.pid, ev.wid });
+                }
+                return;
+            }
+
             addNewWindow(ev.pid, ev.wid);
             retile();
         },
@@ -2332,6 +2347,12 @@ fn handleEvent(ev: *const event_mod.Event) void {
                 retile();
             } else {
                 clearDragPreview();
+            }
+
+            // Flush windows that were deferred during the drag (tab tear-off guard).
+            // Processing them here avoids waiting for the next role_poll_tick.
+            if (processDeferredWindowCandidates()) {
+                retile();
             }
         },
         .window_moved, .window_resized => {
