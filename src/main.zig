@@ -828,6 +828,9 @@ var g_config: config_mod.Config = .{};
 var g_drag_preview: DragPreviewState = .{};
 var g_mouse_left_down = false;
 var g_drag_reconcile_on_drop = false;
+/// PID of the last window we focused via bw_ax_focus_window. Used to detect
+/// same-process focus switches that need a delay for Electron compatibility.
+var g_last_focused_pid: i32 = 0;
 var g_last_space_changed_at_s: f64 = 0;
 var g_last_display_changed_at_s: f64 = 0;
 var g_hotkey_bindings: [128]shim.bw_keybind = undefined;
@@ -1294,7 +1297,15 @@ fn axEnhancedUserInterface(app: c.AXUIElementRef, ax: *const AxStrings) bool {
 }
 
 /// Raise and focus a window, then activate its owning app.
+///
+/// When switching between windows within the same process, a 40ms delay is
+/// inserted between the raise and the activation. Some apps (notably Electron)
+/// get confused by instantaneous same-process focus switches and fail to render
+/// the focus ring or route keyboard events to the wrong window. Yabai uses the
+/// same 40ms delay for same-PSN switches.
 export fn bw_ax_focus_window(pid: i32, wid: u32) bool {
+    const same_process_focus_delay_us: c_uint = 40_000; // 40ms, matches yabai
+
     std.debug.assert(pid > 0);
     std.debug.assert(wid > 0);
 
@@ -1305,8 +1316,18 @@ export fn bw_ax_focus_window(pid: i32, wid: u32) bool {
     const raise_action = ax.raise_action;
     const main_attr = ax.main_attr;
 
+    const is_same_process = (g_last_focused_pid == pid);
+    g_last_focused_pid = pid;
+
     _ = c.AXUIElementPerformAction(win, raise_action);
     _ = c.AXUIElementSetAttributeValue(win, main_attr, c.kCFBooleanTrue);
+
+    // Delay activation for same-process switches so the app has time to
+    // process the deactivation of the previous window before the new
+    // activation arrives.
+    if (is_same_process) {
+        _ = c.usleep(same_process_focus_delay_us);
+    }
 
     const NSRunningApplication = objc.getClass("NSRunningApplication") orelse return true;
     const app = NSRunningApplication.msgSend(objc.Object, "runningApplicationWithProcessIdentifier:", .{pid});
