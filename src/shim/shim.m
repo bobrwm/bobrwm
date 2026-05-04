@@ -2,37 +2,56 @@
 #import <AppKit/AppKit.h>
 
 // ---------------------------------------------------------------------------
-// KVO context token for isFinishedLaunching observation.
+// KVO context tokens.
 // ---------------------------------------------------------------------------
 static void *kBWFinishedLaunchingCtx = &kBWFinishedLaunchingCtx;
+static void *kBWActivationPolicyCtx  = &kBWActivationPolicyCtx;
 
 // ---------------------------------------------------------------------------
-// Per-app KVO helper that waits for isFinishedLaunching == YES before
-// emitting the app-launched event.  Electron apps (VS Code, Slack, Discord)
-// fire NSWorkspaceDidLaunchApplicationNotification well before their
-// accessibility server is ready.  Gating on isFinishedLaunching avoids
-// wasting retry budget on premature AX observer registration attempts.
+// Per-app KVO helper that defers the app-launched event until the process
+// is both finished launching AND has a Regular activation policy.
+//
+// Electron apps (VS Code, Slack, Discord) fire
+// NSWorkspaceDidLaunchApplicationNotification before their accessibility
+// server is ready. Some Electron helper processes also start as
+// NSApplicationActivationPolicyProhibited and transition to Regular later.
+// Gating on both conditions avoids wasting retry budget on premature AX
+// observer registration and catches late policy transitions.
 // ---------------------------------------------------------------------------
 @class BWLaunchGate;
 
-/// Active launch gates kept alive until the KVO fires.
+/// Active launch gates kept alive until both KVO conditions are met.
 /// Access is main-thread-only (NSWorkspace notifications are delivered there).
 static NSMutableDictionary<NSNumber *, BWLaunchGate *> *sLaunchGates;
 
 @interface BWLaunchGate : NSObject
 @property (strong) NSRunningApplication *app;
+@property (assign) BOOL observingLaunch;
+@property (assign) BOOL observingPolicy;
 @end
 
 @implementation BWLaunchGate
 
-- (instancetype)initWithApp:(NSRunningApplication *)app {
+- (instancetype)initWithApp:(NSRunningApplication *)app
+           needsLaunchGate:(BOOL)needsLaunchGate
+           needsPolicyGate:(BOOL)needsPolicyGate {
   self = [super init];
   if (self) {
     _app = app;
-    [app addObserver:self
-          forKeyPath:@"isFinishedLaunching"
-             options:NSKeyValueObservingOptionNew
-             context:kBWFinishedLaunchingCtx];
+    if (needsLaunchGate) {
+      _observingLaunch = YES;
+      [app addObserver:self
+            forKeyPath:@"isFinishedLaunching"
+               options:NSKeyValueObservingOptionNew
+               context:kBWFinishedLaunchingCtx];
+    }
+    if (needsPolicyGate) {
+      _observingPolicy = YES;
+      [app addObserver:self
+            forKeyPath:@"activationPolicy"
+               options:NSKeyValueObservingOptionNew
+               context:kBWActivationPolicyCtx];
+    }
   }
   return self;
 }
@@ -41,32 +60,40 @@ static NSMutableDictionary<NSNumber *, BWLaunchGate *> *sLaunchGates;
                       ofObject:(id)object
                         change:(NSDictionary<NSKeyValueChangeKey,id> *)change
                        context:(void *)context {
-  if (context != kBWFinishedLaunchingCtx) {
+  if (context == kBWFinishedLaunchingCtx) {
+    // isFinishedLaunching transitioned — check if both conditions are met.
+  } else if (context == kBWActivationPolicyCtx) {
+    // activationPolicy transitioned — check if both conditions are met.
+  } else {
     [super observeValueForKeyPath:keyPath ofObject:object change:change context:context];
     return;
   }
 
   NSRunningApplication *app = (NSRunningApplication *)object;
   if (!app.isFinishedLaunching) return;
+  if (app.activationPolicy != NSApplicationActivationPolicyRegular) return;
 
   pid_t pid = app.processIdentifier;
   bw_workspace_app_launched(pid);
 
-  // One-shot: remove KVO and drop the dictionary entry that kept us alive.
-  [app removeObserver:self forKeyPath:@"isFinishedLaunching" context:kBWFinishedLaunchingCtx];
+  // Both conditions met — remove KVO and drop the dictionary entry.
+  [self removeAllObservers];
   [sLaunchGates removeObjectForKey:@(pid)];
 }
 
-- (void)dealloc {
-  // Safety: if the gate is deallocated before the app finishes launching
-  // (e.g. app crashed during startup), remove the KVO to avoid a dangling
-  // observer.  removeObserver:forKeyPath:context: is idempotent when the
-  // observer is already removed.
-  @try {
+- (void)removeAllObservers {
+  if (_observingLaunch) {
     [_app removeObserver:self forKeyPath:@"isFinishedLaunching" context:kBWFinishedLaunchingCtx];
-  } @catch (NSException *) {
-    // Already removed — nothing to do.
+    _observingLaunch = NO;
   }
+  if (_observingPolicy) {
+    [_app removeObserver:self forKeyPath:@"activationPolicy" context:kBWActivationPolicyCtx];
+    _observingPolicy = NO;
+  }
+}
+
+- (void)dealloc {
+  [self removeAllObservers];
 }
 
 @end
@@ -81,18 +108,23 @@ static NSMutableDictionary<NSNumber *, BWLaunchGate *> *sLaunchGates;
   NSRunningApplication *app = note.userInfo[NSWorkspaceApplicationKey];
   pid_t pid = app.processIdentifier;
 
-  if (app.isFinishedLaunching) {
+  BOOL launched = app.isFinishedLaunching;
+  BOOL regular  = app.activationPolicy == NSApplicationActivationPolicyRegular;
+
+  if (launched && regular) {
     bw_workspace_app_launched(pid);
     return;
   }
 
-  // App is not ready yet — install a KVO gate.
+  // One or both conditions not met — install KVO gate(s).
   if (!sLaunchGates) {
     sLaunchGates = [NSMutableDictionary new];
   }
   NSNumber *key = @(pid);
   if (sLaunchGates[key]) return; // already waiting
-  BWLaunchGate *gate = [[BWLaunchGate alloc] initWithApp:app];
+  BWLaunchGate *gate = [[BWLaunchGate alloc] initWithApp:app
+                                        needsLaunchGate:!launched
+                                        needsPolicyGate:!regular];
   sLaunchGates[key] = gate;
 }
 
