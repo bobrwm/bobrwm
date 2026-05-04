@@ -1,7 +1,9 @@
-//! Per-application AX observer runtime moved from shim.m to Zig.
+//! Per-application AX observer runtime.
 //!
-//! This module owns retry timers, AX observer registration, and deferred
-//! CGWindowID resolution while keeping Objective-C class callbacks in shim.m.
+//! AX observer sources are pumped on a dedicated background thread so that
+//! a slow or hung Electron AX server cannot stall the main CFRunLoop.
+//! Notification callbacks emit events via bw_emit_event (thread-safe) and
+//! modify shared tracking state under g_ax_lock.
 
 const std = @import("std");
 const log = std.log.scoped(.ax_observer);
@@ -9,6 +11,8 @@ const objc = @import("objc");
 const c = @cImport({
     @cInclude("ApplicationServices/ApplicationServices.h");
     @cInclude("dispatch/dispatch.h");
+    @cInclude("pthread.h");
+    @cInclude("os/lock.h");
 });
 const shim = @import("shim_api.zig");
 
@@ -55,7 +59,32 @@ const AxObserverStrings = struct {
     deminiaturized_notification: c.CFStringRef,
 };
 
-var g_observer_runloop: c.CFRunLoopRef = null;
+// ---------------------------------------------------------------------------
+// Shared state — protected by g_ax_lock when accessed from both threads.
+//
+// The background thread (notification callbacks) reads/writes:
+//   - entry.known_windows, entry.known_window_count  (via appTrackWindow/appUntrackWindow)
+//   - g_wid_retry_contexts                           (via acquireWidRetryCtx)
+//
+// The main thread reads/writes all of the above plus:
+//   - g_app_observers, g_app_observer_count          (add/remove entries)
+//   - g_observe_retry_entries, g_observe_retry_count
+//   - g_window_scan_idle_ticks
+//
+// g_app_observer_count and entry.pid/observer are only modified from the
+// main thread, so main-thread-only reads of those fields are safe without
+// the lock.  The lock is still required when the background thread reads
+// them (e.g. appObserverIndex called from appTrackWindow).
+// ---------------------------------------------------------------------------
+
+var g_ax_lock: c.os_unfair_lock_s = .{ ._os_unfair_lock_opaque = 0 };
+
+/// Background thread handle and its CFRunLoop for AX observer sources.
+var g_ax_thread: c.pthread_t = null;
+var g_ax_thread_runloop: c.CFRunLoopRef = null;
+/// Synchronisation: background thread signals readiness after capturing its runloop ref.
+var g_ax_thread_ready: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
+
 var g_observe_retry_source: c.dispatch_source_t = null;
 var g_window_scan_source: c.dispatch_source_t = null;
 var g_app_observers: [max_observed_apps]AppObserverEntry = [_]AppObserverEntry{.{}} ** max_observed_apps;
@@ -131,10 +160,69 @@ fn deinitAxObserverStrings() void {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Background observer thread
+// ---------------------------------------------------------------------------
+
+fn axThreadEntry(context: ?*anyopaque) callconv(.c) ?*anyopaque {
+    _ = context;
+    g_ax_thread_runloop = c.CFRunLoopGetCurrent();
+    g_ax_thread_ready.store(true, .release);
+
+    // CFRunLoopRun returns when CFRunLoopStop is called from the main thread
+    // during deinit.  The run loop needs at least one source to avoid
+    // returning immediately; we rely on AX observer sources being added
+    // shortly after init.  As a safety net, run in a timed mode so we can
+    // re-check even if no source is ever added.
+    while (true) {
+        const result = c.CFRunLoopRunInMode(c.kCFRunLoopDefaultMode, 60.0, 0);
+        // kCFRunLoopRunStopped (2) — main thread requested shutdown.
+        if (result == 2) break;
+    }
+
+    return null;
+}
+
+fn startAxThread() void {
+    if (g_ax_thread != null) return;
+
+    var attr: c.pthread_attr_t = undefined;
+    _ = c.pthread_attr_init(&attr);
+    defer _ = c.pthread_attr_destroy(&attr);
+
+    var thread: c.pthread_t = null;
+    if (c.pthread_create(&thread, &attr, axThreadEntry, null) != 0) {
+        log.err("failed to create AX observer thread", .{});
+        return;
+    }
+    g_ax_thread = thread;
+
+    // Spin until the thread has captured its CFRunLoop ref.  This is fast
+    // (< 1ms) because the thread does nothing before signaling readiness.
+    while (!g_ax_thread_ready.load(.acquire)) {
+        std.atomic.spinLoopHint();
+    }
+}
+
+fn stopAxThread() void {
+    if (g_ax_thread_runloop) |rl| {
+        c.CFRunLoopStop(rl);
+    }
+    if (g_ax_thread) |thread| {
+        _ = c.pthread_join(thread, null);
+    }
+    g_ax_thread = null;
+    g_ax_thread_runloop = null;
+    g_ax_thread_ready.store(false, .release);
+}
+
+// ---------------------------------------------------------------------------
+// Public API
+// ---------------------------------------------------------------------------
+
 pub fn init() void {
-    // Re-initialization should be equivalent to a fresh startup.
     deinit();
-    g_observer_runloop = c.CFRunLoopGetMain();
+    startAxThread();
 }
 
 pub fn deinit() void {
@@ -144,11 +232,11 @@ pub fn deinit() void {
     while (i < g_app_observer_count) : (i += 1) {
         const observer = g_app_observers[i].observer;
         if (observer == null) continue;
-        if (g_observer_runloop != null) {
+        if (g_ax_thread_runloop) |rl| {
             c.CFRunLoopRemoveSource(
-                g_observer_runloop,
+                rl,
                 c.AXObserverGetRunLoopSource(observer),
-                c.kCFRunLoopCommonModes,
+                c.kCFRunLoopDefaultMode,
             );
         }
         c.CFRelease(@ptrCast(observer));
@@ -162,6 +250,7 @@ pub fn deinit() void {
     }
 
     deinitAxObserverStrings();
+    stopAxThread();
 }
 
 pub fn observeApp(pid: i32) void {
@@ -187,6 +276,10 @@ pub fn unobserveApp(pid: i32) void {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Internal — main-thread helpers
+// ---------------------------------------------------------------------------
+
 fn cancelRuntimeSources() void {
     if (g_observe_retry_source) |source| {
         c.dispatch_source_cancel(source);
@@ -211,8 +304,15 @@ fn appObserverExists(pid: i32) bool {
     return appObserverIndex(pid) != null;
 }
 
+/// Track a window ID in an app's known-windows set.
+/// Returns true if the window was newly added, false if already tracked or at capacity.
+///
+/// Thread-safety: acquires g_ax_lock internally.
 fn appTrackWindow(pid: i32, wid: u32) bool {
     if (wid == 0) return false;
+
+    c.os_unfair_lock_lock(&g_ax_lock);
+    defer c.os_unfair_lock_unlock(&g_ax_lock);
 
     const index = appObserverIndex(pid) orelse return false;
     var entry = &g_app_observers[index];
@@ -228,17 +328,20 @@ fn appTrackWindow(pid: i32, wid: u32) bool {
         return true;
     }
 
-    // At capacity — refuse tracking rather than silently overwriting the
-    // last entry, which would untrack it and cause duplicate WINDOW_CREATED
-    // emissions on the next scan.
     log.warn("appTrackWindow: capacity exhausted pid={d} wid={d} limit={d}", .{
         pid, wid, max_known_windows_per_app,
     });
     return false;
 }
 
+/// Remove a window ID from an app's known-windows set.
+///
+/// Thread-safety: acquires g_ax_lock internally.
 fn appUntrackWindow(pid: i32, wid: u32) void {
     if (wid == 0) return;
+
+    c.os_unfair_lock_lock(&g_ax_lock);
+    defer c.os_unfair_lock_unlock(&g_ax_lock);
 
     const index = appObserverIndex(pid) orelse return;
     var entry = &g_app_observers[index];
@@ -487,7 +590,13 @@ fn processWindowScanTick() void {
     }
 }
 
+/// Acquire a WID retry context from the fixed-size pool.
+///
+/// Thread-safety: acquires g_ax_lock internally.
 fn acquireWidRetryCtx() ?*WidRetryContext {
+    c.os_unfair_lock_lock(&g_ax_lock);
+    defer c.os_unfair_lock_unlock(&g_ax_lock);
+
     for (&g_wid_retry_contexts) |*ctx| {
         if (ctx.in_use) continue;
         ctx.* = .{ .in_use = true };
@@ -583,6 +692,10 @@ fn scheduleWidResolutionRetry(observer: c.AXObserverRef, element: c.AXUIElementR
     );
 }
 
+// ---------------------------------------------------------------------------
+// AX notification callback — runs on the background observer thread.
+// ---------------------------------------------------------------------------
+
 fn isNotification(notification: c.CFStringRef, expected: c.CFStringRef) bool {
     return c.CFEqual(@ptrCast(notification), @ptrCast(expected)) != 0;
 }
@@ -634,6 +747,10 @@ fn axNotificationHandler(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Observer registration — main thread
+// ---------------------------------------------------------------------------
+
 fn registerAppLevelAXNotifications(observer: c.AXObserverRef, app: c.AXUIElementRef, app_refcon: ?*anyopaque) bool {
     const strings = ensureAxObserverStrings() orelse return false;
 
@@ -679,26 +796,31 @@ fn removeAppObserverAtIndex(index: u32) void {
     if (index >= g_app_observer_count) return;
 
     const observer = g_app_observers[index].observer;
-    if (observer != null and g_observer_runloop != null) {
-        c.CFRunLoopRemoveSource(
-            g_observer_runloop,
-            c.AXObserverGetRunLoopSource(observer),
-            c.kCFRunLoopCommonModes,
-        );
-    }
     if (observer != null) {
+        if (g_ax_thread_runloop) |rl| {
+            c.CFRunLoopRemoveSource(
+                rl,
+                c.AXObserverGetRunLoopSource(observer),
+                c.kCFRunLoopDefaultMode,
+            );
+        }
         c.CFRelease(@ptrCast(observer));
     }
 
+    // Lock the array swap so the background thread's appObserverIndex sees
+    // a consistent view.
+    c.os_unfair_lock_lock(&g_ax_lock);
     g_app_observer_count -= 1;
     g_app_observers[index] = g_app_observers[g_app_observer_count];
+    c.os_unfair_lock_unlock(&g_ax_lock);
+
     updateWindowScanSource();
 }
 
 fn tryObserveApp(pid: i32) bool {
     if (appObserverExists(pid)) return true;
     if (g_app_observer_count >= max_observed_apps) return false;
-    if (g_observer_runloop == null) return false;
+    if (g_ax_thread_runloop == null) return false;
 
     var observer: c.AXObserverRef = null;
     const err = c.AXObserverCreate(pid, axNotificationHandler, &observer);
@@ -717,18 +839,25 @@ fn tryObserveApp(pid: i32) bool {
         return false;
     }
 
+    // Add the observer source to the background thread's runloop so
+    // notification callbacks run off the main thread.
+    const rl = g_ax_thread_runloop.?;
     c.CFRunLoopAddSource(
-        g_observer_runloop,
+        rl,
         c.AXObserverGetRunLoopSource(observer_ref),
-        c.kCFRunLoopCommonModes,
+        c.kCFRunLoopDefaultMode,
     );
-    c.CFRunLoopWakeUp(g_observer_runloop);
+    c.CFRunLoopWakeUp(rl);
 
+    // Lock the array append so the background thread's appObserverIndex sees
+    // a consistent view.
+    c.os_unfair_lock_lock(&g_ax_lock);
     g_app_observers[g_app_observer_count] = .{
         .pid = pid,
         .observer = observer_ref,
     };
     g_app_observer_count += 1;
+    c.os_unfair_lock_unlock(&g_ax_lock);
 
     g_window_scan_idle_ticks = 0;
     updateWindowScanSource();

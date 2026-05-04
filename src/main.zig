@@ -5,6 +5,7 @@ const c = @cImport({
     @cInclude("ApplicationServices/ApplicationServices.h");
     @cInclude("dispatch/dispatch.h");
     @cInclude("pthread.h");
+    @cInclude("os/lock.h");
 });
 const objc = @import("objc");
 const shim = @import("shim_api.zig");
@@ -810,6 +811,8 @@ fn framesEqual(lhs: window_mod.Window.Frame, rhs: window_mod.Window.Frame) bool 
 // ---------------------------------------------------------------------------
 
 var g_ring: EventRing = .{};
+/// Protects g_ring.push from concurrent AX observer threads.
+var g_ring_lock: c.os_unfair_lock_s = .{ ._os_unfair_lock_opaque = 0 };
 var g_sky: ?skylight.SkyLight = null;
 var g_allocator: std.mem.Allocator = undefined;
 var g_store: window_mod.WindowStore = undefined;
@@ -1698,15 +1701,17 @@ export fn bw_set_role_polling(enabled: bool) void {
 // Event bridge (called from ObjC shim)
 // ---------------------------------------------------------------------------
 
-// Single-producer (main thread) only — all ObjC emitters must dispatch
-// on the main queue so the ring buffer stays SPSC.
+// Thread-safe: AX observer callbacks run on per-app background threads
+// and push events here.  The os_unfair_lock serialises concurrent pushes
+// while the main-thread consumer (pop) is wait-free.
 export fn bw_emit_event(kind: u8, pid: i32, wid: u32) void {
-    std.debug.assert(c.pthread_main_np() != 0);
+    c.os_unfair_lock_lock(&g_ring_lock);
     g_ring.push(.{
         .kind = @enumFromInt(kind),
         .pid = pid,
         .wid = wid,
     });
+    c.os_unfair_lock_unlock(&g_ring_lock);
     signalWaker();
 }
 
