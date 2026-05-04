@@ -1,6 +1,7 @@
 const std = @import("std");
 const posix = std.posix;
 const layout_mod = @import("layout.zig");
+const osutil = @import("osutil.zig");
 
 const log = std.log.scoped(.ipc);
 
@@ -77,7 +78,6 @@ pub const IpcCommand = union(enum) {
         return null;
     }
 
-
     fn stripPrefix(cmd: []const u8, prefix: []const u8) ?[]const u8 {
         if (std.mem.startsWith(u8, cmd, prefix))
             return cmd[prefix.len..];
@@ -118,6 +118,11 @@ pub const IpcCommand = union(enum) {
 /// Module-level dispatch — set by main before calling bw_app_setup.
 pub var g_dispatch: ?DispatchFn = null;
 
+// Zig 0.16 removed the std.posix.{socket,bind,listen,connect,write,close,
+// shutdown} wrappers ("posix and os.windows removals" in the release notes).
+// std.c re-exports the underlying libc entry points, so we go lower rather
+// than threading a std.Io instance through every IPC call.
+
 pub const Server = struct {
     fd: posix.socket_t,
     path: [:0]const u8,
@@ -129,33 +134,31 @@ pub const Server = struct {
         // Check if another daemon is already running by probing the socket.
         // If a connection succeeds, abort to prevent two instances from
         // racing on the same socket and window state.
-        if (std.fs.cwd().access(path, .{})) |_| {
-            const probe_fd = posix.socket(posix.AF.UNIX, posix.SOCK.STREAM, 0) catch |err| {
-                log.err("single-instance check: socket() failed: {}", .{err});
-                return err;
-            };
-            defer posix.close(probe_fd);
+        if (osutil.pathExists(path.ptr)) {
+            const probe_fd = std.c.socket(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+            if (probe_fd < 0) {
+                log.err("single-instance check: socket() failed", .{});
+                return error.SocketFailed;
+            }
+            defer _ = std.c.close(probe_fd);
 
             var addr: posix.sockaddr.un = .{ .path = undefined, .family = posix.AF.UNIX };
             @memcpy(addr.path[0..path.len], path[0..path.len]);
             if (path.len < addr.path.len) addr.path[path.len] = 0;
 
-            if (posix.connect(probe_fd, @ptrCast(&addr), @sizeOf(posix.sockaddr.un))) |_| {
+            if (std.c.connect(probe_fd, @ptrCast(&addr), @sizeOf(posix.sockaddr.un)) == 0) {
                 log.err("another bobrwm instance is already running on {s}", .{path});
                 return error.AddressInUse;
-            } else |_| {
-                // Connection refused — stale socket from a crashed instance.
             }
-        } else |_| {}
+            // Connection refused — stale socket from a crashed instance.
+        }
 
-        // Remove stale socket
-        std.fs.cwd().deleteFile(path) catch |err| switch (err) {
-            error.FileNotFound => {},
-            else => return err,
-        };
+        // Remove stale socket (no-op if missing).
+        osutil.deleteFile(path.ptr);
 
-        const fd = try posix.socket(posix.AF.UNIX, posix.SOCK.STREAM, 0);
-        errdefer posix.close(fd);
+        const fd = std.c.socket(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+        if (fd < 0) return error.SocketFailed;
+        errdefer _ = std.c.close(fd);
 
         var addr: posix.sockaddr.un = .{ .path = undefined, .family = posix.AF.UNIX };
         if (path.len > addr.path.len) return error.NameTooLong;
@@ -164,8 +167,8 @@ pub const Server = struct {
             addr.path[path.len] = 0;
         }
 
-        try posix.bind(fd, @ptrCast(&addr), @sizeOf(posix.sockaddr.un));
-        try posix.listen(fd, 5);
+        if (std.c.bind(fd, @ptrCast(&addr), @sizeOf(posix.sockaddr.un)) != 0) return error.BindFailed;
+        if (std.c.listen(fd, 5) != 0) return error.ListenFailed;
 
         log.info("IPC listening on {s}", .{path});
 
@@ -176,13 +179,13 @@ pub const Server = struct {
     }
 
     pub fn deinit(self: *Server, allocator: std.mem.Allocator) void {
-        posix.close(self.fd);
-        std.fs.cwd().deleteFile(self.path) catch {};
+        _ = std.c.close(self.fd);
+        osutil.deleteFile(self.path.ptr);
         allocator.free(self.path);
     }
 };
 
 /// Write a response to the IPC client fd.
 pub fn writeResponse(fd: posix.socket_t, data: []const u8) void {
-    _ = posix.write(fd, data) catch {};
+    _ = std.c.write(fd, data.ptr, data.len);
 }

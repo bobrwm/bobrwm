@@ -30,7 +30,7 @@
       pkgs,
       system,
     }: let
-      zig = zig-overlay.packages.${system}."0.15.1";
+      zig = zig-overlay.packages.${system}."0.16.0";
     in {
       default = pkgs.stdenv.mkDerivation {
         name = "bobrwm";
@@ -51,7 +51,7 @@
       pkgs,
       system,
     }: let
-      zig = zig-overlay.packages.${system}."0.15.1";
+      zig = zig-overlay.packages.${system}."0.16.0";
       zls = zls-overlay.packages.${system}.zls;
       zigdoc = zigdoc-nix.packages.${system}.default;
       ziglint = ziglint-nix.packages.${system}.default;

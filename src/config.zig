@@ -5,6 +5,7 @@
 const std = @import("std");
 const shim = @import("shim_api.zig");
 const layout_mod = @import("layout.zig");
+const osutil = @import("osutil.zig");
 
 const log = std.log.scoped(.config);
 
@@ -86,9 +87,16 @@ pub const Action = enum(u8) {
 
     // Every Action must map 1:1 to an EventKind (hk_ prefixed).
     comptime {
+        // stringToEnum builds a StaticStringMap whose pdq sort blows past
+        // the default branch quota when the enum has many fields.
+        @setEvalBranchQuota(20_000);
         const event = @import("event.zig").EventKind;
         for (@typeInfo(Action).@"enum".fields) |f| {
-            _ = std.enums.nameCast(event, "hk_" ++ f.name);
+            // Verify each Action.<name> has a matching EventKind.hk_<name>;
+            // a missing tag triggers a clear comptime error.
+            if (std.meta.stringToEnum(event, "hk_" ++ f.name) == null) {
+                @compileError("missing EventKind.hk_" ++ f.name ++ " for Action." ++ f.name);
+            }
         }
     }
 };
@@ -165,11 +173,11 @@ pub fn load(allocator: std.mem.Allocator, explicit_path: ?[]const u8) Config {
     // XDG_CONFIG_HOME / ~/.config
     var path_buf: [2048]u8 = undefined;
     const path = blk: {
-        if (std.posix.getenv("XDG_CONFIG_HOME")) |config_home| {
+        if (osutil.getenv("XDG_CONFIG_HOME")) |config_home| {
             break :blk std.fmt.bufPrint(&path_buf, "{s}/bobrwm/config.zon", .{config_home}) catch return .{};
         }
 
-        const home = std.posix.getenv("HOME") orelse return .{};
+        const home = osutil.getenv("HOME") orelse return .{};
         break :blk std.fmt.bufPrint(&path_buf, "{s}/.config/bobrwm/config.zon", .{home}) catch return .{};
     };
     std.debug.assert(path.len > 0);
@@ -183,23 +191,19 @@ pub fn load(allocator: std.mem.Allocator, explicit_path: ?[]const u8) Config {
 fn loadFromPath(allocator: std.mem.Allocator, path: []const u8) ?Config {
     log.info("loading config from {s}", .{path});
 
-    // Open file — if it doesn't exist, that's fine
-    const file = std.fs.cwd().openFile(path, .{}) catch return null;
-    defer file.close();
+    // libc-based read; std.fs.cwd was removed in Zig 0.16. Caller paths
+    // come from CLI / env so they fit easily in PATH_MAX.
+    const path_z = allocator.dupeZ(u8, path) catch return null;
+    defer allocator.free(path_z);
 
-    const stat = file.stat() catch return null;
-    const source = file.readToEndAllocOptions(
-        allocator,
-        1024 * 1024,
-        @intCast(stat.size),
-        .@"1",
-        0,
-    ) catch |err| {
-        log.err("failed to read {s}: {}", .{ path, err });
-        return null;
-    };
+    // Source is intentionally not freed here: zon.parse may retain references
+    // into it for string fields. Caller passes an arena allocator whose
+    // deinit handles cleanup.
+    const source = osutil.readFileAllocSentinel(allocator, path_z, 1024 * 1024) orelse return null;
 
-    const parsed = std.zon.parse.fromSlice(Config, allocator, source, null, .{}) catch |err| {
+    // Config holds slice/pointer fields, so we need fromSliceAlloc; fromSlice
+    // asserts at comptime that T contains no allocator-managed types.
+    const parsed = std.zon.parse.fromSliceAlloc(Config, allocator, source, null, .{}) catch |err| {
         log.err("failed to parse {s}: {}", .{ path, err });
         return null;
     };
@@ -373,9 +377,6 @@ test "loadFromPath: custom zon" {
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    var tmp = t.tmpDir(.{});
-    defer tmp.cleanup();
-
     const zon =
         \\.{
         \\    .keybinds = .{
@@ -395,10 +396,12 @@ test "loadFromPath: custom zon" {
         \\}
     ;
 
-    tmp.dir.writeFile(.{ .sub_path = "config.zon", .data = zon }) catch
-        return error.TestUnexpectedResult;
-    const path = tmp.dir.realpathAlloc(allocator, "config.zon") catch
-        return error.TestUnexpectedResult;
+    // tmpDir.writeFile / realpathAlloc now require an Io instance which we
+    // don't thread through tests. Write to a deterministic /tmp path with
+    // libc instead.
+    const path: [:0]const u8 = "/tmp/bobrwm_test_custom_config.zon";
+    if (!osutil.writeFile(path.ptr, zon)) return error.TestUnexpectedResult;
+    defer osutil.deleteFile(path.ptr);
 
     const cfg = loadFromPath(allocator, path) orelse
         return error.TestUnexpectedResult;

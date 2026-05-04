@@ -16,7 +16,7 @@ pub const Workspace = struct {
     pub fn init(allocator: std.mem.Allocator, id: WorkspaceId) Workspace {
         return .{
             .id = id,
-            .windows = .{},
+            .windows = .empty,
             .focused_wid = null,
             .allocator = allocator,
         };

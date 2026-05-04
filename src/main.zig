@@ -1,12 +1,8 @@
 const std = @import("std");
 const posix = std.posix;
 const build_options = @import("build_options");
-const c = @cImport({
-    @cInclude("ApplicationServices/ApplicationServices.h");
-    @cInclude("dispatch/dispatch.h");
-    @cInclude("pthread.h");
-    @cInclude("os/lock.h");
-});
+const c = @import("c");
+const cg_extra = @import("cg_extra");
 const objc = @import("objc");
 const shim = @import("shim_api.zig");
 const skylight = @import("skylight.zig");
@@ -22,8 +18,13 @@ const statusbar = @import("statusbar.zig");
 const tile_preview = @import("tile_preview.zig");
 const ax_observer = @import("ax_observer.zig");
 const launchd = @import("launchd.zig");
+const osutil = @import("osutil.zig");
 
 extern fn _AXUIElementGetWindow(element: c.AXUIElementRef, wid: *u32) c.AXError;
+
+/// Monotonic wall clock in nanoseconds. Re-exported from osutil so existing
+/// `nanoTimestamp()` call sites in this file keep working unchanged.
+const nanoTimestamp = osutil.nanoTimestamp;
 
 const NSPoint = extern struct {
     x: f64,
@@ -1119,9 +1120,9 @@ export fn bw_ax_get_focused_window(pid: i32) u32 {
 export fn bw_is_window_on_screen(target_wid: u32) bool {
     std.debug.assert(target_wid > 0);
 
-    const options: c.CGWindowListOption =
-        c.kCGWindowListOptionOnScreenOnly | c.kCGWindowListExcludeDesktopElements;
-    const list = c.CGWindowListCopyWindowInfo(options, c.kCGNullWindowID) orelse return false;
+    const options: cg_extra.CGWindowListOption =
+        cg_extra.kCGWindowListOptionOnScreenOnly | cg_extra.kCGWindowListExcludeDesktopElements;
+    const list = cg_extra.CGWindowListCopyWindowInfo(options, cg_extra.kCGNullWindowID) orelse return false;
     defer c.CFRelease(@ptrCast(list));
 
     const count = c.CFArrayGetCount(list);
@@ -1130,7 +1131,7 @@ export fn bw_is_window_on_screen(target_wid: u32) bool {
     while (i < count) : (i += 1) {
         const info_any = c.CFArrayGetValueAtIndex(list, i) orelse continue;
         const info: c.CFDictionaryRef = @ptrCast(info_any);
-        const wid_ref_any = c.CFDictionaryGetValue(info, c.kCGWindowNumber) orelse continue;
+        const wid_ref_any = c.CFDictionaryGetValue(info, cg_extra.kCGWindowNumber) orelse continue;
         const wid_ref: c.CFNumberRef = @ptrCast(wid_ref_any);
 
         var wid: u32 = 0;
@@ -1443,9 +1444,9 @@ export fn bw_discover_windows(out: ?[*]shim.bw_window_info, max_count: u32) u32 
     std.debug.assert(max_count > 0);
     const out_buf = out_ptr[0..@as(usize, @intCast(max_count))];
 
-    const options: c.CGWindowListOption =
-        c.kCGWindowListOptionOnScreenOnly | c.kCGWindowListExcludeDesktopElements;
-    const window_list = c.CGWindowListCopyWindowInfo(options, c.kCGNullWindowID) orelse return 0;
+    const options: cg_extra.CGWindowListOption =
+        cg_extra.kCGWindowListOptionOnScreenOnly | cg_extra.kCGWindowListExcludeDesktopElements;
+    const window_list = cg_extra.CGWindowListCopyWindowInfo(options, cg_extra.kCGNullWindowID) orelse return 0;
     defer c.CFRelease(@ptrCast(window_list));
 
     const total = c.CFArrayGetCount(window_list);
@@ -1465,18 +1466,18 @@ export fn bw_discover_windows(out: ?[*]shim.bw_window_info, max_count: u32) u32 
         const info: c.CFDictionaryRef = @ptrCast(info_any);
 
         var layer: i32 = 0;
-        if (c.CFDictionaryGetValue(info, c.kCGWindowLayer)) |layer_ref_any| {
+        if (c.CFDictionaryGetValue(info, cg_extra.kCGWindowLayer)) |layer_ref_any| {
             const layer_ref: c.CFNumberRef = @ptrCast(layer_ref_any);
             _ = c.CFNumberGetValue(layer_ref, c.kCFNumberSInt32Type, &layer);
         }
         if (layer != 0) continue;
 
-        const wid_ref_any = c.CFDictionaryGetValue(info, c.kCGWindowNumber) orelse continue;
+        const wid_ref_any = c.CFDictionaryGetValue(info, cg_extra.kCGWindowNumber) orelse continue;
         const wid_ref: c.CFNumberRef = @ptrCast(wid_ref_any);
         var wid: u32 = 0;
         _ = c.CFNumberGetValue(wid_ref, c.kCFNumberSInt32Type, &wid);
 
-        const pid_ref_any = c.CFDictionaryGetValue(info, c.kCGWindowOwnerPID) orelse continue;
+        const pid_ref_any = c.CFDictionaryGetValue(info, cg_extra.kCGWindowOwnerPID) orelse continue;
         const pid_ref: c.CFNumberRef = @ptrCast(pid_ref_any);
         var pid: i32 = 0;
         _ = c.CFNumberGetValue(pid_ref, c.kCFNumberSInt32Type, &pid);
@@ -1499,7 +1500,7 @@ export fn bw_discover_windows(out: ?[*]shim.bw_window_info, max_count: u32) u32 
         }
 
         var bounds: c.CGRect = std.mem.zeroes(c.CGRect);
-        if (c.CFDictionaryGetValue(info, c.kCGWindowBounds)) |bounds_ref_any| {
+        if (c.CFDictionaryGetValue(info, cg_extra.kCGWindowBounds)) |bounds_ref_any| {
             const bounds_ref: c.CFDictionaryRef = @ptrCast(bounds_ref_any);
             _ = c.CGRectMakeWithDictionaryRepresentation(bounds_ref, &bounds);
         }
@@ -1570,10 +1571,10 @@ fn setRolePolling(enabled: bool) void {
     if (g_role_poll_source != null) return;
 
     const source = c.dispatch_source_create(
-        c.DISPATCH_SOURCE_TYPE_TIMER,
+        cg_extra.DISPATCH_SOURCE_TYPE_TIMER(),
         0,
         0,
-        c.dispatch_get_main_queue(),
+        cg_extra.dispatch_get_main_queue(),
     );
     if (source == null) return;
 
@@ -1607,7 +1608,7 @@ fn hotkeyTapCallback(
     _ = refcon;
 
     if (event_type == c.kCGEventTapDisabledByTimeout or event_type == c.kCGEventTapDisabledByUserInput) {
-        if (g_tap_port) |tap| c.CGEventTapEnable(tap, true);
+        if (g_tap_port) |tap| cg_extra.CGEventTapEnable(tap, true);
         return event;
     }
 
@@ -1620,8 +1621,8 @@ fn hotkeyTapCallback(
         return event;
     }
 
-    const flags = c.CGEventGetFlags(event);
-    const keycode_raw = c.CGEventGetIntegerValueField(event, c.kCGKeyboardEventKeycode);
+    const flags = cg_extra.CGEventGetFlags(event);
+    const keycode_raw = cg_extra.CGEventGetIntegerValueField(event, c.kCGKeyboardEventKeycode);
     const keycode: u16 = @intCast(keycode_raw);
     const mods = modsFromEventFlags(flags);
 
@@ -1637,7 +1638,7 @@ fn setupHotkeyEventTap() void {
         (@as(c.CGEventMask, 1) << @intCast(c.kCGEventLeftMouseDown)) |
         (@as(c.CGEventMask, 1) << @intCast(c.kCGEventLeftMouseUp));
 
-    g_tap_port = c.CGEventTapCreate(
+    g_tap_port = cg_extra.CGEventTapCreate(
         c.kCGSessionEventTap,
         c.kCGHeadInsertEventTap,
         c.kCGEventTapOptionDefault,
@@ -1651,7 +1652,7 @@ fn setupHotkeyEventTap() void {
     defer c.CFRelease(@ptrCast(tap_source));
 
     c.CFRunLoopAddSource(c.CFRunLoopGetMain(), tap_source, c.kCFRunLoopCommonModes);
-    c.CGEventTapEnable(tap, true);
+    cg_extra.CGEventTapEnable(tap, true);
 }
 
 fn ipcSourceTick(context: ?*anyopaque) callconv(.c) void {
@@ -1667,10 +1668,10 @@ fn initIpcSource(server_fd: c_int) void {
     }
 
     const source = c.dispatch_source_create(
-        c.DISPATCH_SOURCE_TYPE_READ,
+        cg_extra.DISPATCH_SOURCE_TYPE_READ(),
         @intCast(server_fd),
         0,
-        c.dispatch_get_main_queue(),
+        cg_extra.dispatch_get_main_queue(),
     );
     if (source == null) return;
 
@@ -1796,16 +1797,16 @@ export fn bw_hotkey_handle_keydown(keycode: u16, mods: u8) bool {
 // Entry point
 // ---------------------------------------------------------------------------
 
-pub fn main() !void {
+pub fn main(init: std.process.Init.Minimal) !void {
     // -- CLI dispatch (help, version, service, IPC client) --
     var cmd_buf: [512]u8 = undefined;
-    const result = cli.parse(&cmd_buf);
+    const result = cli.parse(init.args, &cmd_buf);
     if (cli.run(result)) return;
 
     // -- Daemon mode --
     log.info("bobrwm starting (log_level={s})...", .{@tagName(std_options.log_level)});
 
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa: std.heap.DebugAllocator(.{}) = .init;
     defer _ = gpa.deinit();
     g_allocator = gpa.allocator();
     defer deinitAxStrings();
@@ -1959,12 +1960,14 @@ export fn bw_drain_events() void {
 
 /// Accept and handle one IPC client connection — called by dispatch_source.
 export fn bw_handle_ipc_client(server_fd: c_int) void {
-    const client_fd = posix.accept(@intCast(server_fd), null, null, 0) catch |err| {
-        log.err("accept failed: {}", .{err});
+    // std.posix.accept was removed in Zig 0.16; call libc directly.
+    const client_fd = std.c.accept(server_fd, null, null);
+    if (client_fd < 0) {
+        log.err("accept failed: errno={d}", .{std.c._errno().*});
         return;
-    };
-    defer posix.close(client_fd);
-    const started_ns = std.time.nanoTimestamp();
+    }
+    defer _ = std.c.close(client_fd);
+    const started_ns = nanoTimestamp();
 
     var buf: [512]u8 = undefined;
     const n = posix.read(client_fd, &buf) catch |err| {
@@ -1973,13 +1976,13 @@ export fn bw_handle_ipc_client(server_fd: c_int) void {
     };
     if (n == 0) return;
 
-    const cmd = std.mem.trimRight(u8, buf[0..n], &.{ '\n', '\r', ' ', 0 });
+    const cmd = std.mem.trimEnd(u8, buf[0..n], &.{ '\n', '\r', ' ', 0 });
     if (cmd.len == 0) return;
     log.debug("[trace] ipc recv fd={} bytes={} cmd={s}", .{ client_fd, n, cmd });
 
     if (ipc.g_dispatch) |dispatch| {
         dispatch(cmd, client_fd);
-        const elapsed_ms = @divTrunc(std.time.nanoTimestamp() - started_ns, std.time.ns_per_ms);
+        const elapsed_ms = @divTrunc(nanoTimestamp() - started_ns, std.time.ns_per_ms);
         log.debug("[trace] ipc handled fd={} cmd={s} elapsed_ms={}", .{ client_fd, cmd, elapsed_ms });
     } else {
         log.warn("ipc dispatch callback missing", .{});
@@ -3792,7 +3795,10 @@ var g_shutdown_requested: std.atomic.Value(bool) = std.atomic.Value(bool).init(f
 /// Graceful signal handler for INT/TERM/HUP/QUIT. Sets a flag and wakes the
 /// run loop so restoreAllWindows() runs on the main thread where AX calls and
 /// hash table access are safe. Only uses async-signal-safe operations.
-fn gracefulSignalHandler(sig: c_int) callconv(.c) void {
+///
+/// Zig 0.16 made `posix.SIG` an enum; the kernel-facing handler signature now
+/// takes that enum directly rather than `c_int`.
+fn gracefulSignalHandler(sig: posix.SIG) callconv(.c) void {
     _ = sig;
     g_shutdown_requested.store(true, .release);
     // CFRunLoopStop is documented as safe to call from a signal handler.
@@ -3805,23 +3811,22 @@ fn gracefulSignalHandler(sig: c_int) callconv(.c) void {
 /// Crash signal handler for SEGV/BUS/TRAP/ABRT. Best-effort restore using
 /// async-signal-unsafe functions. May deadlock if the crash occurs mid-
 /// allocation or mid-hash-table-mutation, but leaving windows hidden is worse.
-fn crashSignalHandler(sig: c_int) callconv(.c) void {
+fn crashSignalHandler(sig: posix.SIG) callconv(.c) void {
     restoreAllWindows();
 
-    // Re-raise with default handler so the OS produces a core dump / correct exit code
-    const sig_u8: u8 = @intCast(sig);
+    // Re-raise with default handler so the OS produces a core dump / correct exit code.
     var default_sa: posix.Sigaction = .{
         .handler = .{ .handler = posix.SIG.DFL },
         .mask = posix.sigemptyset(),
         .flags = 0,
     };
-    posix.sigaction(sig_u8, &default_sa, null);
-    posix.raise(sig_u8) catch {};
+    posix.sigaction(sig, &default_sa, null);
+    posix.raise(sig) catch {};
 }
 
 fn installCrashHandlers() void {
     // Graceful signals: handled safely via run loop stop + main-thread cleanup
-    const graceful_signals = [_]u8{
+    const graceful_signals = [_]posix.SIG{
         posix.SIG.INT, posix.SIG.TERM,
         posix.SIG.HUP, posix.SIG.QUIT,
     };
@@ -3835,9 +3840,9 @@ fn installCrashHandlers() void {
     }
 
     // Crash signals: best-effort restore, then re-raise for core dump
-    const crash_signals = [_]u8{
+    const crash_signals = [_]posix.SIG{
         posix.SIG.ABRT, posix.SIG.SEGV,
-        posix.SIG.BUS, posix.SIG.TRAP,
+        posix.SIG.BUS,  posix.SIG.TRAP,
     };
     for (crash_signals) |sig| {
         var sa: posix.Sigaction = .{
@@ -4552,9 +4557,9 @@ fn focusDirection(dir: FocusDir) void {
 // ---------------------------------------------------------------------------
 
 fn ipcDispatch(cmd: []const u8, client_fd: posix.socket_t) void {
-    const started_ns = std.time.nanoTimestamp();
+    const started_ns = nanoTimestamp();
     defer {
-        const elapsed_ms = @divTrunc(std.time.nanoTimestamp() - started_ns, std.time.ns_per_ms);
+        const elapsed_ms = @divTrunc(nanoTimestamp() - started_ns, std.time.ns_per_ms);
         log.debug("[trace] ipc dispatch cmd={s} elapsed_ms={}", .{ cmd, elapsed_ms });
     }
 
@@ -4710,11 +4715,10 @@ fn ipcDispatch(cmd: []const u8, client_fd: posix.socket_t) void {
 }
 
 fn ipcQueryWindows(fd: posix.socket_t) void {
-    const started_ns = std.time.nanoTimestamp();
+    const started_ns = nanoTimestamp();
     const ws = g_workspaces.active();
     var buf: [8192]u8 = undefined;
-    var fbs = std.io.fixedBufferStream(&buf);
-    const w = fbs.writer();
+    var w = std.Io.Writer.fixed(&buf);
     var written: usize = 0;
 
     for (ws.windows.items) |wid| {
@@ -4731,17 +4735,16 @@ fn ipcQueryWindows(fd: posix.socket_t) void {
         }
     }
 
-    const payload = fbs.getWritten();
+    const payload = w.buffered();
     ipc.writeResponse(fd, payload);
-    const elapsed_ms = @divTrunc(std.time.nanoTimestamp() - started_ns, std.time.ns_per_ms);
+    const elapsed_ms = @divTrunc(nanoTimestamp() - started_ns, std.time.ns_per_ms);
     log.debug("[trace] query windows rows={} bytes={} elapsed_ms={}", .{ written, payload.len, elapsed_ms });
 }
 
 fn ipcQueryApps(fd: posix.socket_t) void {
-    const started_ns = std.time.nanoTimestamp();
+    const started_ns = nanoTimestamp();
     var buf: [8192]u8 = undefined;
-    var fbs = std.io.fixedBufferStream(&buf);
-    const w = fbs.writer();
+    var w = std.Io.Writer.fixed(&buf);
 
     var seen_pids: [256]i32 = undefined;
     var seen_count: usize = 0;
@@ -4773,17 +4776,16 @@ fn ipcQueryApps(fd: posix.socket_t) void {
         }
     }
 
-    const payload = fbs.getWritten();
+    const payload = w.buffered();
     ipc.writeResponse(fd, payload);
-    const elapsed_ms = @divTrunc(std.time.nanoTimestamp() - started_ns, std.time.ns_per_ms);
+    const elapsed_ms = @divTrunc(nanoTimestamp() - started_ns, std.time.ns_per_ms);
     log.debug("[trace] query apps rows={} unique_pids={} bytes={} elapsed_ms={}", .{ written, seen_count, payload.len, elapsed_ms });
 }
 
 fn ipcQueryWorkspaces(fd: posix.socket_t) void {
-    const started_ns = std.time.nanoTimestamp();
+    const started_ns = nanoTimestamp();
     var buf: [1024]u8 = undefined;
-    var fbs = std.io.fixedBufferStream(&buf);
-    const w = fbs.writer();
+    var w = std.Io.Writer.fixed(&buf);
 
     for (&g_workspaces.workspaces) |*ws| {
         const focused: u32 = ws.focused_wid orelse 0;
@@ -4795,16 +4797,15 @@ fn ipcQueryWorkspaces(fd: posix.socket_t) void {
         }) catch break;
     }
 
-    const payload = fbs.getWritten();
+    const payload = w.buffered();
     ipc.writeResponse(fd, payload);
-    const elapsed_ms = @divTrunc(std.time.nanoTimestamp() - started_ns, std.time.ns_per_ms);
+    const elapsed_ms = @divTrunc(nanoTimestamp() - started_ns, std.time.ns_per_ms);
     log.debug("[trace] query workspaces rows={} bytes={} elapsed_ms={}", .{ g_workspaces.workspaces.len, payload.len, elapsed_ms });
 }
 
 fn ipcQueryDisplays(fd: posix.socket_t) void {
     var buf: [2048]u8 = undefined;
-    var fbs = std.io.fixedBufferStream(&buf);
-    const w = fbs.writer();
+    var w = std.Io.Writer.fixed(&buf);
 
     for (g_displays[0..g_display_count], 0..) |display, slot| {
         const workspace_id = g_workspaces.activeIdForDisplaySlot(slot);
@@ -4819,5 +4820,5 @@ fn ipcQueryDisplays(fd: posix.socket_t) void {
         }) catch break;
     }
 
-    ipc.writeResponse(fd, fbs.getWritten());
+    ipc.writeResponse(fd, w.buffered());
 }

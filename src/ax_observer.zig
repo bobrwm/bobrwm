@@ -8,12 +8,8 @@
 const std = @import("std");
 const log = std.log.scoped(.ax_observer);
 const objc = @import("objc");
-const c = @cImport({
-    @cInclude("ApplicationServices/ApplicationServices.h");
-    @cInclude("dispatch/dispatch.h");
-    @cInclude("pthread.h");
-    @cInclude("os/lock.h");
-});
+const c = @import("c");
+const cg_extra = @import("cg_extra");
 const shim = @import("shim_api.zig");
 
 extern fn _AXUIElementGetWindow(element: c.AXUIElementRef, wid: *u32) c.AXError;
@@ -438,10 +434,10 @@ fn scheduleObserveRetry(pid: i32) void {
     if (g_observe_retry_source != null) return;
 
     const source = c.dispatch_source_create(
-        c.DISPATCH_SOURCE_TYPE_TIMER,
+        cg_extra.DISPATCH_SOURCE_TYPE_TIMER(),
         0,
         0,
-        c.dispatch_get_main_queue(),
+        cg_extra.dispatch_get_main_queue(),
     );
     if (source == null) return;
 
@@ -479,10 +475,10 @@ fn updateWindowScanSource() void {
     if (g_window_scan_source != null) return;
 
     const source = c.dispatch_source_create(
-        c.DISPATCH_SOURCE_TYPE_TIMER,
+        cg_extra.DISPATCH_SOURCE_TYPE_TIMER(),
         0,
         0,
-        c.dispatch_get_main_queue(),
+        cg_extra.dispatch_get_main_queue(),
     );
     if (source == null) return;
 
@@ -661,7 +657,7 @@ fn retryResolveWid(context: ?*anyopaque) callconv(.c) void {
     ctx.attempts_remaining -= 1;
     c.dispatch_after_f(
         c.dispatch_time(c.DISPATCH_TIME_NOW, @as(i64, @intCast(wid_retry_delay_ms)) * c.NSEC_PER_MSEC),
-        c.dispatch_get_main_queue(),
+        cg_extra.dispatch_get_main_queue(),
         ctx,
         retryResolveWid,
     );
@@ -686,7 +682,7 @@ fn scheduleWidResolutionRetry(observer: c.AXObserverRef, element: c.AXUIElementR
 
     c.dispatch_after_f(
         c.dispatch_time(c.DISPATCH_TIME_NOW, @as(i64, @intCast(wid_retry_delay_ms)) * c.NSEC_PER_MSEC),
-        c.dispatch_get_main_queue(),
+        cg_extra.dispatch_get_main_queue(),
         ctx,
         retryResolveWid,
     );

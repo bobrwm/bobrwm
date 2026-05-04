@@ -8,6 +8,7 @@ const std = @import("std");
 const posix = std.posix;
 const build_options = @import("build_options");
 const launchd = @import("launchd.zig");
+const osutil = @import("osutil.zig");
 
 const log = std.log.scoped(.cli);
 
@@ -37,10 +38,11 @@ pub const Result = union(enum) {
 /// Parse process arguments into a CLI result.
 /// `cmd_buf` is scratch space for assembling the IPC command string from
 /// positional arguments.
-pub fn parse(cmd_buf: []u8) Result {
+pub fn parse(process_args: std.process.Args, cmd_buf: []u8) Result {
     var config_path: ?[]const u8 = null;
     var pos: usize = 0;
-    var args = std.process.args();
+    var args = process_args.iterate();
+    defer args.deinit();
     _ = args.skip(); // program name
 
     while (args.next()) |arg| {
@@ -132,9 +134,28 @@ pub fn configPath(result: Result) ?[]const u8 {
 // Help
 // ---------------------------------------------------------------------------
 
+/// Write to a fixed file descriptor via libc; `std.fs.File`'s writer-based
+/// API in Zig 0.16 requires an `Io` instance which we don't thread through
+/// CLI helpers.
+fn writeFd(fd: c_int, bytes: []const u8) void {
+    var remaining = bytes;
+    while (remaining.len > 0) {
+        const n = std.c.write(fd, remaining.ptr, remaining.len);
+        if (n <= 0) return;
+        remaining = remaining[@intCast(n)..];
+    }
+}
+
+fn writeStdout(bytes: []const u8) void {
+    writeFd(std.posix.STDOUT_FILENO, bytes);
+}
+
+fn writeStderr(bytes: []const u8) void {
+    writeFd(std.posix.STDERR_FILENO, bytes);
+}
+
 fn printHelp() void {
-    const stdout = std.fs.File.stdout();
-    stdout.writeAll(help_text) catch {};
+    writeStdout(help_text);
 }
 
 const help_text =
@@ -195,8 +216,7 @@ const help_text =
 // ---------------------------------------------------------------------------
 
 fn printVersion() void {
-    const stdout = std.fs.File.stdout();
-    stdout.writeAll("bobrwm " ++ build_options.version ++ "\n") catch {};
+    writeStdout("bobrwm " ++ build_options.version ++ "\n");
 }
 
 // ---------------------------------------------------------------------------
@@ -205,7 +225,7 @@ fn printVersion() void {
 
 fn runService(tail: ?[]const u8) void {
     const sub = tail orelse {
-        std.fs.File.stderr().writeAll(
+        writeStderr(
             \\Usage: bobrwm service <action>
             \\
             \\Actions:
@@ -215,14 +235,14 @@ fn runService(tail: ?[]const u8) void {
             \\  stop         Stop the service
             \\  restart      Restart the service
             \\
-        ) catch {};
+        );
         return;
     };
 
     const cmd = std.meta.stringToEnum(launchd.Command, sub) orelse {
         var buf: [256]u8 = undefined;
         const msg = std.fmt.bufPrint(&buf, "error: unknown service action '{s}'\n", .{sub}) catch return;
-        std.fs.File.stderr().writeAll(msg) catch {};
+        writeStderr(msg);
         return;
     };
 
@@ -234,22 +254,25 @@ fn runService(tail: ?[]const u8) void {
 // ---------------------------------------------------------------------------
 
 fn runClient(cmd: []const u8) void {
-    const stdout = std.fs.File.stdout();
-    const stderr = std.fs.File.stderr();
-    const started_ns = std.time.nanoTimestamp();
+    const started_ns = osutil.nanoTimestamp();
     var response_bytes: usize = 0;
 
     var path_buf: [128]u8 = undefined;
-    const path = std.fmt.bufPrintZ(&path_buf, "/tmp/bobrwm_{d}.sock", .{std.c.getuid()}) catch {
-        stderr.writeAll("error: socket path too long\n") catch {};
+    const path = std.fmt.bufPrintSentinel(&path_buf, "/tmp/bobrwm_{d}.sock", .{std.c.getuid()}, 0) catch {
+        writeStderr("error: socket path too long\n");
         return;
     };
 
-    const fd = posix.socket(posix.AF.UNIX, posix.SOCK.STREAM, 0) catch {
-        stderr.writeAll("error: could not create socket\n") catch {};
+    // Zig 0.16 removed the std.posix.{socket,connect,write,close,shutdown}
+    // wrappers as part of "posix and os.windows removals"; the release notes
+    // direct callers to "go higher" (std.Io) or "go lower" (libc). Going
+    // lower keeps this CLI client self-contained without an Io instance.
+    const fd = std.c.socket(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+    if (fd < 0) {
+        writeStderr("error: could not create socket\n");
         return;
-    };
-    defer posix.close(fd);
+    }
+    defer _ = std.c.close(fd);
 
     var addr: posix.sockaddr.un = .{ .path = undefined, .family = posix.AF.UNIX };
     @memcpy(addr.path[0..path.len], path[0..path.len]);
@@ -257,16 +280,16 @@ fn runClient(cmd: []const u8) void {
 
     log.debug("[trace] ipc client connecting path={s} cmd={s}", .{ path, cmd });
 
-    posix.connect(fd, @ptrCast(&addr), @sizeOf(posix.sockaddr.un)) catch {
-        stderr.writeAll("error: bobrwm is not running\n") catch {};
+    if (std.c.connect(fd, @ptrCast(&addr), @sizeOf(posix.sockaddr.un)) != 0) {
+        writeStderr("error: bobrwm is not running\n");
         return;
-    };
+    }
 
-    _ = posix.write(fd, cmd) catch {
-        stderr.writeAll("error: write failed\n") catch {};
+    if (std.c.write(fd, cmd.ptr, cmd.len) < 0) {
+        writeStderr("error: write failed\n");
         return;
-    };
-    posix.shutdown(fd, .send) catch {};
+    }
+    _ = std.c.shutdown(fd, std.c.SHUT.WR);
 
     while (true) {
         var poll_fds = [_]posix.pollfd{.{
@@ -275,11 +298,11 @@ fn runClient(cmd: []const u8) void {
             .revents = 0,
         }};
         const ready = posix.poll(&poll_fds, 2000) catch {
-            stderr.writeAll("error: IPC poll failed\n") catch {};
+            writeStderr("error: IPC poll failed\n");
             break;
         };
         if (ready == 0) {
-            stderr.writeAll("error: IPC response timeout\n") catch {};
+            writeStderr("error: IPC response timeout\n");
             log.warn("ipc client timeout waiting for response cmd={s}", .{cmd});
             break;
         }
@@ -288,9 +311,9 @@ fn runClient(cmd: []const u8) void {
         const n = posix.read(fd, &buf) catch break;
         if (n == 0) break;
         response_bytes += n;
-        stdout.writeAll(buf[0..n]) catch break;
+        writeStdout(buf[0..n]);
     }
 
-    const elapsed_ms = @divTrunc(std.time.nanoTimestamp() - started_ns, std.time.ns_per_ms);
+    const elapsed_ms = @divTrunc(osutil.nanoTimestamp() - started_ns, std.time.ns_per_ms);
     log.debug("[trace] ipc client completed bytes={} elapsed_ms={}", .{ response_bytes, elapsed_ms });
 }
