@@ -67,13 +67,9 @@ pub extern fn bw_emit_event(kind: u8, pid: i32, wid: u32) void;
 
 pub extern fn bw_drain_events() void;
 pub extern fn bw_handle_ipc_client(server_fd: i32) void;
-pub extern fn bw_will_quit() void;
-pub extern fn bw_retile() void;
-pub extern fn bw_workspace_app_launched(pid: i32) void;
-pub extern fn bw_workspace_app_terminated(pid: i32) void;
-pub extern fn bw_workspace_active_app_changed(pid: i32) void;
-pub extern fn bw_workspace_space_changed() void;
-pub extern fn bw_workspace_display_changed() void;
+// bw_will_quit, bw_retile, and the bw_workspace_* notifications are now
+// regular Zig functions in main.zig; they are imported directly by
+// objc_classes.zig instead of being routed through the C symbol table.
 pub extern fn bw_hotkey_mouse_down() void;
 pub extern fn bw_hotkey_mouse_up() void;
 pub extern fn bw_hotkey_handle_keydown(keycode: u16, mods: u8) bool;

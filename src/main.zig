@@ -19,6 +19,7 @@ const tile_preview = @import("tile_preview.zig");
 const ax_observer = @import("ax_observer.zig");
 const launchd = @import("launchd.zig");
 const osutil = @import("osutil.zig");
+const objc_classes = @import("objc_classes.zig");
 
 extern fn _AXUIElementGetWindow(element: c.AXUIElementRef, wid: *u32) c.AXError;
 
@@ -717,6 +718,27 @@ fn displayIdForFrame(frame: window_mod.Window.Frame) u32 {
     return best_display;
 }
 
+/// Infer the display a not-yet-managed window belongs on by querying its
+/// CG/SkyLight bounds. Returns null if SkyLight isn't initialised or the
+/// window has zero-sized bounds (e.g. mid-construction).
+///
+/// Used by the new-window pipeline so a window born on a non-focused display
+/// (the canonical case: a tab torn off and dropped onto another monitor) is
+/// assigned to the correct display+workspace instead of inheriting whichever
+/// display happened to be focused at creation time.
+fn inferDisplayIdForWindow(wid: u32) ?u32 {
+    const sky = g_sky orelse return null;
+    var rect: skylight.CGRect = undefined;
+    if (sky.getWindowBounds(sky.mainConnectionID(), wid, &rect) != 0) return null;
+    if (rect.size.width <= 0 or rect.size.height <= 0) return null;
+    return displayIdForFrame(.{
+        .x = rect.origin.x,
+        .y = rect.origin.y,
+        .width = rect.size.width,
+        .height = rect.size.height,
+    });
+}
+
 /// Pick the bottom corner that does not border an adjacent monitor.
 /// Falls back to bottom-right on single-monitor setups.
 fn hideCorner(display_id: u32) HideCorner {
@@ -941,7 +963,7 @@ fn initApp() objc.Object {
 }
 
 /// Register NSWorkspace/NSNotificationCenter observers via zig-objc while
-/// keeping selector callbacks in BWObserver (ObjC class in shim.m).
+/// keeping selector callbacks in BWObserver (registered at runtime in objc_classes.zig).
 fn initWorkspaceObservers() void {
     const BWObserver = objc.getClass("BWObserver") orelse
         @panic("BWObserver class not found");
@@ -1716,31 +1738,32 @@ export fn bw_emit_event(kind: u8, pid: i32, wid: u32) void {
     signalWaker();
 }
 
-/// Callback target for BWObserver.appTerminated: selector.
-export fn bw_workspace_app_terminated(pid: i32) void {
+/// Callback target for BWObserver.appTerminated:. Called from
+/// objc_classes.zig so it no longer needs C-symbol export.
+pub fn bw_workspace_app_terminated(pid: i32) void {
     std.debug.assert(pid > 0);
     bw_emit_event(shim.BW_EVENT_APP_TERMINATED, pid, 0);
 }
 
-/// Callback target for BWObserver.appLaunched: selector.
-export fn bw_workspace_app_launched(pid: i32) void {
+/// Callback target for BWObserver.appLaunched:.
+pub fn bw_workspace_app_launched(pid: i32) void {
     std.debug.assert(pid > 0);
     bw_emit_event(shim.BW_EVENT_APP_LAUNCHED, pid, 0);
 }
 
-/// Callback target for BWObserver.activeAppChanged: selector.
-export fn bw_workspace_active_app_changed(pid: i32) void {
+/// Callback target for BWObserver.activeAppChanged:.
+pub fn bw_workspace_active_app_changed(pid: i32) void {
     std.debug.assert(pid > 0);
     bw_emit_event(shim.BW_EVENT_WINDOW_FOCUSED, pid, 0);
 }
 
-/// Callback target for BWObserver.spaceChanged: selector.
-export fn bw_workspace_space_changed() void {
+/// Callback target for BWObserver.spaceChanged:.
+pub fn bw_workspace_space_changed() void {
     bw_emit_event(shim.BW_EVENT_SPACE_CHANGED, 0, 0);
 }
 
-/// Callback target for BWObserver.displayChanged: selector.
-export fn bw_workspace_display_changed() void {
+/// Callback target for BWObserver.displayChanged:.
+pub fn bw_workspace_display_changed() void {
     bw_emit_event(shim.BW_EVENT_DISPLAY_CHANGED, 0, 0);
 }
 
@@ -1908,6 +1931,9 @@ pub fn main(init: std.process.Init.Minimal) !void {
     ipc.g_dispatch = ipcDispatch;
 
     // -- NSApp (zig-objc) --
+    // Register runtime ObjC classes (BWStatusBarDelegate / BWObserver /
+    // BWLaunchGate) before any code does objc.getClass on them.
+    objc_classes.register(g_allocator);
     const NSApp = initApp();
     initWorkspaceObservers();
 
@@ -1989,13 +2015,13 @@ export fn bw_handle_ipc_client(server_fd: c_int) void {
     }
 }
 
-/// Clean shutdown — called from status bar Quit action.
-export fn bw_will_quit() void {
+/// Clean shutdown — called from BWStatusBarDelegate.quit:.
+pub fn bw_will_quit() void {
     restoreAllWindows();
 }
 
-/// Retile — called from status bar Retile action.
-export fn bw_retile() void {
+/// Retile — called from BWStatusBarDelegate.retile:.
+pub fn bw_retile() void {
     retile();
 }
 
@@ -2363,7 +2389,11 @@ fn handleEvent(ev: *const event_mod.Event) void {
             // mouse-up, preventing a layout flash from tiling a half-positioned window.
             if (g_mouse_left_down) {
                 if (g_store.get(ev.wid) == null) {
-                    const display_id = focusedDisplayId();
+                    // Mid-drag bounds may not be settled yet, so the inferred
+                    // display can be wrong; fall back to the focused display
+                    // and let processDeferredWindowCandidates re-derive on
+                    // promotion (it goes through addNewWindowManaged again).
+                    const display_id = inferDisplayIdForWindow(ev.wid) orelse focusedDisplayId();
                     const ws = resolveWorkspace(ev.pid, display_id);
                     trackDeferredWindowCandidate(ev.pid, ev.wid, ws.id, display_id);
                     log.info("window created: deferred pid={} wid={} while mouse is down (tab tear-off guard)", .{ ev.pid, ev.wid });
@@ -2861,7 +2891,11 @@ fn processPendingRoleWindows() bool {
             continue;
         }
 
-        if (addNewWindowManagedWithAssignment(candidate.pid, candidate.wid, candidate.workspace_id, candidate.display_id)) {
+        // Re-derive workspace+display from the current window position; the
+        // snapshot taken when the role gate first fired can be wrong if the
+        // window moved (e.g. tab tear-off across monitors) before its role
+        // settled.
+        if (addNewWindowManaged(candidate.pid, candidate.wid)) {
             added_any = true;
         }
     }
@@ -2962,7 +2996,14 @@ fn processDeferredWindowCandidates() bool {
 
     var added_any = false;
     for (promote_candidates[0..promote_count]) |candidate| {
-        if (addNewWindowManagedWithAssignment(candidate.pid, candidate.wid, candidate.workspace_id, candidate.display_id)) {
+        // Re-derive workspace+display from the *current* window position
+        // rather than the snapshot taken at deferral time. Mid-drag bounds
+        // can be stale or simply wrong (tab tear-off lands on a different
+        // monitor than the one focused when the window first appeared);
+        // by promotion time the window is guaranteed on-screen with stable
+        // bounds, so addNewWindowManaged's inferDisplayIdForWindow is the
+        // authoritative answer.
+        if (addNewWindowManaged(candidate.pid, candidate.wid)) {
             added_any = true;
         }
     }
@@ -3186,7 +3227,11 @@ fn addNewWindowManagedWithAssignment(pid: i32, wid: u32, workspace_id: u8, assig
 }
 
 fn addNewWindowManaged(pid: i32, wid: u32) bool {
-    const display_id = focusedDisplayId();
+    // Prefer the window's actual on-screen position over the currently
+    // focused display: a torn-off tab dropped on another monitor must land
+    // on the workspace that owns the destination monitor, not on whichever
+    // display happened to be focused when the window was created.
+    const display_id = inferDisplayIdForWindow(wid) orelse focusedDisplayId();
     const ws = resolveWorkspace(pid, display_id);
     return addNewWindowManagedWithAssignment(pid, wid, ws.id, display_id);
 }
@@ -3206,7 +3251,10 @@ fn addNewWindow(pid: i32, wid: u32) void {
             _ = addNewWindowManaged(pid, wid);
         },
         .pending => {
-            const display_id = focusedDisplayId();
+            // Same rationale as addNewWindowManaged: derive the display from
+            // the actual window position so a deferred candidate is later
+            // promoted onto the correct workspace+display.
+            const display_id = inferDisplayIdForWindow(wid) orelse focusedDisplayId();
             const ws = resolveWorkspace(pid, display_id);
             trackPendingRoleWindow(pid, wid, ws.id, display_id);
             trackDeferredWindowCandidate(pid, wid, ws.id, display_id);

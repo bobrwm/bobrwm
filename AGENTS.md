@@ -87,7 +87,7 @@ const foo = Type{ .field = value };     // Avoid
 
 ## ObjC Interop
 
-Use zig-objc (`@import("objc")`) for all Objective-C runtime calls from Zig. The ObjC shim (`src/shim/shim.m`) should only contain code that genuinely requires the ObjC compiler — `@interface`/`@implementation` class definitions with selector-based callbacks. Everything else (message sends, class lookups, NSApp lifecycle, AX operations, window discovery) belongs in Zig via zig-objc.
+Use zig-objc (`@import("objc")`) for all Objective-C runtime calls from Zig. There is no clang-compiled shim: custom ObjC classes (`BWStatusBarDelegate`, `BWObserver`, `BWLaunchGate`) are defined at runtime in `src/objc_classes.zig` via `allocateClassPair` / `addMethod`. New BW* classes go there. Message sends, class lookups, NSApp lifecycle, AX operations, and window discovery all live in Zig via zig-objc.
 
 **Message sends:**
 ```zig

@@ -123,12 +123,10 @@ pub fn build(b: *std.Build) !void {
     cg_extra_mod.addImport("c", c_mod);
     exe_mod.addImport("cg_extra", cg_extra_mod);
 
-    exe_mod.addCSourceFile(.{
-        .file = b.path("src/shim/shim.m"),
-        .flags = &.{"-fobjc-arc"},
-    });
+    // BW* Objective-C classes (BWStatusBarDelegate, BWObserver, BWLaunchGate)
+    // are registered at runtime by src/objc_classes.zig via zig-objc's
+    // allocateClassPair. No clang-compiled translation unit is required.
 
-    exe_mod.addIncludePath(b.path("src/shim"));
     exe_mod.addAnonymousImport("launchd_plist", .{
         .root_source_file = b.path("res/com.bobrwm.bobrwm.plist"),
     });

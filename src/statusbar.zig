@@ -1,7 +1,7 @@
 //! macOS status bar (menu bar icon) via zig-objc.
 //!
 //! Displays the active workspace name/index and provides a menu
-//! with Retile and Quit actions (handled by BWStatusBarDelegate in shim.m).
+//! with Retile and Quit actions (handled by BWStatusBarDelegate in objc_classes.zig).
 
 const std = @import("std");
 const objc = @import("objc");
