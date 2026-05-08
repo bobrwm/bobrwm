@@ -53,9 +53,8 @@ pub const std_options = std.Options{
 
 const log = std.log.scoped(.bobrwm);
 
-// ---------------------------------------------------------------------------
 // Lock-free SPSC ring buffer
-// ---------------------------------------------------------------------------
+// 
 // Single-producer (main thread) only. All emitters must run on the
 // main thread / main queue. The consumer is bw_drain_events, also on
 // the main run-loop.
@@ -91,9 +90,7 @@ const EventRing = struct {
     }
 };
 
-// ---------------------------------------------------------------------------
 // Hidden-window position (bottom-right corner, barely visible)
-// ---------------------------------------------------------------------------
 
 /// Pixels visible in the corner when a window is hidden off-screen.
 const hide_peek: f64 = 5;
@@ -829,9 +826,7 @@ fn framesEqual(lhs: window_mod.Window.Frame, rhs: window_mod.Window.Frame) bool 
         @abs(lhs.height - rhs.height) <= tol;
 }
 
-// ---------------------------------------------------------------------------
 // Globals
-// ---------------------------------------------------------------------------
 
 var g_ring: EventRing = .{};
 /// Protects g_ring.push from concurrent AX observer threads.
@@ -947,9 +942,7 @@ fn flushCleanupRequests() bool {
     return removed_any;
 }
 
-// ---------------------------------------------------------------------------
 // NSApp lifecycle (zig-objc)
-// ---------------------------------------------------------------------------
 
 /// Initialise NSApplication with accessory activation policy (menu bar icon,
 /// no dock icon). Returns the shared application object for the run loop.
@@ -1720,9 +1713,7 @@ export fn bw_set_role_polling(enabled: bool) void {
     setRolePolling(enabled);
 }
 
-// ---------------------------------------------------------------------------
 // Event bridge (called from ObjC shim)
-// ---------------------------------------------------------------------------
 
 // Thread-safe: AX observer callbacks run on per-app background threads
 // and push events here.  The os_unfair_lock serialises concurrent pushes
@@ -1816,9 +1807,7 @@ export fn bw_hotkey_handle_keydown(keycode: u16, mods: u8) bool {
     return false;
 }
 
-// ---------------------------------------------------------------------------
 // Entry point
-// ---------------------------------------------------------------------------
 
 pub fn main(init: std.process.Init.Minimal) !void {
     // -- CLI dispatch (help, version, service, IPC client) --
@@ -1958,9 +1947,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     NSApp.msgSend(void, "run", .{});
 }
 
-// ---------------------------------------------------------------------------
 // Exported callbacks (called from ObjC shim on main thread)
-// ---------------------------------------------------------------------------
 
 /// Drain the event ring buffer — called by the CFRunLoopSource waker.
 export fn bw_drain_events() void {
@@ -2324,9 +2311,7 @@ fn retile() void {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Event handling
-// ---------------------------------------------------------------------------
 
 fn handleEvent(ev: *const event_mod.Event) void {
     _ = processPendingFocusQueue();
@@ -2559,9 +2544,7 @@ fn handleEvent(ev: *const event_mod.Event) void {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Window mode (tiled / floating / fullscreen)
-// ---------------------------------------------------------------------------
 
 fn setWindowMode(wid: u32, target: window_mod.WindowMode) void {
     var win = g_store.get(wid) orelse return;
@@ -2584,9 +2567,7 @@ fn setWindowMode(wid: u32, target: window_mod.WindowMode) void {
     retile();
 }
 
-// ---------------------------------------------------------------------------
 // Window management helpers
-// ---------------------------------------------------------------------------
 
 fn windowRoleState(pid: i32, wid: u32) WindowRoleState {
     std.debug.assert(wid != 0);
@@ -3816,9 +3797,7 @@ fn observeDiscoveredApps() void {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Crash / exit recovery — restore all hidden windows to screen center
-// ---------------------------------------------------------------------------
 
 fn restoreAllWindows() void {
     for (&g_workspaces.workspaces) |*ws| {
@@ -3844,16 +3823,18 @@ var g_shutdown_requested: std.atomic.Value(bool) = std.atomic.Value(bool).init(f
 /// run loop so restoreAllWindows() runs on the main thread where AX calls and
 /// hash table access are safe. Only uses async-signal-safe operations.
 ///
+/// CFRunLoopStop alone does NOT exit `[NSApp run]` reliably: NSApplication
+/// re-enters the CFRunLoop internally, so a stop is a no-op for its outer
+/// loop. Instead we set a flag and wake the existing waker source; the main
+/// thread (in bw_drain_events) sees the flag and performs `[NSApp stop:]` +
+/// posts a dummy event, which is the documented way to exit NSApp.run.
+///
 /// Zig 0.16 made `posix.SIG` an enum; the kernel-facing handler signature now
 /// takes that enum directly rather than `c_int`.
 fn gracefulSignalHandler(sig: posix.SIG) callconv(.c) void {
     _ = sig;
     g_shutdown_requested.store(true, .release);
-    // CFRunLoopStop is documented as safe to call from a signal handler.
-    const run_loop = c.CFRunLoopGetMain();
-    if (run_loop != null) {
-        c.CFRunLoopStop(run_loop);
-    }
+    signalWaker();
 }
 
 /// Crash signal handler for SEGV/BUS/TRAP/ABRT. Best-effort restore using
@@ -3902,9 +3883,7 @@ fn installCrashHandlers() void {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Tab group reconciliation
-// ---------------------------------------------------------------------------
 
 /// Called on kAXFocusedWindowChangedNotification — detects tab switches and
 /// forms/updates tab groups so only the active tab occupies a layout slot.
@@ -4171,9 +4150,7 @@ fn checkTabDragOut(_: i32, wid: u32) void {
     retile();
 }
 
-// ---------------------------------------------------------------------------
 // Workspace resolution (config-based app → workspace mapping)
-// ---------------------------------------------------------------------------
 
 /// Return the workspace a window should be placed on, checking
 /// config workspace_assignments by bundle ID before falling back
@@ -4191,9 +4168,7 @@ fn resolveWorkspace(pid: i32, display_id: u32) *workspace_mod.Workspace {
     return g_workspaces.get(ws_id) orelse g_workspaces.active();
 }
 
-// ---------------------------------------------------------------------------
 // Workspace switching
-// ---------------------------------------------------------------------------
 
 fn switchWorkspace(target_id: u8) void {
     const target_ws = g_workspaces.get(target_id) orelse return;
@@ -4529,9 +4504,7 @@ fn moveWorkspaceToDisplayPrev() void {
     moveWorkspaceToDisplay(target_slot);
 }
 
-// ---------------------------------------------------------------------------
 // Focus direction
-// ---------------------------------------------------------------------------
 
 const FocusDir = ipc.IpcCommand.FocusDir;
 
@@ -4600,9 +4573,7 @@ fn focusDirection(dir: FocusDir) void {
     }
 }
 
-// ---------------------------------------------------------------------------
 // IPC command dispatch
-// ---------------------------------------------------------------------------
 
 fn ipcDispatch(cmd: []const u8, client_fd: posix.socket_t) void {
     const started_ns = nanoTimestamp();

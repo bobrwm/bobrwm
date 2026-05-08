@@ -35,9 +35,7 @@ pub fn register(allocator: std.mem.Allocator) void {
     registerLaunchGate();
 }
 
-// ---------------------------------------------------------------------------
 // BWStatusBarDelegate
-// ---------------------------------------------------------------------------
 
 fn registerStatusBarDelegate() void {
     const NSObject = objc.getClass("NSObject").?;
@@ -58,9 +56,7 @@ fn statusBarQuit(_: c.id, _: c.SEL, _: c.id) callconv(.c) void {
     app.msgSend(void, "terminate:", .{@as(objc.Object, .{ .value = null })});
 }
 
-// ---------------------------------------------------------------------------
 // BWObserver
-// ---------------------------------------------------------------------------
 
 fn registerObserver() void {
     const NSObject = objc.getClass("NSObject").?;
@@ -116,9 +112,7 @@ fn observerDisplayChanged(_: c.id, _: c.SEL, _: c.id) callconv(.c) void {
     main.bw_workspace_display_changed();
 }
 
-// ---------------------------------------------------------------------------
 // BWLaunchGate
-// ---------------------------------------------------------------------------
 
 const LaunchGate = struct {
     /// +1 retain on the BWLaunchGate instance. Released in dropLaunchGate.

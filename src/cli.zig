@@ -12,9 +12,7 @@ const osutil = @import("osutil.zig");
 
 const log = std.log.scoped(.cli);
 
-// ---------------------------------------------------------------------------
 // Action — locally handled commands (everything else is IPC)
-// ---------------------------------------------------------------------------
 
 const Action = enum {
     help,
@@ -22,9 +20,7 @@ const Action = enum {
     service,
 };
 
-// ---------------------------------------------------------------------------
 // Parse result
-// ---------------------------------------------------------------------------
 
 pub const Result = union(enum) {
     /// Start the daemon, optionally with an explicit config path.
@@ -97,9 +93,7 @@ pub fn parse(process_args: std.process.Args, cmd_buf: []u8) Result {
     return .{ .ipc = command };
 }
 
-// ---------------------------------------------------------------------------
 // Action dispatch
-// ---------------------------------------------------------------------------
 
 /// Run a parsed CLI result. Returns `true` if main should exit (action or
 /// IPC handled), `false` if the daemon should start.
@@ -130,9 +124,7 @@ pub fn configPath(result: Result) ?[]const u8 {
     };
 }
 
-// ---------------------------------------------------------------------------
 // Help
-// ---------------------------------------------------------------------------
 
 /// Write to a fixed file descriptor via libc; `std.fs.File`'s writer-based
 /// API in Zig 0.16 requires an `Io` instance which we don't thread through
@@ -211,17 +203,13 @@ const help_text =
     \\
 ;
 
-// ---------------------------------------------------------------------------
 // Version
-// ---------------------------------------------------------------------------
 
 fn printVersion() void {
     writeStdout("bobrwm " ++ build_options.version ++ "\n");
 }
 
-// ---------------------------------------------------------------------------
 // Service
-// ---------------------------------------------------------------------------
 
 fn runService(tail: ?[]const u8) void {
     const sub = tail orelse {
@@ -249,9 +237,7 @@ fn runService(tail: ?[]const u8) void {
     launchd.run(cmd);
 }
 
-// ---------------------------------------------------------------------------
 // IPC client (sends command to running daemon)
-// ---------------------------------------------------------------------------
 
 fn runClient(cmd: []const u8) void {
     const started_ns = osutil.nanoTimestamp();

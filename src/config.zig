@@ -9,9 +9,7 @@ const osutil = @import("osutil.zig");
 
 const log = std.log.scoped(.config);
 
-// ---------------------------------------------------------------------------
 // Config types
-// ---------------------------------------------------------------------------
 
 pub const Config = struct {
     keybinds: []const Keybind = &default_keybinds,
@@ -125,9 +123,7 @@ pub const Gaps = struct {
     outer: OuterGaps = .{},
 };
 
-// ---------------------------------------------------------------------------
 // Default keybinds (matches the previously hardcoded behaviour)
-// ---------------------------------------------------------------------------
 
 const default_keybinds: [23]Keybind = blk: {
     var binds: [23]Keybind = undefined;
@@ -158,9 +154,7 @@ const default_keybinds: [23]Keybind = blk: {
     break :blk binds;
 };
 
-// ---------------------------------------------------------------------------
 // Loading
-// ---------------------------------------------------------------------------
 
 pub fn load(allocator: std.mem.Allocator, explicit_path: ?[]const u8) Config {
     if (explicit_path) |p| {
@@ -215,9 +209,7 @@ fn loadFromPath(allocator: std.mem.Allocator, path: []const u8) ?Config {
     return parsed;
 }
 
-// ---------------------------------------------------------------------------
 // Bundle ID helper
-// ---------------------------------------------------------------------------
 
 pub fn getAppBundleId(pid: i32, buf: *[256]u8) ?[]const u8 {
     const len = shim.bw_get_app_bundle_id(pid, buf, 256);
@@ -225,9 +217,7 @@ pub fn getAppBundleId(pid: i32, buf: *[256]u8) ?[]const u8 {
     return buf[0..len];
 }
 
-// ---------------------------------------------------------------------------
 // macOS virtual key code mapping
-// ---------------------------------------------------------------------------
 
 fn keyNameToCode(name: []const u8) ?u16 {
     const Map = struct { []const u8, u16 };

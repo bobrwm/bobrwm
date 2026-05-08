@@ -81,9 +81,7 @@ pub fn run(cmd: Command) void {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Service commands
-// ---------------------------------------------------------------------------
 
 fn serviceInstall() Error!void {
     const home = osutil.getenv("HOME") orelse return error.HomeNotSet;
@@ -169,9 +167,7 @@ fn serviceRestart() Error!void {
     runLaunchctl(&.{ "launchctl", "kickstart", "-k", target });
 }
 
-// ---------------------------------------------------------------------------
 // Helpers
-// ---------------------------------------------------------------------------
 
 fn plistPath(buf: *[1024]u8, home: []const u8) ?[]const u8 {
     return std.fmt.bufPrint(buf, "{s}/{s}", .{ home, plist_rel }) catch null;

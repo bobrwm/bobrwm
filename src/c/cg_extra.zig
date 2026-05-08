@@ -15,7 +15,7 @@
 
 const c = @import("c");
 
-// ----- CGEvent.h ----------------------------------------------------------
+// CGEvent.h 
 
 pub extern fn CGEventGetFlags(event: c.CGEventRef) c.CGEventFlags;
 
@@ -42,7 +42,7 @@ pub extern fn CGEventTapCreate(
 
 pub extern fn CGEventTapEnable(tap: c.CFMachPortRef, enable: bool) void;
 
-// ----- CGWindow.h ---------------------------------------------------------
+// CGWindow.h
 
 pub const CGWindowID = u32;
 pub const kCGNullWindowID: CGWindowID = 0;
@@ -66,7 +66,7 @@ pub extern const kCGWindowLayer: c.CFStringRef;
 pub extern const kCGWindowOwnerPID: c.CFStringRef;
 pub extern const kCGWindowBounds: c.CFStringRef;
 
-// ----- libdispatch --------------------------------------------------------
+// libdispatch
 
 pub extern var _dispatch_main_q: anyopaque;
 pub extern const _dispatch_source_type_timer: anyopaque;

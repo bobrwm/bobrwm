@@ -55,7 +55,6 @@ const AxObserverStrings = struct {
     deminiaturized_notification: c.CFStringRef,
 };
 
-// ---------------------------------------------------------------------------
 // Shared state — protected by g_ax_lock when accessed from both threads.
 //
 // The background thread (notification callbacks) reads/writes:
@@ -71,7 +70,6 @@ const AxObserverStrings = struct {
 // main thread, so main-thread-only reads of those fields are safe without
 // the lock.  The lock is still required when the background thread reads
 // them (e.g. appObserverIndex called from appTrackWindow).
-// ---------------------------------------------------------------------------
 
 var g_ax_lock: c.os_unfair_lock_s = .{ ._os_unfair_lock_opaque = 0 };
 
@@ -156,9 +154,7 @@ fn deinitAxObserverStrings() void {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Background observer thread
-// ---------------------------------------------------------------------------
 
 fn axThreadEntry(context: ?*anyopaque) callconv(.c) ?*anyopaque {
     _ = context;
@@ -212,9 +208,7 @@ fn stopAxThread() void {
     g_ax_thread_ready.store(false, .release);
 }
 
-// ---------------------------------------------------------------------------
 // Public API
-// ---------------------------------------------------------------------------
 
 pub fn init() void {
     deinit();
@@ -272,9 +266,7 @@ pub fn unobserveApp(pid: i32) void {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Internal — main-thread helpers
-// ---------------------------------------------------------------------------
 
 fn cancelRuntimeSources() void {
     if (g_observe_retry_source) |source| {
@@ -688,9 +680,7 @@ fn scheduleWidResolutionRetry(observer: c.AXObserverRef, element: c.AXUIElementR
     );
 }
 
-// ---------------------------------------------------------------------------
 // AX notification callback — runs on the background observer thread.
-// ---------------------------------------------------------------------------
 
 fn isNotification(notification: c.CFStringRef, expected: c.CFStringRef) bool {
     return c.CFEqual(@ptrCast(notification), @ptrCast(expected)) != 0;
@@ -743,9 +733,7 @@ fn axNotificationHandler(
     }
 }
 
-// ---------------------------------------------------------------------------
 // Observer registration — main thread
-// ---------------------------------------------------------------------------
 
 fn registerAppLevelAXNotifications(observer: c.AXObserverRef, app: c.AXUIElementRef, app_refcon: ?*anyopaque) bool {
     const strings = ensureAxObserverStrings() orelse return false;
