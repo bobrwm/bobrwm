@@ -1,11 +1,8 @@
 const std = @import("std");
 const posix = std.posix;
 const build_options = @import("build_options");
-const c = @cImport({
-    @cInclude("ApplicationServices/ApplicationServices.h");
-    @cInclude("dispatch/dispatch.h");
-    @cInclude("pthread.h");
-});
+const c = @import("c");
+const cg_extra = @import("cg_extra");
 const objc = @import("objc");
 const shim = @import("shim_api.zig");
 const skylight = @import("skylight.zig");
@@ -15,13 +12,20 @@ const workspace_mod = @import("workspace.zig");
 const layout = @import("layout.zig");
 const ipc = @import("ipc.zig");
 const tabgroup = @import("tabgroup.zig");
+const cli = @import("cli.zig");
 const config_mod = @import("config.zig");
 const statusbar = @import("statusbar.zig");
 const tile_preview = @import("tile_preview.zig");
 const ax_observer = @import("ax_observer.zig");
 const launchd = @import("launchd.zig");
+const osutil = @import("osutil.zig");
+const objc_classes = @import("objc_classes.zig");
 
 extern fn _AXUIElementGetWindow(element: c.AXUIElementRef, wid: *u32) c.AXError;
+
+/// Monotonic wall clock in nanoseconds. Re-exported from osutil so existing
+/// `nanoTimestamp()` call sites in this file keep working unchanged.
+const nanoTimestamp = osutil.nanoTimestamp;
 
 const NSPoint = extern struct {
     x: f64,
@@ -49,24 +53,30 @@ pub const std_options = std.Options{
 
 const log = std.log.scoped(.bobrwm);
 
-// ---------------------------------------------------------------------------
 // Lock-free SPSC ring buffer
-// ---------------------------------------------------------------------------
+//
 // Single-producer (main thread) only. All emitters must run on the
 // main thread / main queue. The consumer is bw_drain_events, also on
 // the main run-loop.
 
 const EventRing = struct {
-    const capacity = 256;
+    const capacity = 1024;
 
     buf: [capacity]event_mod.Event = undefined,
     head: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
     tail: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
+    dropped: usize = 0,
 
     fn push(self: *EventRing, ev: event_mod.Event) void {
         const t = self.tail.load(.acquire);
         const next = (t + 1) % capacity;
-        if (next == self.head.load(.acquire)) return; // full, drop
+        if (next == self.head.load(.acquire)) {
+            self.dropped += 1;
+            log.err("event ring full, dropped event kind={s} pid={d} wid={d} total_dropped={d}", .{
+                @tagName(ev.kind), ev.pid, ev.wid, self.dropped,
+            });
+            return;
+        }
         self.buf[t] = ev;
         self.tail.store(next, .release);
     }
@@ -80,9 +90,7 @@ const EventRing = struct {
     }
 };
 
-// ---------------------------------------------------------------------------
 // Hidden-window position (bottom-right corner, barely visible)
-// ---------------------------------------------------------------------------
 
 /// Pixels visible in the corner when a window is hidden off-screen.
 const hide_peek: f64 = 5;
@@ -217,6 +225,8 @@ const AxStrings = struct {
     unknown_role: c.CFStringRef,
     subrole_attr: c.CFStringRef,
     standard_window_subrole: c.CFStringRef,
+    floating_window_subrole: c.CFStringRef,
+    dialog_subrole: c.CFStringRef,
     unknown_subrole: c.CFStringRef,
     enhanced_ui_attr: c.CFStringRef,
 };
@@ -244,6 +254,8 @@ fn ensureAxStrings() ?*const AxStrings {
         "AXUnknown",
         "AXSubrole",
         "AXStandardWindow",
+        "AXFloatingWindow",
+        "AXDialog",
         "AXUnknown",
         "AXEnhancedUserInterface",
     };
@@ -271,8 +283,10 @@ fn ensureAxStrings() ?*const AxStrings {
         .unknown_role = refs[8],
         .subrole_attr = refs[9],
         .standard_window_subrole = refs[10],
-        .unknown_subrole = refs[11],
-        .enhanced_ui_attr = refs[12],
+        .floating_window_subrole = refs[11],
+        .dialog_subrole = refs[12],
+        .unknown_subrole = refs[13],
+        .enhanced_ui_attr = refs[14],
     };
     return &g_ax_strings.?;
 }
@@ -282,6 +296,8 @@ fn deinitAxStrings() void {
         const refs = [_]c.CFStringRef{
             strings.enhanced_ui_attr,
             strings.unknown_subrole,
+            strings.dialog_subrole,
+            strings.floating_window_subrole,
             strings.standard_window_subrole,
             strings.subrole_attr,
             strings.unknown_role,
@@ -517,10 +533,10 @@ fn maybeSetFocusedDisplayForWindow(win: window_mod.Window, source: FocusEventSou
 
     setFocusedDisplay(win.display_id);
 
-    // Keyboard intent always wins. Once keyboard focus lands, stale queued focus
-    // from AX/drag must not replay against the old transition.
+    // Keyboard intent always wins — flush stale queued focus from AX/drag
+    // so they don't replay against an old transition epoch.
     if (source == .keyboard and g_workspace_transition.isActive()) {
-        clearWorkspaceTransition();
+        g_pending_focus_count = 0;
     }
 
     return true;
@@ -572,6 +588,17 @@ fn updateStatusBar() void {
 fn clearLayoutRoots() void {
     for (0..workspace_mod.max_workspaces) |ws_idx| {
         g_layout_roots[ws_idx] = null;
+    }
+}
+
+/// Recursively free every workspace's layout tree. Safe to call at any time
+/// after `clearLayoutRoots()` — slots set to null are skipped.
+fn destroyAllLayoutTrees() void {
+    for (0..workspace_mod.max_workspaces) |ws_idx| {
+        if (g_layout_roots[ws_idx]) |root| {
+            layout.destroyTree(root, g_allocator);
+            g_layout_roots[ws_idx] = null;
+        }
     }
 }
 
@@ -699,6 +726,27 @@ fn displayIdForFrame(frame: window_mod.Window.Frame) u32 {
     return best_display;
 }
 
+/// Infer the display a not-yet-managed window belongs on by querying its
+/// CG/SkyLight bounds. Returns null if SkyLight isn't initialised or the
+/// window has zero-sized bounds (e.g. mid-construction).
+///
+/// Used by the new-window pipeline so a window born on a non-focused display
+/// (the canonical case: a tab torn off and dropped onto another monitor) is
+/// assigned to the correct display+workspace instead of inheriting whichever
+/// display happened to be focused at creation time.
+fn inferDisplayIdForWindow(wid: u32) ?u32 {
+    const sky = g_sky orelse return null;
+    var rect: skylight.CGRect = undefined;
+    if (sky.getWindowBounds(sky.mainConnectionID(), wid, &rect) != 0) return null;
+    if (rect.size.width <= 0 or rect.size.height <= 0) return null;
+    return displayIdForFrame(.{
+        .x = rect.origin.x,
+        .y = rect.origin.y,
+        .width = rect.size.width,
+        .height = rect.size.height,
+    });
+}
+
 /// Pick the bottom corner that does not border an adjacent monitor.
 /// Falls back to bottom-right on single-monitor setups.
 fn hideCorner(display_id: u32) HideCorner {
@@ -732,6 +780,8 @@ const HideCtx = struct {
 
     /// Move a single window to the chosen bottom corner, preserving its
     /// stored frame size so there is no layout shift on workspace switch.
+    /// Updates the stored position so retileDisplay detects the move
+    /// and won't skip the window via framesEqual on workspace re-activation.
     fn hide(self: HideCtx, pid: i32, wid: u32) void {
         const pos_y = self.display.y + self.display.h - hide_peek;
 
@@ -742,6 +792,10 @@ const HideCtx = struct {
                     .bottom_left => self.display.x - win.frame.width + hide_peek,
                 };
                 _ = shim.bw_ax_set_window_frame(pid, wid, pos_x, pos_y, win.frame.width, win.frame.height);
+                var updated = win;
+                updated.frame.x = pos_x;
+                updated.frame.y = pos_y;
+                g_store.put(updated) catch {};
                 return;
             }
         }
@@ -774,17 +828,20 @@ fn framesEqual(lhs: window_mod.Window.Frame, rhs: window_mod.Window.Frame) bool 
     std.debug.assert(lhs.width >= 0 and lhs.height >= 0);
     std.debug.assert(rhs.width >= 0 and rhs.height >= 0);
 
-    return lhs.x == rhs.x and
-        lhs.y == rhs.y and
-        lhs.width == rhs.width and
-        lhs.height == rhs.height;
+    // Use 1px tolerance to absorb sub-pixel rounding from CG/AX,
+    // avoiding redundant AX SetAttributeValue calls on every retile.
+    const tol: f64 = 1.0;
+    return @abs(lhs.x - rhs.x) <= tol and
+        @abs(lhs.y - rhs.y) <= tol and
+        @abs(lhs.width - rhs.width) <= tol and
+        @abs(lhs.height - rhs.height) <= tol;
 }
 
-// ---------------------------------------------------------------------------
 // Globals
-// ---------------------------------------------------------------------------
 
 var g_ring: EventRing = .{};
+/// Protects g_ring.push from concurrent AX observer threads.
+var g_ring_lock: c.os_unfair_lock_s = .{ ._os_unfair_lock_opaque = 0 };
 var g_sky: ?skylight.SkyLight = null;
 var g_allocator: std.mem.Allocator = undefined;
 var g_store: window_mod.WindowStore = undefined;
@@ -803,6 +860,9 @@ var g_config: config_mod.Config = .{};
 var g_drag_preview: DragPreviewState = .{};
 var g_mouse_left_down = false;
 var g_drag_reconcile_on_drop = false;
+/// PID of the last window we focused via bw_ax_focus_window. Used to detect
+/// same-process focus switches that need a delay for Electron compatibility.
+var g_last_focused_pid: i32 = 0;
 var g_last_space_changed_at_s: f64 = 0;
 var g_last_display_changed_at_s: f64 = 0;
 var g_hotkey_bindings: [128]shim.bw_keybind = undefined;
@@ -893,9 +953,7 @@ fn flushCleanupRequests() bool {
     return removed_any;
 }
 
-// ---------------------------------------------------------------------------
 // NSApp lifecycle (zig-objc)
-// ---------------------------------------------------------------------------
 
 /// Initialise NSApplication with accessory activation policy (menu bar icon,
 /// no dock icon). Returns the shared application object for the run loop.
@@ -909,7 +967,7 @@ fn initApp() objc.Object {
 }
 
 /// Register NSWorkspace/NSNotificationCenter observers via zig-objc while
-/// keeping selector callbacks in BWObserver (ObjC class in shim.m).
+/// keeping selector callbacks in BWObserver (registered at runtime in objc_classes.zig).
 fn initWorkspaceObservers() void {
     const BWObserver = objc.getClass("BWObserver") orelse
         @panic("BWObserver class not found");
@@ -1088,9 +1146,9 @@ export fn bw_ax_get_focused_window(pid: i32) u32 {
 export fn bw_is_window_on_screen(target_wid: u32) bool {
     std.debug.assert(target_wid > 0);
 
-    const options: c.CGWindowListOption =
-        c.kCGWindowListOptionOnScreenOnly | c.kCGWindowListExcludeDesktopElements;
-    const list = c.CGWindowListCopyWindowInfo(options, c.kCGNullWindowID) orelse return false;
+    const options: cg_extra.CGWindowListOption =
+        cg_extra.kCGWindowListOptionOnScreenOnly | cg_extra.kCGWindowListExcludeDesktopElements;
+    const list = cg_extra.CGWindowListCopyWindowInfo(options, cg_extra.kCGNullWindowID) orelse return false;
     defer c.CFRelease(@ptrCast(list));
 
     const count = c.CFArrayGetCount(list);
@@ -1099,7 +1157,7 @@ export fn bw_is_window_on_screen(target_wid: u32) bool {
     while (i < count) : (i += 1) {
         const info_any = c.CFArrayGetValueAtIndex(list, i) orelse continue;
         const info: c.CFDictionaryRef = @ptrCast(info_any);
-        const wid_ref_any = c.CFDictionaryGetValue(info, c.kCGWindowNumber) orelse continue;
+        const wid_ref_any = c.CFDictionaryGetValue(info, cg_extra.kCGWindowNumber) orelse continue;
         const wid_ref: c.CFNumberRef = @ptrCast(wid_ref_any);
 
         var wid: u32 = 0;
@@ -1269,7 +1327,15 @@ fn axEnhancedUserInterface(app: c.AXUIElementRef, ax: *const AxStrings) bool {
 }
 
 /// Raise and focus a window, then activate its owning app.
+///
+/// When switching between windows within the same process, a 40ms delay is
+/// inserted between the raise and the activation. Some apps (notably Electron)
+/// get confused by instantaneous same-process focus switches and fail to render
+/// the focus ring or route keyboard events to the wrong window. Yabai uses the
+/// same 40ms delay for same-PSN switches.
 export fn bw_ax_focus_window(pid: i32, wid: u32) bool {
+    const same_process_focus_delay_us: c_uint = 40_000; // 40ms, matches yabai
+
     std.debug.assert(pid > 0);
     std.debug.assert(wid > 0);
 
@@ -1280,8 +1346,18 @@ export fn bw_ax_focus_window(pid: i32, wid: u32) bool {
     const raise_action = ax.raise_action;
     const main_attr = ax.main_attr;
 
+    const is_same_process = (g_last_focused_pid == pid);
+    g_last_focused_pid = pid;
+
     _ = c.AXUIElementPerformAction(win, raise_action);
     _ = c.AXUIElementSetAttributeValue(win, main_attr, c.kCFBooleanTrue);
+
+    // Delay activation for same-process switches so the app has time to
+    // process the deactivation of the previous window before the new
+    // activation arrives.
+    if (is_same_process) {
+        _ = c.usleep(same_process_focus_delay_us);
+    }
 
     const NSRunningApplication = objc.getClass("NSRunningApplication") orelse return true;
     const app = NSRunningApplication.msgSend(objc.Object, "runningApplicationWithProcessIdentifier:", .{pid});
@@ -1325,14 +1401,18 @@ fn manageStateForWindow(pid: i32, wid: u32) u8 {
     const subrole_ref: c.CFStringRef = @ptrCast(subrole_any orelse return shim.BW_MANAGE_PENDING);
     defer c.CFRelease(@ptrCast(subrole_ref));
 
-    const standard_subrole = ax.standard_window_subrole;
     const unknown_subrole = ax.unknown_subrole;
-
-    const is_standard = c.CFEqual(@ptrCast(subrole_ref), @ptrCast(standard_subrole)) != 0;
     const is_unknown_subrole = c.CFEqual(@ptrCast(subrole_ref), @ptrCast(unknown_subrole)) != 0;
-    if (!is_standard and is_unknown_subrole) return shim.BW_MANAGE_PENDING;
+    if (is_unknown_subrole) return shim.BW_MANAGE_PENDING;
 
-    return if (is_standard) shim.BW_MANAGE_READY else shim.BW_MANAGE_REJECT;
+    // Accept AXStandardWindow, AXFloatingWindow, and AXDialog as manageable.
+    // Some Electron apps and IDEs report AXDialog or AXFloatingWindow for
+    // their main windows. Yabai also accepts all three subroles.
+    const is_manageable = c.CFEqual(@ptrCast(subrole_ref), @ptrCast(ax.standard_window_subrole)) != 0 or
+        c.CFEqual(@ptrCast(subrole_ref), @ptrCast(ax.floating_window_subrole)) != 0 or
+        c.CFEqual(@ptrCast(subrole_ref), @ptrCast(ax.dialog_subrole)) != 0;
+
+    return if (is_manageable) shim.BW_MANAGE_READY else shim.BW_MANAGE_REJECT;
 }
 
 /// Returns true when a still-pending window has AXUnknown role/subrole metadata.
@@ -1377,6 +1457,12 @@ export fn bw_window_manage_state(pid: i32, wid: u32) u8 {
 }
 
 /// Enumerate on-screen layer-0 windows for regular applications.
+///
+/// Uses a per-call PID cache to avoid redundant isRegularActivationApp calls.
+/// Electron apps spawn many XPC helper processes (renderers, GPU process) that
+/// share the CGWindowList but have Prohibited activation policy. Caching the
+/// accept/reject decision per PID avoids an ObjC message send for every window
+/// belonging to the same rejected process.
 export fn bw_discover_windows(out: ?[*]shim.bw_window_info, max_count: u32) u32 {
     const out_ptr = out orelse return 0;
     if (max_count == 0) return 0;
@@ -1384,13 +1470,20 @@ export fn bw_discover_windows(out: ?[*]shim.bw_window_info, max_count: u32) u32 
     std.debug.assert(max_count > 0);
     const out_buf = out_ptr[0..@as(usize, @intCast(max_count))];
 
-    const options: c.CGWindowListOption =
-        c.kCGWindowListOptionOnScreenOnly | c.kCGWindowListExcludeDesktopElements;
-    const window_list = c.CGWindowListCopyWindowInfo(options, c.kCGNullWindowID) orelse return 0;
+    const options: cg_extra.CGWindowListOption =
+        cg_extra.kCGWindowListOptionOnScreenOnly | cg_extra.kCGWindowListExcludeDesktopElements;
+    const window_list = cg_extra.CGWindowListCopyWindowInfo(options, cg_extra.kCGNullWindowID) orelse return 0;
     defer c.CFRelease(@ptrCast(window_list));
 
     const total = c.CFArrayGetCount(window_list);
     std.debug.assert(total >= 0);
+
+    // Per-call PID caches to fast-path repeated lookups.
+    const pid_cache_capacity = 64;
+    var accepted_pids: [pid_cache_capacity]i32 = undefined;
+    var accepted_pid_count: usize = 0;
+    var rejected_pids: [pid_cache_capacity]i32 = undefined;
+    var rejected_pid_count: usize = 0;
 
     var count: usize = 0;
     var i: c.CFIndex = 0;
@@ -1399,26 +1492,41 @@ export fn bw_discover_windows(out: ?[*]shim.bw_window_info, max_count: u32) u32 
         const info: c.CFDictionaryRef = @ptrCast(info_any);
 
         var layer: i32 = 0;
-        if (c.CFDictionaryGetValue(info, c.kCGWindowLayer)) |layer_ref_any| {
+        if (c.CFDictionaryGetValue(info, cg_extra.kCGWindowLayer)) |layer_ref_any| {
             const layer_ref: c.CFNumberRef = @ptrCast(layer_ref_any);
             _ = c.CFNumberGetValue(layer_ref, c.kCFNumberSInt32Type, &layer);
         }
         if (layer != 0) continue;
 
-        const wid_ref_any = c.CFDictionaryGetValue(info, c.kCGWindowNumber) orelse continue;
+        const wid_ref_any = c.CFDictionaryGetValue(info, cg_extra.kCGWindowNumber) orelse continue;
         const wid_ref: c.CFNumberRef = @ptrCast(wid_ref_any);
         var wid: u32 = 0;
         _ = c.CFNumberGetValue(wid_ref, c.kCFNumberSInt32Type, &wid);
 
-        const pid_ref_any = c.CFDictionaryGetValue(info, c.kCGWindowOwnerPID) orelse continue;
+        const pid_ref_any = c.CFDictionaryGetValue(info, cg_extra.kCGWindowOwnerPID) orelse continue;
         const pid_ref: c.CFNumberRef = @ptrCast(pid_ref_any);
         var pid: i32 = 0;
         _ = c.CFNumberGetValue(pid_ref, c.kCFNumberSInt32Type, &pid);
         if (pid <= 0) continue;
-        if (!isRegularActivationApp(pid)) continue;
+
+        // Fast-path: check per-call caches before the ObjC message send.
+        if (pidInCache(pid, &rejected_pids, rejected_pid_count)) continue;
+        if (!pidInCache(pid, &accepted_pids, accepted_pid_count)) {
+            if (!isRegularActivationApp(pid)) {
+                if (rejected_pid_count < pid_cache_capacity) {
+                    rejected_pids[rejected_pid_count] = pid;
+                    rejected_pid_count += 1;
+                }
+                continue;
+            }
+            if (accepted_pid_count < pid_cache_capacity) {
+                accepted_pids[accepted_pid_count] = pid;
+                accepted_pid_count += 1;
+            }
+        }
 
         var bounds: c.CGRect = std.mem.zeroes(c.CGRect);
-        if (c.CFDictionaryGetValue(info, c.kCGWindowBounds)) |bounds_ref_any| {
+        if (c.CFDictionaryGetValue(info, cg_extra.kCGWindowBounds)) |bounds_ref_any| {
             const bounds_ref: c.CFDictionaryRef = @ptrCast(bounds_ref_any);
             _ = c.CGRectMakeWithDictionaryRepresentation(bounds_ref, &bounds);
         }
@@ -1437,6 +1545,13 @@ export fn bw_discover_windows(out: ?[*]shim.bw_window_info, max_count: u32) u32 
 
     std.debug.assert(count <= out_buf.len);
     return @intCast(count);
+}
+
+fn pidInCache(pid: i32, cache: []const i32, count: usize) bool {
+    for (cache[0..count]) |cached| {
+        if (cached == pid) return true;
+    }
+    return false;
 }
 
 fn wakerPerform(info: ?*anyopaque) callconv(.c) void {
@@ -1482,10 +1597,10 @@ fn setRolePolling(enabled: bool) void {
     if (g_role_poll_source != null) return;
 
     const source = c.dispatch_source_create(
-        c.DISPATCH_SOURCE_TYPE_TIMER,
+        cg_extra.DISPATCH_SOURCE_TYPE_TIMER(),
         0,
         0,
-        c.dispatch_get_main_queue(),
+        cg_extra.dispatch_get_main_queue(),
     );
     if (source == null) return;
 
@@ -1519,7 +1634,7 @@ fn hotkeyTapCallback(
     _ = refcon;
 
     if (event_type == c.kCGEventTapDisabledByTimeout or event_type == c.kCGEventTapDisabledByUserInput) {
-        if (g_tap_port) |tap| c.CGEventTapEnable(tap, true);
+        if (g_tap_port) |tap| cg_extra.CGEventTapEnable(tap, true);
         return event;
     }
 
@@ -1532,8 +1647,8 @@ fn hotkeyTapCallback(
         return event;
     }
 
-    const flags = c.CGEventGetFlags(event);
-    const keycode_raw = c.CGEventGetIntegerValueField(event, c.kCGKeyboardEventKeycode);
+    const flags = cg_extra.CGEventGetFlags(event);
+    const keycode_raw = cg_extra.CGEventGetIntegerValueField(event, c.kCGKeyboardEventKeycode);
     const keycode: u16 = @intCast(keycode_raw);
     const mods = modsFromEventFlags(flags);
 
@@ -1549,7 +1664,7 @@ fn setupHotkeyEventTap() void {
         (@as(c.CGEventMask, 1) << @intCast(c.kCGEventLeftMouseDown)) |
         (@as(c.CGEventMask, 1) << @intCast(c.kCGEventLeftMouseUp));
 
-    g_tap_port = c.CGEventTapCreate(
+    g_tap_port = cg_extra.CGEventTapCreate(
         c.kCGSessionEventTap,
         c.kCGHeadInsertEventTap,
         c.kCGEventTapOptionDefault,
@@ -1563,7 +1678,7 @@ fn setupHotkeyEventTap() void {
     defer c.CFRelease(@ptrCast(tap_source));
 
     c.CFRunLoopAddSource(c.CFRunLoopGetMain(), tap_source, c.kCFRunLoopCommonModes);
-    c.CGEventTapEnable(tap, true);
+    cg_extra.CGEventTapEnable(tap, true);
 }
 
 fn ipcSourceTick(context: ?*anyopaque) callconv(.c) void {
@@ -1579,10 +1694,10 @@ fn initIpcSource(server_fd: c_int) void {
     }
 
     const source = c.dispatch_source_create(
-        c.DISPATCH_SOURCE_TYPE_READ,
+        cg_extra.DISPATCH_SOURCE_TYPE_READ(),
         @intCast(server_fd),
         0,
-        c.dispatch_get_main_queue(),
+        cg_extra.dispatch_get_main_queue(),
     );
     if (source == null) return;
 
@@ -1609,47 +1724,48 @@ export fn bw_set_role_polling(enabled: bool) void {
     setRolePolling(enabled);
 }
 
-// ---------------------------------------------------------------------------
 // Event bridge (called from ObjC shim)
-// ---------------------------------------------------------------------------
 
-// Single-producer (main thread) only — all ObjC emitters must dispatch
-// on the main queue so the ring buffer stays SPSC.
+// Thread-safe: AX observer callbacks run on per-app background threads
+// and push events here.  The os_unfair_lock serialises concurrent pushes
+// while the main-thread consumer (pop) is wait-free.
 export fn bw_emit_event(kind: u8, pid: i32, wid: u32) void {
-    std.debug.assert(c.pthread_main_np() != 0);
+    c.os_unfair_lock_lock(&g_ring_lock);
     g_ring.push(.{
         .kind = @enumFromInt(kind),
         .pid = pid,
         .wid = wid,
     });
+    c.os_unfair_lock_unlock(&g_ring_lock);
     signalWaker();
 }
 
-/// Callback target for BWObserver.appTerminated: selector.
-export fn bw_workspace_app_terminated(pid: i32) void {
+/// Callback target for BWObserver.appTerminated:. Called from
+/// objc_classes.zig so it no longer needs C-symbol export.
+pub fn bw_workspace_app_terminated(pid: i32) void {
     std.debug.assert(pid > 0);
     bw_emit_event(shim.BW_EVENT_APP_TERMINATED, pid, 0);
 }
 
-/// Callback target for BWObserver.appLaunched: selector.
-export fn bw_workspace_app_launched(pid: i32) void {
+/// Callback target for BWObserver.appLaunched:.
+pub fn bw_workspace_app_launched(pid: i32) void {
     std.debug.assert(pid > 0);
     bw_emit_event(shim.BW_EVENT_APP_LAUNCHED, pid, 0);
 }
 
-/// Callback target for BWObserver.activeAppChanged: selector.
-export fn bw_workspace_active_app_changed(pid: i32) void {
+/// Callback target for BWObserver.activeAppChanged:.
+pub fn bw_workspace_active_app_changed(pid: i32) void {
     std.debug.assert(pid > 0);
     bw_emit_event(shim.BW_EVENT_WINDOW_FOCUSED, pid, 0);
 }
 
-/// Callback target for BWObserver.spaceChanged: selector.
-export fn bw_workspace_space_changed() void {
+/// Callback target for BWObserver.spaceChanged:.
+pub fn bw_workspace_space_changed() void {
     bw_emit_event(shim.BW_EVENT_SPACE_CHANGED, 0, 0);
 }
 
-/// Callback target for BWObserver.displayChanged: selector.
-export fn bw_workspace_display_changed() void {
+/// Callback target for BWObserver.displayChanged:.
+pub fn bw_workspace_display_changed() void {
     bw_emit_event(shim.BW_EVENT_DISPLAY_CHANGED, 0, 0);
 }
 
@@ -1702,111 +1818,24 @@ export fn bw_hotkey_handle_keydown(keycode: u16, mods: u8) bool {
     return false;
 }
 
-// ---------------------------------------------------------------------------
-// CLI client (sends command to running daemon)
-// ---------------------------------------------------------------------------
-
-fn runClient(cmd: []const u8) void {
-    const stdout = std.fs.File.stdout();
-    const stderr = std.fs.File.stderr();
-    const started_ns = std.time.nanoTimestamp();
-    var response_bytes: usize = 0;
-
-    var path_buf: [128]u8 = undefined;
-    const path = std.fmt.bufPrintZ(&path_buf, "/tmp/bobrwm_{d}.sock", .{std.c.getuid()}) catch {
-        stderr.writeAll("error: socket path too long\n") catch {};
-        return;
-    };
-
-    const fd = posix.socket(posix.AF.UNIX, posix.SOCK.STREAM, 0) catch {
-        stderr.writeAll("error: could not create socket\n") catch {};
-        return;
-    };
-    defer posix.close(fd);
-
-    var addr: posix.sockaddr.un = .{ .path = undefined, .family = posix.AF.UNIX };
-    @memcpy(addr.path[0..path.len], path[0..path.len]);
-    if (path.len < addr.path.len) addr.path[path.len] = 0;
-
-    log.debug("[trace] ipc client connecting path={s} cmd={s}", .{ path, cmd });
-
-    posix.connect(fd, @ptrCast(&addr), @sizeOf(posix.sockaddr.un)) catch {
-        stderr.writeAll("error: bobrwm is not running\n") catch {};
-        return;
-    };
-
-    _ = posix.write(fd, cmd) catch {
-        stderr.writeAll("error: write failed\n") catch {};
-        return;
-    };
-    posix.shutdown(fd, .send) catch {};
-
-    while (true) {
-        var poll_fds = [_]posix.pollfd{.{
-            .fd = fd,
-            .events = posix.POLL.IN,
-            .revents = 0,
-        }};
-        const ready = posix.poll(&poll_fds, 2000) catch {
-            stderr.writeAll("error: IPC poll failed\n") catch {};
-            break;
-        };
-        if (ready == 0) {
-            stderr.writeAll("error: IPC response timeout\n") catch {};
-            log.warn("ipc client timeout waiting for response cmd={s}", .{cmd});
-            break;
-        }
-
-        var buf: [4096]u8 = undefined;
-        const n = posix.read(fd, &buf) catch break;
-        if (n == 0) break;
-        response_bytes += n;
-        stdout.writeAll(buf[0..n]) catch break;
-    }
-
-    const elapsed_ms = @divTrunc(std.time.nanoTimestamp() - started_ns, std.time.ns_per_ms);
-    log.debug("[trace] ipc client completed bytes={} elapsed_ms={}", .{ response_bytes, elapsed_ms });
-}
-
-// ---------------------------------------------------------------------------
 // Entry point
-// ---------------------------------------------------------------------------
 
-pub fn main() !void {
-    // -- Arg parsing (before anything else) --
+pub fn main(init: std.process.Init.Minimal) !void {
+    // -- CLI dispatch (help, version, service, IPC client) --
     var cmd_buf: [512]u8 = undefined;
-    const args = config_mod.parseArgs(&cmd_buf);
-
-    // Service management: handle locally (not via IPC)
-    if (args.command) |cmd| {
-        if (std.mem.eql(u8, cmd, "service") or std.mem.startsWith(u8, cmd, "service ")) {
-            if (parseServiceCommand(cmd)) |service_cmd| {
-                launchd.run(service_cmd);
-            } else {
-                std.fs.File.stderr().writeAll(
-                    "usage: bobrwm service <install|uninstall|start|stop|restart>\n",
-                ) catch {};
-            }
-            return;
-        }
-    }
-
-    // Client mode: forward command to running daemon via IPC
-    if (args.command) |cmd| {
-        runClient(cmd);
-        return;
-    }
+    const result = cli.parse(init.args, &cmd_buf);
+    if (cli.run(result)) return;
 
     // -- Daemon mode --
     log.info("bobrwm starting (log_level={s})...", .{@tagName(std_options.log_level)});
 
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa: std.heap.DebugAllocator(.{}) = .init;
     defer _ = gpa.deinit();
     g_allocator = gpa.allocator();
     defer deinitAxStrings();
 
     // -- Config --
-    g_config = config_mod.load(g_allocator, args.config_path);
+    g_config = config_mod.load(g_allocator, cli.configPath(result));
     g_bsp_split_mode = g_config.bsp_split;
     g_config.applyKeybinds();
 
@@ -1830,31 +1859,32 @@ pub fn main() !void {
     g_workspaces = workspace_mod.WorkspaceManager.init(g_allocator, ws_count);
     defer g_workspaces.deinit();
     clearLayoutRoots();
+    // Free per-workspace layout trees on exit. discoverWindows() and later
+    // insertions allocate Split nodes and leaf ArrayLists via g_allocator;
+    // without this, DebugAllocator reports leaks on shutdown error paths.
+    defer destroyAllLayoutTrees();
     g_tab_groups = tabgroup.TabGroupManager.init(g_allocator);
     defer g_tab_groups.deinit();
     g_pending_role_windows = PendingRoleWindowMap.init(g_allocator);
-    errdefer g_pending_role_windows.deinit();
+    defer g_pending_role_windows.deinit();
     g_pending_role_windows.ensureTotalCapacity(pending_role_window_capacity) catch |err| {
         log.err("pending-role map reserve failed: {}", .{err});
         return err;
     };
     g_deferred_window_candidates = DeferredWindowCandidateMap.init(g_allocator);
-    errdefer g_deferred_window_candidates.deinit();
+    defer g_deferred_window_candidates.deinit();
     g_deferred_window_candidates.ensureTotalCapacity(deferred_window_candidate_capacity) catch |err| {
         log.err("deferred-window map reserve failed: {}", .{err});
         return err;
     };
     g_app_launch_retries = AppLaunchRetryMap.init(g_allocator);
-    errdefer g_app_launch_retries.deinit();
+    defer g_app_launch_retries.deinit();
     g_app_launch_retries.ensureTotalCapacity(app_launch_retry_capacity) catch |err| {
         log.err("app-launch-retry map reserve failed: {}", .{err});
         return err;
     };
     defer {
         setRolePolling(false);
-        g_app_launch_retries.deinit();
-        g_deferred_window_candidates.deinit();
-        g_pending_role_windows.deinit();
         g_layout_entries.deinit(g_allocator);
     }
     refreshDisplays();
@@ -1905,6 +1935,9 @@ pub fn main() !void {
     ipc.g_dispatch = ipcDispatch;
 
     // -- NSApp (zig-objc) --
+    // Register runtime ObjC classes (BWStatusBarDelegate / BWObserver /
+    // BWLaunchGate) before any code does objc.getClass on them.
+    objc_classes.register(g_allocator);
     const NSApp = initApp();
     initWorkspaceObservers();
 
@@ -1921,42 +1954,85 @@ pub fn main() !void {
     statusbar.init();
     updateStatusBar();
 
-    // -- Enter NSApp run loop (never returns) --
+    // -- Enter NSApp run loop --
+    // Returns when CFRunLoopStop is called (e.g. graceful signal handler).
+    // The defer chain then runs restoreAllWindows() safely on the main thread.
     log.info("entering run loop", .{});
     defer restoreAllWindows();
     NSApp.msgSend(void, "run", .{});
 }
 
-// ---------------------------------------------------------------------------
 // Exported callbacks (called from ObjC shim on main thread)
-// ---------------------------------------------------------------------------
 
 /// Drain the event ring buffer — called by the CFRunLoopSource waker.
 export fn bw_drain_events() void {
     std.debug.assert(!g_event_drain_active);
     g_event_drain_active = true;
-    defer {
-        g_event_drain_active = false;
-        flushRetileRequests();
-    }
+    defer g_event_drain_active = false;
 
     while (g_ring.pop()) |ev| {
         handleEvent(&ev);
     }
 
+    // Flush retile BEFORE cleanup so windows are at their layout positions
+    // when cleanup checks on-screen status. Without this, cleanup sees
+    // corner-parked windows and incorrectly removes them as ghosts.
+    flushRetileRequests();
+
     if (flushCleanupRequests()) {
-        retile();
+        // Cleanup removed windows — retile again to fill the gaps.
+        requestRetileAllDisplays();
+        flushRetileRequests();
     }
+
+    // Honour pending Ctrl-C / SIGTERM by exiting NSApp.run cleanly so the
+    // deferred cleanup (IPC socket unlink, layout free, restoreAllWindows)
+    // actually runs. Without this, NSApp keeps spinning and the next launch
+    // sees a live socket and bails out with AddressInUse.
+    if (g_shutdown_requested.load(.acquire)) {
+        gracefulStopNSApp();
+    }
+}
+
+/// Exit `[NSApp run]` cleanly by setting NSApplication's stop flag and posting
+/// a wake-up event. Must be called on the main thread inside the run loop.
+fn gracefulStopNSApp() void {
+    const NSApplication = objc.getClass("NSApplication") orelse return;
+    const app = NSApplication.msgSend(objc.Object, "sharedApplication", .{});
+    app.msgSend(void, "stop:", .{@as(?*anyopaque, null)});
+
+    // [NSApp stop:] only takes effect after nextEventMatchingMask: returns,
+    // so post a dummy event to ensure the run loop wakes and re-checks.
+    const NSEvent = objc.getClass("NSEvent") orelse return;
+    // NSEventTypeApplicationDefined = 15
+    const event = NSEvent.msgSend(
+        objc.Object,
+        "otherEventWithType:location:modifierFlags:timestamp:windowNumber:context:subtype:data1:data2:",
+        .{
+            @as(u64, 15),
+            NSPoint{ .x = 0, .y = 0 },
+            @as(u64, 0),
+            @as(f64, 0),
+            @as(i64, 0),
+            @as(?*anyopaque, null),
+            @as(i16, 0),
+            @as(i64, 0),
+            @as(i64, 0),
+        },
+    );
+    app.msgSend(void, "postEvent:atStart:", .{ event, true });
 }
 
 /// Accept and handle one IPC client connection — called by dispatch_source.
 export fn bw_handle_ipc_client(server_fd: c_int) void {
-    const client_fd = posix.accept(@intCast(server_fd), null, null, 0) catch |err| {
-        log.err("accept failed: {}", .{err});
+    // std.posix.accept was removed in Zig 0.16; call libc directly.
+    const client_fd = std.c.accept(server_fd, null, null);
+    if (client_fd < 0) {
+        log.err("accept failed: errno={d}", .{std.c._errno().*});
         return;
-    };
-    defer posix.close(client_fd);
-    const started_ns = std.time.nanoTimestamp();
+    }
+    defer _ = std.c.close(client_fd);
+    const started_ns = nanoTimestamp();
 
     var buf: [512]u8 = undefined;
     const n = posix.read(client_fd, &buf) catch |err| {
@@ -1965,26 +2041,26 @@ export fn bw_handle_ipc_client(server_fd: c_int) void {
     };
     if (n == 0) return;
 
-    const cmd = std.mem.trimRight(u8, buf[0..n], &.{ '\n', '\r', ' ', 0 });
+    const cmd = std.mem.trimEnd(u8, buf[0..n], &.{ '\n', '\r', ' ', 0 });
     if (cmd.len == 0) return;
     log.debug("[trace] ipc recv fd={} bytes={} cmd={s}", .{ client_fd, n, cmd });
 
     if (ipc.g_dispatch) |dispatch| {
         dispatch(cmd, client_fd);
-        const elapsed_ms = @divTrunc(std.time.nanoTimestamp() - started_ns, std.time.ns_per_ms);
+        const elapsed_ms = @divTrunc(nanoTimestamp() - started_ns, std.time.ns_per_ms);
         log.debug("[trace] ipc handled fd={} cmd={s} elapsed_ms={}", .{ client_fd, cmd, elapsed_ms });
     } else {
         log.warn("ipc dispatch callback missing", .{});
     }
 }
 
-/// Clean shutdown — called from status bar Quit action.
-export fn bw_will_quit() void {
+/// Clean shutdown — called from BWStatusBarDelegate.quit:.
+pub fn bw_will_quit() void {
     restoreAllWindows();
 }
 
-/// Retile — called from status bar Retile action.
-export fn bw_retile() void {
+/// Retile — called from BWStatusBarDelegate.retile:.
+pub fn bw_retile() void {
     retile();
 }
 
@@ -2032,14 +2108,9 @@ fn insertIntoLayout(workspace_id: u8, wid: u32) void {
 fn setLayoutLeafActive(workspace_id: u8, wid: u32) void {
     const root_ptr = layoutRootPtr(workspace_id);
     if (root_ptr.*) |*root| {
-        _ = layout.setLeafActive(root, wid);
+        const layout_wid = g_tab_groups.resolveLeader(wid);
+        _ = layout.setLeafActive(root, layout_wid);
     }
-}
-
-fn parseAxis(arg: []const u8) ?layout.Direction {
-    if (std.mem.eql(u8, arg, "horizontal")) return .horizontal;
-    if (std.mem.eql(u8, arg, "vertical")) return .vertical;
-    return null;
 }
 
 const FocusedLayoutContext = struct {
@@ -2293,9 +2364,7 @@ fn retile() void {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Event handling
-// ---------------------------------------------------------------------------
 
 fn handleEvent(ev: *const event_mod.Event) void {
     _ = processPendingFocusQueue();
@@ -2351,6 +2420,25 @@ fn handleEvent(ev: *const event_mod.Event) void {
         },
         .window_created => {
             log.info("window created pid={} wid={}", .{ ev.pid, ev.wid });
+
+            // Electron browsers (Chrome, Edge, Brave) fire kAXWindowCreatedNotification
+            // mid-drag during tab tear-out, before the window has settled. Defer these
+            // into the existing deferred-candidate pipeline so they are picked up after
+            // mouse-up, preventing a layout flash from tiling a half-positioned window.
+            if (g_mouse_left_down) {
+                if (g_store.get(ev.wid) == null) {
+                    // Mid-drag bounds may not be settled yet, so the inferred
+                    // display can be wrong; fall back to the focused display
+                    // and let processDeferredWindowCandidates re-derive on
+                    // promotion (it goes through addNewWindowManaged again).
+                    const display_id = inferDisplayIdForWindow(ev.wid) orelse focusedDisplayId();
+                    const ws = resolveWorkspace(ev.pid, display_id);
+                    trackDeferredWindowCandidate(ev.pid, ev.wid, ws.id, display_id);
+                    log.info("window created: deferred pid={} wid={} while mouse is down (tab tear-off guard)", .{ ev.pid, ev.wid });
+                }
+                return;
+            }
+
             addNewWindow(ev.pid, ev.wid);
             retile();
         },
@@ -2403,6 +2491,12 @@ fn handleEvent(ev: *const event_mod.Event) void {
                 retile();
             } else {
                 clearDragPreview();
+            }
+
+            // Flush windows that were deferred during the drag (tab tear-off guard).
+            // Processing them here avoids waiting for the next role_poll_tick.
+            if (processDeferredWindowCandidates()) {
+                retile();
             }
         },
         .window_moved, .window_resized => {
@@ -2465,7 +2559,7 @@ fn handleEvent(ev: *const event_mod.Event) void {
             g_bsp_split_mode = switch (g_bsp_split_mode) {
                 .auto => .horizontal,
                 .horizontal => .vertical,
-                .vertical => .horizontal,
+                .vertical => .auto,
             };
             log.info("split mode: {s}", .{@tagName(g_bsp_split_mode)});
         },
@@ -2503,9 +2597,7 @@ fn handleEvent(ev: *const event_mod.Event) void {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Window mode (tiled / floating / fullscreen)
-// ---------------------------------------------------------------------------
 
 fn setWindowMode(wid: u32, target: window_mod.WindowMode) void {
     var win = g_store.get(wid) orelse return;
@@ -2528,9 +2620,7 @@ fn setWindowMode(wid: u32, target: window_mod.WindowMode) void {
     retile();
 }
 
-// ---------------------------------------------------------------------------
 // Window management helpers
-// ---------------------------------------------------------------------------
 
 fn windowRoleState(pid: i32, wid: u32) WindowRoleState {
     std.debug.assert(wid != 0);
@@ -2835,7 +2925,11 @@ fn processPendingRoleWindows() bool {
             continue;
         }
 
-        if (addNewWindowManagedWithAssignment(candidate.pid, candidate.wid, candidate.workspace_id, candidate.display_id)) {
+        // Re-derive workspace+display from the current window position; the
+        // snapshot taken when the role gate first fired can be wrong if the
+        // window moved (e.g. tab tear-off across monitors) before its role
+        // settled.
+        if (addNewWindowManaged(candidate.pid, candidate.wid)) {
             added_any = true;
         }
     }
@@ -2936,7 +3030,14 @@ fn processDeferredWindowCandidates() bool {
 
     var added_any = false;
     for (promote_candidates[0..promote_count]) |candidate| {
-        if (addNewWindowManagedWithAssignment(candidate.pid, candidate.wid, candidate.workspace_id, candidate.display_id)) {
+        // Re-derive workspace+display from the *current* window position
+        // rather than the snapshot taken at deferral time. Mid-drag bounds
+        // can be stale or simply wrong (tab tear-off lands on a different
+        // monitor than the one focused when the window first appeared);
+        // by promotion time the window is guaranteed on-screen with stable
+        // bounds, so addNewWindowManaged's inferDisplayIdForWindow is the
+        // authoritative answer.
+        if (addNewWindowManaged(candidate.pid, candidate.wid)) {
             added_any = true;
         }
     }
@@ -3160,7 +3261,11 @@ fn addNewWindowManagedWithAssignment(pid: i32, wid: u32, workspace_id: u8, assig
 }
 
 fn addNewWindowManaged(pid: i32, wid: u32) bool {
-    const display_id = focusedDisplayId();
+    // Prefer the window's actual on-screen position over the currently
+    // focused display: a torn-off tab dropped on another monitor must land
+    // on the workspace that owns the destination monitor, not on whichever
+    // display happened to be focused when the window was created.
+    const display_id = inferDisplayIdForWindow(wid) orelse focusedDisplayId();
     const ws = resolveWorkspace(pid, display_id);
     return addNewWindowManagedWithAssignment(pid, wid, ws.id, display_id);
 }
@@ -3180,7 +3285,10 @@ fn addNewWindow(pid: i32, wid: u32) void {
             _ = addNewWindowManaged(pid, wid);
         },
         .pending => {
-            const display_id = focusedDisplayId();
+            // Same rationale as addNewWindowManaged: derive the display from
+            // the actual window position so a deferred candidate is later
+            // promoted onto the correct workspace+display.
+            const display_id = inferDisplayIdForWindow(wid) orelse focusedDisplayId();
             const ws = resolveWorkspace(pid, display_id);
             trackPendingRoleWindow(pid, wid, ws.id, display_id);
             trackDeferredWindowCandidate(pid, wid, ws.id, display_id);
@@ -3439,6 +3547,11 @@ fn cleanupWorkspaceWindowsForPid(pid: i32) bool {
     var truncated = false;
 
     for (&g_workspaces.workspaces) |*ws| {
+        // Windows on hidden workspaces are intentionally parked off-screen.
+        // AX role queries can be flaky for windows at corner positions,
+        // so skip hidden workspaces to avoid false positives.
+        if (!workspaceVisibleAnywhere(ws.id)) continue;
+
         for (ws.windows.items) |wid| {
             const win = g_store.get(wid) orelse continue;
             if (win.pid != pid) continue;
@@ -3737,9 +3850,7 @@ fn observeDiscoveredApps() void {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Crash / exit recovery — restore all hidden windows to screen center
-// ---------------------------------------------------------------------------
 
 fn restoreAllWindows() void {
     for (&g_workspaces.workspaces) |*ws| {
@@ -3759,29 +3870,63 @@ fn restoreAllWindows() void {
     }
 }
 
-fn crashSignalHandler(sig: c_int) callconv(.c) void {
+var g_shutdown_requested: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
+
+/// Graceful signal handler for INT/TERM/HUP/QUIT. Sets a flag and wakes the
+/// run loop so restoreAllWindows() runs on the main thread where AX calls and
+/// hash table access are safe. Only uses async-signal-safe operations.
+///
+/// CFRunLoopStop alone does NOT exit `[NSApp run]` reliably: NSApplication
+/// re-enters the CFRunLoop internally, so a stop is a no-op for its outer
+/// loop. Instead we set a flag and wake the existing waker source; the main
+/// thread (in bw_drain_events) sees the flag and performs `[NSApp stop:]` +
+/// posts a dummy event, which is the documented way to exit NSApp.run.
+///
+/// Zig 0.16 made `posix.SIG` an enum; the kernel-facing handler signature now
+/// takes that enum directly rather than `c_int`.
+fn gracefulSignalHandler(sig: posix.SIG) callconv(.c) void {
+    _ = sig;
+    g_shutdown_requested.store(true, .release);
+    signalWaker();
+}
+
+/// Crash signal handler for SEGV/BUS/TRAP/ABRT. Best-effort restore using
+/// async-signal-unsafe functions. May deadlock if the crash occurs mid-
+/// allocation or mid-hash-table-mutation, but leaving windows hidden is worse.
+fn crashSignalHandler(sig: posix.SIG) callconv(.c) void {
     restoreAllWindows();
 
-    // Re-raise with default handler so the OS produces a core dump / correct exit code
-    const sig_u8: u8 = @intCast(sig);
+    // Re-raise with default handler so the OS produces a core dump / correct exit code.
     var default_sa: posix.Sigaction = .{
         .handler = .{ .handler = posix.SIG.DFL },
         .mask = posix.sigemptyset(),
         .flags = 0,
     };
-    posix.sigaction(sig_u8, &default_sa, null);
-    posix.raise(sig_u8) catch {};
+    posix.sigaction(sig, &default_sa, null);
+    posix.raise(sig) catch {};
 }
 
 fn installCrashHandlers() void {
-    const signals = [_]u8{
-        posix.SIG.INT,  posix.SIG.TERM,
-        posix.SIG.HUP,  posix.SIG.QUIT,
+    // Graceful signals: handled safely via run loop stop + main-thread cleanup
+    const graceful_signals = [_]posix.SIG{
+        posix.SIG.INT, posix.SIG.TERM,
+        posix.SIG.HUP, posix.SIG.QUIT,
+    };
+    for (graceful_signals) |sig| {
+        var sa: posix.Sigaction = .{
+            .handler = .{ .handler = gracefulSignalHandler },
+            .mask = posix.sigemptyset(),
+            .flags = 0,
+        };
+        posix.sigaction(sig, &sa, null);
+    }
+
+    // Crash signals: best-effort restore, then re-raise for core dump
+    const crash_signals = [_]posix.SIG{
         posix.SIG.ABRT, posix.SIG.SEGV,
         posix.SIG.BUS,  posix.SIG.TRAP,
     };
-
-    for (signals) |sig| {
+    for (crash_signals) |sig| {
         var sa: posix.Sigaction = .{
             .handler = .{ .handler = crashSignalHandler },
             .mask = posix.sigemptyset(),
@@ -3791,9 +3936,7 @@ fn installCrashHandlers() void {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Tab group reconciliation
-// ---------------------------------------------------------------------------
 
 /// Called on kAXFocusedWindowChangedNotification — detects tab switches and
 /// forms/updates tab groups so only the active tab occupies a layout slot.
@@ -4060,9 +4203,7 @@ fn checkTabDragOut(_: i32, wid: u32) void {
     retile();
 }
 
-// ---------------------------------------------------------------------------
 // Workspace resolution (config-based app → workspace mapping)
-// ---------------------------------------------------------------------------
 
 /// Return the workspace a window should be placed on, checking
 /// config workspace_assignments by bundle ID before falling back
@@ -4080,9 +4221,7 @@ fn resolveWorkspace(pid: i32, display_id: u32) *workspace_mod.Workspace {
     return g_workspaces.get(ws_id) orelse g_workspaces.active();
 }
 
-// ---------------------------------------------------------------------------
 // Workspace switching
-// ---------------------------------------------------------------------------
 
 fn switchWorkspace(target_id: u8) void {
     const target_ws = g_workspaces.get(target_id) orelse return;
@@ -4094,9 +4233,6 @@ fn switchWorkspace(target_id: u8) void {
         setFocusedDisplay(target_display);
         updateStatusBar();
         focusWorkspaceWindow(target_ws);
-        if (g_workspace_transition.isActive()) {
-            clearWorkspaceTransition();
-        }
         return;
     }
 
@@ -4129,6 +4265,19 @@ fn switchWorkspace(target_id: u8) void {
     // Activate target; old workspace keeps its display_id (just hidden).
     g_workspaces.setActiveForDisplaySlot(display_slot, target_id);
     target_ws.display_id = target_display;
+
+    // Reconcile window display_ids: windows moved here while the workspace
+    // was hidden may carry a stale source display_id. Update them so
+    // retileDisplay (which filters on display_id) includes every window.
+    for (target_ws.windows.items) |wid| {
+        var win = g_store.get(wid) orelse continue;
+        if (win.display_id != target_display) {
+            win.display_id = target_display;
+            g_store.put(win) catch {};
+        }
+        updateTabGroupAssignment(wid, target_ws.id, target_display);
+    }
+
     assertDisplayCoverage();
 
     startWorkspaceTransition(.switch_workspace, target_id, target_display);
@@ -4137,9 +4286,6 @@ fn switchWorkspace(target_id: u8) void {
     updateStatusBar();
 
     focusWorkspaceWindow(target_ws);
-    if (g_workspace_transition.isActive()) {
-        clearWorkspaceTransition();
-    }
 }
 
 /// Focus the remembered (or first available) window on a workspace.
@@ -4166,6 +4312,23 @@ fn focusWorkspaceWindow(ws: *workspace_mod.Workspace) void {
 
     if (g_workspace_transition.isActive()) {
         g_pending_focus_count = 0;
+    }
+}
+
+fn updateTabGroupAssignment(leader_wid: u32, workspace_id: u8, display_id: u32) void {
+    std.debug.assert(leader_wid != 0);
+    std.debug.assert(workspace_id > 0 and workspace_id <= workspace_mod.max_workspaces);
+    std.debug.assert(display_id != 0);
+
+    const group = g_tab_groups.groupOf(leader_wid) orelse return;
+    if (group.leader_wid != leader_wid) return;
+
+    for (group.members.items) |member_wid| {
+        if (member_wid == leader_wid) continue;
+        var member = g_store.get(member_wid) orelse continue;
+        member.workspace_id = workspace_id;
+        member.display_id = display_id;
+        g_store.put(member) catch {};
     }
 }
 
@@ -4211,15 +4374,21 @@ fn moveWindowToWorkspace(target_id: u8) void {
         target_ws.focused_wid = wid;
     }
 
-    // Update window's workspace_id
+    // Update window metadata. Use the target workspace's display so that
+    // retileDisplay (which filters on display_id) will include this window
+    // when the target workspace becomes visible. Fall back to the source
+    // display for hidden workspaces with no assigned display yet —
+    // switchWorkspace will correct it when the workspace is activated.
     updated.workspace_id = target_id;
-    updated.display_id = display_id;
+    updated.display_id = target_ws.display_id orelse display_id;
     g_store.put(updated) catch {};
+    updateTabGroupAssignment(wid, target_id, updated.display_id);
 
-    // If target is not visible, hide the window
-    if (!workspaceVisibleOnDisplay(target_id, display_id)) {
-        if (g_store.get(wid)) |win| {
-            hideWindow(win.pid, wid);
+    // If target is not visible on the window's new display, hide it.
+    if (!workspaceVisibleOnDisplay(target_id, updated.display_id)) {
+        const visible_wid = g_tab_groups.resolveActive(wid);
+        if (g_store.get(visible_wid)) |win| {
+            hideWindow(win.pid, visible_wid);
         }
     }
 
@@ -4262,6 +4431,7 @@ fn moveManagedWindowToDisplay(wid: u32, target_display_id: u32) bool {
             }
             return false;
         };
+        updateTabGroupAssignment(wid, target_workspace_id, target_display_id);
 
         removeFromLayout(source_workspace_id, wid);
         source_ws.removeWindow(wid);
@@ -4275,6 +4445,7 @@ fn moveManagedWindowToDisplay(wid: u32, target_display_id: u32) bool {
         removeFromLayout(source_workspace_id, wid);
         win.display_id = target_display_id;
         g_store.put(win) catch return false;
+        updateTabGroupAssignment(wid, source_workspace_id, target_display_id);
         if (win.mode == .tiled) {
             insertIntoLayout(source_workspace_id, wid);
         }
@@ -4355,6 +4526,7 @@ fn moveWorkspaceToDisplay(target_display_slot: usize) void {
             var updated = w;
             updated.display_id = target_display_id;
             g_store.put(updated) catch {};
+            updateTabGroupAssignment(wid, moving_ws.id, target_display_id);
         }
     }
 
@@ -4392,9 +4564,6 @@ fn moveWorkspaceToDisplay(target_display_slot: usize) void {
             focusWorkspaceWindow(ws);
         }
     }
-    if (g_workspace_transition.isActive()) {
-        clearWorkspaceTransition();
-    }
 }
 
 fn moveWorkspaceToDisplayNext() void {
@@ -4411,11 +4580,9 @@ fn moveWorkspaceToDisplayPrev() void {
     moveWorkspaceToDisplay(target_slot);
 }
 
-// ---------------------------------------------------------------------------
 // Focus direction
-// ---------------------------------------------------------------------------
 
-const FocusDir = enum { left, right, up, down };
+const FocusDir = ipc.IpcCommand.FocusDir;
 
 fn focusDirection(dir: FocusDir) void {
     const ws = g_workspaces.active();
@@ -4482,259 +4649,171 @@ fn focusDirection(dir: FocusDir) void {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Service command parsing
-// ---------------------------------------------------------------------------
-
-fn parseServiceCommand(cmd: []const u8) ?launchd.Command {
-    const prefix = "service ";
-    if (!std.mem.startsWith(u8, cmd, prefix)) return null;
-    const sub = cmd[prefix.len..];
-    return std.meta.stringToEnum(launchd.Command, sub);
-}
-
-// ---------------------------------------------------------------------------
 // IPC command dispatch
-// ---------------------------------------------------------------------------
 
 fn ipcDispatch(cmd: []const u8, client_fd: posix.socket_t) void {
-    const started_ns = std.time.nanoTimestamp();
+    const started_ns = nanoTimestamp();
     defer {
-        const elapsed_ms = @divTrunc(std.time.nanoTimestamp() - started_ns, std.time.ns_per_ms);
+        const elapsed_ms = @divTrunc(nanoTimestamp() - started_ns, std.time.ns_per_ms);
         log.debug("[trace] ipc dispatch cmd={s} elapsed_ms={}", .{ cmd, elapsed_ms });
     }
 
-    if (std.mem.eql(u8, cmd, "retile")) {
-        retile();
-        ipc.writeResponse(client_fd, "ok\n");
-    } else if (std.mem.eql(u8, cmd, "toggle-split")) {
-        g_bsp_split_mode = switch (g_bsp_split_mode) {
-            .auto => .horizontal,
-            .horizontal => .vertical,
-            .vertical => .horizontal,
-        };
-        ipc.writeResponse(client_fd, "ok\n");
-    } else if (std.mem.startsWith(u8, cmd, "bsp ratio rel ")) {
-        const arg = cmd["bsp ratio rel ".len..];
-        const delta = std.fmt.parseFloat(f64, arg) catch {
-            ipc.writeResponse(client_fd, "err: invalid ratio delta\n");
-            return;
-        };
-        const ctx = focusedLayoutContext() orelse {
-            ipc.writeResponse(client_fd, "err: no focused managed window\n");
-            return;
-        };
-        if (!layout.adjustParentRatio(ctx.root, ctx.focused_wid, delta)) {
-            ipc.writeResponse(client_fd, "err: no parent split\n");
-            return;
-        }
-        retileDisplay(ctx.focused_win.display_id);
-        ipc.writeResponse(client_fd, "ok\n");
-    } else if (std.mem.startsWith(u8, cmd, "bsp insert-mode ")) {
-        const arg = cmd["bsp insert-mode ".len..];
-        if (std.mem.eql(u8, arg, "split")) {
-            g_config.bsp_insert_mode = .split;
-        } else if (std.mem.eql(u8, arg, "stack")) {
-            g_config.bsp_insert_mode = .stack;
-        } else {
-            ipc.writeResponse(client_fd, "err: expected split|stack\n");
-            return;
-        }
-        ipc.writeResponse(client_fd, "ok\n");
-    } else if (std.mem.startsWith(u8, cmd, "bsp insert-point ")) {
-        const arg = cmd["bsp insert-point ".len..];
-        if (std.mem.eql(u8, arg, "focused")) {
-            g_config.bsp_insert_point = .focused;
-        } else if (std.mem.eql(u8, arg, "first")) {
-            g_config.bsp_insert_point = .first;
-        } else if (std.mem.eql(u8, arg, "last")) {
-            g_config.bsp_insert_point = .last;
-        } else if (std.mem.eql(u8, arg, "min_depth")) {
-            g_config.bsp_insert_point = .min_depth;
-        } else {
-            ipc.writeResponse(client_fd, "err: expected focused|first|last|min_depth\n");
-            return;
-        }
-        ipc.writeResponse(client_fd, "ok\n");
-    } else if (std.mem.startsWith(u8, cmd, "bsp ratio abs ")) {
-        const arg = cmd["bsp ratio abs ".len..];
-        const ratio = std.fmt.parseFloat(f64, arg) catch {
-            ipc.writeResponse(client_fd, "err: invalid ratio\n");
-            return;
-        };
-        const ctx = focusedLayoutContext() orelse {
-            ipc.writeResponse(client_fd, "err: no focused managed window\n");
-            return;
-        };
-        if (!layout.setParentRatio(ctx.root, ctx.focused_wid, ratio)) {
-            ipc.writeResponse(client_fd, "err: no parent split\n");
-            return;
-        }
-        retileDisplay(ctx.focused_win.display_id);
-        ipc.writeResponse(client_fd, "ok\n");
-    } else if (std.mem.startsWith(u8, cmd, "bsp mirror ")) {
-        const axis = parseAxis(cmd["bsp mirror ".len..]) orelse {
-            ipc.writeResponse(client_fd, "err: expected horizontal|vertical\n");
-            return;
-        };
-        const ws = g_workspaces.active();
-        const wid = ws.focused_wid orelse {
-            ipc.writeResponse(client_fd, "err: no focused window\n");
-            return;
-        };
-        const win = g_store.get(wid) orelse {
-            ipc.writeResponse(client_fd, "err: focused window not managed\n");
-            return;
-        };
-        const root_ptr = layoutRootPtr(win.workspace_id);
-        if (root_ptr.*) |*root| {
-            layout.mirror(root, axis);
-            retileDisplay(win.display_id);
+    const command = ipc.IpcCommand.parse(cmd) orelse {
+        ipc.writeResponse(client_fd, "err: unknown or invalid command\n");
+        return;
+    };
+
+    switch (command) {
+        .retile => {
+            retile();
             ipc.writeResponse(client_fd, "ok\n");
-        } else {
-            ipc.writeResponse(client_fd, "err: no layout root\n");
-        }
-    } else if (std.mem.eql(u8, cmd, "bsp equalize")) {
-        const ws = g_workspaces.active();
-        const wid = ws.focused_wid orelse {
-            ipc.writeResponse(client_fd, "err: no focused window\n");
-            return;
-        };
-        const win = g_store.get(wid) orelse {
-            ipc.writeResponse(client_fd, "err: focused window not managed\n");
-            return;
-        };
-        const root_ptr = layoutRootPtr(win.workspace_id);
-        if (root_ptr.*) |*root| {
-            layout.equalize(root, null, g_config.bsp_split_ratio);
-            retileDisplay(win.display_id);
+        },
+        .toggle_split => {
+            g_bsp_split_mode = switch (g_bsp_split_mode) {
+                .auto => .horizontal,
+                .horizontal => .vertical,
+                .vertical => .auto,
+            };
             ipc.writeResponse(client_fd, "ok\n");
-        } else {
-            ipc.writeResponse(client_fd, "err: no layout root\n");
-        }
-    } else if (std.mem.eql(u8, cmd, "bsp balance")) {
-        const ws = g_workspaces.active();
-        const wid = ws.focused_wid orelse {
-            ipc.writeResponse(client_fd, "err: no focused window\n");
-            return;
-        };
-        const win = g_store.get(wid) orelse {
-            ipc.writeResponse(client_fd, "err: focused window not managed\n");
-            return;
-        };
-        const root_ptr = layoutRootPtr(win.workspace_id);
-        if (root_ptr.*) |*root| {
-            _ = layout.balance(root, null);
-            retileDisplay(win.display_id);
+        },
+        .focus => |dir| {
+            focusDirection(dir);
             ipc.writeResponse(client_fd, "ok\n");
-        } else {
-            ipc.writeResponse(client_fd, "err: no layout root\n");
-        }
-    } else if (std.mem.startsWith(u8, cmd, "bsp rotate ")) {
-        const arg = cmd["bsp rotate ".len..];
-        const degrees = std.fmt.parseInt(i32, arg, 10) catch {
-            ipc.writeResponse(client_fd, "err: invalid degrees\n");
-            return;
-        };
-        if (!(degrees == 90 or degrees == 180 or degrees == 270)) {
-            ipc.writeResponse(client_fd, "err: expected 90|180|270\n");
-            return;
-        }
-        const ws = g_workspaces.active();
-        const wid = ws.focused_wid orelse {
-            ipc.writeResponse(client_fd, "err: no focused window\n");
-            return;
-        };
-        const win = g_store.get(wid) orelse {
-            ipc.writeResponse(client_fd, "err: focused window not managed\n");
-            return;
-        };
-        const root_ptr = layoutRootPtr(win.workspace_id);
-        if (root_ptr.*) |*root| {
-            layout.rotate(root, degrees);
-            retileDisplay(win.display_id);
+        },
+        .focus_workspace => |n| {
+            switchWorkspace(n);
             ipc.writeResponse(client_fd, "ok\n");
-        } else {
-            ipc.writeResponse(client_fd, "err: no layout root\n");
-        }
-    } else if (std.mem.startsWith(u8, cmd, "focus-workspace ")) {
-        const arg = cmd["focus-workspace ".len..];
-        const n = std.fmt.parseInt(u8, arg, 10) catch {
-            ipc.writeResponse(client_fd, "err: invalid workspace number\n");
-            return;
-        };
-        switchWorkspace(n);
-        ipc.writeResponse(client_fd, "ok\n");
-    } else if (std.mem.startsWith(u8, cmd, "move-to-workspace ")) {
-        const arg = cmd["move-to-workspace ".len..];
-        const n = std.fmt.parseInt(u8, arg, 10) catch {
-            ipc.writeResponse(client_fd, "err: invalid workspace number\n");
-            return;
-        };
-        moveWindowToWorkspace(n);
-        ipc.writeResponse(client_fd, "ok\n");
-    } else if (std.mem.startsWith(u8, cmd, "move-to-display ")) {
-        const arg = cmd["move-to-display ".len..];
-        const n = std.fmt.parseInt(u8, arg, 10) catch {
-            ipc.writeResponse(client_fd, "err: invalid display number\n");
-            return;
-        };
-        moveWindowToDisplay(n);
-        ipc.writeResponse(client_fd, "ok\n");
-    } else if (std.mem.startsWith(u8, cmd, "move-workspace-to-display ")) {
-        const arg = cmd["move-workspace-to-display ".len..];
-        if (std.mem.eql(u8, arg, "next")) {
-            moveWorkspaceToDisplayNext();
+        },
+        .move_to_workspace => |n| {
+            moveWindowToWorkspace(n);
             ipc.writeResponse(client_fd, "ok\n");
-        } else if (std.mem.eql(u8, arg, "prev")) {
-            moveWorkspaceToDisplayPrev();
+        },
+        .move_to_display => |n| {
+            moveWindowToDisplay(n);
             ipc.writeResponse(client_fd, "ok\n");
-        } else {
-            const n = std.fmt.parseInt(u8, arg, 10) catch {
-                ipc.writeResponse(client_fd, "err: invalid display number, expected next|prev|<number>\n");
+        },
+        .move_workspace_to_display => |target| switch (target) {
+            .next => {
+                moveWorkspaceToDisplayNext();
+                ipc.writeResponse(client_fd, "ok\n");
+            },
+            .prev => {
+                moveWorkspaceToDisplayPrev();
+                ipc.writeResponse(client_fd, "ok\n");
+            },
+            .index => |n| {
+                if (n == 0) {
+                    ipc.writeResponse(client_fd, "err: display number starts at 1\n");
+                    return;
+                }
+                moveWorkspaceToDisplay(@as(usize, n) - 1);
+                ipc.writeResponse(client_fd, "ok\n");
+            },
+        },
+        .bsp_ratio_rel => |delta| {
+            const ctx = focusedLayoutContext() orelse {
+                ipc.writeResponse(client_fd, "err: no focused managed window\n");
                 return;
             };
-            if (n == 0) {
-                ipc.writeResponse(client_fd, "err: display number starts at 1\n");
+            if (!layout.adjustParentRatio(ctx.root, ctx.focused_wid, delta)) {
+                ipc.writeResponse(client_fd, "err: no parent split\n");
                 return;
             }
-            moveWorkspaceToDisplay(@as(usize, n) - 1);
+            retileDisplay(ctx.focused_win.display_id);
             ipc.writeResponse(client_fd, "ok\n");
-        }
-    } else if (std.mem.startsWith(u8, cmd, "focus ")) {
-        const dir_str = cmd["focus ".len..];
-        if (std.mem.eql(u8, dir_str, "left")) {
-            focusDirection(.left);
-        } else if (std.mem.eql(u8, dir_str, "right")) {
-            focusDirection(.right);
-        } else if (std.mem.eql(u8, dir_str, "up")) {
-            focusDirection(.up);
-        } else if (std.mem.eql(u8, dir_str, "down")) {
-            focusDirection(.down);
-        } else {
-            ipc.writeResponse(client_fd, "err: expected left|right|up|down\n");
-            return;
-        }
-        ipc.writeResponse(client_fd, "ok\n");
-    } else if (std.mem.eql(u8, cmd, "query windows")) {
-        ipcQueryWindows(client_fd);
-    } else if (std.mem.eql(u8, cmd, "query workspaces")) {
-        ipcQueryWorkspaces(client_fd);
-    } else if (std.mem.eql(u8, cmd, "query displays")) {
-        ipcQueryDisplays(client_fd);
-    } else if (std.mem.eql(u8, cmd, "query apps")) {
-        ipcQueryApps(client_fd);
-    } else {
-        ipc.writeResponse(client_fd, "err: unknown command\n");
+        },
+        .bsp_ratio_abs => |ratio| {
+            const ctx = focusedLayoutContext() orelse {
+                ipc.writeResponse(client_fd, "err: no focused managed window\n");
+                return;
+            };
+            if (!layout.setParentRatio(ctx.root, ctx.focused_wid, ratio)) {
+                ipc.writeResponse(client_fd, "err: no parent split\n");
+                return;
+            }
+            retileDisplay(ctx.focused_win.display_id);
+            ipc.writeResponse(client_fd, "ok\n");
+        },
+        .bsp_insert_mode => |mode| {
+            g_config.bsp_insert_mode = mode;
+            ipc.writeResponse(client_fd, "ok\n");
+        },
+        .bsp_insert_point => |point| {
+            g_config.bsp_insert_point = point;
+            ipc.writeResponse(client_fd, "ok\n");
+        },
+        .bsp_mirror => |axis| {
+            const ctx = focusedLayoutContext() orelse {
+                ipc.writeResponse(client_fd, "err: no focused managed window\n");
+                return;
+            };
+            const root_ptr = layoutRootPtr(ctx.focused_win.workspace_id);
+            if (root_ptr.*) |*root| {
+                layout.mirror(root, axis);
+                retileDisplay(ctx.focused_win.display_id);
+                ipc.writeResponse(client_fd, "ok\n");
+            } else {
+                ipc.writeResponse(client_fd, "err: no layout root\n");
+            }
+        },
+        .bsp_equalize => {
+            const ctx = focusedLayoutContext() orelse {
+                ipc.writeResponse(client_fd, "err: no focused managed window\n");
+                return;
+            };
+            const root_ptr = layoutRootPtr(ctx.focused_win.workspace_id);
+            if (root_ptr.*) |*root| {
+                layout.equalize(root, null, g_config.bsp_split_ratio);
+                retileDisplay(ctx.focused_win.display_id);
+                ipc.writeResponse(client_fd, "ok\n");
+            } else {
+                ipc.writeResponse(client_fd, "err: no layout root\n");
+            }
+        },
+        .bsp_balance => {
+            const ctx = focusedLayoutContext() orelse {
+                ipc.writeResponse(client_fd, "err: no focused managed window\n");
+                return;
+            };
+            const root_ptr = layoutRootPtr(ctx.focused_win.workspace_id);
+            if (root_ptr.*) |*root| {
+                _ = layout.balance(root, null);
+                retileDisplay(ctx.focused_win.display_id);
+                ipc.writeResponse(client_fd, "ok\n");
+            } else {
+                ipc.writeResponse(client_fd, "err: no layout root\n");
+            }
+        },
+        .bsp_rotate => |degrees| {
+            if (!(degrees == 90 or degrees == 180 or degrees == 270)) {
+                ipc.writeResponse(client_fd, "err: expected 90|180|270\n");
+                return;
+            }
+            const ctx = focusedLayoutContext() orelse {
+                ipc.writeResponse(client_fd, "err: no focused managed window\n");
+                return;
+            };
+            const root_ptr = layoutRootPtr(ctx.focused_win.workspace_id);
+            if (root_ptr.*) |*root| {
+                layout.rotate(root, degrees);
+                retileDisplay(ctx.focused_win.display_id);
+                ipc.writeResponse(client_fd, "ok\n");
+            } else {
+                ipc.writeResponse(client_fd, "err: no layout root\n");
+            }
+        },
+        .query_windows => ipcQueryWindows(client_fd),
+        .query_workspaces => ipcQueryWorkspaces(client_fd),
+        .query_displays => ipcQueryDisplays(client_fd),
+        .query_apps => ipcQueryApps(client_fd),
     }
 }
 
 fn ipcQueryWindows(fd: posix.socket_t) void {
-    const started_ns = std.time.nanoTimestamp();
+    const started_ns = nanoTimestamp();
     const ws = g_workspaces.active();
     var buf: [8192]u8 = undefined;
-    var fbs = std.io.fixedBufferStream(&buf);
-    const w = fbs.writer();
+    var w = std.Io.Writer.fixed(&buf);
     var written: usize = 0;
 
     for (ws.windows.items) |wid| {
@@ -4751,17 +4830,16 @@ fn ipcQueryWindows(fd: posix.socket_t) void {
         }
     }
 
-    const payload = fbs.getWritten();
+    const payload = w.buffered();
     ipc.writeResponse(fd, payload);
-    const elapsed_ms = @divTrunc(std.time.nanoTimestamp() - started_ns, std.time.ns_per_ms);
+    const elapsed_ms = @divTrunc(nanoTimestamp() - started_ns, std.time.ns_per_ms);
     log.debug("[trace] query windows rows={} bytes={} elapsed_ms={}", .{ written, payload.len, elapsed_ms });
 }
 
 fn ipcQueryApps(fd: posix.socket_t) void {
-    const started_ns = std.time.nanoTimestamp();
+    const started_ns = nanoTimestamp();
     var buf: [8192]u8 = undefined;
-    var fbs = std.io.fixedBufferStream(&buf);
-    const w = fbs.writer();
+    var w = std.Io.Writer.fixed(&buf);
 
     var seen_pids: [256]i32 = undefined;
     var seen_count: usize = 0;
@@ -4793,17 +4871,16 @@ fn ipcQueryApps(fd: posix.socket_t) void {
         }
     }
 
-    const payload = fbs.getWritten();
+    const payload = w.buffered();
     ipc.writeResponse(fd, payload);
-    const elapsed_ms = @divTrunc(std.time.nanoTimestamp() - started_ns, std.time.ns_per_ms);
+    const elapsed_ms = @divTrunc(nanoTimestamp() - started_ns, std.time.ns_per_ms);
     log.debug("[trace] query apps rows={} unique_pids={} bytes={} elapsed_ms={}", .{ written, seen_count, payload.len, elapsed_ms });
 }
 
 fn ipcQueryWorkspaces(fd: posix.socket_t) void {
-    const started_ns = std.time.nanoTimestamp();
+    const started_ns = nanoTimestamp();
     var buf: [1024]u8 = undefined;
-    var fbs = std.io.fixedBufferStream(&buf);
-    const w = fbs.writer();
+    var w = std.Io.Writer.fixed(&buf);
 
     for (&g_workspaces.workspaces) |*ws| {
         const focused: u32 = ws.focused_wid orelse 0;
@@ -4815,16 +4892,15 @@ fn ipcQueryWorkspaces(fd: posix.socket_t) void {
         }) catch break;
     }
 
-    const payload = fbs.getWritten();
+    const payload = w.buffered();
     ipc.writeResponse(fd, payload);
-    const elapsed_ms = @divTrunc(std.time.nanoTimestamp() - started_ns, std.time.ns_per_ms);
+    const elapsed_ms = @divTrunc(nanoTimestamp() - started_ns, std.time.ns_per_ms);
     log.debug("[trace] query workspaces rows={} bytes={} elapsed_ms={}", .{ g_workspaces.workspaces.len, payload.len, elapsed_ms });
 }
 
 fn ipcQueryDisplays(fd: posix.socket_t) void {
     var buf: [2048]u8 = undefined;
-    var fbs = std.io.fixedBufferStream(&buf);
-    const w = fbs.writer();
+    var w = std.Io.Writer.fixed(&buf);
 
     for (g_displays[0..g_display_count], 0..) |display, slot| {
         const workspace_id = g_workspaces.activeIdForDisplaySlot(slot);
@@ -4839,5 +4915,5 @@ fn ipcQueryDisplays(fd: posix.socket_t) void {
         }) catch break;
     }
 
-    ipc.writeResponse(fd, fbs.getWritten());
+    ipc.writeResponse(fd, w.buffered());
 }

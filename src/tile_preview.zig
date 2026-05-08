@@ -6,9 +6,7 @@
 
 const std = @import("std");
 const objc = @import("objc");
-const c = @cImport({
-    @cInclude("ApplicationServices/ApplicationServices.h");
-});
+const c = @import("c");
 
 const NSPoint = extern struct {
     x: f64,

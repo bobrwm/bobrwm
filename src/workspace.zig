@@ -16,7 +16,7 @@ pub const Workspace = struct {
     pub fn init(allocator: std.mem.Allocator, id: WorkspaceId) Workspace {
         return .{
             .id = id,
-            .windows = .{},
+            .windows = .empty,
             .focused_wid = null,
             .allocator = allocator,
         };
@@ -45,7 +45,7 @@ pub const Workspace = struct {
     pub fn removeWindow(self: *Workspace, wid: Window.WindowId) void {
         for (self.windows.items, 0..) |existing, i| {
             if (existing == wid) {
-                _ = self.windows.swapRemove(i);
+                _ = self.windows.orderedRemove(i);
                 if (self.focused_wid == wid) {
                     self.focused_wid = if (self.windows.items.len > 0) self.windows.items[0] else null;
                 }

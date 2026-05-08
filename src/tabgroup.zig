@@ -56,7 +56,7 @@ pub const TabGroupManager = struct {
         const id = self.next_id;
         self.next_id += 1;
 
-        var members: std.ArrayListUnmanaged(WindowId) = .{};
+        var members: std.ArrayListUnmanaged(WindowId) = .empty;
         try members.ensureTotalCapacity(self.allocator, 4);
         try members.append(self.allocator, wid);
 

@@ -5,12 +5,20 @@
 //! the binary path — no app bundle needed.
 
 const std = @import("std");
+const posix = std.posix;
+const osutil = @import("osutil.zig");
 
 const log = std.log.scoped(.launchd);
 
 const label = "com.bobrwm.bobrwm";
 const plist_rel = "Library/LaunchAgents/" ++ label ++ ".plist";
 const plist_template = @embedFile("launchd_plist");
+
+// Zig 0.16 reworked std.process.Child to require an Io instance for spawn
+// and wait. The release notes explicitly endorse "go lower" (libc) as an
+// alternative to "go higher" (std.Io); std.c re-exports the libc syscalls
+// we need. execvp is not surfaced by std.c, so declare just that locally.
+extern "c" fn execvp(file: [*:0]const u8, argv: [*:null]const ?[*:0]const u8) c_int;
 
 pub const Error = error{
     HomeNotSet,
@@ -31,10 +39,16 @@ pub const Command = enum {
     restart,
 };
 
-pub fn run(cmd: Command) void {
-    const stderr = std.fs.File.stderr();
-    const stdout = std.fs.File.stdout();
+fn writeFd(fd: c_int, bytes: []const u8) void {
+    var remaining = bytes;
+    while (remaining.len > 0) {
+        const n = std.c.write(fd, remaining.ptr, remaining.len);
+        if (n <= 0) return;
+        remaining = remaining[@intCast(n)..];
+    }
+}
 
+pub fn run(cmd: Command) void {
     const result: Error!void = switch (cmd) {
         .install => serviceInstall(),
         .uninstall => serviceUninstall(),
@@ -51,7 +65,7 @@ pub fn run(cmd: Command) void {
             .stop => "service stopped.\n",
             .restart => "service restarted.\n",
         };
-        stdout.writeAll(msg) catch {};
+        writeFd(posix.STDOUT_FILENO, msg);
     } else |err| {
         const msg = switch (err) {
             error.HomeNotSet => "error: HOME not set\n",
@@ -63,16 +77,14 @@ pub fn run(cmd: Command) void {
             error.NotInstalled => "error: service is not installed\n",
             error.StillRunning => "error: service is still running; stop it first\n",
         };
-        stderr.writeAll(msg) catch {};
+        writeFd(posix.STDERR_FILENO, msg);
     }
 }
 
-// ---------------------------------------------------------------------------
 // Service commands
-// ---------------------------------------------------------------------------
 
 fn serviceInstall() Error!void {
-    const home = std.posix.getenv("HOME") orelse return error.HomeNotSet;
+    const home = osutil.getenv("HOME") orelse return error.HomeNotSet;
     var path_buf: [1024]u8 = undefined;
     const path = plistPath(&path_buf, home) orelse return error.PathTooLong;
 
@@ -86,18 +98,18 @@ fn serviceInstall() Error!void {
 }
 
 fn serviceUninstall() Error!void {
-    const home = std.posix.getenv("HOME") orelse return error.HomeNotSet;
+    const home = osutil.getenv("HOME") orelse return error.HomeNotSet;
     var path_buf: [1024]u8 = undefined;
     const path = plistPath(&path_buf, home) orelse return error.PathTooLong;
 
     if (!fileExists(path)) return error.NotInstalled;
     if (serviceIsRunning()) return error.StillRunning;
 
-    std.fs.cwd().deleteFile(path) catch {};
+    deleteFile(path);
 }
 
 fn serviceStart() Error!void {
-    const home = std.posix.getenv("HOME") orelse return error.HomeNotSet;
+    const home = osutil.getenv("HOME") orelse return error.HomeNotSet;
     var path_buf: [1024]u8 = undefined;
     const path = plistPath(&path_buf, home) orelse return error.PathTooLong;
 
@@ -123,7 +135,7 @@ fn serviceStart() Error!void {
 }
 
 fn serviceStop() Error!void {
-    const home = std.posix.getenv("HOME") orelse return error.HomeNotSet;
+    const home = osutil.getenv("HOME") orelse return error.HomeNotSet;
     var path_buf: [1024]u8 = undefined;
     const path = plistPath(&path_buf, home) orelse return error.PathTooLong;
 
@@ -144,7 +156,7 @@ fn serviceStop() Error!void {
 
 fn serviceRestart() Error!void {
     var path_buf: [1024]u8 = undefined;
-    const home = std.posix.getenv("HOME") orelse return error.HomeNotSet;
+    const home = osutil.getenv("HOME") orelse return error.HomeNotSet;
     const path = plistPath(&path_buf, home) orelse return error.PathTooLong;
 
     if (!fileExists(path)) return error.NotInstalled;
@@ -155,9 +167,7 @@ fn serviceRestart() Error!void {
     runLaunchctl(&.{ "launchctl", "kickstart", "-k", target });
 }
 
-// ---------------------------------------------------------------------------
 // Helpers
-// ---------------------------------------------------------------------------
 
 fn plistPath(buf: *[1024]u8, home: []const u8) ?[]const u8 {
     return std.fmt.bufPrint(buf, "{s}/{s}", .{ home, plist_rel }) catch null;
@@ -174,33 +184,56 @@ fn domainTarget(buf: *[32]u8) ?[]const u8 {
 fn serviceIsRunning() bool {
     var tbuf: [128]u8 = undefined;
     const target = serviceTarget(&tbuf) orelse return false;
-    var child = std.process.Child.init(
-        &.{ "launchctl", "print", target },
-        std.heap.page_allocator,
-    );
-    child.stdout_behavior = .Ignore;
-    child.stderr_behavior = .Ignore;
-    child.spawn() catch return false;
-    const term = child.wait() catch return false;
-    return term.Exited == 0;
+    // Suppress launchctl print's noisy output by redirecting both fds to
+    // /dev/null in the child.
+    return runProcess(&.{ "launchctl", "print", target }, .silent) == 0;
 }
 
 fn fileExists(path: []const u8) bool {
-    std.fs.cwd().access(path, .{}) catch return false;
-    return true;
+    const alloc = std.heap.page_allocator;
+    const path_z = alloc.dupeZ(u8, path) catch return false;
+    defer alloc.free(path_z);
+    return osutil.pathExists(path_z);
+}
+
+fn deleteFile(path: []const u8) void {
+    const alloc = std.heap.page_allocator;
+    const path_z = alloc.dupeZ(u8, path) catch return;
+    defer alloc.free(path_z);
+    osutil.deleteFile(path_z);
+}
+
+fn writeFile(path: []const u8, data: []const u8) Error!void {
+    const alloc = std.heap.page_allocator;
+    const path_z = alloc.dupeZ(u8, path) catch return error.PlistWrite;
+    defer alloc.free(path_z);
+    if (!osutil.writeFile(path_z, data)) return error.PlistWrite;
+}
+
+fn readFile(alloc: std.mem.Allocator, path: []const u8, max: usize) ?[]u8 {
+    const path_z = alloc.dupeZ(u8, path) catch return null;
+    defer alloc.free(path_z);
+    return osutil.readFileAlloc(alloc, path_z, max);
+}
+
+fn fileSize(path: []const u8) ?usize {
+    const alloc = std.heap.page_allocator;
+    const data = readFile(alloc, path, 1024 * 64) orelse return null;
+    defer alloc.free(data);
+    return data.len;
 }
 
 fn installPlist(path: []const u8, home: []const u8) Error!void {
     // Ensure LaunchAgents directory exists
+    const alloc = std.heap.page_allocator;
     var agents_buf: [1024]u8 = undefined;
     const agents_dir = std.fmt.bufPrint(&agents_buf, "{s}/Library/LaunchAgents", .{home}) catch
         return error.PathTooLong;
-    std.fs.cwd().makePath(agents_dir) catch {};
+    _ = osutil.makePath(alloc, agents_dir);
 
-    const alloc = std.heap.page_allocator;
     const plist = generatePlist(alloc) orelse return error.PlistWrite;
     defer alloc.free(plist);
-    writeFile(path, plist) catch return error.PlistWrite;
+    try writeFile(path, plist);
 }
 
 fn ensurePlistUpToDate(path: []const u8) void {
@@ -208,29 +241,33 @@ fn ensurePlistUpToDate(path: []const u8) void {
     const desired = generatePlist(alloc) orelse return;
     defer alloc.free(desired);
 
-    const file = std.fs.cwd().openFile(path, .{}) catch return;
-    defer file.close();
-
-    const stat = file.stat() catch return;
-    if (stat.size != desired.len) {
+    const existing = readFile(alloc, path, 1024 * 64) orelse {
         writeFile(path, desired) catch {};
         return;
-    }
-
-    // Read existing and compare
-    const existing = file.readToEndAlloc(alloc, 1024 * 64) catch return;
+    };
     defer alloc.free(existing);
+
     if (!std.mem.eql(u8, existing, desired)) {
         writeFile(path, desired) catch {};
     }
 }
 
+fn selfExePathAlloc(alloc: std.mem.Allocator) ?[]u8 {
+    var buf: [4096]u8 = undefined;
+    var n: u32 = buf.len;
+    if (std.c._NSGetExecutablePath(&buf, &n) != 0) return null;
+    const len = std.mem.indexOfScalar(u8, &buf, 0) orelse return null;
+    const out = alloc.alloc(u8, len) catch return null;
+    @memcpy(out, buf[0..len]);
+    return out;
+}
+
 fn generatePlist(alloc: std.mem.Allocator) ?[]u8 {
-    const exe_path = std.fs.selfExePathAlloc(alloc) catch return null;
+    const exe_path = selfExePathAlloc(alloc) orelse return null;
     defer alloc.free(exe_path);
 
-    const env_path = std.posix.getenv("PATH") orelse "/usr/local/bin:/usr/bin:/bin";
-    const user = std.posix.getenv("USER") orelse "unknown";
+    const env_path = osutil.getenv("PATH") orelse "/usr/local/bin:/usr/bin:/bin";
+    const user = osutil.getenv("USER") orelse "unknown";
 
     var result = std.mem.replaceOwned(u8, alloc, plist_template, "{exe_path}", exe_path) catch return null;
     errdefer alloc.free(result);
@@ -247,21 +284,62 @@ fn generatePlist(alloc: std.mem.Allocator) ?[]u8 {
     return result;
 }
 
-fn writeFile(path: []const u8, data: []const u8) !void {
-    const file = try std.fs.cwd().createFile(path, .{});
-    defer file.close();
-    try file.writeAll(data);
+const StdioMode = enum { inherit, silent };
+
+/// Spawn `argv[0]` with `argv` via fork+execvp+waitpid. Returns the child's
+/// exit status, or a non-zero sentinel on failure.
+fn runProcess(argv: []const []const u8, stdio: StdioMode) c_int {
+    std.debug.assert(argv.len >= 1);
+    std.debug.assert(argv.len < 32);
+
+    // Build a NUL-terminated argv array on the stack.
+    const alloc = std.heap.page_allocator;
+    var z_args: [32]?[*:0]const u8 = undefined;
+    var dup_count: usize = 0;
+    defer {
+        var i: usize = 0;
+        while (i < dup_count) : (i += 1) {
+            if (z_args[i]) |p| alloc.free(std.mem.span(p));
+        }
+    }
+    for (argv, 0..) |a, i| {
+        const z = alloc.dupeZ(u8, a) catch return -1;
+        z_args[i] = z.ptr;
+        dup_count += 1;
+    }
+    z_args[argv.len] = null;
+
+    const pid = std.c.fork();
+    if (pid < 0) return -1;
+    if (pid == 0) {
+        // Child
+        if (stdio == .silent) {
+            const devnull = std.c.open("/dev/null", .{ .ACCMODE = .WRONLY });
+            if (devnull >= 0) {
+                _ = std.c.dup2(devnull, posix.STDOUT_FILENO);
+                _ = std.c.dup2(devnull, posix.STDERR_FILENO);
+                _ = std.c.close(devnull);
+            }
+        }
+        _ = execvp(z_args[0].?, @ptrCast(&z_args));
+        std.c._exit(127);
+    }
+
+    // Parent
+    var status: c_int = 0;
+    _ = std.c.waitpid(pid, &status, 0);
+    // POSIX exit status: low 7 bits = signal, bit 7 = core, next 8 = exit code.
+    // Match WEXITSTATUS for normal termination; non-normal exit returns the
+    // raw status which is non-zero.
+    if ((status & 0x7f) == 0) {
+        return (status >> 8) & 0xff;
+    }
+    return status;
 }
 
 fn runLaunchctl(argv: []const []const u8) void {
-    var child = std.process.Child.init(argv, std.heap.page_allocator);
-    child.stderr_behavior = .Inherit;
-    child.stdout_behavior = .Inherit;
-    child.spawn() catch |err| {
-        log.err("failed to spawn launchctl: {}", .{err});
-        return;
-    };
-    _ = child.wait() catch |err| {
-        log.err("failed to wait for launchctl: {}", .{err});
-    };
+    const rc = runProcess(argv, .inherit);
+    if (rc != 0) {
+        log.err("launchctl exited rc={d}", .{rc});
+    }
 }

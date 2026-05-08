@@ -1,7 +1,7 @@
 //! macOS status bar (menu bar icon) via zig-objc.
 //!
 //! Displays the active workspace name/index and provides a menu
-//! with Retile and Quit actions (handled by BWStatusBarDelegate in shim.m).
+//! with Retile and Quit actions (handled by BWStatusBarDelegate in objc_classes.zig).
 
 const std = @import("std");
 const objc = @import("objc");
@@ -75,8 +75,11 @@ pub fn setTitleMulti(workspaces: []const DisplayWorkspace) void {
             }
         }
 
+        // Format numeric ID into a separate buffer to avoid aliasing
+        // with `buf` when brackets are inserted for focused workspaces.
+        var id_buf: [4]u8 = undefined;
         const label = if (ws.name.len > 0) ws.name else blk: {
-            const s = std.fmt.bufPrint(buf[pos..], "{d}", .{ws.id}) catch break :blk "";
+            const s = std.fmt.bufPrint(&id_buf, "{d}", .{ws.id}) catch break :blk "";
             break :blk s;
         };
 
@@ -88,11 +91,7 @@ pub fn setTitleMulti(workspaces: []const DisplayWorkspace) void {
         }
 
         const n = @min(label.len, buf.len - pos);
-        // label might alias buf (from the bufPrint fallback), so use
-        // a forward copy that is always safe when src >= dst.
-        if (label.ptr != buf[pos..].ptr) {
-            @memcpy(buf[pos..][0..n], label[0..n]);
-        }
+        @memcpy(buf[pos..][0..n], label[0..n]);
         pos += n;
 
         if (ws.focused) {

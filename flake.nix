@@ -30,12 +30,13 @@
       pkgs,
       system,
     }: let
-      zig = zig-overlay.packages.${system}."0.15.1";
+      zig = zig-overlay.packages.${system}."0.16.0";
     in {
       default = pkgs.stdenv.mkDerivation {
         name = "bobrwm";
         src = ./.;
         nativeBuildInputs = [zig];
+        SDKROOT = pkgs.apple-sdk.sdkroot;
 
         buildPhase = ''
           export ZIG_GLOBAL_CACHE_DIR=$TMPDIR/zig-cache
@@ -51,12 +52,13 @@
       pkgs,
       system,
     }: let
-      zig = zig-overlay.packages.${system}."0.15.1";
+      zig = zig-overlay.packages.${system}."0.16.0";
       zls = zls-overlay.packages.${system}.zls;
       zigdoc = zigdoc-nix.packages.${system}.default;
       ziglint = ziglint-nix.packages.${system}.default;
     in {
       default = pkgs.mkShell {
+        SDKROOT = pkgs.apple-sdk.sdkroot;
         buildInputs = [
           zig
           zls
