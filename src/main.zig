@@ -591,6 +591,17 @@ fn clearLayoutRoots() void {
     }
 }
 
+/// Recursively free every workspace's layout tree. Safe to call at any time
+/// after `clearLayoutRoots()` — slots set to null are skipped.
+fn destroyAllLayoutTrees() void {
+    for (0..workspace_mod.max_workspaces) |ws_idx| {
+        if (g_layout_roots[ws_idx]) |root| {
+            layout.destroyTree(root, g_allocator);
+            g_layout_roots[ws_idx] = null;
+        }
+    }
+}
+
 /// Rebuilds the current display snapshot from `NSScreen`.
 ///
 /// Coordinates are normalized to CG top-left origin so window bounds from
@@ -1848,6 +1859,10 @@ pub fn main(init: std.process.Init.Minimal) !void {
     g_workspaces = workspace_mod.WorkspaceManager.init(g_allocator, ws_count);
     defer g_workspaces.deinit();
     clearLayoutRoots();
+    // Free per-workspace layout trees on exit. discoverWindows() and later
+    // insertions allocate Split nodes and leaf ArrayLists via g_allocator;
+    // without this, DebugAllocator reports leaks on shutdown error paths.
+    defer destroyAllLayoutTrees();
     g_tab_groups = tabgroup.TabGroupManager.init(g_allocator);
     defer g_tab_groups.deinit();
     g_pending_role_windows = PendingRoleWindowMap.init(g_allocator);
@@ -1969,6 +1984,43 @@ export fn bw_drain_events() void {
         requestRetileAllDisplays();
         flushRetileRequests();
     }
+
+    // Honour pending Ctrl-C / SIGTERM by exiting NSApp.run cleanly so the
+    // deferred cleanup (IPC socket unlink, layout free, restoreAllWindows)
+    // actually runs. Without this, NSApp keeps spinning and the next launch
+    // sees a live socket and bails out with AddressInUse.
+    if (g_shutdown_requested.load(.acquire)) {
+        gracefulStopNSApp();
+    }
+}
+
+/// Exit `[NSApp run]` cleanly by setting NSApplication's stop flag and posting
+/// a wake-up event. Must be called on the main thread inside the run loop.
+fn gracefulStopNSApp() void {
+    const NSApplication = objc.getClass("NSApplication") orelse return;
+    const app = NSApplication.msgSend(objc.Object, "sharedApplication", .{});
+    app.msgSend(void, "stop:", .{@as(?*anyopaque, null)});
+
+    // [NSApp stop:] only takes effect after nextEventMatchingMask: returns,
+    // so post a dummy event to ensure the run loop wakes and re-checks.
+    const NSEvent = objc.getClass("NSEvent") orelse return;
+    // NSEventTypeApplicationDefined = 15
+    const event = NSEvent.msgSend(
+        objc.Object,
+        "otherEventWithType:location:modifierFlags:timestamp:windowNumber:context:subtype:data1:data2:",
+        .{
+            @as(u64, 15),
+            NSPoint{ .x = 0, .y = 0 },
+            @as(u64, 0),
+            @as(f64, 0),
+            @as(i64, 0),
+            @as(?*anyopaque, null),
+            @as(i16, 0),
+            @as(i64, 0),
+            @as(i64, 0),
+        },
+    );
+    app.msgSend(void, "postEvent:atStart:", .{ event, true });
 }
 
 /// Accept and handle one IPC client connection — called by dispatch_source.
