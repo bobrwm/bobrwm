@@ -54,7 +54,7 @@ pub const std_options = std.Options{
 const log = std.log.scoped(.bobrwm);
 
 // Lock-free SPSC ring buffer
-// 
+//
 // Single-producer (main thread) only. All emitters must run on the
 // main thread / main queue. The consumer is bw_drain_events, also on
 // the main run-loop.
@@ -2108,7 +2108,8 @@ fn insertIntoLayout(workspace_id: u8, wid: u32) void {
 fn setLayoutLeafActive(workspace_id: u8, wid: u32) void {
     const root_ptr = layoutRootPtr(workspace_id);
     if (root_ptr.*) |*root| {
-        _ = layout.setLeafActive(root, wid);
+        const layout_wid = g_tab_groups.resolveLeader(wid);
+        _ = layout.setLeafActive(root, layout_wid);
     }
 }
 
@@ -4274,6 +4275,7 @@ fn switchWorkspace(target_id: u8) void {
             win.display_id = target_display;
             g_store.put(win) catch {};
         }
+        updateTabGroupAssignment(wid, target_ws.id, target_display);
     }
 
     assertDisplayCoverage();
@@ -4310,6 +4312,23 @@ fn focusWorkspaceWindow(ws: *workspace_mod.Workspace) void {
 
     if (g_workspace_transition.isActive()) {
         g_pending_focus_count = 0;
+    }
+}
+
+fn updateTabGroupAssignment(leader_wid: u32, workspace_id: u8, display_id: u32) void {
+    std.debug.assert(leader_wid != 0);
+    std.debug.assert(workspace_id > 0 and workspace_id <= workspace_mod.max_workspaces);
+    std.debug.assert(display_id != 0);
+
+    const group = g_tab_groups.groupOf(leader_wid) orelse return;
+    if (group.leader_wid != leader_wid) return;
+
+    for (group.members.items) |member_wid| {
+        if (member_wid == leader_wid) continue;
+        var member = g_store.get(member_wid) orelse continue;
+        member.workspace_id = workspace_id;
+        member.display_id = display_id;
+        g_store.put(member) catch {};
     }
 }
 
@@ -4363,11 +4382,13 @@ fn moveWindowToWorkspace(target_id: u8) void {
     updated.workspace_id = target_id;
     updated.display_id = target_ws.display_id orelse display_id;
     g_store.put(updated) catch {};
+    updateTabGroupAssignment(wid, target_id, updated.display_id);
 
     // If target is not visible on the window's new display, hide it.
     if (!workspaceVisibleOnDisplay(target_id, updated.display_id)) {
-        if (g_store.get(wid)) |win| {
-            hideWindow(win.pid, wid);
+        const visible_wid = g_tab_groups.resolveActive(wid);
+        if (g_store.get(visible_wid)) |win| {
+            hideWindow(win.pid, visible_wid);
         }
     }
 
@@ -4410,6 +4431,7 @@ fn moveManagedWindowToDisplay(wid: u32, target_display_id: u32) bool {
             }
             return false;
         };
+        updateTabGroupAssignment(wid, target_workspace_id, target_display_id);
 
         removeFromLayout(source_workspace_id, wid);
         source_ws.removeWindow(wid);
@@ -4423,6 +4445,7 @@ fn moveManagedWindowToDisplay(wid: u32, target_display_id: u32) bool {
         removeFromLayout(source_workspace_id, wid);
         win.display_id = target_display_id;
         g_store.put(win) catch return false;
+        updateTabGroupAssignment(wid, source_workspace_id, target_display_id);
         if (win.mode == .tiled) {
             insertIntoLayout(source_workspace_id, wid);
         }
@@ -4503,6 +4526,7 @@ fn moveWorkspaceToDisplay(target_display_slot: usize) void {
             var updated = w;
             updated.display_id = target_display_id;
             g_store.put(updated) catch {};
+            updateTabGroupAssignment(wid, moving_ws.id, target_display_id);
         }
     }
 
