@@ -21,28 +21,35 @@ pub fn build(b: *std.Build) !void {
         .os_tag = .macos,
     });
     const optimize = b.standardOptimizeOption(.{});
-
-    // Resolve macOS SDK paths via xcrun (wrapped by Zig stdlib). Hard-fail
-    // if the SDK isn't installed; bobrwm is macOS-only so we can't proceed.
-    const libc = try std.zig.LibCInstallation.findNative(b.allocator, b.graph.io, .{
-        .target = &target.result,
-        .environ_map = &b.graph.environ_map,
-        .verbose = false,
-    });
-    const sdk_include = libc.sys_include_dir orelse
-        @panic("macOS SDK sys_include_dir missing from LibCInstallation");
-    // sys_include_dir is `<SDK>/usr/include`; framework root and lib dir
-    // sit two levels up alongside it.
-    const sdk_root = std.fs.path.dirname(std.fs.path.dirname(sdk_include) orelse
-        @panic("unexpected SDK layout")) orelse
-        @panic("unexpected SDK layout");
-    const sdk_lib = b.fmt("{s}/lib", .{std.fs.path.dirname(sdk_include) orelse unreachable});
-    const sdk_frameworks = b.fmt("{s}/System/Library/Frameworks", .{sdk_root});
-    const sdk_private_frameworks = b.fmt("{s}/System/Library/PrivateFrameworks", .{sdk_root});
-
     // Process environment is already captured by the build graph; query
     // it directly rather than re-fetching.
     const env = &b.graph.environ_map;
+
+    // Prefer an explicit SDKROOT so Nix sandbox builds can use the SDK path
+    // provided by the derivation instead of probing host Xcode via xcrun.
+    const sdk_root = if (env.get("SDKROOT")) |raw| blk: {
+        const trimmed = std.mem.trim(u8, raw, &.{ ' ', '\t', '\r', '\n' });
+        if (trimmed.len == 0) @panic("SDKROOT is empty");
+        break :blk trimmed;
+    } else blk: {
+        // Resolve macOS SDK paths via xcrun (wrapped by Zig stdlib). Hard-fail
+        // if the SDK isn't installed; bobrwm is macOS-only so we can't proceed.
+        const libc = try std.zig.LibCInstallation.findNative(b.allocator, b.graph.io, .{
+            .target = &target.result,
+            .environ_map = env,
+            .verbose = false,
+        });
+        const sdk_include_native = libc.sys_include_dir orelse
+            @panic("macOS SDK sys_include_dir missing from LibCInstallation");
+        // sys_include_dir is `<SDK>/usr/include`.
+        break :blk std.fs.path.dirname(std.fs.path.dirname(sdk_include_native) orelse
+            @panic("unexpected SDK layout")) orelse
+            @panic("unexpected SDK layout");
+    };
+    const sdk_include = b.fmt("{s}/usr/include", .{sdk_root});
+    const sdk_lib = b.fmt("{s}/usr/lib", .{sdk_root});
+    const sdk_frameworks = b.fmt("{s}/System/Library/Frameworks", .{sdk_root});
+    const sdk_private_frameworks = b.fmt("{s}/System/Library/PrivateFrameworks", .{sdk_root});
 
     const exe_mod = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),

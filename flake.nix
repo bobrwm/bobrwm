@@ -36,6 +36,7 @@
         name = "bobrwm";
         src = ./.;
         nativeBuildInputs = [zig];
+        SDKROOT = pkgs.apple-sdk.sdkroot;
 
         buildPhase = ''
           export ZIG_GLOBAL_CACHE_DIR=$TMPDIR/zig-cache
@@ -57,6 +58,7 @@
       ziglint = ziglint-nix.packages.${system}.default;
     in {
       default = pkgs.mkShell {
+        SDKROOT = pkgs.apple-sdk.sdkroot;
         buildInputs = [
           zig
           zls
