@@ -4945,7 +4945,12 @@ fn ipcQueryWorkspaces(fd: posix.socket_t, format: ipc.IpcCommand.QueryFormat) vo
                 json.objectField("windows") catch break;
                 json.beginArray() catch break;
                 for (ws.windows.items) |wid| {
-                    json.write(wid) catch break;
+                    const win = g_store.get(wid) orelse continue;
+                    var id_buf: [256]u8 = undefined;
+                    const id_len = shim.bw_get_app_bundle_id(win.pid, &id_buf, 256);
+                    const bundle_id: []const u8 = if (id_len > 0) id_buf[0..id_len] else "(unknown)";
+
+                    writeWindowJson(&json, win, bundle_id) catch break;
                 }
                 json.endArray() catch break;
                 json.endObject() catch break;
