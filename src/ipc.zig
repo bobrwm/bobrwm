@@ -25,12 +25,14 @@ pub const IpcCommand = union(enum) {
     bsp_equalize,
     bsp_balance,
     bsp_rotate: i32,
-    query_windows,
-    query_workspaces,
-    query_displays,
-    query_apps,
+    query_windows: QueryFormat,
+    query_workspaces: QueryFormat,
+    query_displays: QueryFormat,
+    query_apps: QueryFormat,
 
     pub const FocusDir = enum { left, right, up, down };
+
+    pub const QueryFormat = enum { text, json };
 
     pub const DisplayTarget = union(enum) {
         next,
@@ -46,10 +48,14 @@ pub const IpcCommand = union(enum) {
         if (std.mem.eql(u8, cmd, "toggle-split")) return .toggle_split;
         if (std.mem.eql(u8, cmd, "bsp equalize")) return .bsp_equalize;
         if (std.mem.eql(u8, cmd, "bsp balance")) return .bsp_balance;
-        if (std.mem.eql(u8, cmd, "query windows")) return .query_windows;
-        if (std.mem.eql(u8, cmd, "query workspaces")) return .query_workspaces;
-        if (std.mem.eql(u8, cmd, "query displays")) return .query_displays;
-        if (std.mem.eql(u8, cmd, "query apps")) return .query_apps;
+        if (std.mem.eql(u8, cmd, "query windows")) return .{ .query_windows = .text };
+        if (std.mem.eql(u8, cmd, "query windows --json")) return .{ .query_windows = .json };
+        if (std.mem.eql(u8, cmd, "query workspaces")) return .{ .query_workspaces = .text };
+        if (std.mem.eql(u8, cmd, "query workspaces --json")) return .{ .query_workspaces = .json };
+        if (std.mem.eql(u8, cmd, "query displays")) return .{ .query_displays = .text };
+        if (std.mem.eql(u8, cmd, "query displays --json")) return .{ .query_displays = .json };
+        if (std.mem.eql(u8, cmd, "query apps")) return .{ .query_apps = .text };
+        if (std.mem.eql(u8, cmd, "query apps --json")) return .{ .query_apps = .json };
 
         // Commands with arguments — extract the tail after the prefix
         if (stripPrefix(cmd, "focus ")) |arg|
@@ -188,4 +194,15 @@ pub const Server = struct {
 /// Write a response to the IPC client fd.
 pub fn writeResponse(fd: posix.socket_t, data: []const u8) void {
     _ = std.c.write(fd, data.ptr, data.len);
+}
+
+test "parse query format" {
+    const t = std.testing;
+
+    try t.expectEqual(IpcCommand{ .query_windows = .text }, IpcCommand.parse("query windows").?);
+    try t.expectEqual(IpcCommand{ .query_windows = .json }, IpcCommand.parse("query windows --json").?);
+    try t.expectEqual(IpcCommand{ .query_workspaces = .json }, IpcCommand.parse("query workspaces --json").?);
+    try t.expectEqual(IpcCommand{ .query_displays = .json }, IpcCommand.parse("query displays --json").?);
+    try t.expectEqual(IpcCommand{ .query_apps = .json }, IpcCommand.parse("query apps --json").?);
+    try t.expectEqual(@as(?IpcCommand, null), IpcCommand.parse("query windows --json extra"));
 }

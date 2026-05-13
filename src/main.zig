@@ -4802,31 +4802,49 @@ fn ipcDispatch(cmd: []const u8, client_fd: posix.socket_t) void {
                 ipc.writeResponse(client_fd, "err: no layout root\n");
             }
         },
-        .query_windows => ipcQueryWindows(client_fd),
-        .query_workspaces => ipcQueryWorkspaces(client_fd),
-        .query_displays => ipcQueryDisplays(client_fd),
-        .query_apps => ipcQueryApps(client_fd),
+        .query_windows => |format| ipcQueryWindows(client_fd, format),
+        .query_workspaces => |format| ipcQueryWorkspaces(client_fd, format),
+        .query_displays => |format| ipcQueryDisplays(client_fd, format),
+        .query_apps => |format| ipcQueryApps(client_fd, format),
     }
 }
 
-fn ipcQueryWindows(fd: posix.socket_t) void {
+fn ipcQueryWindows(fd: posix.socket_t, format: ipc.IpcCommand.QueryFormat) void {
     const started_ns = nanoTimestamp();
     const ws = g_workspaces.active();
-    var buf: [8192]u8 = undefined;
+    var buf: [16384]u8 = undefined;
     var w = std.Io.Writer.fixed(&buf);
     var written: usize = 0;
 
-    for (ws.windows.items) |wid| {
-        if (g_store.get(wid)) |win| {
-            var id_buf: [256]u8 = undefined;
-            const id_len = shim.bw_get_app_bundle_id(win.pid, &id_buf, 256);
-            const bundle_id: []const u8 = if (id_len > 0) id_buf[0..id_len] else "(unknown)";
+    switch (format) {
+        .text => for (ws.windows.items) |wid| {
+            if (g_store.get(wid)) |win| {
+                var id_buf: [256]u8 = undefined;
+                const id_len = shim.bw_get_app_bundle_id(win.pid, &id_buf, 256);
+                const bundle_id: []const u8 = if (id_len > 0) id_buf[0..id_len] else "(unknown)";
 
-            w.print("{d} {d} {s} {d} {d} {d:.0} {d:.0} {d:.0} {d:.0}\n", .{
-                win.wid,     win.pid,     bundle_id,       win.workspace_id, win.display_id,
-                win.frame.x, win.frame.y, win.frame.width, win.frame.height,
-            }) catch break;
-            written += 1;
+                w.print("{d} {d} {s} {d} {d} {d:.0} {d:.0} {d:.0} {d:.0}\n", .{
+                    win.wid,     win.pid,     bundle_id,       win.workspace_id, win.display_id,
+                    win.frame.x, win.frame.y, win.frame.width, win.frame.height,
+                }) catch break;
+                written += 1;
+            }
+        },
+        .json => {
+            var json: std.json.Stringify = .{ .writer = &w };
+            json.beginArray() catch {};
+            for (ws.windows.items) |wid| {
+                if (g_store.get(wid)) |win| {
+                    var id_buf: [256]u8 = undefined;
+                    const id_len = shim.bw_get_app_bundle_id(win.pid, &id_buf, 256);
+                    const bundle_id: []const u8 = if (id_len > 0) id_buf[0..id_len] else "(unknown)";
+
+                    writeWindowJson(&json, win, bundle_id) catch break;
+                    written += 1;
+                }
+            }
+            json.endArray() catch {};
+            w.writeByte('\n') catch {};
         }
     }
 
@@ -4836,14 +4854,17 @@ fn ipcQueryWindows(fd: posix.socket_t) void {
     log.debug("[trace] query windows rows={} bytes={} elapsed_ms={}", .{ written, payload.len, elapsed_ms });
 }
 
-fn ipcQueryApps(fd: posix.socket_t) void {
+fn ipcQueryApps(fd: posix.socket_t, format: ipc.IpcCommand.QueryFormat) void {
     const started_ns = nanoTimestamp();
-    var buf: [8192]u8 = undefined;
+    var buf: [16384]u8 = undefined;
     var w = std.Io.Writer.fixed(&buf);
 
     var seen_pids: [256]i32 = undefined;
     var seen_count: usize = 0;
     var written: usize = 0;
+
+    var json: std.json.Stringify = .{ .writer = &w };
+    if (format == .json) json.beginArray() catch {};
 
     for (&g_workspaces.workspaces) |*ws| {
         for (ws.windows.items) |wid| {
@@ -4865,10 +4886,25 @@ fn ipcQueryApps(fd: posix.socket_t) void {
                 const id_len = shim.bw_get_app_bundle_id(win.pid, &id_buf, 256);
                 const bundle_id: []const u8 = if (id_len > 0) id_buf[0..id_len] else "(unknown)";
 
-                w.print("{s}\t{d}\n", .{ bundle_id, win.pid }) catch break;
+                switch (format) {
+                    .text => w.print("{s}\t{d}\n", .{ bundle_id, win.pid }) catch break,
+                    .json => {
+                        json.beginObject() catch break;
+                        json.objectField("bundle_id") catch break;
+                        json.write(bundle_id) catch break;
+                        json.objectField("process_id") catch break;
+                        json.write(win.pid) catch break;
+                        json.endObject() catch break;
+                    },
+                }
                 written += 1;
             }
         }
+    }
+
+    if (format == .json) {
+        json.endArray() catch {};
+        w.writeByte('\n') catch {};
     }
 
     const payload = w.buffered();
@@ -4877,19 +4913,43 @@ fn ipcQueryApps(fd: posix.socket_t) void {
     log.debug("[trace] query apps rows={} unique_pids={} bytes={} elapsed_ms={}", .{ written, seen_count, payload.len, elapsed_ms });
 }
 
-fn ipcQueryWorkspaces(fd: posix.socket_t) void {
+fn ipcQueryWorkspaces(fd: posix.socket_t, format: ipc.IpcCommand.QueryFormat) void {
     const started_ns = nanoTimestamp();
-    var buf: [1024]u8 = undefined;
+    var buf: [8192]u8 = undefined;
     var w = std.Io.Writer.fixed(&buf);
 
-    for (&g_workspaces.workspaces) |*ws| {
-        const focused: u32 = ws.focused_wid orelse 0;
-        w.print("{d} {s} {d} {d}\n", .{
-            ws.id,
-            if (workspaceVisibleAnywhere(ws.id)) "visible" else "hidden",
-            focused,
-            ws.windows.items.len,
-        }) catch break;
+    switch (format) {
+        .text => for (&g_workspaces.workspaces) |*ws| {
+            const focused: u32 = ws.focused_wid orelse 0;
+            w.print("{d} {s} {d} {d}\n", .{
+                ws.id,
+                if (workspaceVisibleAnywhere(ws.id)) "visible" else "hidden",
+                focused,
+                ws.windows.items.len,
+            }) catch break;
+        },
+        .json => {
+            var json: std.json.Stringify = .{ .writer = &w };
+            json.beginArray() catch {};
+            for (&g_workspaces.workspaces) |*ws| {
+                json.beginObject() catch break;
+                json.objectField("workspace_id") catch break;
+                json.write(ws.id) catch break;
+                json.objectField("visible") catch break;
+                json.write(workspaceVisibleAnywhere(ws.id)) catch break;
+                json.objectField("focused_window") catch break;
+                json.write(ws.focused_wid) catch break;
+                json.objectField("windows") catch break;
+                json.beginArray() catch break;
+                for (ws.windows.items) |wid| {
+                    json.write(wid) catch break;
+                }
+                json.endArray() catch break;
+                json.endObject() catch break;
+            }
+            json.endArray() catch {};
+            w.writeByte('\n') catch {};
+        },
     }
 
     const payload = w.buffered();
@@ -4898,22 +4958,78 @@ fn ipcQueryWorkspaces(fd: posix.socket_t) void {
     log.debug("[trace] query workspaces rows={} bytes={} elapsed_ms={}", .{ g_workspaces.workspaces.len, payload.len, elapsed_ms });
 }
 
-fn ipcQueryDisplays(fd: posix.socket_t) void {
-    var buf: [2048]u8 = undefined;
+fn ipcQueryDisplays(fd: posix.socket_t, format: ipc.IpcCommand.QueryFormat) void {
+    var buf: [8192]u8 = undefined;
     var w = std.Io.Writer.fixed(&buf);
 
-    for (g_displays[0..g_display_count], 0..) |display, slot| {
-        const workspace_id = g_workspaces.activeIdForDisplaySlot(slot);
-        w.print("{d} {d} {d:.0} {d:.0} {d:.0} {d:.0} {d}\n", .{
-            slot + 1,
-            display.id,
-            display.visible.x,
-            display.visible.y,
-            display.visible.w,
-            display.visible.h,
-            workspace_id,
-        }) catch break;
+    switch (format) {
+        .text => for (g_displays[0..g_display_count], 0..) |display, slot| {
+            const workspace_id = g_workspaces.activeIdForDisplaySlot(slot);
+            w.print("{d} {d} {d:.0} {d:.0} {d:.0} {d:.0} {d}\n", .{
+                slot + 1,
+                display.id,
+                display.visible.x,
+                display.visible.y,
+                display.visible.w,
+                display.visible.h,
+                workspace_id,
+            }) catch break;
+        },
+        .json => {
+            var json: std.json.Stringify = .{ .writer = &w };
+            json.beginArray() catch {};
+            for (g_displays[0..g_display_count], 0..) |display, slot| {
+                const workspace_id = g_workspaces.activeIdForDisplaySlot(slot);
+                json.beginObject() catch break;
+                json.objectField("display_num") catch break;
+                json.write(slot + 1) catch break;
+                json.objectField("display_id") catch break;
+                json.write(display.id) catch break;
+                json.objectField("workspace_id") catch break;
+                json.write(workspace_id) catch break;
+                json.objectField("visible_frame") catch break;
+                json.beginObject() catch break;
+                json.objectField("x") catch break;
+                json.print("{d:.0}", .{display.visible.x}) catch break;
+                json.objectField("y") catch break;
+                json.print("{d:.0}", .{display.visible.y}) catch break;
+                json.objectField("width") catch break;
+                json.print("{d:.0}", .{display.visible.w}) catch break;
+                json.objectField("height") catch break;
+                json.print("{d:.0}", .{display.visible.h}) catch break;
+                json.endObject() catch break;
+                json.endObject() catch break;
+            }
+            json.endArray() catch {};
+            w.writeByte('\n') catch {};
+        },
     }
 
     ipc.writeResponse(fd, w.buffered());
+}
+
+fn writeWindowJson(json: *std.json.Stringify, win: window_mod.Window, bundle_id: []const u8) std.Io.Writer.Error!void {
+    try json.beginObject();
+    try json.objectField("window_id");
+    try json.write(win.wid);
+    try json.objectField("process_id");
+    try json.write(win.pid);
+    try json.objectField("bundle_id");
+    try json.write(bundle_id);
+    try json.objectField("workspace_id");
+    try json.write(win.workspace_id);
+    try json.objectField("display_id");
+    try json.write(win.display_id);
+    try json.objectField("frame");
+    try json.beginObject();
+    try json.objectField("x");
+    try json.print("{d:.0}", .{win.frame.x});
+    try json.objectField("y");
+    try json.print("{d:.0}", .{win.frame.y});
+    try json.objectField("width");
+    try json.print("{d:.0}", .{win.frame.width});
+    try json.objectField("height");
+    try json.print("{d:.0}", .{win.frame.height});
+    try json.endObject();
+    try json.endObject();
 }

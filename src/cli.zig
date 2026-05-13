@@ -187,10 +187,10 @@ const help_text =
     \\  bsp rotate <degrees>      Rotate layout (90, 180, 270)
     \\
     \\Query Commands (IPC):
-    \\  query windows             List windows on the active workspace
-    \\  query workspaces          List all workspaces
-    \\  query displays            List connected displays
-    \\  query apps                List managed applications
+    \\  query windows [--json]    List windows on the active workspace
+    \\  query workspaces [--json] List all workspaces
+    \\  query displays [--json]   List connected displays
+    \\  query apps [--json]       List managed applications
     \\
     \\Options:
     \\  -c, --config <path>       Use a specific config file

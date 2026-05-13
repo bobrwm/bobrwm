@@ -16,9 +16,13 @@ brew install --HEAD bobrwm/tap/bobrwm
 bobrwm                    # start daemon
 bobrwm -c /path/to/config.zon  # start with explicit config
 bobrwm query windows      # IPC: list managed windows
+bobrwm query windows --json  # IPC: list managed windows as JSON
 bobrwm query workspaces   # IPC: list workspaces
+bobrwm query workspaces --json # IPC: list workspaces as JSON
 bobrwm query displays     # IPC: list connected displays
+bobrwm query displays --json # IPC: list connected displays as JSON
 bobrwm query apps         # IPC: list observed apps
+bobrwm query apps --json  # IPC: list observed apps as JSON
 bobrwm move-to-display 2  # IPC: move focused window to display slot 2
 bobrwm bsp insert-mode stack          # IPC: split | stack
 bobrwm bsp insert-point min_depth     # IPC: focused | first | last | min_depth
