@@ -2459,6 +2459,9 @@ fn handleEvent(ev: *const event_mod.Event) void {
                     if (g_workspaces.get(win.workspace_id)) |ws| {
                         ws.focused_wid = leader;
                     }
+                    if (!g_workspace_transition.isActive() and !workspaceVisibleOnDisplay(win.workspace_id, win.display_id)) {
+                        switchWorkspace(win.workspace_id);
+                    }
                     setLayoutLeafActive(win.workspace_id, wid);
                 }
             }
