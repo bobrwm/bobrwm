@@ -4812,8 +4812,9 @@ fn ipcDispatch(cmd: []const u8, client_fd: posix.socket_t) void {
 fn ipcQueryWindows(fd: posix.socket_t, format: ipc.IpcCommand.QueryFormat) void {
     const started_ns = nanoTimestamp();
     const ws = g_workspaces.active();
-    var buf: [16384]u8 = undefined;
-    var w = std.Io.Writer.fixed(&buf);
+    var out: std.Io.Writer.Allocating = .init(g_allocator);
+    defer out.deinit();
+    const w = &out.writer;
     var written: usize = 0;
 
     switch (format) {
@@ -4831,7 +4832,7 @@ fn ipcQueryWindows(fd: posix.socket_t, format: ipc.IpcCommand.QueryFormat) void 
             }
         },
         .json => {
-            var json: std.json.Stringify = .{ .writer = &w };
+            var json: std.json.Stringify = .{ .writer = w };
             json.beginArray() catch {};
             for (ws.windows.items) |wid| {
                 if (g_store.get(wid)) |win| {
@@ -4848,7 +4849,7 @@ fn ipcQueryWindows(fd: posix.socket_t, format: ipc.IpcCommand.QueryFormat) void 
         }
     }
 
-    const payload = w.buffered();
+    const payload = out.written();
     ipc.writeResponse(fd, payload);
     const elapsed_ms = @divTrunc(nanoTimestamp() - started_ns, std.time.ns_per_ms);
     log.debug("[trace] query windows rows={} bytes={} elapsed_ms={}", .{ written, payload.len, elapsed_ms });
@@ -4856,14 +4857,15 @@ fn ipcQueryWindows(fd: posix.socket_t, format: ipc.IpcCommand.QueryFormat) void 
 
 fn ipcQueryApps(fd: posix.socket_t, format: ipc.IpcCommand.QueryFormat) void {
     const started_ns = nanoTimestamp();
-    var buf: [16384]u8 = undefined;
-    var w = std.Io.Writer.fixed(&buf);
+    var out: std.Io.Writer.Allocating = .init(g_allocator);
+    defer out.deinit();
+    const w = &out.writer;
 
     var seen_pids: [256]i32 = undefined;
     var seen_count: usize = 0;
     var written: usize = 0;
 
-    var json: std.json.Stringify = .{ .writer = &w };
+    var json: std.json.Stringify = .{ .writer = w };
     if (format == .json) json.beginArray() catch {};
 
     for (&g_workspaces.workspaces) |*ws| {
@@ -4907,7 +4909,7 @@ fn ipcQueryApps(fd: posix.socket_t, format: ipc.IpcCommand.QueryFormat) void {
         w.writeByte('\n') catch {};
     }
 
-    const payload = w.buffered();
+    const payload = out.written();
     ipc.writeResponse(fd, payload);
     const elapsed_ms = @divTrunc(nanoTimestamp() - started_ns, std.time.ns_per_ms);
     log.debug("[trace] query apps rows={} unique_pids={} bytes={} elapsed_ms={}", .{ written, seen_count, payload.len, elapsed_ms });
@@ -4915,8 +4917,9 @@ fn ipcQueryApps(fd: posix.socket_t, format: ipc.IpcCommand.QueryFormat) void {
 
 fn ipcQueryWorkspaces(fd: posix.socket_t, format: ipc.IpcCommand.QueryFormat) void {
     const started_ns = nanoTimestamp();
-    var buf: [8192]u8 = undefined;
-    var w = std.Io.Writer.fixed(&buf);
+    var out: std.Io.Writer.Allocating = .init(g_allocator);
+    defer out.deinit();
+    const w = &out.writer;
 
     switch (format) {
         .text => for (&g_workspaces.workspaces) |*ws| {
@@ -4929,7 +4932,7 @@ fn ipcQueryWorkspaces(fd: posix.socket_t, format: ipc.IpcCommand.QueryFormat) vo
             }) catch break;
         },
         .json => {
-            var json: std.json.Stringify = .{ .writer = &w };
+            var json: std.json.Stringify = .{ .writer = w };
             json.beginArray() catch {};
             for (&g_workspaces.workspaces) |*ws| {
                 json.beginObject() catch break;
@@ -4952,15 +4955,16 @@ fn ipcQueryWorkspaces(fd: posix.socket_t, format: ipc.IpcCommand.QueryFormat) vo
         },
     }
 
-    const payload = w.buffered();
+    const payload = out.written();
     ipc.writeResponse(fd, payload);
     const elapsed_ms = @divTrunc(nanoTimestamp() - started_ns, std.time.ns_per_ms);
     log.debug("[trace] query workspaces rows={} bytes={} elapsed_ms={}", .{ g_workspaces.workspaces.len, payload.len, elapsed_ms });
 }
 
 fn ipcQueryDisplays(fd: posix.socket_t, format: ipc.IpcCommand.QueryFormat) void {
-    var buf: [8192]u8 = undefined;
-    var w = std.Io.Writer.fixed(&buf);
+    var out: std.Io.Writer.Allocating = .init(g_allocator);
+    defer out.deinit();
+    const w = &out.writer;
 
     switch (format) {
         .text => for (g_displays[0..g_display_count], 0..) |display, slot| {
@@ -4976,7 +4980,7 @@ fn ipcQueryDisplays(fd: posix.socket_t, format: ipc.IpcCommand.QueryFormat) void
             }) catch break;
         },
         .json => {
-            var json: std.json.Stringify = .{ .writer = &w };
+            var json: std.json.Stringify = .{ .writer = w };
             json.beginArray() catch {};
             for (g_displays[0..g_display_count], 0..) |display, slot| {
                 const workspace_id = g_workspaces.activeIdForDisplaySlot(slot);
@@ -5005,7 +5009,7 @@ fn ipcQueryDisplays(fd: posix.socket_t, format: ipc.IpcCommand.QueryFormat) void
         },
     }
 
-    ipc.writeResponse(fd, w.buffered());
+    ipc.writeResponse(fd, out.written());
 }
 
 fn writeWindowJson(json: *std.json.Stringify, win: window_mod.Window, bundle_id: []const u8) std.Io.Writer.Error!void {
