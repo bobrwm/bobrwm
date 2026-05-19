@@ -30,6 +30,8 @@ pub const BW_HK_FOCUS_DOWN: u8 = @intFromEnum(event_mod.EventKind.hk_focus_down)
 pub const BW_HK_TOGGLE_SPLIT: u8 = @intFromEnum(event_mod.EventKind.hk_toggle_split);
 pub const BW_HK_TOGGLE_FULLSCREEN: u8 = @intFromEnum(event_mod.EventKind.hk_toggle_fullscreen);
 pub const BW_HK_TOGGLE_FLOAT: u8 = @intFromEnum(event_mod.EventKind.hk_toggle_float);
+pub const BW_HK_FOCUS_PREVIOUS_WORKSPACE: u8 = @intFromEnum(event_mod.EventKind.hk_focus_previous_workspace);
+pub const BW_HK_FOCUS_NEXT_WORKSPACE: u8 = @intFromEnum(event_mod.EventKind.hk_focus_next_workspace);
 
 pub const BW_MOD_ALT: u8 = 1 << 0;
 pub const BW_MOD_SHIFT: u8 = 1 << 1;

@@ -143,6 +143,21 @@ const FocusEventSource = enum {
     ax,
 };
 
+const WorkspaceTraversalDirection = enum {
+    previous,
+    next,
+};
+
+const HotkeyEvent = struct {
+    kind: u8,
+    arg: u32,
+};
+
+const HotkeyDispatch = union(enum) {
+    emit: HotkeyEvent,
+    pass_through,
+};
+
 const WorkspaceTransitionKind = enum {
     idle,
     switch_workspace,
@@ -335,6 +350,39 @@ fn primaryDisplayId() u32 {
 fn activeWorkspaceIdForDisplay(display_id: u32) u8 {
     const slot = displayIndexById(display_id) orelse return 1;
     return g_workspaces.activeIdForDisplaySlot(slot);
+}
+
+fn workspaceTraversalDirectionFromAction(action: u8) ?WorkspaceTraversalDirection {
+    if (action == shim.BW_HK_FOCUS_PREVIOUS_WORKSPACE) return .previous;
+    if (action == shim.BW_HK_FOCUS_NEXT_WORKSPACE) return .next;
+    return null;
+}
+
+fn adjacentWorkspaceId(direction: WorkspaceTraversalDirection) ?u8 {
+    std.debug.assert(g_workspaces.workspace_count > 0);
+    std.debug.assert(g_workspaces.workspace_count <= workspace_mod.max_workspaces);
+
+    const active_id = g_workspaces.active().id;
+    std.debug.assert(active_id > 0 and active_id <= g_workspaces.workspace_count);
+
+    return switch (direction) {
+        .previous => if (active_id > 1) active_id - 1 else null,
+        .next => if (active_id < g_workspaces.workspace_count) active_id + 1 else null,
+    };
+}
+
+fn switchAdjacentWorkspace(direction: WorkspaceTraversalDirection) void {
+    const target_id = adjacentWorkspaceId(direction) orelse return;
+    switchWorkspace(target_id);
+}
+
+fn dispatchForHotkeyBinding(binding: shim.bw_keybind) HotkeyDispatch {
+    if (workspaceTraversalDirectionFromAction(binding.action)) |direction| {
+        const target_id = adjacentWorkspaceId(direction) orelse return .pass_through;
+        return .{ .emit = .{ .kind = shim.BW_HK_FOCUS_WORKSPACE, .arg = @intCast(target_id) } };
+    }
+
+    return .{ .emit = .{ .kind = binding.action, .arg = binding.arg } };
 }
 
 fn workspaceVisibleOnDisplay(workspace_id: u8, display_id: u32) bool {
@@ -1812,8 +1860,13 @@ export fn bw_hotkey_handle_keydown(keycode: u16, mods: u8) bool {
         if (binding.keycode != keycode) continue;
         if (binding.mods != mods) continue;
 
-        bw_emit_event(binding.action, 0, binding.arg);
-        return true;
+        switch (dispatchForHotkeyBinding(binding)) {
+            .pass_through => return false,
+            .emit => |emit| {
+                bw_emit_event(emit.kind, 0, emit.arg);
+                return true;
+            },
+        }
     }
     return false;
 }
@@ -2551,6 +2604,8 @@ fn handleEvent(ev: *const event_mod.Event) void {
             log.info("hotkey: move to workspace {}", .{target});
             moveWindowToWorkspace(target);
         },
+        .hk_focus_previous_workspace => switchAdjacentWorkspace(.previous),
+        .hk_focus_next_workspace => switchAdjacentWorkspace(.next),
         .hk_focus_left => focusDirection(.left),
         .hk_focus_right => focusDirection(.right),
         .hk_focus_up => focusDirection(.up),
@@ -4846,7 +4901,7 @@ fn ipcQueryWindows(fd: posix.socket_t, format: ipc.IpcCommand.QueryFormat) void 
             }
             json.endArray() catch {};
             w.writeByte('\n') catch {};
-        }
+        },
     }
 
     const payload = out.written();

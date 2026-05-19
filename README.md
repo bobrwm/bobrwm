@@ -73,6 +73,8 @@ Map a key + modifiers to an action:
 | Action | Description | `arg` |
 | --- | --- | --- |
 | `focus_workspace` | Switch to workspace N | workspace number |
+| `focus_previous_workspace` | Switch to the previous workspace; if already at the first workspace, pass the key through | — |
+| `focus_next_workspace` | Switch to the next workspace; if already at the last workspace, pass the key through | — |
 | `move_to_workspace` | Move focused window to workspace N | workspace number |
 | `focus_left` | Focus window to the left | — |
 | `focus_right` | Focus window to the right | — |
