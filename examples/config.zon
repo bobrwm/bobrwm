@@ -66,6 +66,10 @@
 
         // alt+f → toggle fullscreen
         .{ .key = "f", .mods = .{ .alt = true }, .action = .toggle_fullscreen },
+
+        // ctrl+left/right → traverse bobrwm workspaces; native Spaces handle the edge
+        .{ .key = "left", .mods = .{ .ctrl = true }, .action = .focus_previous_workspace },
+        .{ .key = "right", .mods = .{ .ctrl = true }, .action = .focus_next_workspace },
     },
 
     .workspace_assignments = .{

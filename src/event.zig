@@ -27,6 +27,8 @@ pub const EventKind = enum(u8) {
     hk_toggle_fullscreen = 27,
     hk_toggle_float = 28,
     hk_move_workspace_to_display = 29,
+    hk_focus_previous_workspace = 30,
+    hk_focus_next_workspace = 31,
 };
 
 pub const Event = extern struct {
