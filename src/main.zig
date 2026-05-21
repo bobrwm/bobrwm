@@ -422,10 +422,24 @@ fn frontmostApplicationPid() ?i32 {
     return pid;
 }
 
-fn focusedManagedLeaderWindow() ?window_mod.Window {
-    const pid = frontmostApplicationPid() orelse return null;
+fn focusedWindowIdForPid(pid: i32) ?u32 {
+    std.debug.assert(pid > 0);
+
     const focused_wid = bw_ax_get_focused_window(pid);
     if (focused_wid == 0) return null;
+
+    return focused_wid;
+}
+
+fn focusedWindowIdForLoggedEvent(comptime event_name: []const u8, pid: i32) ?u32 {
+    const focused_wid = focusedWindowIdForPid(pid);
+    log.info(event_name ++ " pid={} wid={}", .{ pid, focused_wid orelse 0 });
+    return focused_wid;
+}
+
+fn focusedManagedLeaderWindow() ?window_mod.Window {
+    const pid = frontmostApplicationPid() orelse return null;
+    const focused_wid = focusedWindowIdForPid(pid) orelse return null;
 
     const leader_wid = g_tab_groups.resolveLeader(focused_wid);
     const leader = g_store.get(leader_wid) orelse return null;
@@ -481,6 +495,7 @@ fn shouldAcceptFocusForWindow(win: window_mod.Window, source: FocusEventSource) 
 
 fn pendingFocusInsertOrReplace(entry: PendingFocusEntry) void {
     std.debug.assert(entry.pid > 0);
+    std.debug.assert(entry.wid != 0);
     std.debug.assert(entry.workspace_id > 0 and entry.workspace_id <= g_workspaces.workspace_count);
     std.debug.assert(entry.display_id != 0);
 
@@ -491,7 +506,9 @@ fn pendingFocusInsertOrReplace(entry: PendingFocusEntry) void {
     var i: usize = 0;
     while (i < g_pending_focus_count) : (i += 1) {
         const existing = g_pending_focus_entries[i];
-        if (existing.pid == entry.pid) {
+        // A single process can own multiple windows across workspaces, so the
+        // queue must preserve per-window focus intent instead of collapsing by PID.
+        if (existing.wid == entry.wid) {
             existing_idx = i;
             break;
         }
@@ -586,6 +603,39 @@ fn maybeSetFocusedDisplayForWindow(win: window_mod.Window, source: FocusEventSou
     if (source == .keyboard and g_workspace_transition.isActive()) {
         g_pending_focus_count = 0;
     }
+
+    return true;
+}
+
+fn switchToWindowWorkspaceIfHidden(win: window_mod.Window) void {
+    std.debug.assert(win.wid != 0);
+    std.debug.assert(win.workspace_id > 0 and win.workspace_id <= workspace_mod.max_workspaces);
+    std.debug.assert(win.display_id != 0);
+
+    if (g_workspace_transition.isActive()) return;
+    if (workspaceVisibleOnDisplay(win.workspace_id, win.display_id)) return;
+
+    switchWorkspace(win.workspace_id);
+}
+
+fn syncFocusStateForWindowId(focused_wid: u32, source: FocusEventSource) bool {
+    std.debug.assert(focused_wid != 0);
+
+    const leader = g_tab_groups.resolveLeader(focused_wid);
+    std.debug.assert(leader != 0);
+
+    const win = g_store.get(leader) orelse return false;
+    std.debug.assert(win.wid == leader);
+
+    // Window ID is the canonical identity. PID-only notifications are resolved
+    // before this point so same-process windows do not overwrite each other.
+    g_tab_groups.setActive(focused_wid);
+    _ = maybeSetFocusedDisplayForWindow(win, source);
+    if (g_workspaces.get(win.workspace_id)) |ws| {
+        ws.focused_wid = leader;
+    }
+    switchToWindowWorkspaceIfHidden(win);
+    setLayoutLeafActive(win.workspace_id, focused_wid);
 
     return true;
 }
@@ -2440,39 +2490,27 @@ fn handleEvent(ev: *const event_mod.Event) void {
             retile();
         },
         .window_focused => {
-            log.info("window focused pid={}", .{ev.pid});
+            const focused_wid_opt = focusedWindowIdForLoggedEvent("window focused", ev.pid);
             if (!g_workspace_transition.isActive()) {
                 requestCleanupForPid(ev.pid);
                 requestOffscreenCleanup();
             }
-            const wid = shim.bw_ax_get_focused_window(ev.pid);
-            if (wid != 0) {
-                if (g_store.get(wid) == null) {
-                    ax_observer.observeApp(ev.pid);
-                    discoverWindows();
-                    retile();
-                }
-                // Track leader in workspace, not raw active tab
-                const leader = g_tab_groups.resolveLeader(wid);
-                if (g_store.get(leader)) |win| {
-                    _ = maybeSetFocusedDisplayForWindow(win, .ax);
-                    if (g_workspaces.get(win.workspace_id)) |ws| {
-                        ws.focused_wid = leader;
-                    }
-                    if (!g_workspace_transition.isActive() and !workspaceVisibleOnDisplay(win.workspace_id, win.display_id)) {
-                        switchWorkspace(win.workspace_id);
-                    }
-                    setLayoutLeafActive(win.workspace_id, wid);
-                }
+            const focused_wid = focused_wid_opt orelse return;
+            if (!syncFocusStateForWindowId(focused_wid, .ax)) {
+                ax_observer.observeApp(ev.pid);
+                discoverWindows();
+                retile();
+                _ = syncFocusStateForWindowId(focused_wid, .ax);
             }
         },
         .focused_window_changed => {
-            log.info("focused window changed pid={}", .{ev.pid});
+            const focused_wid_opt = focusedWindowIdForLoggedEvent("focused window changed", ev.pid);
             if (!g_workspace_transition.isActive()) {
                 requestCleanupForPid(ev.pid);
                 requestOffscreenCleanup();
             }
-            reconcileAppTabs(ev.pid);
+            const focused_wid = focused_wid_opt orelse return;
+            reconcileFocusedWindow(ev.pid, focused_wid);
         },
         .window_created => {
             log.info("window created pid={} wid={}", .{ ev.pid, ev.wid });
@@ -3998,13 +4036,11 @@ fn installCrashHandlers() void {
 
 /// Called on kAXFocusedWindowChangedNotification — detects tab switches and
 /// forms/updates tab groups so only the active tab occupies a layout slot.
-fn reconcileAppTabs(pid: i32) void {
-    const focused_wid = shim.bw_ax_get_focused_window(pid);
+fn reconcileFocusedWindow(pid: i32, focused_wid: u32) void {
+    std.debug.assert(pid > 0);
+    std.debug.assert(focused_wid != 0);
+
     log.debug("reconcile: pid={d} focused_wid={d}", .{ pid, focused_wid });
-    if (focused_wid == 0) {
-        log.debug("reconcile: focused_wid=0, aborting", .{});
-        return;
-    }
 
     const in_store = g_store.get(focused_wid) != null;
     const suppressed = g_tab_groups.isSuppressed(focused_wid);
@@ -4013,31 +4049,13 @@ fn reconcileAppTabs(pid: i32) void {
         focused_wid, in_store, suppressed, in_group,
     });
 
-    // Case 1: focused wid is already managed and not suppressed → just update
-    if (in_store and !suppressed) {
-        g_tab_groups.setActive(focused_wid);
+    if (syncFocusStateForWindowId(focused_wid, .ax)) {
         const leader = g_tab_groups.resolveLeader(focused_wid);
-        if (g_store.get(leader)) |win| {
-            _ = maybeSetFocusedDisplayForWindow(win, .ax);
-            if (g_workspaces.get(win.workspace_id)) |ws| {
-                ws.focused_wid = leader;
-            }
+        if (suppressed) {
+            log.info("reconcile case 2: tab switch, active={d} leader={d}", .{ focused_wid, leader });
+        } else {
+            log.debug("reconcile case 1: known window, leader={d}", .{leader});
         }
-        log.debug("reconcile case 1: known window, leader={d}", .{leader});
-        return;
-    }
-
-    // Case 2: focused wid is suppressed → tab switch within existing group
-    if (suppressed) {
-        g_tab_groups.setActive(focused_wid);
-        const leader = g_tab_groups.resolveLeader(focused_wid);
-        if (g_store.get(leader)) |win| {
-            _ = maybeSetFocusedDisplayForWindow(win, .ax);
-            if (g_workspaces.get(win.workspace_id)) |ws| {
-                ws.focused_wid = leader;
-            }
-        }
-        log.info("reconcile case 2: tab switch, active={d} leader={d}", .{ focused_wid, leader });
         return;
     }
 
@@ -4179,14 +4197,7 @@ fn reconcileAppTabs(pid: i32) void {
         }
 
         const leader = g_tab_groups.resolveLeader(focused_wid);
-        if (g_workspaces.get(matching_ws_id)) |ws| {
-            ws.focused_wid = leader;
-        }
-        if (workspaceVisibleOnDisplay(matching_ws_id, matching_display_id)) {
-            if (g_store.get(leader)) |leader_win| {
-                _ = maybeSetFocusedDisplayForWindow(leader_win, .ax);
-            }
-        }
+        _ = syncFocusStateForWindowId(focused_wid, .ax);
 
         log.info("reconcile: tab group formed leader={d} active={d} members={d}", .{
             leader,
