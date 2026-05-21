@@ -1938,7 +1938,9 @@ pub fn main(init: std.process.Init.Minimal) !void {
     defer deinitAxStrings();
 
     // -- Config --
-    g_config = config_mod.load(g_allocator, cli.configPath(result));
+    var config_arena = std.heap.ArenaAllocator.init(g_allocator);
+    defer config_arena.deinit();
+    g_config = config_mod.load(config_arena.allocator(), cli.configPath(result));
     g_bsp_split_mode = g_config.bsp_split;
     g_config.applyKeybinds();
 
