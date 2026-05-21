@@ -157,6 +157,39 @@ pub fn build(b: *std.Build) !void {
 
     b.installArtifact(exe);
 
+    const swipe_config_mod = b.createModule(.{
+        .root_source_file = b.path("src/config.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+
+    const swipe_mod = b.createModule(.{
+        .root_source_file = b.path("packages/bobrwm-swipe/src/main.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    swipe_mod.addImport("objc", objc_dep.module("objc"));
+    swipe_mod.addImport("c", c_mod);
+    swipe_mod.addImport("cg_extra", cg_extra_mod);
+    swipe_mod.addImport("bobrwm_config", swipe_config_mod);
+    swipe_mod.addAssemblyFile(b.path("packages/bobrwm-swipe/src/info_plist.s"));
+    swipe_mod.linkFramework("ApplicationServices", .{});
+    swipe_mod.linkFramework("CoreGraphics", .{});
+    swipe_mod.linkFramework("AppKit", .{});
+    swipe_mod.linkFramework("CoreFoundation", .{});
+    swipe_mod.addSystemFrameworkPath(.{ .cwd_relative = sdk_frameworks });
+    swipe_mod.addSystemIncludePath(.{ .cwd_relative = sdk_include });
+    swipe_mod.addLibraryPath(.{ .cwd_relative = sdk_lib });
+
+    const swipe_exe = b.addExecutable(.{
+        .name = "bobrwm-swipe",
+        .root_module = swipe_mod,
+    });
+
+    b.installArtifact(swipe_exe);
+
     const run_cmd = b.addRunArtifact(exe);
     run_cmd.step.dependOn(b.getInstallStep());
     if (b.args) |args| {
@@ -166,7 +199,16 @@ pub fn build(b: *std.Build) !void {
     const run_step = b.step("run", "Run bobrwm");
     run_step.dependOn(&run_cmd.step);
 
-    // config.zig has no @cImport / shim usage, so the test module needs
+    const run_swipe_cmd = b.addRunArtifact(swipe_exe);
+    run_swipe_cmd.step.dependOn(b.getInstallStep());
+    if (b.args) |args| {
+        run_swipe_cmd.addArgs(args);
+    }
+
+    const run_swipe_step = b.step("run-swipe", "Run bobrwm-swipe");
+    run_swipe_step.dependOn(&run_swipe_cmd.step);
+
+    // config.zig imports only Zig declarations, so the test module needs
     // no SDK or include wiring.
     const test_mod = b.createModule(.{
         .root_source_file = b.path("src/config.zig"),
@@ -181,6 +223,33 @@ pub fn build(b: *std.Build) !void {
     });
 
     const run_tests = b.addRunArtifact(tests);
+
+    const swipe_test_mod = b.createModule(.{
+        .root_source_file = b.path("packages/bobrwm-swipe/src/main.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    swipe_test_mod.addImport("objc", objc_dep.module("objc"));
+    swipe_test_mod.addImport("c", c_mod);
+    swipe_test_mod.addImport("cg_extra", cg_extra_mod);
+    swipe_test_mod.addImport("bobrwm_config", swipe_config_mod);
+    swipe_test_mod.linkFramework("ApplicationServices", .{});
+    swipe_test_mod.linkFramework("CoreGraphics", .{});
+    swipe_test_mod.linkFramework("AppKit", .{});
+    swipe_test_mod.linkFramework("CoreFoundation", .{});
+    swipe_test_mod.addSystemFrameworkPath(.{ .cwd_relative = sdk_frameworks });
+    swipe_test_mod.addSystemIncludePath(.{ .cwd_relative = sdk_include });
+    swipe_test_mod.addLibraryPath(.{ .cwd_relative = sdk_lib });
+
+    const swipe_tests = b.addTest(.{
+        .name = "bobrwm-swipe-tests",
+        .root_module = swipe_test_mod,
+    });
+
+    const run_swipe_tests = b.addRunArtifact(swipe_tests);
+
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_tests.step);
+    test_step.dependOn(&run_swipe_tests.step);
 }

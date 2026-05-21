@@ -15,6 +15,7 @@ pub const Config = struct {
     keybinds: []const Keybind = &default_keybinds,
     workspace_assignments: []const WorkspaceAssignment = &.{},
     workspace_names: []const []const u8 = &.{},
+    swipe: SwipeConfig = .{},
     gaps: Gaps = .{},
     layout: layout_mod.LayoutKind = .bsp,
     bsp_split: layout_mod.SplitMode = .auto,
@@ -111,6 +112,12 @@ pub const Keybind = struct {
 pub const WorkspaceAssignment = struct {
     app_id: []const u8,
     workspace: u8,
+};
+
+pub const SwipeConfig = struct {
+    enabled: bool = false,
+    fingers: u8 = 3,
+    distance_pct: f64 = 0.08,
 };
 
 pub const OuterGaps = struct {
@@ -301,6 +308,9 @@ test "default config" {
     try t.expectEqual(@as(usize, 25), cfg.keybinds.len);
     try t.expectEqual(@as(usize, 0), cfg.workspace_assignments.len);
     try t.expectEqual(@as(usize, 0), cfg.workspace_names.len);
+    try t.expect(!cfg.swipe.enabled);
+    try t.expectEqual(@as(u8, 3), cfg.swipe.fingers);
+    try t.expectApproxEqAbs(@as(f64, 0.08), cfg.swipe.distance_pct, 0.0001);
     try t.expectEqual(@as(u16, 0), cfg.gaps.inner);
     try t.expectEqual(@as(u16, 0), cfg.gaps.outer.left);
     try t.expectEqual(layout_mod.LayoutKind.bsp, cfg.layout);
@@ -398,6 +408,7 @@ test "loadFromPath: custom zon" {
         \\    .workspace_assignments = .{
         \\        .{ .app_id = "com.test.App", .workspace = 3 },
         \\    },
+        \\    .swipe = .{ .enabled = true, .fingers = 4, .distance_pct = 0.1 },
         \\    .gaps = .{ .inner = 8, .outer = .{ .left = 4, .right = 4, .top = 4, .bottom = 4 } },
         \\    .layout = .monocle,
         \\    .bsp_split = .vertical,
@@ -425,6 +436,9 @@ test "loadFromPath: custom zon" {
     try t.expectEqual(@as(usize, 1), cfg.workspace_assignments.len);
     try t.expect(std.mem.eql(u8, "com.test.App", cfg.workspace_assignments[0].app_id));
     try t.expectEqual(@as(u8, 3), cfg.workspace_assignments[0].workspace);
+    try t.expect(cfg.swipe.enabled);
+    try t.expectEqual(@as(u8, 4), cfg.swipe.fingers);
+    try t.expectApproxEqAbs(@as(f64, 0.1), cfg.swipe.distance_pct, 0.0001);
 
     try t.expectEqual(@as(u16, 8), cfg.gaps.inner);
     try t.expectEqual(@as(u16, 4), cfg.gaps.outer.left);
