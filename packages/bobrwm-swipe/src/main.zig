@@ -297,6 +297,10 @@ fn sendIpcCommand(cmd: []const u8) IpcResult {
     const fd = std.c.socket(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0);
     if (fd < 0) return .failed;
     defer _ = std.c.close(fd);
+    const no_sigpipe: i32 = 1;
+    std.posix.setsockopt(fd, std.posix.SOL.SOCKET, std.posix.SO.NOSIGPIPE, std.mem.asBytes(&no_sigpipe)) catch |err| {
+        log.warn("bobrwm IPC socket SO_NOSIGPIPE failed: {}", .{err});
+    };
 
     var addr: std.posix.sockaddr.un = .{ .path = undefined, .family = std.posix.AF.UNIX };
     @memcpy(addr.path[0..path.len], path[0..path.len]);

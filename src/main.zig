@@ -2142,6 +2142,7 @@ export fn bw_handle_ipc_client(server_fd: c_int) void {
         return;
     }
     defer _ = std.c.close(client_fd);
+    ipc.disableSigpipe(client_fd);
     const started_ns = nanoTimestamp();
 
     var buf: [512]u8 = undefined;

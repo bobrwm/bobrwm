@@ -224,6 +224,20 @@ pub fn build(b: *std.Build) !void {
 
     const run_tests = b.addRunArtifact(tests);
 
+    const ipc_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/ipc.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+
+    const ipc_tests = b.addTest(.{
+        .name = "ipc-tests",
+        .root_module = ipc_test_mod,
+    });
+
+    const run_ipc_tests = b.addRunArtifact(ipc_tests);
+
     const swipe_test_mod = b.createModule(.{
         .root_source_file = b.path("packages/bobrwm-swipe/src/main.zig"),
         .target = target,
@@ -251,5 +265,6 @@ pub fn build(b: *std.Build) !void {
 
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_tests.step);
+    test_step.dependOn(&run_ipc_tests.step);
     test_step.dependOn(&run_swipe_tests.step);
 }
