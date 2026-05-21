@@ -23,6 +23,8 @@ bobrwm query displays     # IPC: list connected displays
 bobrwm query displays --json # IPC: list connected displays as JSON
 bobrwm query apps         # IPC: list observed apps
 bobrwm query apps --json  # IPC: list observed apps as JSON
+bobrwm focus-workspace next # IPC: switch to next workspace without wrapping
+bobrwm focus-workspace prev # IPC: switch to previous workspace without wrapping
 bobrwm move-to-display 2  # IPC: move focused window to display slot 2
 bobrwm bsp insert-mode stack          # IPC: split | stack
 bobrwm bsp insert-point min_depth     # IPC: focused | first | last | min_depth

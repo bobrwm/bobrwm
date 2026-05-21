@@ -372,8 +372,13 @@ fn adjacentWorkspaceId(direction: WorkspaceTraversalDirection) ?u8 {
 }
 
 fn switchAdjacentWorkspace(direction: WorkspaceTraversalDirection) void {
-    const target_id = adjacentWorkspaceId(direction) orelse return;
+    _ = switchAdjacentWorkspaceHandled(direction);
+}
+
+fn switchAdjacentWorkspaceHandled(direction: WorkspaceTraversalDirection) bool {
+    const target_id = adjacentWorkspaceId(direction) orelse return false;
     switchWorkspace(target_id);
+    return true;
 }
 
 fn dispatchForHotkeyBinding(binding: shim.bw_keybind) HotkeyDispatch {
@@ -4751,8 +4756,22 @@ fn ipcDispatch(cmd: []const u8, client_fd: posix.socket_t) void {
             focusDirection(dir);
             ipc.writeResponse(client_fd, "ok\n");
         },
-        .focus_workspace => |n| {
-            switchWorkspace(n);
+        .focus_workspace => |target| {
+            switch (target) {
+                .prev => {
+                    if (!switchAdjacentWorkspaceHandled(.previous)) {
+                        ipc.writeResponse(client_fd, "pass\n");
+                        return;
+                    }
+                },
+                .next => {
+                    if (!switchAdjacentWorkspaceHandled(.next)) {
+                        ipc.writeResponse(client_fd, "pass\n");
+                        return;
+                    }
+                },
+                .index => |n| switchWorkspace(n),
+            }
             ipc.writeResponse(client_fd, "ok\n");
         },
         .move_to_workspace => |n| {
