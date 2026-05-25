@@ -26,6 +26,15 @@
     // .second = right/bottom, .first = left/top
     // .new_window_split = .second,
 
+    // Optional bobrwm-swipe companion configuration. Core bobrwm only
+    // parses this field; the companion package owns gesture handling.
+    // .swipe = .{
+    //     .enabled = false,
+    //     .fingers = 3,
+    //     // Fraction of normalized trackpad width before a swipe fires.
+    //     .distance_pct = 0.08,
+    // },
+
     // Gaps between windows (pixels). Omit or set to 0 for no gaps.
     // .gaps = .{
     //     .inner = 4,

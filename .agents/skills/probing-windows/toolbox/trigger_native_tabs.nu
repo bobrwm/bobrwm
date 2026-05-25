@@ -220,10 +220,11 @@ def execute [] {
 }
 
 def main [] {
+    let input_json = $in
     let action = ($env | get -o TOOLBOX_ACTION | default "describe")
     match $action {
         "describe" => { describe }
-        "execute" => { execute }
+        "execute" => { $input_json | execute }
         _ => {
             $"Unknown action: ($action)\n" | save --raw --append /dev/stderr
             exit 1

@@ -23,6 +23,8 @@ bobrwm query displays     # IPC: list connected displays
 bobrwm query displays --json # IPC: list connected displays as JSON
 bobrwm query apps         # IPC: list observed apps
 bobrwm query apps --json  # IPC: list observed apps as JSON
+bobrwm focus-workspace next # IPC: switch to next workspace without wrapping
+bobrwm focus-workspace prev # IPC: switch to previous workspace without wrapping
 bobrwm move-to-display 2  # IPC: move focused window to display slot 2
 bobrwm bsp insert-mode stack          # IPC: split | stack
 bobrwm bsp insert-point min_depth     # IPC: focused | first | last | min_depth
@@ -32,6 +34,7 @@ bobrwm bsp mirror horizontal          # IPC: horizontal | vertical
 bobrwm bsp equalize                   # IPC: set all split ratios to config ratio
 bobrwm bsp balance                    # IPC: proportional balance by subtree size
 bobrwm bsp rotate 90                  # IPC: 90 | 180 | 270
+bobrwm-swipe                          # optional trackpad swipe companion
 ```
 
 ### Logging
@@ -113,3 +116,21 @@ Pin apps to specific workspaces by bundle ID:
     .{ .app_id = "com.brave.Browser", .workspace = 2 },
 },
 ```
+
+### Swipe companion
+
+The optional `bobrwm-swipe` companion reads its opt-in flag from the main bobrwm config:
+
+```zon
+.swipe = .{
+    .enabled = true,
+    .fingers = 3,
+    .distance_pct = 0.08,
+},
+```
+
+`distance_pct` is the average horizontal movement threshold as a normalized fraction of the trackpad width; `0.08` means roughly 8% of the trackpad.
+
+Core bobrwm does not start a gesture listener from this flag. It only defines the shared config shape and exposes `focus-workspace next|prev` over IPC. Run `bobrwm-swipe` as the companion process after enabling the field. macOS grants Accessibility permissions per executable, so `bobrwm-swipe` needs its own grant even if bobrwm is already trusted.
+
+When bobrwm has an adjacent workspace, the swipe listener consumes the matching macOS gesture. At the first or last bobrwm workspace, it passes the gesture through so native Spaces can handle it.

@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const posix = std.posix;
 const layout_mod = @import("layout.zig");
 const osutil = @import("osutil.zig");
@@ -13,7 +14,7 @@ pub const IpcCommand = union(enum) {
     retile,
     toggle_split,
     focus: FocusDir,
-    focus_workspace: u8,
+    focus_workspace: WorkspaceTarget,
     move_to_workspace: u8,
     move_to_display: u8,
     move_workspace_to_display: DisplayTarget,
@@ -31,6 +32,12 @@ pub const IpcCommand = union(enum) {
     query_apps: QueryFormat,
 
     pub const FocusDir = enum { left, right, up, down };
+
+    pub const WorkspaceTarget = union(enum) {
+        prev,
+        next,
+        index: u8,
+    };
 
     pub const QueryFormat = enum { text, json };
 
@@ -61,7 +68,7 @@ pub const IpcCommand = union(enum) {
         if (stripPrefix(cmd, "focus ")) |arg|
             return parseEnum(FocusDir, arg, .focus);
         if (stripPrefix(cmd, "focus-workspace ")) |arg|
-            return parseU8(arg, .focus_workspace);
+            return parseWorkspaceTarget(arg);
         if (stripPrefix(cmd, "move-to-workspace ")) |arg|
             return parseU8(arg, .move_to_workspace);
         if (stripPrefix(cmd, "move-to-display ")) |arg|
@@ -109,6 +116,15 @@ pub const IpcCommand = union(enum) {
     fn parseFloat(arg: []const u8, comptime tag: anytype) ?IpcCommand {
         const val = std.fmt.parseFloat(f64, arg) catch return null;
         return @unionInit(IpcCommand, @tagName(tag), val);
+    }
+
+    fn parseWorkspaceTarget(arg: []const u8) ?IpcCommand {
+        if (std.mem.eql(u8, arg, "prev"))
+            return .{ .focus_workspace = .prev };
+        if (std.mem.eql(u8, arg, "next"))
+            return .{ .focus_workspace = .next };
+        const n = std.fmt.parseInt(u8, arg, 10) catch return null;
+        return .{ .focus_workspace = .{ .index = n } };
     }
 
     fn parseDisplayTarget(arg: []const u8) ?IpcCommand {
@@ -165,6 +181,7 @@ pub const Server = struct {
         const fd = std.c.socket(posix.AF.UNIX, posix.SOCK.STREAM, 0);
         if (fd < 0) return error.SocketFailed;
         errdefer _ = std.c.close(fd);
+        disableSigpipe(fd);
 
         var addr: posix.sockaddr.un = .{ .path = undefined, .family = posix.AF.UNIX };
         if (path.len > addr.path.len) return error.NameTooLong;
@@ -191,9 +208,54 @@ pub const Server = struct {
     }
 };
 
+/// Prevent a disconnected IPC client from killing bobrwm with SIGPIPE.
+pub fn disableSigpipe(fd: posix.socket_t) void {
+    std.debug.assert(fd >= 0);
+
+    switch (builtin.os.tag) {
+        .driverkit, .ios, .maccatalyst, .macos, .tvos, .visionos, .watchos, .freebsd => {
+            const enabled: i32 = 1;
+            posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.NOSIGPIPE, std.mem.asBytes(&enabled)) catch |err| {
+                log.warn("ipc socket SO_NOSIGPIPE failed: {}", .{err});
+            };
+        },
+        else => {},
+    }
+}
+
 /// Write a response to the IPC client fd.
 pub fn writeResponse(fd: posix.socket_t, data: []const u8) void {
-    _ = std.c.write(fd, data.ptr, data.len);
+    std.debug.assert(fd >= 0);
+
+    var remaining = data;
+    while (remaining.len > 0) {
+        const written = std.c.write(fd, remaining.ptr, remaining.len);
+        if (written < 0) {
+            switch (posix.errno(written)) {
+                .PIPE, .CONNRESET => return,
+                else => |err| log.warn("ipc response write failed: {}", .{err}),
+            }
+            return;
+        }
+        if (written == 0) return;
+        remaining = remaining[@intCast(written)..];
+    }
+}
+
+test "write response tolerates closed IPC peer" {
+    switch (builtin.os.tag) {
+        .driverkit, .ios, .maccatalyst, .macos, .tvos, .visionos, .watchos, .freebsd => {},
+        else => return error.SkipZigTest,
+    }
+
+    const t = std.testing;
+    var fds: [2]posix.socket_t = undefined;
+    try t.expectEqual(0, std.c.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0, &fds));
+    defer _ = std.c.close(fds[0]);
+
+    disableSigpipe(fds[0]);
+    try t.expectEqual(0, std.c.close(fds[1]));
+    writeResponse(fds[0], "ok\n");
 }
 
 test "parse query format" {
@@ -205,4 +267,13 @@ test "parse query format" {
     try t.expectEqual(IpcCommand{ .query_displays = .json }, IpcCommand.parse("query displays --json").?);
     try t.expectEqual(IpcCommand{ .query_apps = .json }, IpcCommand.parse("query apps --json").?);
     try t.expectEqual(@as(?IpcCommand, null), IpcCommand.parse("query windows --json extra"));
+}
+
+test "parse focus workspace target" {
+    const t = std.testing;
+
+    try t.expectEqual(IpcCommand{ .focus_workspace = .{ .index = 3 } }, IpcCommand.parse("focus-workspace 3").?);
+    try t.expectEqual(IpcCommand{ .focus_workspace = .prev }, IpcCommand.parse("focus-workspace prev").?);
+    try t.expectEqual(IpcCommand{ .focus_workspace = .next }, IpcCommand.parse("focus-workspace next").?);
+    try t.expectEqual(@as(?IpcCommand, null), IpcCommand.parse("focus-workspace previous"));
 }

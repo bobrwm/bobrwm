@@ -170,7 +170,8 @@ const help_text =
     \\  retile                    Re-tile all windows on the active workspace
     \\  toggle-split              Cycle BSP split mode (auto, horizontal, vertical)
     \\  focus <direction>         Focus window in direction (left, right, up, down)
-    \\  focus-workspace <n>       Focus workspace by number
+    \\  focus-workspace <n|prev|next>
+    \\                            Focus workspace by number or adjacent direction
     \\  move-to-workspace <n>     Move focused window to workspace
     \\  move-to-display <n>       Move focused window to display
     \\  move-workspace-to-display <n|next|prev>
@@ -259,6 +260,10 @@ fn runClient(cmd: []const u8) void {
         return;
     }
     defer _ = std.c.close(fd);
+    const no_sigpipe: i32 = 1;
+    posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.NOSIGPIPE, std.mem.asBytes(&no_sigpipe)) catch |err| {
+        log.warn("ipc client SO_NOSIGPIPE failed: {}", .{err});
+    };
 
     var addr: posix.sockaddr.un = .{ .path = undefined, .family = posix.AF.UNIX };
     @memcpy(addr.path[0..path.len], path[0..path.len]);

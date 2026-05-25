@@ -372,8 +372,13 @@ fn adjacentWorkspaceId(direction: WorkspaceTraversalDirection) ?u8 {
 }
 
 fn switchAdjacentWorkspace(direction: WorkspaceTraversalDirection) void {
-    const target_id = adjacentWorkspaceId(direction) orelse return;
+    _ = switchAdjacentWorkspaceHandled(direction);
+}
+
+fn switchAdjacentWorkspaceHandled(direction: WorkspaceTraversalDirection) bool {
+    const target_id = adjacentWorkspaceId(direction) orelse return false;
     switchWorkspace(target_id);
+    return true;
 }
 
 fn dispatchForHotkeyBinding(binding: shim.bw_keybind) HotkeyDispatch {
@@ -1938,7 +1943,9 @@ pub fn main(init: std.process.Init.Minimal) !void {
     defer deinitAxStrings();
 
     // -- Config --
-    g_config = config_mod.load(g_allocator, cli.configPath(result));
+    var config_arena = std.heap.ArenaAllocator.init(g_allocator);
+    defer config_arena.deinit();
+    g_config = config_mod.load(config_arena.allocator(), cli.configPath(result));
     g_bsp_split_mode = g_config.bsp_split;
     g_config.applyKeybinds();
 
@@ -2135,6 +2142,7 @@ export fn bw_handle_ipc_client(server_fd: c_int) void {
         return;
     }
     defer _ = std.c.close(client_fd);
+    ipc.disableSigpipe(client_fd);
     const started_ns = nanoTimestamp();
 
     var buf: [512]u8 = undefined;
@@ -4749,8 +4757,22 @@ fn ipcDispatch(cmd: []const u8, client_fd: posix.socket_t) void {
             focusDirection(dir);
             ipc.writeResponse(client_fd, "ok\n");
         },
-        .focus_workspace => |n| {
-            switchWorkspace(n);
+        .focus_workspace => |target| {
+            switch (target) {
+                .prev => {
+                    if (!switchAdjacentWorkspaceHandled(.previous)) {
+                        ipc.writeResponse(client_fd, "pass\n");
+                        return;
+                    }
+                },
+                .next => {
+                    if (!switchAdjacentWorkspaceHandled(.next)) {
+                        ipc.writeResponse(client_fd, "pass\n");
+                        return;
+                    }
+                },
+                .index => |n| switchWorkspace(n),
+            }
             ipc.writeResponse(client_fd, "ok\n");
         },
         .move_to_workspace => |n| {

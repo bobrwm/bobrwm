@@ -11,6 +11,7 @@ def describe [] {
             properties: {
                 app: { type: "string", description: "App name to kill, relaunch, and probe (e.g. Discord, Safari)" }
                 pid: { type: "integer", description: "PID to probe directly (skips app launch)" }
+                wid: { type: "integer", description: "CG window ID to query directly. Can be combined with pid to verify ownership." }
                 duration_sec: { type: "integer", description: "How many seconds to sample (default: 10)" }
                 interval_ms: { type: "integer", description: "Milliseconds between samples (default: 100)" }
                 output_file: { type: "string", description: "Optional file path to save raw JSONL output" }
@@ -24,6 +25,7 @@ def execute [] {
 
     let app = ($input | get -o app)
     let pid_arg = ($input | get -o pid)
+    let wid_arg = ($input | get -o wid)
     let duration_sec = ($input | get -o duration_sec | default 10)
     let interval_ms_val = ($input | get -o interval_ms | default 100)
     let output_file = ($input | get -o output_file)
@@ -40,7 +42,26 @@ def execute [] {
 
         mut found_pid = null
         for _ in 1..200 {
-            let result = try { ^pgrep -x $app | lines | first } catch { "" }
+            let exact_result = try { ^pgrep -x $app | lines | first } catch { "" }
+            let result = if ($exact_result | is-not-empty) {
+                $exact_result
+            } else {
+                let full_result = try { ^pgrep -f $app | lines | first } catch { "" }
+                if ($full_result | is-not-empty) {
+                    $full_result
+                } else {
+                    try {
+                        ^ps ax -ww -o pid=,args=
+                        | lines
+                        | where {|line| $line | str downcase | str contains ($app | str downcase) }
+                        | first
+                        | str trim
+                        | split row " "
+                        | where {|part| $part | is-not-empty }
+                        | first
+                    } catch { "" }
+                }
+            }
             if ($result | is-not-empty) {
                 $found_pid = ($result | into int)
                 break
@@ -53,12 +74,17 @@ def execute [] {
         }
         $found_pid
     } else {
-        print "error: either app or pid parameter is required"
+        null
+    }
+
+    if $target_pid == null and $wid_arg == null {
+        print "error: app, pid, or wid parameter is required"
         exit 1
     }
 
     # Build swift probe (use Xcode toolchain to avoid Nix SDK conflicts)
-    let skill_dir = ($env | get -o FILE_PWD | default ([$env.HOME, ".config", "agents", "skills", "probing-windows"] | path join))
+    let file_pwd = ($env | get -o FILE_PWD | default ([$env.HOME, ".config", "agents", "skills", "probing-windows"] | path join))
+    let skill_dir = if ($file_pwd | path basename) == "toolbox" { $file_pwd | path dirname } else { $file_pwd }
     let swift_src = ([$skill_dir, "scripts", "probe.swift"] | path join)
     let tmp_dir = (mktemp -d)
     let probe_bin = ([$tmp_dir, "window-probe"] | path join)
@@ -69,7 +95,13 @@ def execute [] {
     }
 
     # Run probe
-    let raw_output = (^$probe_bin --pid $"($target_pid)" --duration-ms $"($duration_ms)" --interval-ms $"($interval_ms_val)")
+    let raw_output = if $target_pid != null and $wid_arg != null {
+        ^$probe_bin --pid $"($target_pid)" --wid $"($wid_arg)" --duration-ms $"($duration_ms)" --interval-ms $"($interval_ms_val)"
+    } else if $target_pid != null {
+        ^$probe_bin --pid $"($target_pid)" --duration-ms $"($duration_ms)" --interval-ms $"($interval_ms_val)"
+    } else {
+        ^$probe_bin --wid $"($wid_arg)" --duration-ms $"($duration_ms)" --interval-ms $"($interval_ms_val)"
+    }
 
     # Save raw JSONL if requested
     if $output_file != null {
@@ -100,17 +132,29 @@ def execute [] {
         let ready_ms = if ($ready_change | is-not-empty) { $ready_change | get elapsed_ms } else { "-" }
 
         {
+            pid: ($w | get pid)
             wid: $wid
+            onscreen: ($w | get cg_onscreen)
+            layer: ($w | get cg_layer)
             role: ($w | get -o role | default "null")
             subrole: ($w | get -o subrole | default "null")
             manage_state: ($w | get manage_state)
+            bounds: ($"x=($w.cg_bounds.x) y=($w.cg_bounds.y) w=($w.cg_bounds.w) h=($w.cg_bounds.h)")
+            title: ($w | get -o title | default "")
             first_seen_ms: $first_seen_ms
             role_ready_ms: $ready_ms
         }
     })
 
     # Output for model consumption
-    print $"Probed pid=($target_pid) for ($duration_sec)s at ($interval_ms_val)ms intervals"
+    let target_desc = if $target_pid != null and $wid_arg != null {
+        $"pid=($target_pid) wid=($wid_arg)"
+    } else if $target_pid != null {
+        $"pid=($target_pid)"
+    } else {
+        $"wid=($wid_arg)"
+    }
+    print $"Probed ($target_desc) for ($duration_sec)s at ($interval_ms_val)ms intervals"
     print $"Total samples: ($samples | length), Windows in final sample: ($windows | length)"
     print ""
     $summary | to md | print
@@ -122,8 +166,10 @@ def execute [] {
         print "Change timeline:"
         for event in $change_events {
             let wid = ($event | get -o wid | default ($event | get -o current | get -o wid | default "?"))
+            let pid = ($event | get -o current | get -o pid | default ($event | get -o previous | get -o pid | default "?"))
             let state = ($event | get -o current | get -o manage_state | default "?")
-            print $"  ($event.elapsed_ms)ms: ($event.change) wid=($wid) manage_state=($state)"
+            let onscreen = ($event | get -o current | get -o cg_onscreen | default "?")
+            print $"  ($event.elapsed_ms)ms: ($event.change) pid=($pid) wid=($wid) onscreen=($onscreen) manage_state=($state)"
         }
     }
 
@@ -132,10 +178,11 @@ def execute [] {
 }
 
 def main [] {
+    let input_json = $in
     let action = ($env | get -o TOOLBOX_ACTION | default "describe")
     match $action {
         "describe" => { describe }
-        "execute" => { execute }
+        "execute" => { $input_json | execute }
         _ => {
             $"Unknown action: ($action)\n" | save --raw --append /dev/stderr
             exit 1
