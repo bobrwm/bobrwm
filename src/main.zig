@@ -3382,11 +3382,22 @@ fn addNewWindowManagedWithAssignment(pid: i32, wid: u32, workspace_id: u8, assig
             };
         }
     }
+    // Look up a config-level per-app default mode (app_rules). When set,
+    // it wins over the auto-float heuristic: the user has explicitly asked
+    // for this bundle ID to behave a certain way.
+    const configured_mode: ?window_mod.WindowMode = blk: {
+        if (g_config.app_rules.len == 0) break :blk null;
+        var id_buf: [256]u8 = undefined;
+        const bundle_id = config_mod.getAppBundleId(pid, &id_buf) orelse break :blk null;
+        break :blk g_config.modeForApp(bundle_id);
+    };
+
     // Non-resizable windows that are undersized (≤500px in either dimension)
     // are floated instead of tiled. This catches transient splash screens and
     // updater dialogs (e.g. Discord Updater at 300x300) that have standard
     // AX roles but are not real application windows.
     const should_float = blk: {
+        if (configured_mode != null) break :blk false;
         if (window_frame.width > 500 and window_frame.height > 500) break :blk false;
         const ax_win = findAxWindow(pid, wid) orelse break :blk false;
         defer c.CFRelease(@ptrCast(ax_win));
@@ -3395,7 +3406,8 @@ fn addNewWindowManagedWithAssignment(pid: i32, wid: u32, workspace_id: u8, assig
     };
 
     const ws = g_workspaces.get(workspace_id) orelse resolveWorkspace(pid, display_id);
-    const mode: window_mod.WindowMode = if (should_float) .floating else .tiled;
+    const mode: window_mod.WindowMode = configured_mode orelse
+        if (should_float) .floating else .tiled;
 
     const win = window_mod.Window{
         .wid = wid,
@@ -3418,13 +3430,22 @@ fn addNewWindowManagedWithAssignment(pid: i32, wid: u32, workspace_id: u8, assig
     // If assigned to a non-visible workspace, hide immediately
     if (!workspaceVisibleOnDisplay(ws.id, display_id)) {
         hideWindow(pid, wid);
+    } else if (mode == .floating_above) {
+        // Re-assert stacking right away so a configured floating-above
+        // window does not get buried by whatever opened it.
+        enforceKeepAboveForDisplay(display_id);
     }
 
-    log.info("addNewWindow: {s} wid={d} on workspace {d}", .{
-        if (mode == .tiled) "tiled" else "floated (undersized+non-resizable)",
-        wid,
-        ws.id,
-    });
+    const reason: []const u8 = if (configured_mode != null) switch (mode) {
+        .tiled => "tiled (app_rule)",
+        .floating => "floated (app_rule)",
+        .floating_above => "floated-above (app_rule)",
+    } else switch (mode) {
+        .tiled => "tiled",
+        .floating => "floated (undersized+non-resizable)",
+        .floating_above => "floated-above",
+    };
+    log.info("addNewWindow: {s} wid={d} on workspace {d}", .{ reason, wid, ws.id });
     return true;
 }
 

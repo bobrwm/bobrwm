@@ -84,8 +84,22 @@
         .{ .key = "right", .mods = .{ .ctrl = true }, .action = .focus_next_workspace },
     },
 
-    .workspace_assignments = .{
-        // .{ .app_id = "com.apple.Safari", .workspace = 2 },
-        // .{ .app_id = "com.apple.MobileSMS", .workspace = 3 },
+    // Per-app rules, matched by bundle ID when a window is registered.
+    // Either or both fields may be set:
+    //   .workspace = N         → pin matching windows to workspace N
+    //   .mode = .floating      → exclude from BSP/monocle layout
+    //   .mode = .floating_above → exclude from layout AND keep raised
+    //   .mode = .tiled         → opt out of the small-non-resizable auto-float
+    .app_rules = .{
+        // .{ .app_id = "com.apple.Safari",            .workspace = 2 },
+        // .{ .app_id = "com.apple.systempreferences", .mode = .floating_above },
+        // .{ .app_id = "com.apple.calculator",        .mode = .floating },
+        // .{ .app_id = "com.brave.Browser",           .workspace = 1, .mode = .floating_above },
     },
+
+    // Deprecated: use `app_rules` with `.workspace = N` instead.
+    // Still parsed for backward compatibility; logs a warning on load.
+    // .workspace_assignments = .{
+    //     .{ .app_id = "com.apple.Safari", .workspace = 2 },
+    // },
 }

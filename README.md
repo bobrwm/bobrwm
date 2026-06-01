@@ -111,16 +111,36 @@ Choose the tiling algorithm:
 .layout = .bsp, // .bsp | .monocle
 ```
 
-### Workspace Assignments
+### App rules
 
-Pin apps to specific workspaces by bundle ID:
+Configure per-app behavior keyed by bundle ID. Either or both fields may
+be set on a rule, and the two concerns (workspace pin, default mode) can
+be combined on the same `app_id`:
 
 ```zon
-.workspace_assignments = .{
-    .{ .app_id = "com.mitchellh.ghostty", .workspace = 1 },
-    .{ .app_id = "com.brave.Browser", .workspace = 2 },
+.app_rules = .{
+    // pin Safari to workspace 2
+    .{ .app_id = "com.apple.Safari", .workspace = 2 },
+    // open System Settings as floating-above
+    .{ .app_id = "com.apple.systempreferences", .mode = .floating_above },
+    // both: pin Brave to workspace 1 and float it above
+    .{ .app_id = "com.brave.Browser", .workspace = 1, .mode = .floating_above },
 },
 ```
+
+| Mode | Behavior |
+| --- | --- |
+| `.tiled` | Participate in BSP/monocle layout (default for unmatched windows). |
+| `.floating` | Excluded from layout. |
+| `.floating_above` | Excluded from layout and re-raised after retile, focus, and workspace switches. |
+
+A matching rule overrides the built-in small-non-resizable auto-float
+heuristic, so set `.mode = .tiled` to force-tile apps that bobrwm would
+otherwise float by default.
+
+> **Deprecated:** the older `workspace_assignments` field is still parsed
+> and merged into the lookup for backward compatibility, but logs a
+> warning at startup. Migrate entries to `app_rules` with `.workspace = N`.
 
 ### Swipe companion
 

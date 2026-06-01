@@ -6,6 +6,7 @@ const std = @import("std");
 const shim = @import("shim_api.zig");
 const layout_mod = @import("layout.zig");
 const osutil = @import("osutil.zig");
+const window_mod = @import("window.zig");
 
 const log = std.log.scoped(.config);
 
@@ -14,6 +15,7 @@ const log = std.log.scoped(.config);
 pub const Config = struct {
     keybinds: []const Keybind = &default_keybinds,
     workspace_assignments: []const WorkspaceAssignment = &.{},
+    app_rules: []const AppRule = &.{},
     workspace_names: []const []const u8 = &.{},
     swipe: SwipeConfig = .{},
     gaps: Gaps = .{},
@@ -25,9 +27,28 @@ pub const Config = struct {
     new_window_split: layout_mod.InsertChild = .second,
 
     /// Look up the assigned workspace for a given bundle identifier.
+    /// Checks `app_rules` first, then falls back to the legacy
+    /// `workspace_assignments` table.
     pub fn workspaceForApp(self: *const Config, bundle_id: []const u8) ?u8 {
+        for (self.app_rules) |r| {
+            if (r.workspace) |ws| {
+                if (std.mem.eql(u8, r.app_id, bundle_id)) return ws;
+            }
+        }
         for (self.workspace_assignments) |a| {
             if (std.mem.eql(u8, a.app_id, bundle_id)) return a.workspace;
+        }
+        return null;
+    }
+
+    /// Look up the default window mode for a given bundle identifier.
+    /// Returns null when no app rule matches; caller falls back to its
+    /// own defaulting (tiled, or the small-non-resizable auto-float).
+    pub fn modeForApp(self: *const Config, bundle_id: []const u8) ?window_mod.WindowMode {
+        for (self.app_rules) |r| {
+            if (r.mode) |m| {
+                if (std.mem.eql(u8, r.app_id, bundle_id)) return m;
+            }
         }
         return null;
     }
@@ -110,9 +131,27 @@ pub const Keybind = struct {
     arg: u8 = 0,
 };
 
+/// Legacy: pin an app to a workspace by bundle ID. Superseded by
+/// `app_rules`; still parsed for backward compatibility and merged
+/// after `app_rules` during lookup. A deprecation warning is logged
+/// at load time when non-empty.
 pub const WorkspaceAssignment = struct {
     app_id: []const u8,
     workspace: u8,
+};
+
+/// Per-app rule keyed by bundle ID. Either or both fields may be set:
+///
+/// - `workspace`: pin matching windows to this workspace on creation.
+/// - `mode`: set the default WindowMode (.tiled / .floating / .floating_above).
+///
+/// Bundle IDs are matched exactly. The first matching rule wins per
+/// field, so listing the same `app_id` more than once is allowed but
+/// only the first non-null value of each field is used.
+pub const AppRule = struct {
+    app_id: []const u8,
+    workspace: ?u8 = null,
+    mode: ?window_mod.WindowMode = null,
 };
 
 pub const SwipeConfig = struct {
@@ -225,10 +264,17 @@ fn loadFromPath(allocator: std.mem.Allocator, path: []const u8) ?Config {
         return null;
     };
 
-    log.info("loaded config: {d} keybinds, {d} workspace assignments", .{
+    log.info("loaded config: {d} keybinds, {d} app rules, {d} workspace assignments", .{
         parsed.keybinds.len,
+        parsed.app_rules.len,
         parsed.workspace_assignments.len,
     });
+    if (parsed.workspace_assignments.len > 0) {
+        log.warn(
+            "`workspace_assignments` is deprecated; use `app_rules` instead (e.g. .{{ .app_id = \"...\", .workspace = N }})",
+            .{},
+        );
+    }
     return parsed;
 }
 
@@ -292,7 +338,7 @@ test "keyNameToCode" {
     try t.expectEqual(@as(?u16, null), keyNameToCode(""));
 }
 
-test "workspaceForApp" {
+test "workspaceForApp: legacy workspace_assignments still resolves" {
     const cfg: Config = .{
         .workspace_assignments = &.{
             .{ .app_id = "com.apple.Safari", .workspace = 2 },
@@ -307,10 +353,69 @@ test "workspaceForApp" {
     try t.expectEqual(@as(?u8, null), empty.workspaceForApp("com.apple.Safari"));
 }
 
+test "workspaceForApp: app_rules takes precedence over workspace_assignments" {
+    const cfg: Config = .{
+        .app_rules = &.{
+            .{ .app_id = "com.apple.Safari", .workspace = 5 },
+        },
+        .workspace_assignments = &.{
+            .{ .app_id = "com.apple.Safari", .workspace = 2 },
+        },
+    };
+    try t.expectEqual(@as(?u8, 5), cfg.workspaceForApp("com.apple.Safari"));
+}
+
+test "modeForApp" {
+    const cfg: Config = .{
+        .app_rules = &.{
+            .{ .app_id = "com.apple.systempreferences", .mode = .floating_above },
+            .{ .app_id = "com.apple.calculator", .mode = .floating },
+            // workspace-only rule must not match a mode lookup.
+            .{ .app_id = "com.apple.Safari", .workspace = 2 },
+        },
+    };
+    try t.expectEqual(
+        @as(?window_mod.WindowMode, .floating_above),
+        cfg.modeForApp("com.apple.systempreferences"),
+    );
+    try t.expectEqual(
+        @as(?window_mod.WindowMode, .floating),
+        cfg.modeForApp("com.apple.calculator"),
+    );
+    try t.expectEqual(
+        @as(?window_mod.WindowMode, null),
+        cfg.modeForApp("com.apple.Safari"),
+    );
+    try t.expectEqual(
+        @as(?window_mod.WindowMode, null),
+        cfg.modeForApp("com.apple.Terminal"),
+    );
+
+    const empty: Config = .{};
+    try t.expectEqual(
+        @as(?window_mod.WindowMode, null),
+        empty.modeForApp("com.apple.systempreferences"),
+    );
+}
+
+test "app_rules: combined workspace + mode on one rule" {
+    const cfg: Config = .{
+        .app_rules = &.{
+            .{ .app_id = "com.brave.Browser", .workspace = 1, .mode = .floating_above },
+        },
+    };
+    try t.expectEqual(@as(?u8, 1), cfg.workspaceForApp("com.brave.Browser"));
+    try t.expectEqual(
+        @as(?window_mod.WindowMode, .floating_above),
+        cfg.modeForApp("com.brave.Browser"),
+    );
+}
+
 test "default config" {
     const cfg: Config = .{};
     try t.expectEqual(@as(usize, 26), cfg.keybinds.len);
     try t.expectEqual(@as(usize, 0), cfg.workspace_assignments.len);
+    try t.expectEqual(@as(usize, 0), cfg.app_rules.len);
     try t.expectEqual(@as(usize, 0), cfg.workspace_names.len);
     try t.expect(!cfg.swipe.enabled);
     try t.expectEqual(@as(u8, 3), cfg.swipe.fingers);
@@ -420,6 +525,11 @@ test "loadFromPath: custom zon" {
         \\    .workspace_assignments = .{
         \\        .{ .app_id = "com.test.App", .workspace = 3 },
         \\    },
+        \\    .app_rules = .{
+        \\        .{ .app_id = "com.test.Floater", .mode = .floating_above },
+        \\        .{ .app_id = "com.test.Free",    .mode = .floating },
+        \\        .{ .app_id = "com.test.Combo",   .workspace = 4, .mode = .floating_above },
+        \\    },
         \\    .swipe = .{ .enabled = true, .fingers = 4, .distance_pct = 0.1 },
         \\    .gaps = .{ .inner = 8, .outer = .{ .left = 4, .right = 4, .top = 4, .bottom = 4 } },
         \\    .layout = .monocle,
@@ -448,6 +558,25 @@ test "loadFromPath: custom zon" {
     try t.expectEqual(@as(usize, 1), cfg.workspace_assignments.len);
     try t.expect(std.mem.eql(u8, "com.test.App", cfg.workspace_assignments[0].app_id));
     try t.expectEqual(@as(u8, 3), cfg.workspace_assignments[0].workspace);
+
+    try t.expectEqual(@as(usize, 3), cfg.app_rules.len);
+    try t.expect(std.mem.eql(u8, "com.test.Floater", cfg.app_rules[0].app_id));
+    try t.expectEqual(@as(?u8, null), cfg.app_rules[0].workspace);
+    try t.expectEqual(@as(?window_mod.WindowMode, .floating_above), cfg.app_rules[0].mode);
+    try t.expect(std.mem.eql(u8, "com.test.Free", cfg.app_rules[1].app_id));
+    try t.expectEqual(@as(?u8, null), cfg.app_rules[1].workspace);
+    try t.expectEqual(@as(?window_mod.WindowMode, .floating), cfg.app_rules[1].mode);
+    try t.expect(std.mem.eql(u8, "com.test.Combo", cfg.app_rules[2].app_id));
+    try t.expectEqual(@as(?u8, 4), cfg.app_rules[2].workspace);
+    try t.expectEqual(@as(?window_mod.WindowMode, .floating_above), cfg.app_rules[2].mode);
+
+    // Combined rule reaches both lookups.
+    try t.expectEqual(@as(?u8, 4), cfg.workspaceForApp("com.test.Combo"));
+    try t.expectEqual(
+        @as(?window_mod.WindowMode, .floating_above),
+        cfg.modeForApp("com.test.Combo"),
+    );
+
     try t.expect(cfg.swipe.enabled);
     try t.expectEqual(@as(u8, 4), cfg.swipe.fingers);
     try t.expectApproxEqAbs(@as(f64, 0.1), cfg.swipe.distance_pct, 0.0001);
