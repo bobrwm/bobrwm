@@ -641,6 +641,7 @@ fn syncFocusStateForWindowId(focused_wid: u32, source: FocusEventSource) bool {
     }
     switchToWindowWorkspaceIfHidden(win);
     setLayoutLeafActive(win.workspace_id, focused_wid);
+    enforceKeepAboveForDisplay(win.display_id);
 
     return true;
 }
@@ -896,6 +897,9 @@ const HideCtx = struct {
                 };
                 _ = shim.bw_ax_set_window_frame(pid, wid, pos_x, pos_y, win.frame.width, win.frame.height);
                 var updated = win;
+                if (win.mode != .tiled and win.restore_frame == null) {
+                    updated.restore_frame = win.frame;
+                }
                 updated.frame.x = pos_x;
                 updated.frame.y = pos_y;
                 g_store.put(updated) catch {};
@@ -915,6 +919,34 @@ const HideCtx = struct {
 fn hideWindow(pid: i32, wid: u32) void {
     const display_id = if (g_store.get(wid)) |win| win.display_id else focusedDisplayId();
     (HideCtx.init(display_id)).hide(pid, wid);
+}
+
+fn restoreFloatingWindowsForWorkspace(ws: *workspace_mod.Workspace, display_id: u32) void {
+    std.debug.assert(ws.id > 0 and ws.id <= workspace_mod.max_workspaces);
+    std.debug.assert(display_id != 0);
+
+    for (ws.windows.items) |wid| {
+        const active_wid = g_tab_groups.resolveActive(wid);
+        const restore_wid = if (g_store.get(active_wid) != null) active_wid else wid;
+        var win = g_store.get(restore_wid) orelse continue;
+        if (win.mode == .tiled) continue;
+
+        win.workspace_id = ws.id;
+        win.display_id = display_id;
+        if (win.restore_frame) |frame| {
+            _ = shim.bw_ax_set_window_frame(
+                win.pid,
+                restore_wid,
+                frame.x,
+                frame.y,
+                frame.width,
+                frame.height,
+            );
+            win.frame = frame;
+            win.restore_frame = null;
+        }
+        g_store.put(win) catch {};
+    }
 }
 
 /// Workspace-aware on-screen check. Windows on hidden workspaces are parked
@@ -1427,6 +1459,18 @@ fn axEnhancedUserInterface(app: c.AXUIElementRef, ax: *const AxStrings) bool {
     if (err != c.kAXErrorSuccess or value == null) return false;
     defer c.CFRelease(value.?);
     return c.CFEqual(value.?, @ptrCast(c.kCFBooleanTrue)) != 0;
+}
+
+/// Raise a window without making it main or activating its owning app.
+fn axRaiseWindow(pid: i32, wid: u32) bool {
+    std.debug.assert(pid > 0);
+    std.debug.assert(wid > 0);
+
+    const win = findAxWindow(pid, wid) orelse return false;
+    defer c.CFRelease(@ptrCast(win));
+
+    const ax = ensureAxStrings() orelse return false;
+    return c.AXUIElementPerformAction(win, ax.raise_action) == c.kAXErrorSuccess;
 }
 
 /// Raise and focus a window, then activate its owning app.
@@ -2600,6 +2644,7 @@ fn handleEvent(ev: *const event_mod.Event) void {
             if (processDeferredWindowCandidates()) {
                 retile();
             }
+            enforceKeepAboveForDisplay(focusedDisplayId());
         },
         .window_moved, .window_resized => {
             if (inWorkspaceTransition() and !g_mouse_left_down) {
@@ -2698,10 +2743,26 @@ fn handleEvent(ev: *const event_mod.Event) void {
             const target: window_mod.WindowMode = if (win.mode != .tiled) .tiled else .floating;
             setWindowMode(focused, target);
         },
+        .hk_toggle_keep_above => toggleFocusedWindowKeepAbove(),
     }
 }
 
-// Window mode (tiled / floating / fullscreen)
+// Window mode (tiled / floating / floating-above / fullscreen)
+
+fn toggleFocusedWindowKeepAbove() void {
+    const ws = g_workspaces.active();
+    const focused = ws.focused_wid orelse return;
+    const win = g_store.get(focused) orelse return;
+    const target: window_mod.WindowMode = switch (win.mode) {
+        .floating_above => .floating,
+        .tiled, .floating => .floating_above,
+    };
+
+    setWindowMode(focused, target);
+    if (target == .floating_above) {
+        enforceKeepAboveForDisplay(win.display_id);
+    }
+}
 
 fn setWindowMode(wid: u32, target: window_mod.WindowMode) void {
     var win = g_store.get(wid) orelse return;
@@ -2719,6 +2780,9 @@ fn setWindowMode(wid: u32, target: window_mod.WindowMode) void {
     }
 
     win.mode = target;
+    if (target == .tiled) {
+        win.restore_frame = null;
+    }
     g_store.put(win) catch {};
     log.info("window {d} mode: {s} → {s}", .{ wid, @tagName(old), @tagName(target) });
     retile();
@@ -3850,6 +3914,9 @@ fn reconcileDisplayChange() void {
 }
 
 fn retileDisplay(display_id: u32) void {
+    std.debug.assert(display_id != 0);
+    defer enforceKeepAboveForDisplay(display_id);
+
     const ws_id = activeWorkspaceIdForDisplay(display_id);
     const root = layoutRootPtr(ws_id).* orelse return;
     const display_slot = displayIndexById(display_id) orelse return;
@@ -3944,6 +4011,31 @@ fn retileAllDisplays() void {
     }
 }
 
+fn enforceKeepAboveForDisplay(display_id: u32) void {
+    std.debug.assert(display_id != 0);
+
+    const ws_id = activeWorkspaceIdForDisplay(display_id);
+    const ws = g_workspaces.get(ws_id) orelse return;
+    if (!workspaceVisibleOnDisplay(ws.id, display_id)) return;
+
+    for (ws.windows.items) |wid| {
+        const mode_win = g_store.get(wid) orelse continue;
+        if (mode_win.mode != .floating_above) continue;
+        if (mode_win.restore_frame != null) continue;
+
+        const active_wid = g_tab_groups.resolveActive(wid);
+        const raise_wid = if (g_store.get(active_wid) != null) active_wid else wid;
+        const raise_win = g_store.get(raise_wid) orelse continue;
+        if (raise_win.is_fullscreen) continue;
+        if (raise_win.workspace_id != ws.id) continue;
+        if (raise_win.display_id != display_id) continue;
+
+        if (!axRaiseWindow(raise_win.pid, raise_wid)) {
+            log.debug("keep-above raise failed wid={d} pid={d}", .{ raise_wid, raise_win.pid });
+        }
+    }
+}
+
 fn observeDiscoveredApps() void {
     for (&g_workspaces.workspaces) |*ws| {
         for (ws.windows.items) |wid| {
@@ -3963,12 +4055,18 @@ fn restoreAllWindows() void {
                 if (workspaceVisibleOnDisplay(ws.id, win.display_id)) continue;
                 const display_slot = displayIndexById(win.display_id) orelse continue;
                 const display = g_displays[display_slot].visible;
-                // Place at screen center with stored size (or sensible default)
-                const w = if (win.frame.width > 1) win.frame.width else display.w * 0.5;
-                const h = if (win.frame.height > 1) win.frame.height else display.h * 0.5;
-                const x = display.x + (display.w - w) / 2.0;
-                const y = display.y + (display.h - h) / 2.0;
-                _ = shim.bw_ax_set_window_frame(win.pid, wid, x, y, w, h);
+                const frame = win.restore_frame orelse blk: {
+                    // Place at screen center with stored size (or sensible default).
+                    const w = if (win.frame.width > 1) win.frame.width else display.w * 0.5;
+                    const h = if (win.frame.height > 1) win.frame.height else display.h * 0.5;
+                    break :blk window_mod.Window.Frame{
+                        .x = display.x + (display.w - w) / 2.0,
+                        .y = display.y + (display.h - h) / 2.0,
+                        .width = w,
+                        .height = h,
+                    };
+                };
+                _ = shim.bw_ax_set_window_frame(win.pid, wid, frame.x, frame.y, frame.width, frame.height);
             }
         }
     }
@@ -4310,6 +4408,7 @@ fn switchWorkspace(target_id: u8) void {
         setFocusedDisplay(target_display);
         updateStatusBar();
         focusWorkspaceWindow(target_ws);
+        enforceKeepAboveForDisplay(target_display);
         return;
     }
 
@@ -4354,6 +4453,7 @@ fn switchWorkspace(target_id: u8) void {
         }
         updateTabGroupAssignment(wid, target_ws.id, target_display);
     }
+    restoreFloatingWindowsForWorkspace(target_ws, target_display);
 
     assertDisplayCoverage();
 
@@ -4363,6 +4463,7 @@ fn switchWorkspace(target_id: u8) void {
     updateStatusBar();
 
     focusWorkspaceWindow(target_ws);
+    enforceKeepAboveForDisplay(target_display);
 }
 
 /// Focus the remembered (or first available) window on a workspace.
@@ -4751,6 +4852,10 @@ fn ipcDispatch(cmd: []const u8, client_fd: posix.socket_t) void {
                 .horizontal => .vertical,
                 .vertical => .auto,
             };
+            ipc.writeResponse(client_fd, "ok\n");
+        },
+        .toggle_keep_above => {
+            toggleFocusedWindowKeepAbove();
             ipc.writeResponse(client_fd, "ok\n");
         },
         .focus => |dir| {

@@ -23,6 +23,7 @@ bobrwm query displays     # IPC: list connected displays
 bobrwm query displays --json # IPC: list connected displays as JSON
 bobrwm query apps         # IPC: list observed apps
 bobrwm query apps --json  # IPC: list observed apps as JSON
+bobrwm toggle-keep-above  # IPC: keep focused floating window above its workspace
 bobrwm focus-workspace next # IPC: switch to next workspace without wrapping
 bobrwm focus-workspace prev # IPC: switch to previous workspace without wrapping
 bobrwm move-to-display 2  # IPC: move focused window to display slot 2
@@ -66,10 +67,13 @@ Map a key + modifiers to an action:
     .{ .key = "1", .mods = .{ .alt = true }, .action = .focus_workspace, .arg = 1 },
     .{ .key = "h", .mods = .{ .alt = true }, .action = .focus_left },
     .{ .key = "return", .mods = .{ .alt = true }, .action = .toggle_split },
+    .{ .key = "f", .mods = .{ .alt = true, .shift = true }, .action = .toggle_keep_above },
 },
 ```
 
 **Available modifiers:** `alt`, `shift`, `cmd`, `ctrl`
+
+Built-in defaults include `alt+shift+f` for `toggle_keep_above`.
 
 **Available actions:**
 
@@ -86,6 +90,7 @@ Map a key + modifiers to an action:
 | `toggle_split` | Toggle next split direction | — |
 | `toggle_fullscreen` | Toggle focused window fullscreen | — |
 | `toggle_float` | Toggle focused window floating | — |
+| `toggle_keep_above` | Toggle focused window floating above other windows in its workspace | — |
 
 ### Gaps
 

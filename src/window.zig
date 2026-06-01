@@ -5,6 +5,7 @@ pub const WindowId = u32;
 pub const WindowMode = enum {
     tiled,
     floating,
+    floating_above,
 };
 
 pub const Window = struct {
@@ -15,6 +16,8 @@ pub const Window = struct {
     is_minimized: bool,
     is_fullscreen: bool = false,
     mode: WindowMode = .tiled,
+    /// Last visible frame for floating windows parked while their workspace is hidden.
+    restore_frame: ?Frame = null,
     workspace_id: u8,
     display_id: u32,
 

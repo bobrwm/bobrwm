@@ -169,6 +169,7 @@ const help_text =
     \\Window Commands (IPC):
     \\  retile                    Re-tile all windows on the active workspace
     \\  toggle-split              Cycle BSP split mode (auto, horizontal, vertical)
+    \\  toggle-keep-above         Toggle focused window floating above its workspace
     \\  focus <direction>         Focus window in direction (left, right, up, down)
     \\  focus-workspace <n|prev|next>
     \\                            Focus workspace by number or adjacent direction

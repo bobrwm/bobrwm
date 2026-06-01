@@ -85,6 +85,7 @@ pub const Action = enum(u8) {
     move_workspace_to_display = 29,
     focus_previous_workspace = 30,
     focus_next_workspace = 31,
+    toggle_keep_above = 32,
 
     // Every Action must map 1:1 to an EventKind (hk_ prefixed).
     comptime {
@@ -134,7 +135,7 @@ pub const Gaps = struct {
 
 // Default keybinds (matches the previously hardcoded behaviour)
 
-const default_keybind_count = 25;
+const default_keybind_count = 26;
 
 const default_keybinds: [default_keybind_count]Keybind = blk: {
     var binds: [default_keybind_count]Keybind = undefined;
@@ -161,6 +162,9 @@ const default_keybinds: [default_keybind_count]Keybind = blk: {
     i += 1;
     // alt+return → toggle split
     binds[i] = .{ .key = "return", .mods = .{ .alt = true }, .action = .toggle_split };
+    i += 1;
+    // alt+shift+f → float above workspace
+    binds[i] = .{ .key = "f", .mods = .{ .alt = true, .shift = true }, .action = .toggle_keep_above };
     i += 1;
     // ctrl+left/right → traverse workspaces, pass through at native Space edges
     binds[i] = .{ .key = "left", .mods = .{ .ctrl = true }, .action = .focus_previous_workspace };
@@ -305,7 +309,7 @@ test "workspaceForApp" {
 
 test "default config" {
     const cfg: Config = .{};
-    try t.expectEqual(@as(usize, 25), cfg.keybinds.len);
+    try t.expectEqual(@as(usize, 26), cfg.keybinds.len);
     try t.expectEqual(@as(usize, 0), cfg.workspace_assignments.len);
     try t.expectEqual(@as(usize, 0), cfg.workspace_names.len);
     try t.expect(!cfg.swipe.enabled);
@@ -351,13 +355,18 @@ test "default_keybinds" {
     try t.expectEqual(Action.toggle_split, default_keybinds[22].action);
     try t.expect(std.mem.eql(u8, "return", default_keybinds[22].key));
 
+    // alt+shift+f float above workspace
+    try t.expectEqual(Action.toggle_keep_above, default_keybinds[23].action);
+    try t.expect(default_keybinds[23].mods.alt and default_keybinds[23].mods.shift);
+    try t.expect(std.mem.eql(u8, "f", default_keybinds[23].key));
+
     // ctrl+left/right workspace traversal
-    try t.expectEqual(Action.focus_previous_workspace, default_keybinds[23].action);
-    try t.expect(default_keybinds[23].mods.ctrl);
-    try t.expect(std.mem.eql(u8, "left", default_keybinds[23].key));
-    try t.expectEqual(Action.focus_next_workspace, default_keybinds[24].action);
+    try t.expectEqual(Action.focus_previous_workspace, default_keybinds[24].action);
     try t.expect(default_keybinds[24].mods.ctrl);
-    try t.expect(std.mem.eql(u8, "right", default_keybinds[24].key));
+    try t.expect(std.mem.eql(u8, "left", default_keybinds[24].key));
+    try t.expectEqual(Action.focus_next_workspace, default_keybinds[25].action);
+    try t.expect(default_keybinds[25].mods.ctrl);
+    try t.expect(std.mem.eql(u8, "right", default_keybinds[25].key));
 }
 
 test "loadFromPath: missing file" {
@@ -371,7 +380,7 @@ test "loadFromPath: examples/config.zon" {
     const cfg = loadFromPath(arena.allocator(), "examples/config.zon") orelse
         return error.TestUnexpectedResult;
 
-    try t.expectEqual(@as(usize, 26), cfg.keybinds.len);
+    try t.expectEqual(@as(usize, 27), cfg.keybinds.len);
 
     try t.expectEqual(Action.focus_workspace, cfg.keybinds[0].action);
     try t.expectEqual(@as(u8, 1), cfg.keybinds[0].arg);
@@ -381,8 +390,11 @@ test "loadFromPath: examples/config.zon" {
 
     try t.expectEqual(Action.toggle_fullscreen, cfg.keybinds[23].action);
     try t.expect(std.mem.eql(u8, "f", cfg.keybinds[23].key));
-    try t.expectEqual(Action.focus_previous_workspace, cfg.keybinds[24].action);
-    try t.expectEqual(Action.focus_next_workspace, cfg.keybinds[25].action);
+    try t.expectEqual(Action.toggle_keep_above, cfg.keybinds[24].action);
+    try t.expect(cfg.keybinds[24].mods.alt and cfg.keybinds[24].mods.shift);
+    try t.expect(std.mem.eql(u8, "f", cfg.keybinds[24].key));
+    try t.expectEqual(Action.focus_previous_workspace, cfg.keybinds[25].action);
+    try t.expectEqual(Action.focus_next_workspace, cfg.keybinds[26].action);
 
     try t.expectEqual(@as(usize, 0), cfg.workspace_assignments.len);
     try t.expectEqual(@as(u16, 0), cfg.gaps.inner);

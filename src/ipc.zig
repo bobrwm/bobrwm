@@ -13,6 +13,7 @@ pub const DispatchFn = *const fn (cmd: []const u8, client_fd: posix.socket_t) vo
 pub const IpcCommand = union(enum) {
     retile,
     toggle_split,
+    toggle_keep_above,
     focus: FocusDir,
     focus_workspace: WorkspaceTarget,
     move_to_workspace: u8,
@@ -53,6 +54,7 @@ pub const IpcCommand = union(enum) {
         // Exact-match commands (no arguments)
         if (std.mem.eql(u8, cmd, "retile")) return .retile;
         if (std.mem.eql(u8, cmd, "toggle-split")) return .toggle_split;
+        if (std.mem.eql(u8, cmd, "toggle-keep-above")) return .toggle_keep_above;
         if (std.mem.eql(u8, cmd, "bsp equalize")) return .bsp_equalize;
         if (std.mem.eql(u8, cmd, "bsp balance")) return .bsp_balance;
         if (std.mem.eql(u8, cmd, "query windows")) return .{ .query_windows = .text };
@@ -267,6 +269,13 @@ test "parse query format" {
     try t.expectEqual(IpcCommand{ .query_displays = .json }, IpcCommand.parse("query displays --json").?);
     try t.expectEqual(IpcCommand{ .query_apps = .json }, IpcCommand.parse("query apps --json").?);
     try t.expectEqual(@as(?IpcCommand, null), IpcCommand.parse("query windows --json extra"));
+}
+
+test "parse toggle keep above" {
+    const t = std.testing;
+
+    try t.expectEqual(IpcCommand.toggle_keep_above, IpcCommand.parse("toggle-keep-above").?);
+    try t.expectEqual(@as(?IpcCommand, null), IpcCommand.parse("toggle-keep-above now"));
 }
 
 test "parse focus workspace target" {
