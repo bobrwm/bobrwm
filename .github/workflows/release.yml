@@ -28,16 +28,19 @@ jobs:
 
       - name: Move tip tag
         if: github.event_name == 'push'
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_TOKEN || github.token }}
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git tag -fa tip -m "Latest Continuous Release" "$GITHUB_SHA"
+          git remote set-url origin "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
           git push --force origin tip
 
       - name: Upload binary to tip release
         if: github.event_name == 'push'
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ secrets.RELEASE_TOKEN || github.token }}
         run: |
           tar -czf /tmp/bobrwm-tip-aarch64-macos.tar.gz -C /tmp/bobrwm .
           gh release view tip >/dev/null 2>&1 || \
