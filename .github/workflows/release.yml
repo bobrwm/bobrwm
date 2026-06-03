@@ -1,8 +1,14 @@
 name: Release
 
 on:
+  push:
+    branches: [main]
   release:
     types: [published]
+
+concurrency:
+  group: release-${{ github.event_name == 'push' && 'tip' || github.ref }}
+  cancel-in-progress: false
 
 permissions:
   contents: write
@@ -20,15 +26,44 @@ jobs:
       - name: Build
         run: zig build -Doptimize=ReleaseFast --prefix /tmp/bobrwm
 
+      - name: Move tip tag
+        if: github.event_name == 'push'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -fa tip -m "Latest Continuous Release" "$GITHUB_SHA"
+          git push --force origin tip
+
+      - name: Upload binary to tip release
+        if: github.event_name == 'push'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tar -czf /tmp/bobrwm-tip-aarch64-macos.tar.gz -C /tmp/bobrwm .
+          gh release view tip >/dev/null 2>&1 || \
+            gh release create tip \
+              --title 'bobrwm tip' \
+              --notes 'Latest continuous build from main.' \
+              --prerelease \
+              --target "$GITHUB_SHA"
+          gh release edit tip \
+            --title 'bobrwm tip' \
+            --notes 'Latest continuous build from main.' \
+            --prerelease \
+            --target "$GITHUB_SHA"
+          gh release upload tip /tmp/bobrwm-tip-aarch64-macos.tar.gz --clobber
+
       - name: Upload binary to release
+        if: github.event_name == 'release'
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ github.event.release.tag_name }}
         run: |
-          tar -czf /tmp/bobrwm-${TAG}-aarch64-macos.tar.gz -C /tmp/bobrwm .
+          tar -czf "/tmp/bobrwm-${TAG}-aarch64-macos.tar.gz" -C /tmp/bobrwm .
           gh release upload "$TAG" "/tmp/bobrwm-${TAG}-aarch64-macos.tar.gz"
 
       - name: Dispatch to homebrew-tap
+        if: github.event_name == 'release'
         env:
           GH_TOKEN: ${{ secrets.RELEASE_TOKEN }}
           TAG: ${{ github.event.release.tag_name }}
