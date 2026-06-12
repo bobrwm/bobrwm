@@ -106,6 +106,12 @@ const pending_role_window_capacity: usize = 256;
 const deferred_window_candidate_capacity: usize = 256;
 /// Capacity reserved for app launch retries (pid-keyed, bounded by observers).
 const app_launch_retry_capacity: usize = 64;
+/// Focus query retry budget. Electron apps (Discord) can report no AX
+/// focused window for several hundred milliseconds after activation;
+/// 10 attempts at the 100ms role-poll cadence covers that window.
+const focus_retry_attempts_max: u8 = 10;
+/// Capacity reserved for focus retries (pid-keyed, bounded by observers).
+const focus_retry_capacity: usize = 64;
 /// Debounce workspace/display notifications that can fire in short bursts.
 const workspace_event_debounce_interval_s: f64 = 0.05;
 /// Hard cap for workspace transition convergence before we fail closed.
@@ -221,6 +227,7 @@ const DeferredWindowPromotion = struct {
 const PendingRoleWindowMap = std.AutoHashMap(u32, PendingRoleWindow);
 const DeferredWindowCandidateMap = std.AutoHashMap(u32, DeferredWindowCandidate);
 const AppLaunchRetryMap = std.AutoHashMap(i32, u8);
+const FocusRetryMap = std.AutoHashMap(i32, u8);
 
 fn nsString(str: [*:0]const u8) objc.Object {
     const NSString = objc.getClass("NSString") orelse
@@ -957,6 +964,7 @@ var g_tab_groups: tabgroup.TabGroupManager = undefined;
 var g_pending_role_windows: PendingRoleWindowMap = undefined;
 var g_deferred_window_candidates: DeferredWindowCandidateMap = undefined;
 var g_app_launch_retries: AppLaunchRetryMap = undefined;
+var g_focus_retries: FocusRetryMap = undefined;
 var g_workspace_observer: ?objc.Object = null;
 var g_ipc: ipc.Server = undefined;
 var g_config: config_mod.Config = .{};
@@ -1993,6 +2001,12 @@ pub fn main(init: std.process.Init.Minimal) !void {
         log.err("app-launch-retry map reserve failed: {}", .{err});
         return err;
     };
+    g_focus_retries = FocusRetryMap.init(g_allocator);
+    defer g_focus_retries.deinit();
+    g_focus_retries.ensureTotalCapacity(focus_retry_capacity) catch |err| {
+        log.err("focus-retry map reserve failed: {}", .{err});
+        return err;
+    };
     defer {
         setRolePolling(false);
         g_layout_entries.deinit(g_allocator);
@@ -2493,6 +2507,7 @@ fn handleEvent(ev: *const event_mod.Event) void {
         .app_terminated => {
             log.info("app terminated pid={}", .{ev.pid});
             untrackAppLaunchRetry(ev.pid);
+            untrackFocusRetry(ev.pid);
             ax_observer.unobserveApp(ev.pid);
             removeAppWindows(ev.pid);
             retile();
@@ -2503,7 +2518,11 @@ fn handleEvent(ev: *const event_mod.Event) void {
                 requestCleanupForPid(ev.pid);
                 requestOffscreenCleanup();
             }
-            const focused_wid = focused_wid_opt orelse return;
+            const focused_wid = focused_wid_opt orelse {
+                trackFocusRetry(ev.pid);
+                return;
+            };
+            untrackFocusRetry(ev.pid);
             if (!syncFocusStateForWindowId(focused_wid, .ax)) {
                 ax_observer.observeApp(ev.pid);
                 discoverWindows();
@@ -2517,7 +2536,11 @@ fn handleEvent(ev: *const event_mod.Event) void {
                 requestCleanupForPid(ev.pid);
                 requestOffscreenCleanup();
             }
-            const focused_wid = focused_wid_opt orelse return;
+            const focused_wid = focused_wid_opt orelse {
+                trackFocusRetry(ev.pid);
+                return;
+            };
+            untrackFocusRetry(ev.pid);
             reconcileFocusedWindow(ev.pid, focused_wid);
         },
         .window_created => {
@@ -2574,6 +2597,7 @@ fn handleEvent(ev: *const event_mod.Event) void {
             const promoted_pending = processPendingRoleWindows();
             const promoted_deferred = processDeferredWindowCandidates();
             const retried_launch = processAppLaunchRetries();
+            processFocusRetries();
             _ = processPendingFocusQueue();
             if (promoted_pending or promoted_deferred or retried_launch) {
                 retile();
@@ -2743,8 +2767,84 @@ fn windowRoleState(pid: i32, wid: u32) WindowRoleState {
 fn refreshRolePolling() void {
     const has_pending = g_pending_role_windows.count() > 0 or
         g_deferred_window_candidates.count() > 0 or
-        g_app_launch_retries.count() > 0;
+        g_app_launch_retries.count() > 0 or
+        g_focus_retries.count() > 0;
     setRolePolling(has_pending);
+}
+
+/// Track a pid whose AX focused-window query returned nothing. Electron apps
+/// (Discord) publish AXFocusedWindow late after activation; without a retry
+/// the focus event is dropped and workspace focus state silently desyncs.
+fn trackFocusRetry(pid: i32) void {
+    std.debug.assert(pid > 0);
+
+    if (g_focus_retries.getPtr(pid)) |attempts_remaining| {
+        attempts_remaining.* = focus_retry_attempts_max;
+    } else {
+        g_focus_retries.put(pid, focus_retry_attempts_max) catch {
+            log.err("focus-retry: failed to track pid={d}", .{pid});
+            return;
+        };
+    }
+
+    refreshRolePolling();
+}
+
+fn untrackFocusRetry(pid: i32) void {
+    std.debug.assert(pid > 0);
+    if (g_focus_retries.remove(pid)) {
+        refreshRolePolling();
+    }
+}
+
+/// Re-query the AX focused window for tracked pids on the role-poll cadence.
+/// Resolved pids run the normal focus reconciliation path; exhausted pids are
+/// dropped (the next real focus event will try again).
+fn processFocusRetries() void {
+    if (g_focus_retries.count() == 0) return;
+
+    var resolved_pids: [64]i32 = undefined;
+    var resolved_wids: [64]u32 = undefined;
+    var resolved_count: usize = 0;
+    var expired_pids: [64]i32 = undefined;
+    var expired_count: usize = 0;
+
+    var it = g_focus_retries.iterator();
+    while (it.next()) |entry| {
+        const pid = entry.key_ptr.*;
+        std.debug.assert(pid > 0);
+
+        const focused_wid = bw_ax_get_focused_window(pid);
+        if (focused_wid != 0) {
+            if (resolved_count < resolved_pids.len) {
+                resolved_pids[resolved_count] = pid;
+                resolved_wids[resolved_count] = focused_wid;
+                resolved_count += 1;
+            }
+            continue;
+        }
+
+        if (entry.value_ptr.* == 0) {
+            if (expired_count < expired_pids.len) {
+                expired_pids[expired_count] = pid;
+                expired_count += 1;
+            }
+            continue;
+        }
+        entry.value_ptr.* -= 1;
+    }
+
+    // Map mutations deferred until iteration is done.
+    for (expired_pids[0..expired_count]) |pid| {
+        log.debug("focus-retry: gave up pid={d}", .{pid});
+        _ = g_focus_retries.remove(pid);
+    }
+    for (resolved_pids[0..resolved_count], resolved_wids[0..resolved_count]) |pid, wid| {
+        _ = g_focus_retries.remove(pid);
+        log.info("focus-retry: resolved pid={d} wid={d}", .{ pid, wid });
+        reconcileFocusedWindow(pid, wid);
+    }
+    refreshRolePolling();
 }
 
 fn trackAppLaunchRetry(pid: i32) void {
