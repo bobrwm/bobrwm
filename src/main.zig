@@ -3569,10 +3569,18 @@ fn removeWindow(wid: u32) void {
         clearDragPreview();
     }
     // Clean up tab group membership first
+    const group_id_before: ?tabgroup.GroupId = if (g_tab_groups.groupOf(wid)) |g| g.id else null;
     const removal = g_tab_groups.removeMember(wid);
 
     const win = g_store.get(wid) orelse return;
     g_store.remove(wid);
+
+    // removeMember guesses members[0] as the new active tab, but macOS
+    // selects the adjacent tab when the active one closes. Align with the
+    // app's actual focus so focus operations do not raise a background tab.
+    if (group_id_before) |gid| {
+        reconcileGroupActiveAfterRemoval(gid, win.pid);
+    }
 
     switch (removal) {
         // The removed window led a surviving tab group. It is the group's
@@ -3611,6 +3619,25 @@ fn removeWindow(wid: u32) void {
             }
         },
     }
+}
+
+/// Align a surviving tab group's active tab with the window the app actually
+/// focused after a member was removed. Best-effort: when the app has not yet
+/// focused the adjacent tab (or AX reports nothing), the members[0] guess
+/// stands until the next AXFocusedWindowChanged notification corrects it.
+fn reconcileGroupActiveAfterRemoval(group_id: tabgroup.GroupId, pid: i32) void {
+    std.debug.assert(group_id != 0);
+    std.debug.assert(pid > 0);
+
+    const focused_wid = bw_ax_get_focused_window(pid);
+    if (focused_wid == 0) return;
+
+    // Only accept the focused window when it belongs to the same group;
+    // a same-process standalone window must not be recorded as a tab.
+    const g = g_tab_groups.groupOf(focused_wid) orelse return;
+    if (g.id != group_id) return;
+
+    g_tab_groups.setActive(focused_wid);
 }
 
 /// Hand a removed tab-group leader's workspace and layout slot to the new
