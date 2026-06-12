@@ -3235,16 +3235,19 @@ fn discoverWindows() void {
     }
 }
 
-/// Guards tab inference against standalone window creation races.
-/// If another managed on-screen sibling already occupies the same frame,
-/// the focused/created window should be treated as a standalone window.
-fn hasOnScreenMatchingManagedSibling(
+/// Find a managed on-screen sibling of the same PID occupying the same frame.
+///
+/// Used to guard tab inference against standalone window creation races
+/// (an on-screen sibling at the same frame means the candidate is a
+/// standalone window) and to locate the active tab when adopting an
+/// off-screen background tab into a group.
+fn findOnScreenMatchingManagedSibling(
     pid: i32,
     exclude_wid: u32,
     target_frame: window_mod.Window.Frame,
     sky: skylight.SkyLight,
     conn: c_int,
-) bool {
+) ?u32 {
     var store_it = g_store.windows.iterator();
     while (store_it.next()) |entry| {
         const candidate_wid = entry.key_ptr.*;
@@ -3272,10 +3275,10 @@ fn hasOnScreenMatchingManagedSibling(
             matches,
         });
 
-        if (matches) return true;
+        if (matches) return candidate_wid;
     }
 
-    return false;
+    return null;
 }
 
 fn addNewWindowManagedWithAssignment(pid: i32, wid: u32, workspace_id: u8, assigned_display_id: u32) bool {
@@ -3423,7 +3426,7 @@ fn tryFormTabGroupOnCreate(pid: i32, new_wid: u32) bool {
         new_wid, new_frame.x, new_frame.y, new_frame.width, new_frame.height,
     });
 
-    if (hasOnScreenMatchingManagedSibling(pid, new_wid, new_frame, sky, conn)) {
+    if (findOnScreenMatchingManagedSibling(pid, new_wid, new_frame, sky, conn) != null) {
         log.debug("tryFormTabGroup: on-screen sibling matches new wid={d}, treating as standalone", .{new_wid});
         return false;
     }
@@ -3747,9 +3750,13 @@ fn cleanupWorkspaceWindowsForPid(pid: i32) bool {
 ///
 /// Some Electron apps (Discord) close-to-background without emitting AX
 /// destroy/minimize notifications. This catches those ghost entries.
+///
+/// Native background tabs are also off-screen, so windows that look like a
+/// missed tab-group inference are adopted into their sibling's group instead
+/// of being reaped (see adoptOffscreenWindowAsTab).
 fn cleanupOffscreenManagedWindows() bool {
-    var stale_wids: [128]u32 = undefined;
-    var stale_count: usize = 0;
+    var candidate_wids: [128]u32 = undefined;
+    var candidate_count: usize = 0;
     var truncated = false;
 
     for (&g_workspaces.workspaces) |*ws| {
@@ -3757,7 +3764,7 @@ fn cleanupOffscreenManagedWindows() bool {
         if (!workspaceVisibleAnywhere(ws.id)) continue;
 
         for (ws.windows.items) |wid| {
-            const win = g_store.get(wid) orelse continue;
+            if (g_store.get(wid) == null) continue;
 
             // Tab-group members can be intentionally off-screen when a sibling
             // tab is active; treating them as ghosts causes layout churn.
@@ -3765,10 +3772,9 @@ fn cleanupOffscreenManagedWindows() bool {
 
             if (shim.bw_is_window_on_screen(wid)) continue;
 
-            log.info("cleanup: removing wid={d} pid={d} reason=offscreen", .{ wid, win.pid });
-            if (stale_count < stale_wids.len) {
-                stale_wids[stale_count] = wid;
-                stale_count += 1;
+            if (candidate_count < candidate_wids.len) {
+                candidate_wids[candidate_count] = wid;
+                candidate_count += 1;
             } else {
                 truncated = true;
             }
@@ -3776,14 +3782,90 @@ fn cleanupOffscreenManagedWindows() bool {
     }
 
     if (truncated) {
-        log.warn("cleanup: offscreen batch truncated queued={d}", .{stale_count});
+        log.warn("cleanup: offscreen batch truncated queued={d}", .{candidate_count});
     }
 
-    for (stale_wids[0..stale_count]) |wid| {
+    // Mutations deferred to here — removeWindow/adoption modify workspace
+    // window lists, which must not happen while iterating them above.
+    var mutated = false;
+    for (candidate_wids[0..candidate_count]) |wid| {
+        const win = g_store.get(wid) orelse continue;
+
+        if (adoptOffscreenWindowAsTab(win)) {
+            mutated = true;
+            continue;
+        }
+
+        log.info("cleanup: removing wid={d} pid={d} reason=offscreen", .{ wid, win.pid });
         removeWindow(wid);
+        mutated = true;
     }
 
-    return stale_count > 0;
+    return mutated;
+}
+
+/// Adopt an off-screen managed window as a member of an on-screen sibling's
+/// tab group. Returns true when adoption happened.
+///
+/// Tab groups are inferred heuristically at window-creation / focus time;
+/// when that inference is missed (event races, mid-animation bounds, events
+/// dropped during workspace transitions) a background tab remains managed as
+/// a standalone window that is now off-screen. Reaping it would lose the tab.
+///
+/// A window qualifies when the app's AXWindows list still exposes it (hidden
+/// and destroyed ghosts drop out of AXWindows, native background tabs stay
+/// listed) and an on-screen managed sibling occupies the same frame (the
+/// active tab).
+fn adoptOffscreenWindowAsTab(win: window_mod.Window) bool {
+    const sky = g_sky orelse return false;
+    const conn = sky.mainConnectionID();
+
+    var rect: skylight.CGRect = undefined;
+    if (sky.getWindowBounds(conn, win.wid, &rect) != 0) return false;
+    const frame = window_mod.Window.Frame{
+        .x = rect.origin.x,
+        .y = rect.origin.y,
+        .width = rect.size.width,
+        .height = rect.size.height,
+    };
+
+    var ax_wids: [128]u32 = undefined;
+    const ax_count = shim.bw_get_app_window_ids(win.pid, &ax_wids, 128);
+    var listed_in_ax = false;
+    for (ax_wids[0..ax_count]) |ax_wid| {
+        if (ax_wid == win.wid) {
+            listed_in_ax = true;
+            break;
+        }
+    }
+    if (!listed_in_ax) return false;
+
+    const sibling_wid = findOnScreenMatchingManagedSibling(win.pid, win.wid, frame, sky, conn) orelse return false;
+    const sibling = g_store.get(sibling_wid) orelse return false;
+
+    const group_id = if (g_tab_groups.groupOf(sibling_wid)) |g|
+        g.id
+    else
+        g_tab_groups.createGroup(win.pid, sibling_wid, sibling.frame) catch return false;
+    g_tab_groups.addMember(group_id, win.wid) catch return false;
+    g_tab_groups.setActive(sibling_wid);
+
+    // Members live only in the store; drop the standalone workspace/layout slot.
+    if (g_workspaces.get(win.workspace_id)) |ws| {
+        ws.removeWindow(win.wid);
+    }
+    removeFromLayout(win.workspace_id, win.wid);
+
+    var updated = win;
+    updated.frame = frame;
+    updated.workspace_id = sibling.workspace_id;
+    updated.display_id = sibling.display_id;
+    g_store.put(updated) catch {};
+
+    log.info("cleanup: adopted wid={d} as background tab, leader={d} pid={d}", .{
+        win.wid, g_tab_groups.resolveLeader(sibling_wid), win.pid,
+    });
+    return true;
 }
 
 /// Updates `display_id` when a user-dragged window crosses monitors.
@@ -4150,7 +4232,7 @@ fn reconcileFocusedWindow(pid: i32, focused_wid: u32) void {
     const on_screen = isVisibleOnScreen(focused_wid);
     log.debug("reconcile: on_screen={}", .{on_screen});
 
-    if (hasOnScreenMatchingManagedSibling(pid, focused_wid, focused_frame, sky, conn)) {
+    if (findOnScreenMatchingManagedSibling(pid, focused_wid, focused_frame, sky, conn) != null) {
         log.debug("reconcile: on-screen sibling matches focused wid={d}, treating as new window", .{focused_wid});
         addNewWindow(pid, focused_wid);
         retile();
