@@ -3504,6 +3504,76 @@ fn addNewWindow(pid: i32, wid: u32) void {
     }
 }
 
+/// Add unmanaged same-PID AX windows that share the group's frame and are
+/// off-screen to the group as background tabs.
+///
+/// The guards matter: an unmanaged window that is visible on-screen or at
+/// different bounds is a standalone window racing through the role-pending
+/// or deferred pipelines, not a tab. Swallowing it as a group member would
+/// leave it permanently untiled (members are not in the layout) while other
+/// windows tile over its position.
+fn discoverBackgroundTabs(
+    pid: i32,
+    group_id: tabgroup.GroupId,
+    group_frame: window_mod.Window.Frame,
+    workspace_id: u8,
+    display_id: u32,
+) void {
+    std.debug.assert(pid > 0);
+    std.debug.assert(group_id != 0);
+    std.debug.assert(workspace_id > 0 and workspace_id <= workspace_mod.max_workspaces);
+
+    const sky = g_sky orelse return;
+    const conn = sky.mainConnectionID();
+
+    var ax_wids: [128]u32 = undefined;
+    const ax_count = shim.bw_get_app_window_ids(pid, &ax_wids, 128);
+    log.debug("discoverBackgroundTabs: AX found {d} windows for pid={d}", .{ ax_count, pid });
+
+    for (ax_wids[0..ax_count]) |ax_wid| {
+        // Managed windows (including the group's leader and active tab,
+        // which are stored before discovery runs) are never re-swallowed.
+        if (g_store.get(ax_wid) != null) continue;
+
+        var rect: skylight.CGRect = undefined;
+        if (sky.getWindowBounds(conn, ax_wid, &rect) != 0) {
+            log.debug("discoverBackgroundTabs: SkyLight.getWindowBounds failed for ax_wid={d}", .{ax_wid});
+            continue;
+        }
+        const f = window_mod.Window.Frame{
+            .x = rect.origin.x,
+            .y = rect.origin.y,
+            .width = rect.size.width,
+            .height = rect.size.height,
+        };
+
+        const frame_matches = tabgroup.TabGroupManager.framesMatch(f, group_frame);
+        const on_screen = shim.bw_is_window_on_screen(ax_wid);
+        log.debug("discoverBackgroundTabs: ax_wid={d} frame=({d:.0},{d:.0},{d:.0},{d:.0}) match={} on_screen={}", .{
+            ax_wid, f.x, f.y, f.width, f.height, frame_matches, on_screen,
+        });
+        if (!frame_matches) continue;
+        if (on_screen) continue;
+
+        g_tab_groups.addMember(group_id, ax_wid) catch continue;
+        // The wid may still sit in the role-pending or deferred pipelines;
+        // it is accounted for as a tab member now, so promotion must not
+        // race against the group.
+        untrackPendingRoleWindow(ax_wid);
+        untrackDeferredWindowCandidate(ax_wid);
+        g_store.put(.{
+            .wid = ax_wid,
+            .pid = pid,
+            .title = null,
+            .frame = f,
+            .is_minimized = false,
+            .mode = .tiled,
+            .workspace_id = workspace_id,
+            .display_id = display_id,
+        }) catch continue;
+    }
+}
+
 /// When a new on-screen window appears, check if an existing managed window
 /// from the same PID just went off-screen. If so, the new window is a tab
 /// that replaced the old one — form a tab group instead of tiling independently.
@@ -3609,34 +3679,7 @@ fn tryFormTabGroupOnCreate(pid: i32, new_wid: u32) bool {
             }) catch break :outer;
 
             // Also discover any other background tabs
-            var ax_wids: [128]u32 = undefined;
-            const ax_count = shim.bw_get_app_window_ids(pid, &ax_wids, 128);
-            log.debug("tryFormTabGroup: AX found {d} windows for pid={d}", .{ ax_count, pid });
-            for (ax_wids[0..ax_count]) |ax_wid| {
-                if (ax_wid == existing_wid or ax_wid == new_wid) continue;
-                if (g_store.get(ax_wid) != null) continue;
-
-                var rect: skylight.CGRect = undefined;
-                if (sky.getWindowBounds(conn, ax_wid, &rect) != 0) continue;
-                const f = window_mod.Window.Frame{
-                    .x = rect.origin.x,
-                    .y = rect.origin.y,
-                    .width = rect.size.width,
-                    .height = rect.size.height,
-                };
-
-                g_tab_groups.addMember(group_id, ax_wid) catch continue;
-                g_store.put(.{
-                    .wid = ax_wid,
-                    .pid = pid,
-                    .title = null,
-                    .frame = f,
-                    .is_minimized = false,
-                    .mode = .tiled,
-                    .workspace_id = ws.id,
-                    .display_id = existing.display_id,
-                }) catch continue;
-            }
+            discoverBackgroundTabs(pid, group_id, new_frame, ws.id, existing.display_id);
 
             ws.focused_wid = existing_wid; // leader stays
             log.info("tryFormTabGroup: formed group leader={d} active={d} members={d}", .{
@@ -4426,43 +4469,7 @@ fn reconcileFocusedWindow(pid: i32, focused_wid: u32) void {
         }) catch return;
 
         // Discover additional background tabs
-        var ax_wids: [128]u32 = undefined;
-        const ax_count = shim.bw_get_app_window_ids(pid, &ax_wids, 128);
-        log.debug("reconcile: AX enumeration found {d} windows for pid={d}", .{ ax_count, pid });
-        for (ax_wids[0..ax_count]) |ax_wid| {
-            if (ax_wid == managed_wid or ax_wid == focused_wid) continue;
-            if (g_store.get(ax_wid) != null) continue;
-
-            var rect: skylight.CGRect = undefined;
-            if (sky.getWindowBounds(conn, ax_wid, &rect) != 0) {
-                log.debug("reconcile: SkyLight.getWindowBounds failed for ax_wid={d}", .{ax_wid});
-                continue;
-            }
-
-            const f = window_mod.Window.Frame{
-                .x = rect.origin.x,
-                .y = rect.origin.y,
-                .width = rect.size.width,
-                .height = rect.size.height,
-            };
-            const bg_match = tabgroup.TabGroupManager.framesMatch(f, focused_frame);
-            log.debug("reconcile: bg tab ax_wid={d} frame=({d:.0},{d:.0},{d:.0},{d:.0}) match={}", .{
-                ax_wid, f.x, f.y, f.width, f.height, bg_match,
-            });
-            if (!bg_match) continue;
-
-            g_tab_groups.addMember(group_id, ax_wid) catch continue;
-            g_store.put(.{
-                .wid = ax_wid,
-                .pid = pid,
-                .title = null,
-                .frame = f,
-                .is_minimized = false,
-                .mode = .tiled,
-                .workspace_id = matching_ws_id,
-                .display_id = matching_display_id,
-            }) catch continue;
-        }
+        discoverBackgroundTabs(pid, group_id, focused_frame, matching_ws_id, matching_display_id);
 
         const leader = g_tab_groups.resolveLeader(focused_wid);
         _ = syncFocusStateForWindowId(focused_wid, .ax);
