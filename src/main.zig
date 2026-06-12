@@ -3566,31 +3566,82 @@ fn removeWindow(wid: u32) void {
         clearDragPreview();
     }
     // Clean up tab group membership first
-    const survivor = g_tab_groups.removeMember(wid);
+    const removal = g_tab_groups.removeMember(wid);
 
     const win = g_store.get(wid) orelse return;
     g_store.remove(wid);
-    if (g_workspaces.get(win.workspace_id)) |ws| {
-        ws.removeWindow(wid);
-    }
-    removeFromLayout(win.workspace_id, wid);
 
-    // If the group dissolved, restore the survivor to workspace and layout
-    if (survivor) |solo_wid| {
-        if (g_workspaces.get(win.workspace_id)) |ws| {
-            var in_ws = false;
-            for (ws.windows.items) |w| {
-                if (w == solo_wid) {
-                    in_ws = true;
-                    break;
+    switch (removal) {
+        // The removed window led a surviving tab group. It is the group's
+        // only representative in workspace/layout state, so hand its slot to
+        // the new leader instead of deleting it; otherwise the remaining tabs
+        // become invisible to tiling and directional focus.
+        .leader_changed => |new_leader| {
+            transferLeaderSlot(win.workspace_id, wid, new_leader);
+        },
+        .none => {
+            if (g_workspaces.get(win.workspace_id)) |ws| {
+                ws.removeWindow(wid);
+            }
+            removeFromLayout(win.workspace_id, wid);
+        },
+        // The group dissolved — restore the solo survivor to workspace and layout.
+        .dissolved_solo => |solo_wid| {
+            if (g_workspaces.get(win.workspace_id)) |ws| {
+                ws.removeWindow(wid);
+            }
+            removeFromLayout(win.workspace_id, wid);
+
+            if (g_workspaces.get(win.workspace_id)) |ws| {
+                var in_ws = false;
+                for (ws.windows.items) |w| {
+                    if (w == solo_wid) {
+                        in_ws = true;
+                        break;
+                    }
+                }
+                if (!in_ws) {
+                    log.info("removeWindow: restoring tab survivor wid={d} to workspace", .{solo_wid});
+                    ws.addWindow(solo_wid) catch {};
+                    insertIntoLayout(win.workspace_id, solo_wid);
                 }
             }
-            if (!in_ws) {
-                log.info("removeWindow: restoring tab survivor wid={d} to workspace", .{solo_wid});
-                ws.addWindow(solo_wid) catch {};
-                insertIntoLayout(win.workspace_id, solo_wid);
-            }
+        },
+    }
+}
+
+/// Hand a removed tab-group leader's workspace and layout slot to the new
+/// leader, preserving the window's position in both. Falls back to plain
+/// insertion when the old leader was not present (state drift).
+fn transferLeaderSlot(workspace_id: u8, old_leader: u32, new_leader: u32) void {
+    std.debug.assert(old_leader != 0 and new_leader != 0);
+    std.debug.assert(old_leader != new_leader);
+
+    var replaced_in_workspace = false;
+    if (g_workspaces.get(workspace_id)) |ws| {
+        replaced_in_workspace = ws.replaceWindow(old_leader, new_leader);
+        if (!replaced_in_workspace) {
+            ws.addWindow(new_leader) catch {};
         }
+    }
+
+    var replaced_in_layout = false;
+    const root_ptr = layoutRootPtr(workspace_id);
+    if (root_ptr.*) |*root| {
+        replaced_in_layout = layout.replaceWindowId(root, old_leader, new_leader);
+    }
+    if (!replaced_in_layout) {
+        insertIntoLayout(workspace_id, new_leader);
+    }
+
+    if (replaced_in_workspace and replaced_in_layout) {
+        log.info("leader succession: wid={d} slot handed to wid={d} ws={d}", .{
+            old_leader, new_leader, workspace_id,
+        });
+    } else {
+        log.warn("leader succession fallback: old={d} new={d} ws={d} in_workspace={} in_layout={}", .{
+            old_leader, new_leader, workspace_id, replaced_in_workspace, replaced_in_layout,
+        });
     }
 }
 
@@ -4244,7 +4295,7 @@ fn checkTabDragOut(_: i32, wid: u32) void {
     if (!isVisibleOnScreen(wid)) return; // still off-screen, not a drag-out
 
     log.info("tab drag-out detected: wid={d} promoted to standalone", .{wid});
-    const survivor = g_tab_groups.removeMember(wid);
+    const removal = g_tab_groups.removeMember(wid);
 
     // Update stored frame and add to workspace + layout
     if (g_store.get(wid)) |win| {
@@ -4256,25 +4307,48 @@ fn checkTabDragOut(_: i32, wid: u32) void {
 
     const win = g_store.get(wid) orelse return;
     const ws = g_workspaces.get(win.workspace_id) orelse return;
-    ws.addWindow(wid) catch return;
-    insertIntoLayout(win.workspace_id, wid);
+
+    // If the dragged-out tab led the group, its existing workspace/layout
+    // slot belongs to the surviving group — hand it to the new leader before
+    // re-adding wid as a standalone window.
+    switch (removal) {
+        .leader_changed => |new_leader| transferLeaderSlot(win.workspace_id, wid, new_leader),
+        .none, .dissolved_solo => {},
+    }
+
+    // The wid may still occupy a workspace/layout slot when it was the
+    // group's leader and the group dissolved; avoid inserting a duplicate.
+    var wid_in_ws = false;
+    for (ws.windows.items) |w| {
+        if (w == wid) {
+            wid_in_ws = true;
+            break;
+        }
+    }
+    if (!wid_in_ws) {
+        ws.addWindow(wid) catch return;
+        insertIntoLayout(win.workspace_id, wid);
+    }
     ws.focused_wid = wid;
     _ = maybeSetFocusedDisplayForWindow(win, .drag);
 
     // If the group dissolved, verify the survivor is still managed
-    if (survivor) |solo_wid| {
-        var in_ws = false;
-        for (ws.windows.items) |w| {
-            if (w == solo_wid) {
-                in_ws = true;
-                break;
+    switch (removal) {
+        .dissolved_solo => |solo_wid| {
+            var in_ws = false;
+            for (ws.windows.items) |w| {
+                if (w == solo_wid) {
+                    in_ws = true;
+                    break;
+                }
             }
-        }
-        if (!in_ws) {
-            log.info("drag-out: restoring survivor wid={d} to workspace", .{solo_wid});
-            ws.addWindow(solo_wid) catch {};
-            insertIntoLayout(win.workspace_id, solo_wid);
-        }
+            if (!in_ws) {
+                log.info("drag-out: restoring survivor wid={d} to workspace", .{solo_wid});
+                ws.addWindow(solo_wid) catch {};
+                insertIntoLayout(win.workspace_id, solo_wid);
+            }
+        },
+        .none, .leader_changed => {},
     }
 
     retile();

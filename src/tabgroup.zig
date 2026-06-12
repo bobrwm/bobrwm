@@ -95,14 +95,30 @@ pub const TabGroupManager = struct {
         });
     }
 
+    /// Outcome of removing a window from its tab group. The leader is the
+    /// group's only member registered in workspace window lists and the BSP
+    /// layout, so callers must act on leadership changes or the surviving
+    /// tabs become invisible to tiling.
+    pub const RemoveResult = union(enum) {
+        /// wid was not in a group, a non-leader member left a surviving
+        /// group, or the group dissolved with no member left.
+        none,
+        /// The removed wid led a group that survives; payload is the new
+        /// leader. Callers must hand the old leader's workspace/layout slot
+        /// to the new leader.
+        leader_changed: WindowId,
+        /// The group dissolved leaving a single member; callers should
+        /// restore it as a standalone window.
+        dissolved_solo: WindowId,
+    };
+
     /// Remove a window from its group.
-    /// Dissolves the group if fewer than 2 members remain (returns remaining
-    /// solo wid so the caller can treat it as standalone again).
-    pub fn removeMember(self: *TabGroupManager, wid: WindowId) ?WindowId {
-        const group_id = self.wid_to_group.get(wid) orelse return null;
+    /// Dissolves the group if fewer than 2 members remain.
+    pub fn removeMember(self: *TabGroupManager, wid: WindowId) RemoveResult {
+        const group_id = self.wid_to_group.get(wid) orelse return .none;
         _ = self.wid_to_group.remove(wid);
 
-        const g = self.groups.getPtr(group_id) orelse return null;
+        const g = self.groups.getPtr(group_id) orelse return .none;
 
         for (g.members.items, 0..) |m, i| {
             if (m == wid) {
@@ -111,7 +127,8 @@ pub const TabGroupManager = struct {
             }
         }
 
-        if (g.leader_wid == wid and g.members.items.len > 0) {
+        const was_leader = g.leader_wid == wid;
+        if (was_leader and g.members.items.len > 0) {
             g.leader_wid = g.members.items[0];
         }
         if (g.active_wid == wid and g.members.items.len > 0) {
@@ -128,10 +145,17 @@ pub const TabGroupManager = struct {
             g.members.deinit(self.allocator);
             _ = self.groups.remove(group_id);
             log.info("dissolved group {d}", .{group_id});
-            return solo_wid;
+            if (solo_wid) |solo| return .{ .dissolved_solo = solo };
+            return .none;
         }
 
-        return null;
+        if (was_leader) {
+            log.info("group {d} leader changed from {d} to {d}", .{
+                group_id, wid, g.leader_wid,
+            });
+            return .{ .leader_changed = g.leader_wid };
+        }
+        return .none;
     }
 
     /// Get the group a window belongs to (read-only).
@@ -194,3 +218,70 @@ pub const TabGroupManager = struct {
             @abs(a.height - b.height) <= tol;
     }
 };
+
+// Tests
+
+const testing = std.testing;
+
+const test_frame: Frame = .{ .x = 0, .y = 0, .width = 800, .height = 600 };
+
+test "removeMember hands leadership to a surviving member" {
+    var mgr = TabGroupManager.init(testing.allocator);
+    defer mgr.deinit();
+
+    const gid = try mgr.createGroup(100, 1, test_frame);
+    try mgr.addMember(gid, 2);
+    try mgr.addMember(gid, 3);
+
+    switch (mgr.removeMember(1)) {
+        .leader_changed => |new_leader| {
+            const g = mgr.groupOf(new_leader) orelse return error.TestUnexpectedResult;
+            try testing.expectEqual(new_leader, g.leader_wid);
+            try testing.expectEqual(@as(usize, 2), g.members.items.len);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "removeMember dissolves a two-member group to a solo survivor" {
+    var mgr = TabGroupManager.init(testing.allocator);
+    defer mgr.deinit();
+
+    const gid = try mgr.createGroup(100, 1, test_frame);
+    try mgr.addMember(gid, 2);
+
+    switch (mgr.removeMember(1)) {
+        .dissolved_solo => |solo| {
+            try testing.expectEqual(@as(WindowId, 2), solo);
+            try testing.expect(mgr.groupOf(2) == null);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "removeMember returns none for a non-leader member" {
+    var mgr = TabGroupManager.init(testing.allocator);
+    defer mgr.deinit();
+
+    const gid = try mgr.createGroup(100, 1, test_frame);
+    try mgr.addMember(gid, 2);
+    try mgr.addMember(gid, 3);
+
+    switch (mgr.removeMember(2)) {
+        .none => {
+            const g = mgr.groupOf(1) orelse return error.TestUnexpectedResult;
+            try testing.expectEqual(@as(WindowId, 1), g.leader_wid);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "removeMember returns none for an untracked window" {
+    var mgr = TabGroupManager.init(testing.allocator);
+    defer mgr.deinit();
+
+    switch (mgr.removeMember(42)) {
+        .none => {},
+        else => return error.TestUnexpectedResult,
+    }
+}
