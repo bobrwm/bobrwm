@@ -170,6 +170,12 @@ const WorkspaceTransitionKind = enum {
     move_workspace_to_display,
 };
 
+const WorkspaceTransitionCompletionReason = enum {
+    none,
+    focus_accepted,
+    empty_workspace,
+};
+
 const WorkspaceTransitionState = struct {
     kind: WorkspaceTransitionKind = .idle,
     epoch: u64 = 0,
@@ -463,7 +469,24 @@ fn clearWorkspaceTransition() void {
     g_workspace_transition = .{
         .epoch = g_workspace_transition.epoch,
     };
+    g_workspace_transition_completion_reason = .none;
     g_pending_focus_count = 0;
+}
+
+fn markWorkspaceTransitionComplete(reason: WorkspaceTransitionCompletionReason) void {
+    if (!g_workspace_transition.isActive()) return;
+    if (g_workspace_transition_completion_reason != .none) return;
+    std.debug.assert(reason != .none);
+
+    g_workspace_transition_completion_reason = reason;
+    const transition = g_workspace_transition;
+    log.debug("workspace transition marked complete epoch={d} kind={s} workspace={d} display={d} reason={s}", .{
+        transition.epoch,
+        @tagName(transition.kind),
+        transition.target_workspace_id,
+        transition.target_display_id,
+        @tagName(reason),
+    });
 }
 
 fn startWorkspaceTransition(kind: WorkspaceTransitionKind, target_workspace_id: u8, target_display_id: u32) void {
@@ -481,7 +504,14 @@ fn startWorkspaceTransition(kind: WorkspaceTransitionKind, target_workspace_id: 
         .target_workspace_id = target_workspace_id,
         .target_display_id = target_display_id,
     };
+    g_workspace_transition_completion_reason = .none;
     g_pending_focus_count = 0;
+    log.debug("workspace transition started epoch={d} kind={s} workspace={d} display={d}", .{
+        next_epoch,
+        @tagName(kind),
+        target_workspace_id,
+        target_display_id,
+    });
 }
 
 fn workspaceTransitionTimedOut() bool {
@@ -558,17 +588,81 @@ fn queuePendingFocus(win: window_mod.Window, source: FocusEventSource) void {
         .workspace_id = win.workspace_id,
         .display_id = win.display_id,
     });
+    const transition = g_workspace_transition;
+    log.debug("workspace transition pending focus queued epoch={d} wid={d} pid={d} source={s} workspace={d} display={d} target_workspace={d} target_display={d} pending={d}", .{
+        transition.epoch,
+        win.wid,
+        win.pid,
+        @tagName(source),
+        win.workspace_id,
+        win.display_id,
+        transition.target_workspace_id,
+        transition.target_display_id,
+        g_pending_focus_count,
+    });
 }
 
 fn applyPendingFocusEntry(entry: PendingFocusEntry) bool {
     if (!g_workspace_transition.isActive()) return false;
-    if (entry.workspace_id != g_workspace_transition.target_workspace_id) return false;
-    if (entry.display_id != g_workspace_transition.target_display_id) return false;
+    const transition = g_workspace_transition;
+    if (entry.workspace_id != transition.target_workspace_id) {
+        log.debug("workspace transition pending focus skipped epoch={d} wid={d} pid={d} reason=workspace-mismatch entry_workspace={d} target_workspace={d}", .{
+            transition.epoch,
+            entry.wid,
+            entry.pid,
+            entry.workspace_id,
+            transition.target_workspace_id,
+        });
+        return false;
+    }
+    if (entry.display_id != transition.target_display_id) {
+        log.debug("workspace transition pending focus skipped epoch={d} wid={d} pid={d} reason=display-mismatch entry_display={d} target_display={d}", .{
+            transition.epoch,
+            entry.wid,
+            entry.pid,
+            entry.display_id,
+            transition.target_display_id,
+        });
+        return false;
+    }
 
-    const win = g_store.get(entry.wid) orelse return false;
-    if (win.pid != entry.pid) return false;
-    if (win.workspace_id != entry.workspace_id) return false;
-    if (win.display_id != entry.display_id) return false;
+    const win = g_store.get(entry.wid) orelse {
+        log.debug("workspace transition pending focus skipped epoch={d} wid={d} pid={d} reason=missing-store", .{
+            transition.epoch,
+            entry.wid,
+            entry.pid,
+        });
+        return false;
+    };
+    if (win.pid != entry.pid) {
+        log.debug("workspace transition pending focus skipped epoch={d} wid={d} pid={d} reason=pid-mismatch store_pid={d}", .{
+            transition.epoch,
+            entry.wid,
+            entry.pid,
+            win.pid,
+        });
+        return false;
+    }
+    if (win.workspace_id != entry.workspace_id) {
+        log.debug("workspace transition pending focus skipped epoch={d} wid={d} pid={d} reason=store-workspace-changed entry_workspace={d} store_workspace={d}", .{
+            transition.epoch,
+            entry.wid,
+            entry.pid,
+            entry.workspace_id,
+            win.workspace_id,
+        });
+        return false;
+    }
+    if (win.display_id != entry.display_id) {
+        log.debug("workspace transition pending focus skipped epoch={d} wid={d} pid={d} reason=store-display-changed entry_display={d} store_display={d}", .{
+            transition.epoch,
+            entry.wid,
+            entry.pid,
+            entry.display_id,
+            win.display_id,
+        });
+        return false;
+    }
 
     return maybeSetFocusedDisplayForWindow(win, entry.source);
 }
@@ -604,11 +698,40 @@ fn processPendingFocusQueue() bool {
 
 fn maybeSetFocusedDisplayForWindow(win: window_mod.Window, source: FocusEventSource) bool {
     if (!shouldAcceptFocusForWindow(win, source)) {
+        if (g_workspace_transition.isActive()) {
+            const transition = g_workspace_transition;
+            log.debug("workspace transition focus deferred epoch={d} wid={d} pid={d} source={s} workspace={d} display={d} target_workspace={d} target_display={d} visible={}", .{
+                transition.epoch,
+                win.wid,
+                win.pid,
+                @tagName(source),
+                win.workspace_id,
+                win.display_id,
+                transition.target_workspace_id,
+                transition.target_display_id,
+                workspaceVisibleOnDisplay(win.workspace_id, win.display_id),
+            });
+        }
         queuePendingFocus(win, source);
         return false;
     }
 
     setFocusedDisplay(win.display_id);
+
+    if (g_workspace_transition.isActive()) {
+        const transition = g_workspace_transition;
+        log.debug("workspace transition focus accepted epoch={d} wid={d} pid={d} source={s} workspace={d} display={d} target_workspace={d} target_display={d}", .{
+            transition.epoch,
+            win.wid,
+            win.pid,
+            @tagName(source),
+            win.workspace_id,
+            win.display_id,
+            transition.target_workspace_id,
+            transition.target_display_id,
+        });
+        markWorkspaceTransitionComplete(.focus_accepted);
+    }
 
     // Keyboard intent always wins — flush stale queued focus from AX/drag
     // so they don't replay against an old transition epoch.
@@ -658,9 +781,34 @@ fn tickWorkspaceTransitionState() void {
     if (!workspaceTransitionTimedOut()) return;
 
     const transition = g_workspace_transition;
+    if (g_workspace_transition_completion_reason != .none) {
+        log.debug("workspace transition completed epoch={d} kind={s} workspace={d} display={d} reason={s}", .{
+            transition.epoch,
+            @tagName(transition.kind),
+            transition.target_workspace_id,
+            transition.target_display_id,
+            @tagName(g_workspace_transition_completion_reason),
+        });
+        clearWorkspaceTransition();
+        return;
+    }
+
+    const front_pid = frontmostApplicationPid() orelse 0;
+    const front_wid = if (front_pid > 0) focusedWindowIdForPid(front_pid) orelse 0 else 0;
+    const active_workspace_id = activeWorkspaceIdForDisplay(transition.target_display_id);
     log.warn(
-        "workspace transition watchdog expired epoch={d} kind={s} workspace={d} display={d}",
-        .{ transition.epoch, @tagName(transition.kind), transition.target_workspace_id, transition.target_display_id },
+        "workspace transition watchdog expired epoch={d} kind={s} workspace={d} display={d} active_workspace={d} focused_display={d} front_pid={d} front_wid={d} pending={d}",
+        .{
+            transition.epoch,
+            @tagName(transition.kind),
+            transition.target_workspace_id,
+            transition.target_display_id,
+            active_workspace_id,
+            focusedDisplayId(),
+            front_pid,
+            front_wid,
+            g_pending_focus_count,
+        },
     );
     clearWorkspaceTransition();
 }
@@ -901,7 +1049,22 @@ const HideCtx = struct {
                     .bottom_right => self.display.x + self.display.w - hide_peek,
                     .bottom_left => self.display.x - win.frame.width + hide_peek,
                 };
-                _ = shim.bw_ax_set_window_frame(pid, wid, pos_x, pos_y, win.frame.width, win.frame.height);
+                const ok = shim.bw_ax_set_window_frame(pid, wid, pos_x, pos_y, win.frame.width, win.frame.height);
+                log.debug("hide window wid={d} pid={d} ok={} x={d:.0} y={d:.0} w={d:.0} h={d:.0}", .{
+                    wid,
+                    pid,
+                    ok,
+                    pos_x,
+                    pos_y,
+                    win.frame.width,
+                    win.frame.height,
+                });
+                if (!ok) {
+                    if (self.hideFocusedFallback(pid, wid, pos_x, pos_y, win.frame.width, win.frame.height)) {
+                        return;
+                    }
+                    log.warn("hide failed wid={d} pid={d}", .{ wid, pid });
+                }
                 var updated = win;
                 updated.frame.x = pos_x;
                 updated.frame.y = pos_y;
@@ -914,7 +1077,54 @@ const HideCtx = struct {
             .bottom_right => self.display.x + self.display.w - hide_peek,
             .bottom_left => self.display.x - 1 + hide_peek,
         };
-        _ = shim.bw_ax_set_window_frame(pid, wid, pos_x, pos_y, 1, 1);
+        const ok = shim.bw_ax_set_window_frame(pid, wid, pos_x, pos_y, 1, 1);
+        log.debug("hide window wid={d} pid={d} ok={} x={d:.0} y={d:.0} w=1 h=1", .{
+            wid,
+            pid,
+            ok,
+            pos_x,
+            pos_y,
+        });
+        if (!ok) {
+            if (!self.hideFocusedFallback(pid, wid, pos_x, pos_y, 1, 1)) {
+                log.warn("hide failed wid={d} pid={d}", .{ wid, pid });
+            }
+        }
+    }
+
+    /// Ghostty can replace the active native-tab window ID before Bobrwm has
+    /// reconciled focus. If hiding the stored ID fails, hide the app's current
+    /// focused AX window at the same off-screen frame so it cannot leak onto
+    /// the newly activated empty workspace.
+    fn hideFocusedFallback(self: HideCtx, pid: i32, failed_wid: u32, x: f64, y: f64, w: f64, h: f64) bool {
+        _ = self;
+        std.debug.assert(pid > 0);
+        std.debug.assert(failed_wid > 0);
+        std.debug.assert(w > 0 and h > 0);
+
+        const focused_wid = focusedWindowIdForPid(pid) orelse return false;
+        if (focused_wid == failed_wid) return false;
+
+        const ok = shim.bw_ax_set_window_frame(pid, focused_wid, x, y, w, h);
+        log.debug("hide fallback focused window failed_wid={d} focused_wid={d} pid={d} ok={} x={d:.0} y={d:.0} w={d:.0} h={d:.0}", .{
+            failed_wid,
+            focused_wid,
+            pid,
+            ok,
+            x,
+            y,
+            w,
+            h,
+        });
+        if (!ok) return false;
+
+        const replacement_frame: window_mod.Window.Frame = .{
+            .x = x,
+            .y = y,
+            .width = w,
+            .height = h,
+        };
+        return replaceManagedWindowId(failed_wid, focused_wid, replacement_frame);
     }
 };
 
@@ -984,6 +1194,7 @@ var g_ipc_source: c.dispatch_source_t = null;
 var g_tap_port: c.CFMachPortRef = null;
 var g_ax_strings: ?AxStrings = null;
 var g_workspace_transition: WorkspaceTransitionState = .{};
+var g_workspace_transition_completion_reason: WorkspaceTransitionCompletionReason = .none;
 var g_pending_focus_entries: [pending_focus_capacity_per_epoch]PendingFocusEntry = undefined;
 var g_pending_focus_count: usize = 0;
 var g_pending_focus_sequence: u64 = 0;
@@ -2238,6 +2449,60 @@ fn setLayoutLeafActive(workspace_id: u8, wid: u32) void {
     }
 }
 
+fn replaceManagedWindowId(old_wid: u32, new_wid: u32, frame: window_mod.Window.Frame) bool {
+    std.debug.assert(old_wid != 0);
+    std.debug.assert(new_wid != 0);
+    std.debug.assert(frame.width > 0 and frame.height > 0);
+    if (old_wid == new_wid) return false;
+    if (g_store.get(new_wid) != null) return false;
+    if (g_tab_groups.groupOf(old_wid) != null) return false;
+    if (g_tab_groups.groupOf(new_wid) != null) return false;
+
+    const old = g_store.get(old_wid) orelse return false;
+    const ws = g_workspaces.get(old.workspace_id) orelse return false;
+    const root_ptr = layoutRootPtr(old.workspace_id);
+    var replaced_in_layout = false;
+    if (root_ptr.*) |*root| {
+        replaced_in_layout = layout.replaceWindowId(root, old_wid, new_wid);
+    }
+
+    const replaced_in_workspace = ws.replaceWindow(old_wid, new_wid);
+    if (!replaced_in_workspace or (old.mode == .tiled and !replaced_in_layout)) {
+        if (replaced_in_workspace) _ = ws.replaceWindow(new_wid, old_wid);
+        if (replaced_in_layout) {
+            if (root_ptr.*) |*root| _ = layout.replaceWindowId(root, new_wid, old_wid);
+        }
+        log.warn("window id replacement failed old={d} new={d} workspace={d} in_workspace={} in_layout={}", .{
+            old_wid,
+            new_wid,
+            old.workspace_id,
+            replaced_in_workspace,
+            replaced_in_layout,
+        });
+        return false;
+    }
+
+    var updated = old;
+    updated.wid = new_wid;
+    updated.frame = frame;
+    g_store.put(updated) catch {
+        _ = ws.replaceWindow(new_wid, old_wid);
+        if (replaced_in_layout) {
+            if (root_ptr.*) |*root| _ = layout.replaceWindowId(root, new_wid, old_wid);
+        }
+        return false;
+    };
+    g_store.remove(old_wid);
+    log.info("window id replaced old={d} new={d} pid={d} workspace={d} display={d}", .{
+        old_wid,
+        new_wid,
+        updated.pid,
+        updated.workspace_id,
+        updated.display_id,
+    });
+    return true;
+}
+
 const FocusedLayoutContext = struct {
     focused_wid: u32,
     focused_win: window_mod.Window,
@@ -2524,10 +2789,7 @@ fn handleEvent(ev: *const event_mod.Event) void {
             };
             untrackFocusRetry(ev.pid);
             if (!syncFocusStateForWindowId(focused_wid, .ax)) {
-                ax_observer.observeApp(ev.pid);
-                discoverWindows();
-                retile();
-                _ = syncFocusStateForWindowId(focused_wid, .ax);
+                reconcileFocusedWindow(ev.pid, focused_wid);
             }
         },
         .focused_window_changed => {
@@ -4596,6 +4858,11 @@ fn switchWorkspace(target_id: u8) void {
     // If target is already visible on some display, just focus there.
     if (workspaceVisibleAnywhere(target_id)) {
         const target_display = target_ws.display_id orelse return;
+        log.debug("workspace switch target already visible workspace={d} display={d} windows={d}", .{
+            target_id,
+            target_display,
+            target_ws.windows.items.len,
+        });
         startWorkspaceTransition(.switch_workspace, target_id, target_display);
         setFocusedDisplay(target_display);
         updateStatusBar();
@@ -4610,24 +4877,58 @@ fn switchWorkspace(target_id: u8) void {
     if (target_id == current_id) return;
 
     const old_ws = g_workspaces.get(current_id) orelse return;
+    log.debug("workspace switch preparing current_workspace={d} target_workspace={d} display={d} current_windows={d} target_windows={d}", .{
+        current_id,
+        target_id,
+        target_display,
+        old_ws.windows.items.len,
+        target_ws.windows.items.len,
+    });
 
     // Hide current workspace windows (only those on target_display)
     const hctx = HideCtx.init(target_display);
+    var hidden_count: usize = 0;
     for (old_ws.windows.items) |wid| {
         const visible_wid = g_tab_groups.resolveActive(wid);
         const hide_wid = if (g_store.get(visible_wid) != null) visible_wid else wid;
         if (g_store.get(hide_wid)) |win| {
             if (win.display_id != target_display) continue;
+            if (g_tab_groups.groupOf(wid)) |group| {
+                log.debug("workspace switch hiding window workspace={d} layout_wid={d} hide_wid={d} group_leader={d} group_active={d} members={d}", .{
+                    current_id,
+                    wid,
+                    hide_wid,
+                    group.leader_wid,
+                    group.active_wid,
+                    group.members.items.len,
+                });
+            } else {
+                log.debug("workspace switch hiding window workspace={d} layout_wid={d} hide_wid={d} group=none", .{
+                    current_id,
+                    wid,
+                    hide_wid,
+                });
+            }
             hctx.hide(win.pid, hide_wid);
+            hidden_count += 1;
         }
     }
+    var hidden_pending_count: usize = 0;
     var pending_it = g_pending_role_windows.iterator();
     while (pending_it.next()) |entry| {
         const pending = entry.value_ptr.*;
         if (pending.workspace_id != current_id) continue;
         if (pending.display_id != target_display) continue;
         hctx.hide(pending.pid, entry.key_ptr.*);
+        hidden_pending_count += 1;
     }
+    log.debug("workspace switch hid current windows current_workspace={d} target_workspace={d} display={d} hidden={d} hidden_pending={d}", .{
+        current_id,
+        target_id,
+        target_display,
+        hidden_count,
+        hidden_pending_count,
+    });
 
     // Activate target; old workspace keeps its display_id (just hidden).
     g_workspaces.setActiveForDisplaySlot(display_slot, target_id);
@@ -4644,6 +4945,11 @@ fn switchWorkspace(target_id: u8) void {
         }
         updateTabGroupAssignment(wid, target_ws.id, target_display);
     }
+    log.debug("workspace switch activated target workspace={d} display={d} windows={d}", .{
+        target_id,
+        target_display,
+        target_ws.windows.items.len,
+    });
 
     assertDisplayCoverage();
 
@@ -4671,9 +4977,34 @@ fn focusWorkspaceWindow(ws: *workspace_mod.Workspace) void {
     if (focus_wid) |fwid| {
         const actual_wid = g_tab_groups.resolveActive(fwid);
         if (g_store.get(actual_wid)) |win| {
+            if (g_tab_groups.groupOf(fwid)) |group| {
+                log.debug("workspace focus target workspace={d} focused_wid={d} actual_wid={d} group_leader={d} group_active={d} members={d}", .{
+                    ws.id,
+                    fwid,
+                    actual_wid,
+                    group.leader_wid,
+                    group.active_wid,
+                    group.members.items.len,
+                });
+            } else {
+                log.debug("workspace focus target workspace={d} focused_wid={d} actual_wid={d} group=none", .{
+                    ws.id,
+                    fwid,
+                    actual_wid,
+                });
+            }
             _ = shim.bw_ax_focus_window(win.pid, actual_wid);
             ws.focused_wid = fwid;
             _ = maybeSetFocusedDisplayForWindow(win, .keyboard);
+        }
+    }
+
+    if (focus_wid == null) {
+        log.debug("workspace focus target workspace={d} focused_wid=0 actual_wid=0 reason=empty", .{ws.id});
+        if (g_workspace_transition.isActive() and
+            g_workspace_transition.target_workspace_id == ws.id)
+        {
+            markWorkspaceTransitionComplete(.empty_workspace);
         }
     }
 
