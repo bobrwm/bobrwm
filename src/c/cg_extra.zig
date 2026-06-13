@@ -15,7 +15,7 @@
 
 const c = @import("c");
 
-// CGEvent.h 
+// CGEvent.h
 
 pub extern fn CGEventGetFlags(event: c.CGEventRef) c.CGEventFlags;
 
@@ -65,6 +65,7 @@ pub extern const kCGWindowNumber: c.CFStringRef;
 pub extern const kCGWindowLayer: c.CFStringRef;
 pub extern const kCGWindowOwnerPID: c.CFStringRef;
 pub extern const kCGWindowBounds: c.CFStringRef;
+pub extern const kCGWindowAlpha: c.CFStringRef;
 
 // libdispatch
 

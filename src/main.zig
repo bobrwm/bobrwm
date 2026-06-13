@@ -1485,10 +1485,21 @@ export fn bw_is_window_on_screen(target_wid: u32) bool {
         var wid: u32 = 0;
         const ok = c.CFNumberGetValue(wid_ref, c.kCFNumberSInt32Type, &wid);
         if (ok == 0) continue;
+        if (!cgWindowInfoVisible(info)) continue;
         if (wid == target_wid) return true;
     }
 
     return false;
+}
+
+fn cgWindowInfoVisible(info: c.CFDictionaryRef) bool {
+    const alpha_ref_any = c.CFDictionaryGetValue(info, cg_extra.kCGWindowAlpha) orelse return true;
+    const alpha_ref: c.CFNumberRef = @ptrCast(alpha_ref_any);
+
+    var alpha: c.CGFloat = 1;
+    const ok = c.CFNumberGetValue(alpha_ref, c.kCFNumberCGFloatType, &alpha);
+    if (ok == 0) return true;
+    return alpha > 0.01;
 }
 
 /// Get all AX-backed window IDs for an application PID.
@@ -1819,6 +1830,7 @@ export fn bw_discover_windows(out: ?[*]shim.bw_window_info, max_count: u32) u32 
             _ = c.CFNumberGetValue(layer_ref, c.kCFNumberSInt32Type, &layer);
         }
         if (layer != 0) continue;
+        if (!cgWindowInfoVisible(info)) continue;
 
         const wid_ref_any = c.CFDictionaryGetValue(info, cg_extra.kCGWindowNumber) orelse continue;
         const wid_ref: c.CFNumberRef = @ptrCast(wid_ref_any);
