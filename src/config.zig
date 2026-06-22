@@ -119,6 +119,7 @@ pub const SwipeConfig = struct {
     fingers: u8 = 3,
     distance_pct: f64 = 0.08,
     reverse: bool = false,
+    haptics: bool = false,
 };
 
 pub const OuterGaps = struct {

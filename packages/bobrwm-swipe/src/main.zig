@@ -5,6 +5,7 @@ const objc = @import("objc");
 const c = @import("c");
 const cg_extra = @import("cg_extra");
 const config_mod = @import("bobrwm_config");
+const haptics = @import("haptics.zig");
 
 const log = std.log.scoped(.bobrwm_swipe);
 
@@ -17,6 +18,7 @@ const RuntimeConfig = struct {
     fingers: usize = 3,
     distance_pct: f64 = 0.08,
     reverse: bool = false,
+    haptics: bool = false,
 };
 
 const IpcResult = enum {
@@ -100,6 +102,11 @@ const GestureState = struct {
         if (@abs(avg_dx) <= @abs(avg_dy)) return null;
 
         self.fired = true;
+
+        if (runtime.haptics) {
+            _ = haptics.performHaptic(.level_change); // ignore failure
+        }
+
         return if (avg_dx < 0 and !runtime.reverse) .previous else .next;
     }
 };
@@ -171,6 +178,7 @@ fn validateSwipeConfig(config: config_mod.SwipeConfig) !RuntimeConfig {
         .fingers = config.fingers,
         .distance_pct = config.distance_pct,
         .reverse = config.reverse,
+        .haptics = config.haptics,
     };
 }
 

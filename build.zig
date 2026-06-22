@@ -58,6 +58,22 @@ pub fn build(b: *std.Build) !void {
         .link_libc = true,
     });
 
+    const haptics_mod = b.createModule(.{
+        .root_source_file = b.path("src/haptics.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    haptics_mod.addSystemFrameworkPath(.{ .cwd_relative = sdk_private_frameworks });
+    haptics_mod.addSystemFrameworkPath(.{ .cwd_relative = sdk_frameworks });
+    haptics_mod.addSystemIncludePath(.{ .cwd_relative = sdk_include });
+    haptics_mod.addLibraryPath(.{ .cwd_relative = sdk_lib });
+    haptics_mod.linkFramework("IOKit", .{});
+    haptics_mod.linkFramework("CoreFoundation", .{});
+haptics_mod.linkFramework("MultitouchSupport", .{});
+
+    exe_mod.addImport("haptics", haptics_mod);
+
     // Log level: -Dlog_level=debug, or LOG_LEVEL=debug zig build
     const log_level: ?std.log.Level = b.option(
         std.log.Level,
