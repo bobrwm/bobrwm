@@ -16,6 +16,7 @@ const touch_phase_cancelled: u32 = 1 << 4;
 const RuntimeConfig = struct {
     fingers: usize = 3,
     distance_pct: f64 = 0.08,
+    reverse: bool = false,
 };
 
 const IpcResult = enum {
@@ -99,7 +100,7 @@ const GestureState = struct {
         if (@abs(avg_dx) <= @abs(avg_dy)) return null;
 
         self.fired = true;
-        return if (avg_dx < 0) .previous else .next;
+        return if (avg_dx < 0 and !runtime.reverse) .previous else .next;
     }
 };
 
@@ -169,6 +170,7 @@ fn validateSwipeConfig(config: config_mod.SwipeConfig) !RuntimeConfig {
     return .{
         .fingers = config.fingers,
         .distance_pct = config.distance_pct,
+        .reverse = config.reverse,
     };
 }
 
