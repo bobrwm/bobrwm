@@ -61,6 +61,8 @@
         SDKROOT = pkgs.apple-sdk.sdkroot;
         buildInputs = [
           zig
+        ];
+        packages = [
           zls
           zigdoc
           ziglint
