@@ -126,6 +126,7 @@ The optional `bobrwm-swipe` companion reads its opt-in flag from the main bobrwm
     .enabled = true,
     .fingers = 3,
     .distance_pct = 0.08,
+    .reverse = false,
 },
 ```
 

@@ -118,6 +118,7 @@ pub const SwipeConfig = struct {
     enabled: bool = false,
     fingers: u8 = 3,
     distance_pct: f64 = 0.08,
+    reverse: bool = false,
 };
 
 pub const OuterGaps = struct {

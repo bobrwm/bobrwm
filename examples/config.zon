@@ -33,6 +33,8 @@
     //     .fingers = 3,
     //     // Fraction of normalized trackpad width before a swipe fires.
     //     .distance_pct = 0.08,
+    //     // Reverse swipe direction.
+    //     .reverse = false,
     // },
 
     // Gaps between windows (pixels). Omit or set to 0 for no gaps.
