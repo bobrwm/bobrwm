@@ -106,6 +106,12 @@ const pending_role_window_capacity: usize = 256;
 const deferred_window_candidate_capacity: usize = 256;
 /// Capacity reserved for app launch retries (pid-keyed, bounded by observers).
 const app_launch_retry_capacity: usize = 64;
+/// Focus query retry budget. Electron apps (Discord) can report no AX
+/// focused window for several hundred milliseconds after activation;
+/// 10 attempts at the 100ms role-poll cadence covers that window.
+const focus_retry_attempts_max: u8 = 10;
+/// Capacity reserved for focus retries (pid-keyed, bounded by observers).
+const focus_retry_capacity: usize = 64;
 /// Debounce workspace/display notifications that can fire in short bursts.
 const workspace_event_debounce_interval_s: f64 = 0.05;
 /// Hard cap for workspace transition convergence before we fail closed.
@@ -162,6 +168,12 @@ const WorkspaceTransitionKind = enum {
     idle,
     switch_workspace,
     move_workspace_to_display,
+};
+
+const WorkspaceTransitionCompletionReason = enum {
+    none,
+    focus_accepted,
+    empty_workspace,
 };
 
 const WorkspaceTransitionState = struct {
@@ -221,6 +233,7 @@ const DeferredWindowPromotion = struct {
 const PendingRoleWindowMap = std.AutoHashMap(u32, PendingRoleWindow);
 const DeferredWindowCandidateMap = std.AutoHashMap(u32, DeferredWindowCandidate);
 const AppLaunchRetryMap = std.AutoHashMap(i32, u8);
+const FocusRetryMap = std.AutoHashMap(i32, u8);
 
 fn nsString(str: [*:0]const u8) objc.Object {
     const NSString = objc.getClass("NSString") orelse
@@ -456,7 +469,24 @@ fn clearWorkspaceTransition() void {
     g_workspace_transition = .{
         .epoch = g_workspace_transition.epoch,
     };
+    g_workspace_transition_completion_reason = .none;
     g_pending_focus_count = 0;
+}
+
+fn markWorkspaceTransitionComplete(reason: WorkspaceTransitionCompletionReason) void {
+    if (!g_workspace_transition.isActive()) return;
+    if (g_workspace_transition_completion_reason != .none) return;
+    std.debug.assert(reason != .none);
+
+    g_workspace_transition_completion_reason = reason;
+    const transition = g_workspace_transition;
+    log.debug("workspace transition marked complete epoch={d} kind={s} workspace={d} display={d} reason={s}", .{
+        transition.epoch,
+        @tagName(transition.kind),
+        transition.target_workspace_id,
+        transition.target_display_id,
+        @tagName(reason),
+    });
 }
 
 fn startWorkspaceTransition(kind: WorkspaceTransitionKind, target_workspace_id: u8, target_display_id: u32) void {
@@ -474,7 +504,14 @@ fn startWorkspaceTransition(kind: WorkspaceTransitionKind, target_workspace_id: 
         .target_workspace_id = target_workspace_id,
         .target_display_id = target_display_id,
     };
+    g_workspace_transition_completion_reason = .none;
     g_pending_focus_count = 0;
+    log.debug("workspace transition started epoch={d} kind={s} workspace={d} display={d}", .{
+        next_epoch,
+        @tagName(kind),
+        target_workspace_id,
+        target_display_id,
+    });
 }
 
 fn workspaceTransitionTimedOut() bool {
@@ -551,17 +588,81 @@ fn queuePendingFocus(win: window_mod.Window, source: FocusEventSource) void {
         .workspace_id = win.workspace_id,
         .display_id = win.display_id,
     });
+    const transition = g_workspace_transition;
+    log.debug("workspace transition pending focus queued epoch={d} wid={d} pid={d} source={s} workspace={d} display={d} target_workspace={d} target_display={d} pending={d}", .{
+        transition.epoch,
+        win.wid,
+        win.pid,
+        @tagName(source),
+        win.workspace_id,
+        win.display_id,
+        transition.target_workspace_id,
+        transition.target_display_id,
+        g_pending_focus_count,
+    });
 }
 
 fn applyPendingFocusEntry(entry: PendingFocusEntry) bool {
     if (!g_workspace_transition.isActive()) return false;
-    if (entry.workspace_id != g_workspace_transition.target_workspace_id) return false;
-    if (entry.display_id != g_workspace_transition.target_display_id) return false;
+    const transition = g_workspace_transition;
+    if (entry.workspace_id != transition.target_workspace_id) {
+        log.debug("workspace transition pending focus skipped epoch={d} wid={d} pid={d} reason=workspace-mismatch entry_workspace={d} target_workspace={d}", .{
+            transition.epoch,
+            entry.wid,
+            entry.pid,
+            entry.workspace_id,
+            transition.target_workspace_id,
+        });
+        return false;
+    }
+    if (entry.display_id != transition.target_display_id) {
+        log.debug("workspace transition pending focus skipped epoch={d} wid={d} pid={d} reason=display-mismatch entry_display={d} target_display={d}", .{
+            transition.epoch,
+            entry.wid,
+            entry.pid,
+            entry.display_id,
+            transition.target_display_id,
+        });
+        return false;
+    }
 
-    const win = g_store.get(entry.wid) orelse return false;
-    if (win.pid != entry.pid) return false;
-    if (win.workspace_id != entry.workspace_id) return false;
-    if (win.display_id != entry.display_id) return false;
+    const win = g_store.get(entry.wid) orelse {
+        log.debug("workspace transition pending focus skipped epoch={d} wid={d} pid={d} reason=missing-store", .{
+            transition.epoch,
+            entry.wid,
+            entry.pid,
+        });
+        return false;
+    };
+    if (win.pid != entry.pid) {
+        log.debug("workspace transition pending focus skipped epoch={d} wid={d} pid={d} reason=pid-mismatch store_pid={d}", .{
+            transition.epoch,
+            entry.wid,
+            entry.pid,
+            win.pid,
+        });
+        return false;
+    }
+    if (win.workspace_id != entry.workspace_id) {
+        log.debug("workspace transition pending focus skipped epoch={d} wid={d} pid={d} reason=store-workspace-changed entry_workspace={d} store_workspace={d}", .{
+            transition.epoch,
+            entry.wid,
+            entry.pid,
+            entry.workspace_id,
+            win.workspace_id,
+        });
+        return false;
+    }
+    if (win.display_id != entry.display_id) {
+        log.debug("workspace transition pending focus skipped epoch={d} wid={d} pid={d} reason=store-display-changed entry_display={d} store_display={d}", .{
+            transition.epoch,
+            entry.wid,
+            entry.pid,
+            entry.display_id,
+            win.display_id,
+        });
+        return false;
+    }
 
     return maybeSetFocusedDisplayForWindow(win, entry.source);
 }
@@ -597,11 +698,40 @@ fn processPendingFocusQueue() bool {
 
 fn maybeSetFocusedDisplayForWindow(win: window_mod.Window, source: FocusEventSource) bool {
     if (!shouldAcceptFocusForWindow(win, source)) {
+        if (g_workspace_transition.isActive()) {
+            const transition = g_workspace_transition;
+            log.debug("workspace transition focus deferred epoch={d} wid={d} pid={d} source={s} workspace={d} display={d} target_workspace={d} target_display={d} visible={}", .{
+                transition.epoch,
+                win.wid,
+                win.pid,
+                @tagName(source),
+                win.workspace_id,
+                win.display_id,
+                transition.target_workspace_id,
+                transition.target_display_id,
+                workspaceVisibleOnDisplay(win.workspace_id, win.display_id),
+            });
+        }
         queuePendingFocus(win, source);
         return false;
     }
 
     setFocusedDisplay(win.display_id);
+
+    if (g_workspace_transition.isActive()) {
+        const transition = g_workspace_transition;
+        log.debug("workspace transition focus accepted epoch={d} wid={d} pid={d} source={s} workspace={d} display={d} target_workspace={d} target_display={d}", .{
+            transition.epoch,
+            win.wid,
+            win.pid,
+            @tagName(source),
+            win.workspace_id,
+            win.display_id,
+            transition.target_workspace_id,
+            transition.target_display_id,
+        });
+        markWorkspaceTransitionComplete(.focus_accepted);
+    }
 
     // Keyboard intent always wins — flush stale queued focus from AX/drag
     // so they don't replay against an old transition epoch.
@@ -651,9 +781,34 @@ fn tickWorkspaceTransitionState() void {
     if (!workspaceTransitionTimedOut()) return;
 
     const transition = g_workspace_transition;
+    if (g_workspace_transition_completion_reason != .none) {
+        log.debug("workspace transition completed epoch={d} kind={s} workspace={d} display={d} reason={s}", .{
+            transition.epoch,
+            @tagName(transition.kind),
+            transition.target_workspace_id,
+            transition.target_display_id,
+            @tagName(g_workspace_transition_completion_reason),
+        });
+        clearWorkspaceTransition();
+        return;
+    }
+
+    const front_pid = frontmostApplicationPid() orelse 0;
+    const front_wid = if (front_pid > 0) focusedWindowIdForPid(front_pid) orelse 0 else 0;
+    const active_workspace_id = activeWorkspaceIdForDisplay(transition.target_display_id);
     log.warn(
-        "workspace transition watchdog expired epoch={d} kind={s} workspace={d} display={d}",
-        .{ transition.epoch, @tagName(transition.kind), transition.target_workspace_id, transition.target_display_id },
+        "workspace transition watchdog expired epoch={d} kind={s} workspace={d} display={d} active_workspace={d} focused_display={d} front_pid={d} front_wid={d} pending={d}",
+        .{
+            transition.epoch,
+            @tagName(transition.kind),
+            transition.target_workspace_id,
+            transition.target_display_id,
+            active_workspace_id,
+            focusedDisplayId(),
+            front_pid,
+            front_wid,
+            g_pending_focus_count,
+        },
     );
     clearWorkspaceTransition();
 }
@@ -894,7 +1049,22 @@ const HideCtx = struct {
                     .bottom_right => self.display.x + self.display.w - hide_peek,
                     .bottom_left => self.display.x - win.frame.width + hide_peek,
                 };
-                _ = shim.bw_ax_set_window_frame(pid, wid, pos_x, pos_y, win.frame.width, win.frame.height);
+                const ok = shim.bw_ax_set_window_frame(pid, wid, pos_x, pos_y, win.frame.width, win.frame.height);
+                log.debug("hide window wid={d} pid={d} ok={} x={d:.0} y={d:.0} w={d:.0} h={d:.0}", .{
+                    wid,
+                    pid,
+                    ok,
+                    pos_x,
+                    pos_y,
+                    win.frame.width,
+                    win.frame.height,
+                });
+                if (!ok) {
+                    if (self.hideFocusedFallback(pid, wid, pos_x, pos_y, win.frame.width, win.frame.height)) {
+                        return;
+                    }
+                    log.warn("hide failed wid={d} pid={d}", .{ wid, pid });
+                }
                 var updated = win;
                 updated.frame.x = pos_x;
                 updated.frame.y = pos_y;
@@ -907,7 +1077,54 @@ const HideCtx = struct {
             .bottom_right => self.display.x + self.display.w - hide_peek,
             .bottom_left => self.display.x - 1 + hide_peek,
         };
-        _ = shim.bw_ax_set_window_frame(pid, wid, pos_x, pos_y, 1, 1);
+        const ok = shim.bw_ax_set_window_frame(pid, wid, pos_x, pos_y, 1, 1);
+        log.debug("hide window wid={d} pid={d} ok={} x={d:.0} y={d:.0} w=1 h=1", .{
+            wid,
+            pid,
+            ok,
+            pos_x,
+            pos_y,
+        });
+        if (!ok) {
+            if (!self.hideFocusedFallback(pid, wid, pos_x, pos_y, 1, 1)) {
+                log.warn("hide failed wid={d} pid={d}", .{ wid, pid });
+            }
+        }
+    }
+
+    /// Ghostty can replace the active native-tab window ID before Bobrwm has
+    /// reconciled focus. If hiding the stored ID fails, hide the app's current
+    /// focused AX window at the same off-screen frame so it cannot leak onto
+    /// the newly activated empty workspace.
+    fn hideFocusedFallback(self: HideCtx, pid: i32, failed_wid: u32, x: f64, y: f64, w: f64, h: f64) bool {
+        _ = self;
+        std.debug.assert(pid > 0);
+        std.debug.assert(failed_wid > 0);
+        std.debug.assert(w > 0 and h > 0);
+
+        const focused_wid = focusedWindowIdForPid(pid) orelse return false;
+        if (focused_wid == failed_wid) return false;
+
+        const ok = shim.bw_ax_set_window_frame(pid, focused_wid, x, y, w, h);
+        log.debug("hide fallback focused window failed_wid={d} focused_wid={d} pid={d} ok={} x={d:.0} y={d:.0} w={d:.0} h={d:.0}", .{
+            failed_wid,
+            focused_wid,
+            pid,
+            ok,
+            x,
+            y,
+            w,
+            h,
+        });
+        if (!ok) return false;
+
+        const replacement_frame: window_mod.Window.Frame = .{
+            .x = x,
+            .y = y,
+            .width = w,
+            .height = h,
+        };
+        return replaceManagedWindowId(failed_wid, focused_wid, replacement_frame);
     }
 };
 
@@ -957,6 +1174,7 @@ var g_tab_groups: tabgroup.TabGroupManager = undefined;
 var g_pending_role_windows: PendingRoleWindowMap = undefined;
 var g_deferred_window_candidates: DeferredWindowCandidateMap = undefined;
 var g_app_launch_retries: AppLaunchRetryMap = undefined;
+var g_focus_retries: FocusRetryMap = undefined;
 var g_workspace_observer: ?objc.Object = null;
 var g_ipc: ipc.Server = undefined;
 var g_config: config_mod.Config = .{};
@@ -976,6 +1194,7 @@ var g_ipc_source: c.dispatch_source_t = null;
 var g_tap_port: c.CFMachPortRef = null;
 var g_ax_strings: ?AxStrings = null;
 var g_workspace_transition: WorkspaceTransitionState = .{};
+var g_workspace_transition_completion_reason: WorkspaceTransitionCompletionReason = .none;
 var g_pending_focus_entries: [pending_focus_capacity_per_epoch]PendingFocusEntry = undefined;
 var g_pending_focus_count: usize = 0;
 var g_pending_focus_sequence: u64 = 0;
@@ -1266,10 +1485,21 @@ export fn bw_is_window_on_screen(target_wid: u32) bool {
         var wid: u32 = 0;
         const ok = c.CFNumberGetValue(wid_ref, c.kCFNumberSInt32Type, &wid);
         if (ok == 0) continue;
+        if (!cgWindowInfoVisible(info)) continue;
         if (wid == target_wid) return true;
     }
 
     return false;
+}
+
+fn cgWindowInfoVisible(info: c.CFDictionaryRef) bool {
+    const alpha_ref_any = c.CFDictionaryGetValue(info, cg_extra.kCGWindowAlpha) orelse return true;
+    const alpha_ref: c.CFNumberRef = @ptrCast(alpha_ref_any);
+
+    var alpha: c.CGFloat = 1;
+    const ok = c.CFNumberGetValue(alpha_ref, c.kCFNumberCGFloatType, &alpha);
+    if (ok == 0) return true;
+    return alpha > 0.01;
 }
 
 /// Get all AX-backed window IDs for an application PID.
@@ -1600,6 +1830,7 @@ export fn bw_discover_windows(out: ?[*]shim.bw_window_info, max_count: u32) u32 
             _ = c.CFNumberGetValue(layer_ref, c.kCFNumberSInt32Type, &layer);
         }
         if (layer != 0) continue;
+        if (!cgWindowInfoVisible(info)) continue;
 
         const wid_ref_any = c.CFDictionaryGetValue(info, cg_extra.kCGWindowNumber) orelse continue;
         const wid_ref: c.CFNumberRef = @ptrCast(wid_ref_any);
@@ -1993,6 +2224,12 @@ pub fn main(init: std.process.Init.Minimal) !void {
         log.err("app-launch-retry map reserve failed: {}", .{err});
         return err;
     };
+    g_focus_retries = FocusRetryMap.init(g_allocator);
+    defer g_focus_retries.deinit();
+    g_focus_retries.ensureTotalCapacity(focus_retry_capacity) catch |err| {
+        log.err("focus-retry map reserve failed: {}", .{err});
+        return err;
+    };
     defer {
         setRolePolling(false);
         g_layout_entries.deinit(g_allocator);
@@ -2222,6 +2459,60 @@ fn setLayoutLeafActive(workspace_id: u8, wid: u32) void {
         const layout_wid = g_tab_groups.resolveLeader(wid);
         _ = layout.setLeafActive(root, layout_wid);
     }
+}
+
+fn replaceManagedWindowId(old_wid: u32, new_wid: u32, frame: window_mod.Window.Frame) bool {
+    std.debug.assert(old_wid != 0);
+    std.debug.assert(new_wid != 0);
+    std.debug.assert(frame.width > 0 and frame.height > 0);
+    if (old_wid == new_wid) return false;
+    if (g_store.get(new_wid) != null) return false;
+    if (g_tab_groups.groupOf(old_wid) != null) return false;
+    if (g_tab_groups.groupOf(new_wid) != null) return false;
+
+    const old = g_store.get(old_wid) orelse return false;
+    const ws = g_workspaces.get(old.workspace_id) orelse return false;
+    const root_ptr = layoutRootPtr(old.workspace_id);
+    var replaced_in_layout = false;
+    if (root_ptr.*) |*root| {
+        replaced_in_layout = layout.replaceWindowId(root, old_wid, new_wid);
+    }
+
+    const replaced_in_workspace = ws.replaceWindow(old_wid, new_wid);
+    if (!replaced_in_workspace or (old.mode == .tiled and !replaced_in_layout)) {
+        if (replaced_in_workspace) _ = ws.replaceWindow(new_wid, old_wid);
+        if (replaced_in_layout) {
+            if (root_ptr.*) |*root| _ = layout.replaceWindowId(root, new_wid, old_wid);
+        }
+        log.warn("window id replacement failed old={d} new={d} workspace={d} in_workspace={} in_layout={}", .{
+            old_wid,
+            new_wid,
+            old.workspace_id,
+            replaced_in_workspace,
+            replaced_in_layout,
+        });
+        return false;
+    }
+
+    var updated = old;
+    updated.wid = new_wid;
+    updated.frame = frame;
+    g_store.put(updated) catch {
+        _ = ws.replaceWindow(new_wid, old_wid);
+        if (replaced_in_layout) {
+            if (root_ptr.*) |*root| _ = layout.replaceWindowId(root, new_wid, old_wid);
+        }
+        return false;
+    };
+    g_store.remove(old_wid);
+    log.info("window id replaced old={d} new={d} pid={d} workspace={d} display={d}", .{
+        old_wid,
+        new_wid,
+        updated.pid,
+        updated.workspace_id,
+        updated.display_id,
+    });
+    return true;
 }
 
 const FocusedLayoutContext = struct {
@@ -2493,6 +2784,7 @@ fn handleEvent(ev: *const event_mod.Event) void {
         .app_terminated => {
             log.info("app terminated pid={}", .{ev.pid});
             untrackAppLaunchRetry(ev.pid);
+            untrackFocusRetry(ev.pid);
             ax_observer.unobserveApp(ev.pid);
             removeAppWindows(ev.pid);
             retile();
@@ -2503,12 +2795,13 @@ fn handleEvent(ev: *const event_mod.Event) void {
                 requestCleanupForPid(ev.pid);
                 requestOffscreenCleanup();
             }
-            const focused_wid = focused_wid_opt orelse return;
+            const focused_wid = focused_wid_opt orelse {
+                trackFocusRetry(ev.pid);
+                return;
+            };
+            untrackFocusRetry(ev.pid);
             if (!syncFocusStateForWindowId(focused_wid, .ax)) {
-                ax_observer.observeApp(ev.pid);
-                discoverWindows();
-                retile();
-                _ = syncFocusStateForWindowId(focused_wid, .ax);
+                reconcileFocusedWindow(ev.pid, focused_wid);
             }
         },
         .focused_window_changed => {
@@ -2517,7 +2810,11 @@ fn handleEvent(ev: *const event_mod.Event) void {
                 requestCleanupForPid(ev.pid);
                 requestOffscreenCleanup();
             }
-            const focused_wid = focused_wid_opt orelse return;
+            const focused_wid = focused_wid_opt orelse {
+                trackFocusRetry(ev.pid);
+                return;
+            };
+            untrackFocusRetry(ev.pid);
             reconcileFocusedWindow(ev.pid, focused_wid);
         },
         .window_created => {
@@ -2574,6 +2871,7 @@ fn handleEvent(ev: *const event_mod.Event) void {
             const promoted_pending = processPendingRoleWindows();
             const promoted_deferred = processDeferredWindowCandidates();
             const retried_launch = processAppLaunchRetries();
+            processFocusRetries();
             _ = processPendingFocusQueue();
             if (promoted_pending or promoted_deferred or retried_launch) {
                 retile();
@@ -2743,8 +3041,84 @@ fn windowRoleState(pid: i32, wid: u32) WindowRoleState {
 fn refreshRolePolling() void {
     const has_pending = g_pending_role_windows.count() > 0 or
         g_deferred_window_candidates.count() > 0 or
-        g_app_launch_retries.count() > 0;
+        g_app_launch_retries.count() > 0 or
+        g_focus_retries.count() > 0;
     setRolePolling(has_pending);
+}
+
+/// Track a pid whose AX focused-window query returned nothing. Electron apps
+/// (Discord) publish AXFocusedWindow late after activation; without a retry
+/// the focus event is dropped and workspace focus state silently desyncs.
+fn trackFocusRetry(pid: i32) void {
+    std.debug.assert(pid > 0);
+
+    if (g_focus_retries.getPtr(pid)) |attempts_remaining| {
+        attempts_remaining.* = focus_retry_attempts_max;
+    } else {
+        g_focus_retries.put(pid, focus_retry_attempts_max) catch {
+            log.err("focus-retry: failed to track pid={d}", .{pid});
+            return;
+        };
+    }
+
+    refreshRolePolling();
+}
+
+fn untrackFocusRetry(pid: i32) void {
+    std.debug.assert(pid > 0);
+    if (g_focus_retries.remove(pid)) {
+        refreshRolePolling();
+    }
+}
+
+/// Re-query the AX focused window for tracked pids on the role-poll cadence.
+/// Resolved pids run the normal focus reconciliation path; exhausted pids are
+/// dropped (the next real focus event will try again).
+fn processFocusRetries() void {
+    if (g_focus_retries.count() == 0) return;
+
+    var resolved_pids: [64]i32 = undefined;
+    var resolved_wids: [64]u32 = undefined;
+    var resolved_count: usize = 0;
+    var expired_pids: [64]i32 = undefined;
+    var expired_count: usize = 0;
+
+    var it = g_focus_retries.iterator();
+    while (it.next()) |entry| {
+        const pid = entry.key_ptr.*;
+        std.debug.assert(pid > 0);
+
+        const focused_wid = bw_ax_get_focused_window(pid);
+        if (focused_wid != 0) {
+            if (resolved_count < resolved_pids.len) {
+                resolved_pids[resolved_count] = pid;
+                resolved_wids[resolved_count] = focused_wid;
+                resolved_count += 1;
+            }
+            continue;
+        }
+
+        if (entry.value_ptr.* == 0) {
+            if (expired_count < expired_pids.len) {
+                expired_pids[expired_count] = pid;
+                expired_count += 1;
+            }
+            continue;
+        }
+        entry.value_ptr.* -= 1;
+    }
+
+    // Map mutations deferred until iteration is done.
+    for (expired_pids[0..expired_count]) |pid| {
+        log.debug("focus-retry: gave up pid={d}", .{pid});
+        _ = g_focus_retries.remove(pid);
+    }
+    for (resolved_pids[0..resolved_count], resolved_wids[0..resolved_count]) |pid, wid| {
+        _ = g_focus_retries.remove(pid);
+        log.info("focus-retry: resolved pid={d} wid={d}", .{ pid, wid });
+        reconcileFocusedWindow(pid, wid);
+    }
+    refreshRolePolling();
 }
 
 fn trackAppLaunchRetry(pid: i32) void {
@@ -3235,16 +3609,19 @@ fn discoverWindows() void {
     }
 }
 
-/// Guards tab inference against standalone window creation races.
-/// If another managed on-screen sibling already occupies the same frame,
-/// the focused/created window should be treated as a standalone window.
-fn hasOnScreenMatchingManagedSibling(
+/// Find a managed on-screen sibling of the same PID occupying the same frame.
+///
+/// Used to guard tab inference against standalone window creation races
+/// (an on-screen sibling at the same frame means the candidate is a
+/// standalone window) and to locate the active tab when adopting an
+/// off-screen background tab into a group.
+fn findOnScreenMatchingManagedSibling(
     pid: i32,
     exclude_wid: u32,
     target_frame: window_mod.Window.Frame,
     sky: skylight.SkyLight,
     conn: c_int,
-) bool {
+) ?u32 {
     var store_it = g_store.windows.iterator();
     while (store_it.next()) |entry| {
         const candidate_wid = entry.key_ptr.*;
@@ -3272,10 +3649,10 @@ fn hasOnScreenMatchingManagedSibling(
             matches,
         });
 
-        if (matches) return true;
+        if (matches) return candidate_wid;
     }
 
-    return false;
+    return null;
 }
 
 fn addNewWindowManagedWithAssignment(pid: i32, wid: u32, workspace_id: u8, assigned_display_id: u32) bool {
@@ -3401,6 +3778,76 @@ fn addNewWindow(pid: i32, wid: u32) void {
     }
 }
 
+/// Add unmanaged same-PID AX windows that share the group's frame and are
+/// off-screen to the group as background tabs.
+///
+/// The guards matter: an unmanaged window that is visible on-screen or at
+/// different bounds is a standalone window racing through the role-pending
+/// or deferred pipelines, not a tab. Swallowing it as a group member would
+/// leave it permanently untiled (members are not in the layout) while other
+/// windows tile over its position.
+fn discoverBackgroundTabs(
+    pid: i32,
+    group_id: tabgroup.GroupId,
+    group_frame: window_mod.Window.Frame,
+    workspace_id: u8,
+    display_id: u32,
+) void {
+    std.debug.assert(pid > 0);
+    std.debug.assert(group_id != 0);
+    std.debug.assert(workspace_id > 0 and workspace_id <= workspace_mod.max_workspaces);
+
+    const sky = g_sky orelse return;
+    const conn = sky.mainConnectionID();
+
+    var ax_wids: [128]u32 = undefined;
+    const ax_count = shim.bw_get_app_window_ids(pid, &ax_wids, 128);
+    log.debug("discoverBackgroundTabs: AX found {d} windows for pid={d}", .{ ax_count, pid });
+
+    for (ax_wids[0..ax_count]) |ax_wid| {
+        // Managed windows (including the group's leader and active tab,
+        // which are stored before discovery runs) are never re-swallowed.
+        if (g_store.get(ax_wid) != null) continue;
+
+        var rect: skylight.CGRect = undefined;
+        if (sky.getWindowBounds(conn, ax_wid, &rect) != 0) {
+            log.debug("discoverBackgroundTabs: SkyLight.getWindowBounds failed for ax_wid={d}", .{ax_wid});
+            continue;
+        }
+        const f = window_mod.Window.Frame{
+            .x = rect.origin.x,
+            .y = rect.origin.y,
+            .width = rect.size.width,
+            .height = rect.size.height,
+        };
+
+        const frame_matches = tabgroup.TabGroupManager.framesMatch(f, group_frame);
+        const on_screen = shim.bw_is_window_on_screen(ax_wid);
+        log.debug("discoverBackgroundTabs: ax_wid={d} frame=({d:.0},{d:.0},{d:.0},{d:.0}) match={} on_screen={}", .{
+            ax_wid, f.x, f.y, f.width, f.height, frame_matches, on_screen,
+        });
+        if (!frame_matches) continue;
+        if (on_screen) continue;
+
+        g_tab_groups.addMember(group_id, ax_wid) catch continue;
+        // The wid may still sit in the role-pending or deferred pipelines;
+        // it is accounted for as a tab member now, so promotion must not
+        // race against the group.
+        untrackPendingRoleWindow(ax_wid);
+        untrackDeferredWindowCandidate(ax_wid);
+        g_store.put(.{
+            .wid = ax_wid,
+            .pid = pid,
+            .title = null,
+            .frame = f,
+            .is_minimized = false,
+            .mode = .tiled,
+            .workspace_id = workspace_id,
+            .display_id = display_id,
+        }) catch continue;
+    }
+}
+
 /// When a new on-screen window appears, check if an existing managed window
 /// from the same PID just went off-screen. If so, the new window is a tab
 /// that replaced the old one — form a tab group instead of tiling independently.
@@ -3423,7 +3870,7 @@ fn tryFormTabGroupOnCreate(pid: i32, new_wid: u32) bool {
         new_wid, new_frame.x, new_frame.y, new_frame.width, new_frame.height,
     });
 
-    if (hasOnScreenMatchingManagedSibling(pid, new_wid, new_frame, sky, conn)) {
+    if (findOnScreenMatchingManagedSibling(pid, new_wid, new_frame, sky, conn) != null) {
         log.debug("tryFormTabGroup: on-screen sibling matches new wid={d}, treating as standalone", .{new_wid});
         return false;
     }
@@ -3506,34 +3953,7 @@ fn tryFormTabGroupOnCreate(pid: i32, new_wid: u32) bool {
             }) catch break :outer;
 
             // Also discover any other background tabs
-            var ax_wids: [128]u32 = undefined;
-            const ax_count = shim.bw_get_app_window_ids(pid, &ax_wids, 128);
-            log.debug("tryFormTabGroup: AX found {d} windows for pid={d}", .{ ax_count, pid });
-            for (ax_wids[0..ax_count]) |ax_wid| {
-                if (ax_wid == existing_wid or ax_wid == new_wid) continue;
-                if (g_store.get(ax_wid) != null) continue;
-
-                var rect: skylight.CGRect = undefined;
-                if (sky.getWindowBounds(conn, ax_wid, &rect) != 0) continue;
-                const f = window_mod.Window.Frame{
-                    .x = rect.origin.x,
-                    .y = rect.origin.y,
-                    .width = rect.size.width,
-                    .height = rect.size.height,
-                };
-
-                g_tab_groups.addMember(group_id, ax_wid) catch continue;
-                g_store.put(.{
-                    .wid = ax_wid,
-                    .pid = pid,
-                    .title = null,
-                    .frame = f,
-                    .is_minimized = false,
-                    .mode = .tiled,
-                    .workspace_id = ws.id,
-                    .display_id = existing.display_id,
-                }) catch continue;
-            }
+            discoverBackgroundTabs(pid, group_id, new_frame, ws.id, existing.display_id);
 
             ws.focused_wid = existing_wid; // leader stays
             log.info("tryFormTabGroup: formed group leader={d} active={d} members={d}", .{
@@ -3566,31 +3986,109 @@ fn removeWindow(wid: u32) void {
         clearDragPreview();
     }
     // Clean up tab group membership first
-    const survivor = g_tab_groups.removeMember(wid);
+    const group_id_before: ?tabgroup.GroupId = if (g_tab_groups.groupOf(wid)) |g| g.id else null;
+    const removal = g_tab_groups.removeMember(wid);
 
     const win = g_store.get(wid) orelse return;
     g_store.remove(wid);
-    if (g_workspaces.get(win.workspace_id)) |ws| {
-        ws.removeWindow(wid);
-    }
-    removeFromLayout(win.workspace_id, wid);
 
-    // If the group dissolved, restore the survivor to workspace and layout
-    if (survivor) |solo_wid| {
-        if (g_workspaces.get(win.workspace_id)) |ws| {
-            var in_ws = false;
-            for (ws.windows.items) |w| {
-                if (w == solo_wid) {
-                    in_ws = true;
-                    break;
+    // removeMember guesses members[0] as the new active tab, but macOS
+    // selects the adjacent tab when the active one closes. Align with the
+    // app's actual focus so focus operations do not raise a background tab.
+    if (group_id_before) |gid| {
+        reconcileGroupActiveAfterRemoval(gid, win.pid);
+    }
+
+    switch (removal) {
+        // The removed window led a surviving tab group. It is the group's
+        // only representative in workspace/layout state, so hand its slot to
+        // the new leader instead of deleting it; otherwise the remaining tabs
+        // become invisible to tiling and directional focus.
+        .leader_changed => |new_leader| {
+            transferLeaderSlot(win.workspace_id, wid, new_leader);
+        },
+        .none => {
+            if (g_workspaces.get(win.workspace_id)) |ws| {
+                ws.removeWindow(wid);
+            }
+            removeFromLayout(win.workspace_id, wid);
+        },
+        // The group dissolved — restore the solo survivor to workspace and layout.
+        .dissolved_solo => |solo_wid| {
+            if (g_workspaces.get(win.workspace_id)) |ws| {
+                ws.removeWindow(wid);
+            }
+            removeFromLayout(win.workspace_id, wid);
+
+            if (g_workspaces.get(win.workspace_id)) |ws| {
+                var in_ws = false;
+                for (ws.windows.items) |w| {
+                    if (w == solo_wid) {
+                        in_ws = true;
+                        break;
+                    }
+                }
+                if (!in_ws) {
+                    log.info("removeWindow: restoring tab survivor wid={d} to workspace", .{solo_wid});
+                    ws.addWindow(solo_wid) catch {};
+                    insertIntoLayout(win.workspace_id, solo_wid);
                 }
             }
-            if (!in_ws) {
-                log.info("removeWindow: restoring tab survivor wid={d} to workspace", .{solo_wid});
-                ws.addWindow(solo_wid) catch {};
-                insertIntoLayout(win.workspace_id, solo_wid);
-            }
+        },
+    }
+}
+
+/// Align a surviving tab group's active tab with the window the app actually
+/// focused after a member was removed. Best-effort: when the app has not yet
+/// focused the adjacent tab (or AX reports nothing), the members[0] guess
+/// stands until the next AXFocusedWindowChanged notification corrects it.
+fn reconcileGroupActiveAfterRemoval(group_id: tabgroup.GroupId, pid: i32) void {
+    std.debug.assert(group_id != 0);
+    std.debug.assert(pid > 0);
+
+    const focused_wid = bw_ax_get_focused_window(pid);
+    if (focused_wid == 0) return;
+
+    // Only accept the focused window when it belongs to the same group;
+    // a same-process standalone window must not be recorded as a tab.
+    const g = g_tab_groups.groupOf(focused_wid) orelse return;
+    if (g.id != group_id) return;
+
+    g_tab_groups.setActive(focused_wid);
+}
+
+/// Hand a removed tab-group leader's workspace and layout slot to the new
+/// leader, preserving the window's position in both. Falls back to plain
+/// insertion when the old leader was not present (state drift).
+fn transferLeaderSlot(workspace_id: u8, old_leader: u32, new_leader: u32) void {
+    std.debug.assert(old_leader != 0 and new_leader != 0);
+    std.debug.assert(old_leader != new_leader);
+
+    var replaced_in_workspace = false;
+    if (g_workspaces.get(workspace_id)) |ws| {
+        replaced_in_workspace = ws.replaceWindow(old_leader, new_leader);
+        if (!replaced_in_workspace) {
+            ws.addWindow(new_leader) catch {};
         }
+    }
+
+    var replaced_in_layout = false;
+    const root_ptr = layoutRootPtr(workspace_id);
+    if (root_ptr.*) |*root| {
+        replaced_in_layout = layout.replaceWindowId(root, old_leader, new_leader);
+    }
+    if (!replaced_in_layout) {
+        insertIntoLayout(workspace_id, new_leader);
+    }
+
+    if (replaced_in_workspace and replaced_in_layout) {
+        log.info("leader succession: wid={d} slot handed to wid={d} ws={d}", .{
+            old_leader, new_leader, workspace_id,
+        });
+    } else {
+        log.warn("leader succession fallback: old={d} new={d} ws={d} in_workspace={} in_layout={}", .{
+            old_leader, new_leader, workspace_id, replaced_in_workspace, replaced_in_layout,
+        });
     }
 }
 
@@ -3696,9 +4194,13 @@ fn cleanupWorkspaceWindowsForPid(pid: i32) bool {
 ///
 /// Some Electron apps (Discord) close-to-background without emitting AX
 /// destroy/minimize notifications. This catches those ghost entries.
+///
+/// Native background tabs are also off-screen, so windows that look like a
+/// missed tab-group inference are adopted into their sibling's group instead
+/// of being reaped (see adoptOffscreenWindowAsTab).
 fn cleanupOffscreenManagedWindows() bool {
-    var stale_wids: [128]u32 = undefined;
-    var stale_count: usize = 0;
+    var candidate_wids: [128]u32 = undefined;
+    var candidate_count: usize = 0;
     var truncated = false;
 
     for (&g_workspaces.workspaces) |*ws| {
@@ -3706,7 +4208,7 @@ fn cleanupOffscreenManagedWindows() bool {
         if (!workspaceVisibleAnywhere(ws.id)) continue;
 
         for (ws.windows.items) |wid| {
-            const win = g_store.get(wid) orelse continue;
+            if (g_store.get(wid) == null) continue;
 
             // Tab-group members can be intentionally off-screen when a sibling
             // tab is active; treating them as ghosts causes layout churn.
@@ -3714,10 +4216,9 @@ fn cleanupOffscreenManagedWindows() bool {
 
             if (shim.bw_is_window_on_screen(wid)) continue;
 
-            log.info("cleanup: removing wid={d} pid={d} reason=offscreen", .{ wid, win.pid });
-            if (stale_count < stale_wids.len) {
-                stale_wids[stale_count] = wid;
-                stale_count += 1;
+            if (candidate_count < candidate_wids.len) {
+                candidate_wids[candidate_count] = wid;
+                candidate_count += 1;
             } else {
                 truncated = true;
             }
@@ -3725,14 +4226,90 @@ fn cleanupOffscreenManagedWindows() bool {
     }
 
     if (truncated) {
-        log.warn("cleanup: offscreen batch truncated queued={d}", .{stale_count});
+        log.warn("cleanup: offscreen batch truncated queued={d}", .{candidate_count});
     }
 
-    for (stale_wids[0..stale_count]) |wid| {
+    // Mutations deferred to here — removeWindow/adoption modify workspace
+    // window lists, which must not happen while iterating them above.
+    var mutated = false;
+    for (candidate_wids[0..candidate_count]) |wid| {
+        const win = g_store.get(wid) orelse continue;
+
+        if (adoptOffscreenWindowAsTab(win)) {
+            mutated = true;
+            continue;
+        }
+
+        log.info("cleanup: removing wid={d} pid={d} reason=offscreen", .{ wid, win.pid });
         removeWindow(wid);
+        mutated = true;
     }
 
-    return stale_count > 0;
+    return mutated;
+}
+
+/// Adopt an off-screen managed window as a member of an on-screen sibling's
+/// tab group. Returns true when adoption happened.
+///
+/// Tab groups are inferred heuristically at window-creation / focus time;
+/// when that inference is missed (event races, mid-animation bounds, events
+/// dropped during workspace transitions) a background tab remains managed as
+/// a standalone window that is now off-screen. Reaping it would lose the tab.
+///
+/// A window qualifies when the app's AXWindows list still exposes it (hidden
+/// and destroyed ghosts drop out of AXWindows, native background tabs stay
+/// listed) and an on-screen managed sibling occupies the same frame (the
+/// active tab).
+fn adoptOffscreenWindowAsTab(win: window_mod.Window) bool {
+    const sky = g_sky orelse return false;
+    const conn = sky.mainConnectionID();
+
+    var rect: skylight.CGRect = undefined;
+    if (sky.getWindowBounds(conn, win.wid, &rect) != 0) return false;
+    const frame = window_mod.Window.Frame{
+        .x = rect.origin.x,
+        .y = rect.origin.y,
+        .width = rect.size.width,
+        .height = rect.size.height,
+    };
+
+    var ax_wids: [128]u32 = undefined;
+    const ax_count = shim.bw_get_app_window_ids(win.pid, &ax_wids, 128);
+    var listed_in_ax = false;
+    for (ax_wids[0..ax_count]) |ax_wid| {
+        if (ax_wid == win.wid) {
+            listed_in_ax = true;
+            break;
+        }
+    }
+    if (!listed_in_ax) return false;
+
+    const sibling_wid = findOnScreenMatchingManagedSibling(win.pid, win.wid, frame, sky, conn) orelse return false;
+    const sibling = g_store.get(sibling_wid) orelse return false;
+
+    const group_id = if (g_tab_groups.groupOf(sibling_wid)) |g|
+        g.id
+    else
+        g_tab_groups.createGroup(win.pid, sibling_wid, sibling.frame) catch return false;
+    g_tab_groups.addMember(group_id, win.wid) catch return false;
+    g_tab_groups.setActive(sibling_wid);
+
+    // Members live only in the store; drop the standalone workspace/layout slot.
+    if (g_workspaces.get(win.workspace_id)) |ws| {
+        ws.removeWindow(win.wid);
+    }
+    removeFromLayout(win.workspace_id, win.wid);
+
+    var updated = win;
+    updated.frame = frame;
+    updated.workspace_id = sibling.workspace_id;
+    updated.display_id = sibling.display_id;
+    g_store.put(updated) catch {};
+
+    log.info("cleanup: adopted wid={d} as background tab, leader={d} pid={d}", .{
+        win.wid, g_tab_groups.resolveLeader(sibling_wid), win.pid,
+    });
+    return true;
 }
 
 /// Updates `display_id` when a user-dragged window crosses monitors.
@@ -4099,7 +4676,7 @@ fn reconcileFocusedWindow(pid: i32, focused_wid: u32) void {
     const on_screen = isVisibleOnScreen(focused_wid);
     log.debug("reconcile: on_screen={}", .{on_screen});
 
-    if (hasOnScreenMatchingManagedSibling(pid, focused_wid, focused_frame, sky, conn)) {
+    if (findOnScreenMatchingManagedSibling(pid, focused_wid, focused_frame, sky, conn) != null) {
         log.debug("reconcile: on-screen sibling matches focused wid={d}, treating as new window", .{focused_wid});
         addNewWindow(pid, focused_wid);
         retile();
@@ -4166,43 +4743,7 @@ fn reconcileFocusedWindow(pid: i32, focused_wid: u32) void {
         }) catch return;
 
         // Discover additional background tabs
-        var ax_wids: [128]u32 = undefined;
-        const ax_count = shim.bw_get_app_window_ids(pid, &ax_wids, 128);
-        log.debug("reconcile: AX enumeration found {d} windows for pid={d}", .{ ax_count, pid });
-        for (ax_wids[0..ax_count]) |ax_wid| {
-            if (ax_wid == managed_wid or ax_wid == focused_wid) continue;
-            if (g_store.get(ax_wid) != null) continue;
-
-            var rect: skylight.CGRect = undefined;
-            if (sky.getWindowBounds(conn, ax_wid, &rect) != 0) {
-                log.debug("reconcile: SkyLight.getWindowBounds failed for ax_wid={d}", .{ax_wid});
-                continue;
-            }
-
-            const f = window_mod.Window.Frame{
-                .x = rect.origin.x,
-                .y = rect.origin.y,
-                .width = rect.size.width,
-                .height = rect.size.height,
-            };
-            const bg_match = tabgroup.TabGroupManager.framesMatch(f, focused_frame);
-            log.debug("reconcile: bg tab ax_wid={d} frame=({d:.0},{d:.0},{d:.0},{d:.0}) match={}", .{
-                ax_wid, f.x, f.y, f.width, f.height, bg_match,
-            });
-            if (!bg_match) continue;
-
-            g_tab_groups.addMember(group_id, ax_wid) catch continue;
-            g_store.put(.{
-                .wid = ax_wid,
-                .pid = pid,
-                .title = null,
-                .frame = f,
-                .is_minimized = false,
-                .mode = .tiled,
-                .workspace_id = matching_ws_id,
-                .display_id = matching_display_id,
-            }) catch continue;
-        }
+        discoverBackgroundTabs(pid, group_id, focused_frame, matching_ws_id, matching_display_id);
 
         const leader = g_tab_groups.resolveLeader(focused_wid);
         _ = syncFocusStateForWindowId(focused_wid, .ax);
@@ -4244,7 +4785,7 @@ fn checkTabDragOut(_: i32, wid: u32) void {
     if (!isVisibleOnScreen(wid)) return; // still off-screen, not a drag-out
 
     log.info("tab drag-out detected: wid={d} promoted to standalone", .{wid});
-    const survivor = g_tab_groups.removeMember(wid);
+    const removal = g_tab_groups.removeMember(wid);
 
     // Update stored frame and add to workspace + layout
     if (g_store.get(wid)) |win| {
@@ -4256,25 +4797,48 @@ fn checkTabDragOut(_: i32, wid: u32) void {
 
     const win = g_store.get(wid) orelse return;
     const ws = g_workspaces.get(win.workspace_id) orelse return;
-    ws.addWindow(wid) catch return;
-    insertIntoLayout(win.workspace_id, wid);
+
+    // If the dragged-out tab led the group, its existing workspace/layout
+    // slot belongs to the surviving group — hand it to the new leader before
+    // re-adding wid as a standalone window.
+    switch (removal) {
+        .leader_changed => |new_leader| transferLeaderSlot(win.workspace_id, wid, new_leader),
+        .none, .dissolved_solo => {},
+    }
+
+    // The wid may still occupy a workspace/layout slot when it was the
+    // group's leader and the group dissolved; avoid inserting a duplicate.
+    var wid_in_ws = false;
+    for (ws.windows.items) |w| {
+        if (w == wid) {
+            wid_in_ws = true;
+            break;
+        }
+    }
+    if (!wid_in_ws) {
+        ws.addWindow(wid) catch return;
+        insertIntoLayout(win.workspace_id, wid);
+    }
     ws.focused_wid = wid;
     _ = maybeSetFocusedDisplayForWindow(win, .drag);
 
     // If the group dissolved, verify the survivor is still managed
-    if (survivor) |solo_wid| {
-        var in_ws = false;
-        for (ws.windows.items) |w| {
-            if (w == solo_wid) {
-                in_ws = true;
-                break;
+    switch (removal) {
+        .dissolved_solo => |solo_wid| {
+            var in_ws = false;
+            for (ws.windows.items) |w| {
+                if (w == solo_wid) {
+                    in_ws = true;
+                    break;
+                }
             }
-        }
-        if (!in_ws) {
-            log.info("drag-out: restoring survivor wid={d} to workspace", .{solo_wid});
-            ws.addWindow(solo_wid) catch {};
-            insertIntoLayout(win.workspace_id, solo_wid);
-        }
+            if (!in_ws) {
+                log.info("drag-out: restoring survivor wid={d} to workspace", .{solo_wid});
+                ws.addWindow(solo_wid) catch {};
+                insertIntoLayout(win.workspace_id, solo_wid);
+            }
+        },
+        .none, .leader_changed => {},
     }
 
     retile();
@@ -4306,6 +4870,11 @@ fn switchWorkspace(target_id: u8) void {
     // If target is already visible on some display, just focus there.
     if (workspaceVisibleAnywhere(target_id)) {
         const target_display = target_ws.display_id orelse return;
+        log.debug("workspace switch target already visible workspace={d} display={d} windows={d}", .{
+            target_id,
+            target_display,
+            target_ws.windows.items.len,
+        });
         startWorkspaceTransition(.switch_workspace, target_id, target_display);
         setFocusedDisplay(target_display);
         updateStatusBar();
@@ -4320,24 +4889,58 @@ fn switchWorkspace(target_id: u8) void {
     if (target_id == current_id) return;
 
     const old_ws = g_workspaces.get(current_id) orelse return;
+    log.debug("workspace switch preparing current_workspace={d} target_workspace={d} display={d} current_windows={d} target_windows={d}", .{
+        current_id,
+        target_id,
+        target_display,
+        old_ws.windows.items.len,
+        target_ws.windows.items.len,
+    });
 
     // Hide current workspace windows (only those on target_display)
     const hctx = HideCtx.init(target_display);
+    var hidden_count: usize = 0;
     for (old_ws.windows.items) |wid| {
         const visible_wid = g_tab_groups.resolveActive(wid);
         const hide_wid = if (g_store.get(visible_wid) != null) visible_wid else wid;
         if (g_store.get(hide_wid)) |win| {
             if (win.display_id != target_display) continue;
+            if (g_tab_groups.groupOf(wid)) |group| {
+                log.debug("workspace switch hiding window workspace={d} layout_wid={d} hide_wid={d} group_leader={d} group_active={d} members={d}", .{
+                    current_id,
+                    wid,
+                    hide_wid,
+                    group.leader_wid,
+                    group.active_wid,
+                    group.members.items.len,
+                });
+            } else {
+                log.debug("workspace switch hiding window workspace={d} layout_wid={d} hide_wid={d} group=none", .{
+                    current_id,
+                    wid,
+                    hide_wid,
+                });
+            }
             hctx.hide(win.pid, hide_wid);
+            hidden_count += 1;
         }
     }
+    var hidden_pending_count: usize = 0;
     var pending_it = g_pending_role_windows.iterator();
     while (pending_it.next()) |entry| {
         const pending = entry.value_ptr.*;
         if (pending.workspace_id != current_id) continue;
         if (pending.display_id != target_display) continue;
         hctx.hide(pending.pid, entry.key_ptr.*);
+        hidden_pending_count += 1;
     }
+    log.debug("workspace switch hid current windows current_workspace={d} target_workspace={d} display={d} hidden={d} hidden_pending={d}", .{
+        current_id,
+        target_id,
+        target_display,
+        hidden_count,
+        hidden_pending_count,
+    });
 
     // Activate target; old workspace keeps its display_id (just hidden).
     g_workspaces.setActiveForDisplaySlot(display_slot, target_id);
@@ -4354,6 +4957,11 @@ fn switchWorkspace(target_id: u8) void {
         }
         updateTabGroupAssignment(wid, target_ws.id, target_display);
     }
+    log.debug("workspace switch activated target workspace={d} display={d} windows={d}", .{
+        target_id,
+        target_display,
+        target_ws.windows.items.len,
+    });
 
     assertDisplayCoverage();
 
@@ -4381,9 +4989,34 @@ fn focusWorkspaceWindow(ws: *workspace_mod.Workspace) void {
     if (focus_wid) |fwid| {
         const actual_wid = g_tab_groups.resolveActive(fwid);
         if (g_store.get(actual_wid)) |win| {
+            if (g_tab_groups.groupOf(fwid)) |group| {
+                log.debug("workspace focus target workspace={d} focused_wid={d} actual_wid={d} group_leader={d} group_active={d} members={d}", .{
+                    ws.id,
+                    fwid,
+                    actual_wid,
+                    group.leader_wid,
+                    group.active_wid,
+                    group.members.items.len,
+                });
+            } else {
+                log.debug("workspace focus target workspace={d} focused_wid={d} actual_wid={d} group=none", .{
+                    ws.id,
+                    fwid,
+                    actual_wid,
+                });
+            }
             _ = shim.bw_ax_focus_window(win.pid, actual_wid);
             ws.focused_wid = fwid;
             _ = maybeSetFocusedDisplayForWindow(win, .keyboard);
+        }
+    }
+
+    if (focus_wid == null) {
+        log.debug("workspace focus target workspace={d} focused_wid=0 actual_wid=0 reason=empty", .{ws.id});
+        if (g_workspace_transition.isActive() and
+            g_workspace_transition.target_workspace_id == ws.id)
+        {
+            markWorkspaceTransitionComplete(.empty_workspace);
         }
     }
 

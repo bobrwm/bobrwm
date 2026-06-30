@@ -42,6 +42,25 @@ pub const Workspace = struct {
         try self.windows.append(self.allocator, wid);
     }
 
+    /// Replace a window ID in-place, preserving its position in the window
+    /// list. Used for tab-group leader succession. Returns true when old_wid
+    /// was present and replaced.
+    pub fn replaceWindow(self: *Workspace, old_wid: Window.WindowId, new_wid: Window.WindowId) bool {
+        std.debug.assert(old_wid != 0 and new_wid != 0);
+        if (old_wid == new_wid) return false;
+
+        for (self.windows.items) |*slot| {
+            if (slot.* == old_wid) {
+                slot.* = new_wid;
+                if (self.focused_wid == old_wid) {
+                    self.focused_wid = new_wid;
+                }
+                return true;
+            }
+        }
+        return false;
+    }
+
     pub fn removeWindow(self: *Workspace, wid: Window.WindowId) void {
         for (self.windows.items, 0..) |existing, i| {
             if (existing == wid) {

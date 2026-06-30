@@ -314,8 +314,7 @@ pub fn stackNeighbor(root: Node, wid: WindowId, forward: bool) ?WindowId {
                 if (existing != wid) continue;
                 const next_index = if (forward)
                     (index + 1) % count
-                else
-                    if (index == 0) count - 1 else index - 1;
+                else if (index == 0) count - 1 else index - 1;
                 return leaf.windows.items[next_index];
             }
             return null;
@@ -482,6 +481,22 @@ pub fn swapWindowIds(root: *Node, first_wid: WindowId, second_wid: WindowId) boo
     return true;
 }
 
+/// Replace a window ID in-place inside an existing BSP tree, preserving the
+/// leaf position. Used for tab-group leader succession: the new leader must
+/// inherit the old leader's layout slot instead of being re-inserted.
+///
+/// Returns true when old_wid was present and replaced.
+pub fn replaceWindowId(root: *Node, old_wid: WindowId, new_wid: WindowId) bool {
+    std.debug.assert(old_wid != 0 and new_wid != 0);
+    if (old_wid == new_wid) return false;
+
+    var slot: ?LeafSlot = null;
+    findLeafSlot(root, old_wid, &slot);
+    const found = slot orelse return false;
+    found.leaf.windows.items[found.index] = new_wid;
+    return true;
+}
+
 const LeafSlot = struct {
     leaf: *Node.Leaf,
     index: usize,
@@ -618,4 +633,22 @@ pub fn destroyTree(node: Node, allocator: std.mem.Allocator) void {
             allocator.destroy(split);
         },
     }
+}
+
+// Tests
+
+test "replaceWindowId swaps a wid in place and preserves the leaf slot" {
+    const allocator = std.testing.allocator;
+    const options: InsertOptions = .{ .split_mode = .auto, .child = .second };
+
+    var root: Node = try insertWindow(null, 1, options, allocator);
+    root = try insertWindow(root, 2, options, allocator);
+    defer destroyTree(root, allocator);
+
+    try std.testing.expect(replaceWindowId(&root, 1, 9));
+    try std.testing.expectEqual(@as(WindowId, 9), firstLeafWid(root));
+    try std.testing.expectEqual(@as(WindowId, 2), lastLeafWid(root));
+
+    // The old wid is gone; replacing it again must fail.
+    try std.testing.expect(!replaceWindowId(&root, 1, 10));
 }
