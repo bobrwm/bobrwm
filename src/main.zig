@@ -1945,9 +1945,10 @@ pub fn main(init: std.process.Init.Minimal) !void {
     // -- Config --
     var config_arena = std.heap.ArenaAllocator.init(g_allocator);
     defer config_arena.deinit();
-    g_config = config_mod.load(config_arena.allocator(), cli.configPath(result));
+    const config_allocator = config_arena.allocator();
+    g_config = config_mod.load(config_allocator, cli.configPath(result));
     g_bsp_split_mode = g_config.bsp_split;
-    g_config.applyKeybinds();
+    g_config.applyKeybinds(config_allocator);
 
     // -- Accessibility check --
     if (!shim.bw_ax_is_trusted()) {

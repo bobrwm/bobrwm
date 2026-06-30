@@ -34,12 +34,15 @@ pub const Config = struct {
 
     /// Push the keybind table into the ObjC shim so the CGEventTap
     /// matches against it instead of hardcoded binds.
-    pub fn applyKeybinds(self: *const Config) void {
+    pub fn applyKeybinds(self: *const Config, allocator: std.mem.Allocator) void {
         const max = 128;
         var c_binds: [max]shim.bw_keybind = undefined;
         var count: u32 = 0;
 
-        for (self.keybinds) |kb| {
+        const keybinds = mergeKeybindsWithDefaults(allocator, self.keybinds);
+        defer allocator.free(keybinds);
+
+        for (keybinds) |kb| {
             const keycode = keyNameToCode(kb.key) orelse {
                 log.warn("unknown key name: {s}", .{kb.key});
                 continue;
@@ -64,6 +67,33 @@ pub const Config = struct {
         log.info("applied {d} keybinds", .{count});
     }
 };
+
+fn mergeKeybindsWithDefaults(allocator: std.mem.Allocator, keybinds: []const Keybind) []const Keybind {
+    var mergedKeybinds: []Keybind = allocator.alloc(Keybind, keybinds.len + default_keybind_count) catch {
+        return keybinds;
+    };
+
+    for (default_keybinds, 0..) |keybind, i| {
+        mergedKeybinds[i] = keybind;
+    }
+
+    var i: u16 = 0;
+
+    outer: for (keybinds) |keybind| {
+        for (mergedKeybinds, 0..) |currKeybind, j| {
+            if (std.mem.eql(u8, currKeybind.key, keybind.key) and std.meta.eql(currKeybind.mods, keybind.mods)) {
+                mergedKeybinds[j].action = keybind.action;
+                continue :outer;
+            }
+        }
+        mergedKeybinds[default_keybind_count + i] = keybind;
+        i += 1;
+    }
+
+    mergedKeybinds = allocator.realloc(mergedKeybinds, default_keybind_count + i) catch mergedKeybinds; // We are definitely not out of memory here
+
+    return mergedKeybinds;
+}
 
 pub const Mods = struct {
     alt: bool = false,
