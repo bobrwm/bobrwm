@@ -35,11 +35,12 @@ pub const Config = struct {
     /// Push the keybind table into the ObjC shim so the CGEventTap
     /// matches against it instead of hardcoded binds.
     pub fn applyKeybinds(self: *const Config) void {
-        const max = 128;
-        var c_binds: [max]shim.bw_keybind = undefined;
+        var c_binds: [max_keybinds]shim.bw_keybind = undefined;
         var count: u32 = 0;
 
-        for (self.keybinds) |kb| {
+        const keybinds = mergeKeybindsWithDefaults(self.keybinds);
+
+        for (keybinds) |kb| {
             const keycode = keyNameToCode(kb.key) orelse {
                 log.warn("unknown key name: {s}", .{kb.key});
                 continue;
@@ -57,13 +58,36 @@ pub const Config = struct {
                 .arg = kb.arg,
             };
             count += 1;
-            if (count >= max) break;
+            if (count >= max_keybinds) break;
         }
 
         shim.bw_set_keybinds(&c_binds, count);
         log.info("applied {d} keybinds", .{count});
     }
 };
+
+inline fn mergeKeybindsWithDefaults(keybinds: []const Keybind) []const Keybind {
+    var merged_keybinds: [max_keybinds]Keybind = undefined;
+
+    for (default_keybinds, 0..) |keybind, i| {
+        merged_keybinds[i] = keybind;
+    }
+
+    var i: usize = 0;
+
+    outer: for (keybinds) |keybind| {
+        for (merged_keybinds[0 .. default_keybind_count + i], 0..) |curr_keybind, j| {
+            if (std.mem.eql(u8, curr_keybind.key, keybind.key) and std.meta.eql(curr_keybind.mods, keybind.mods)) {
+                merged_keybinds[j] = keybind;
+                continue :outer;
+            }
+        }
+        merged_keybinds[default_keybind_count + i] = keybind;
+        i += 1;
+    }
+
+    return merged_keybinds[0 .. default_keybind_count + i];
+}
 
 pub const Mods = struct {
     alt: bool = false,
@@ -134,6 +158,8 @@ pub const Gaps = struct {
 };
 
 // Default keybinds (matches the previously hardcoded behaviour)
+
+const max_keybinds = 256;
 
 const default_keybind_count = 25;
 
@@ -359,6 +385,31 @@ test "default_keybinds" {
     try t.expectEqual(Action.focus_next_workspace, default_keybinds[24].action);
     try t.expect(default_keybinds[24].mods.ctrl);
     try t.expect(std.mem.eql(u8, "right", default_keybinds[24].key));
+}
+
+test "mergeKeybindsWithDefaults appends custom keybinds" {
+    const custom_keybinds: []const Keybind = &.{
+        .{ .key = "f", .mods = .{ .alt = true }, .action = .toggle_fullscreen },
+    };
+
+    const merged = mergeKeybindsWithDefaults(custom_keybinds);
+
+    try t.expectEqual(@as(usize, default_keybind_count + custom_keybinds.len), merged.len);
+    try t.expectEqual(Action.toggle_fullscreen, merged[default_keybind_count].action);
+    try t.expect(std.mem.eql(u8, "f", merged[default_keybind_count].key));
+    try t.expect(merged[default_keybind_count].mods.alt);
+}
+
+test "mergeKeybindsWithDefaults replaces matching default keybinds" {
+    const custom_keybinds: []const Keybind = &.{
+        .{ .key = "1", .mods = .{ .alt = true }, .action = .move_to_workspace, .arg = 9 },
+    };
+
+    const merged = mergeKeybindsWithDefaults(custom_keybinds);
+
+    try t.expectEqual(@as(usize, default_keybind_count), merged.len);
+    try t.expectEqual(Action.move_to_workspace, merged[0].action);
+    try t.expectEqual(@as(u8, 9), merged[0].arg);
 }
 
 test "loadFromPath: missing file" {
