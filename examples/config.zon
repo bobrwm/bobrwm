@@ -43,6 +43,8 @@
     //     .outer = .{ .left = 4, .right = 4, .top = 4, .bottom = 4 },
     // },
 
+    // Keybinds merge with built-in defaults. Use the same key + modifiers to
+    // override a default binding, or add new entries for additional shortcuts.
     .keybinds = .{
         // alt+1..9 → focus workspace
         .{ .key = "1", .mods = .{ .alt = true }, .action = .focus_workspace, .arg = 1 },

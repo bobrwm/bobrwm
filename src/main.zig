@@ -2178,7 +2178,9 @@ pub fn main(init: std.process.Init.Minimal) !void {
     defer config_arena.deinit();
     g_config = config_mod.load(config_arena.allocator(), cli.configPath(result));
     g_bsp_split_mode = g_config.bsp_split;
-    g_config.applyKeybinds();
+    var keybind_table = try config_mod.KeybindTable.init(config_arena.allocator(), &g_config);
+    defer keybind_table.deinit(config_arena.allocator());
+    g_config.applyKeybinds(&keybind_table);
 
     // -- Accessibility check --
     if (!shim.bw_ax_is_trusted()) {
