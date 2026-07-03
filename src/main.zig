@@ -258,6 +258,11 @@ const AxStrings = struct {
     dialog_subrole: c.CFStringRef,
     unknown_subrole: c.CFStringRef,
     enhanced_ui_attr: c.CFStringRef,
+    close_button_attr: c.CFStringRef,
+    minimize_button_attr: c.CFStringRef,
+    zoom_button_attr: c.CFStringRef,
+    fullscreen_button_attr: c.CFStringRef,
+    focused_attr: c.CFStringRef,
 };
 
 fn createAxString(raw: [*:0]const u8) ?c.CFStringRef {
@@ -287,6 +292,11 @@ fn ensureAxStrings() ?*const AxStrings {
         "AXDialog",
         "AXUnknown",
         "AXEnhancedUserInterface",
+        "AXCloseButton",
+        "AXMinimizeButton",
+        "AXZoomButton",
+        "AXFullScreenButton",
+        "AXFocused",
     };
     var refs: [names.len]c.CFStringRef = undefined;
 
@@ -316,6 +326,11 @@ fn ensureAxStrings() ?*const AxStrings {
         .dialog_subrole = refs[12],
         .unknown_subrole = refs[13],
         .enhanced_ui_attr = refs[14],
+        .close_button_attr = refs[15],
+        .minimize_button_attr = refs[16],
+        .zoom_button_attr = refs[17],
+        .fullscreen_button_attr = refs[18],
+        .focused_attr = refs[19],
     };
     return &g_ax_strings.?;
 }
@@ -323,6 +338,11 @@ fn ensureAxStrings() ?*const AxStrings {
 fn deinitAxStrings() void {
     if (g_ax_strings) |strings| {
         const refs = [_]c.CFStringRef{
+            strings.focused_attr,
+            strings.fullscreen_button_attr,
+            strings.zoom_button_attr,
+            strings.minimize_button_attr,
+            strings.close_button_attr,
             strings.enhanced_ui_attr,
             strings.unknown_subrole,
             strings.dialog_subrole,
@@ -1737,14 +1757,63 @@ fn manageStateForWindow(pid: i32, wid: u32) u8 {
     const is_unknown_subrole = c.CFEqual(@ptrCast(subrole_ref), @ptrCast(unknown_subrole)) != 0;
     if (is_unknown_subrole) return shim.BW_MANAGE_PENDING;
 
-    // Accept AXStandardWindow, AXFloatingWindow, and AXDialog as manageable.
-    // Some Electron apps and IDEs report AXDialog or AXFloatingWindow for
-    // their main windows. Yabai also accepts all three subroles.
-    const is_manageable = c.CFEqual(@ptrCast(subrole_ref), @ptrCast(ax.standard_window_subrole)) != 0 or
-        c.CFEqual(@ptrCast(subrole_ref), @ptrCast(ax.floating_window_subrole)) != 0 or
-        c.CFEqual(@ptrCast(subrole_ref), @ptrCast(ax.dialog_subrole)) != 0;
+    // AXStandardWindow is the canonical tileable subrole — accept unconditionally.
+    if (c.CFEqual(@ptrCast(subrole_ref), @ptrCast(ax.standard_window_subrole)) != 0) {
+        return shim.BW_MANAGE_READY;
+    }
 
-    return if (is_manageable) shim.BW_MANAGE_READY else shim.BW_MANAGE_REJECT;
+    // AXFloatingWindow and AXDialog are accepted only as a heuristic exception:
+    // some Electron apps and IDEs report these subroles for their real, top-level
+    // windows. But transient chrome-less popups also report AXDialog — Xcode's
+    // autocomplete list is role=AXWindow/subrole=AXDialog with an empty title and
+    // no title-bar buttons. Tiling one shrinks the editor on every keystroke as
+    // the popup is created and destroyed (a resize storm).
+    //
+    // Distinguish a real window from a popup the way yabai/AeroSpace/OmniWM do: a
+    // real window exposes title-bar controls or is the app's main/focused window;
+    // a popup exposes none of these. Rejecting (not pending) matters — a window
+    // that stays pending is tiled by the legacy timeout fallback.
+    const is_dialog_like = c.CFEqual(@ptrCast(subrole_ref), @ptrCast(ax.floating_window_subrole)) != 0 or
+        c.CFEqual(@ptrCast(subrole_ref), @ptrCast(ax.dialog_subrole)) != 0;
+    if (is_dialog_like and windowHasRealWindowSignal(win, ax)) {
+        return shim.BW_MANAGE_READY;
+    }
+
+    return shim.BW_MANAGE_REJECT;
+}
+
+/// Returns true when a window exposes a real top-level-window signal: any
+/// title-bar button (close/minimize/zoom/fullscreen) or being the app's main or
+/// focused window. Transient popups — Xcode's autocomplete list, tooltips,
+/// context menus — report a dialog/floating subrole but have none of these, so
+/// this guard keeps them from being tiled. Mirrors the button/subrole heuristics
+/// used by yabai, AeroSpace, and OmniWM.
+fn windowHasRealWindowSignal(win: c.AXUIElementRef, ax: *const AxStrings) bool {
+    if (axAttributePresent(win, ax.close_button_attr)) return true;
+    if (axAttributePresent(win, ax.minimize_button_attr)) return true;
+    if (axAttributePresent(win, ax.zoom_button_attr)) return true;
+    if (axAttributePresent(win, ax.fullscreen_button_attr)) return true;
+    if (axBooleanAttributeTrue(win, ax.main_attr)) return true;
+    if (axBooleanAttributeTrue(win, ax.focused_attr)) return true;
+    return false;
+}
+
+/// True when the AX attribute exists and is non-null on the element.
+fn axAttributePresent(win: c.AXUIElementRef, attr: c.CFStringRef) bool {
+    var value: c.CFTypeRef = null;
+    const err = c.AXUIElementCopyAttributeValue(win, attr, &value);
+    if (err != c.kAXErrorSuccess or value == null) return false;
+    c.CFRelease(value.?);
+    return true;
+}
+
+/// True when the AX attribute is a CFBoolean set to true.
+fn axBooleanAttributeTrue(win: c.AXUIElementRef, attr: c.CFStringRef) bool {
+    var value: c.CFTypeRef = null;
+    const err = c.AXUIElementCopyAttributeValue(win, attr, &value);
+    if (err != c.kAXErrorSuccess or value == null) return false;
+    defer c.CFRelease(value.?);
+    return c.CFEqual(value.?, @ptrCast(c.kCFBooleanTrue)) != 0;
 }
 
 /// Returns true when a still-pending window has AXUnknown role/subrole metadata.
