@@ -1,7 +1,9 @@
 const std = @import("std");
 const WindowId = @import("../window.zig").WindowId;
 const Frame = @import("../window.zig").Window.Frame;
-const LayoutEntry = @import("bsp.zig").LayoutEntry;
+const bsp = @import("bsp.zig");
+const LayoutEntry = bsp.LayoutEntry;
+const InsertOptions = bsp.InsertOptions;
 
 pub const State = struct {
     windows: std.ArrayListUnmanaged(WindowId) = .empty,
@@ -16,13 +18,12 @@ pub const State = struct {
 
     // ── Common interface ──────────────────────────────────────────────────────
 
-    pub fn insert(s: *State, wid: WindowId, allocator: std.mem.Allocator) !void {
+    pub fn insert(s: *State, wid: WindowId, _: InsertOptions, allocator: std.mem.Allocator) !void {
         for (s.windows.items) |w| if (w == wid) return;
         try s.windows.append(allocator, wid);
     }
 
-    pub fn remove(s: *State, wid: WindowId, allocator: std.mem.Allocator) void {
-        _ = allocator;
+    pub fn remove(s: *State, wid: WindowId, _: std.mem.Allocator) void {
         for (s.windows.items, 0..) |w, i| {
             if (w == wid) {
                 _ = s.windows.swapRemove(i);
@@ -40,8 +41,7 @@ pub const State = struct {
     }
 
     pub fn lastWid(s: *const State) ?WindowId {
-        const n = s.windows.items.len;
-        return if (n > 0) s.windows.items[n - 1] else null;
+        return if (s.windows.items.len > 0) s.windows.items[s.windows.items.len - 1] else null;
     }
 
     pub fn cycleFocus(s: *const State, wid: WindowId, forward: bool) ?WindowId {
@@ -61,9 +61,7 @@ pub const State = struct {
         for (s.windows.items, 0..) |w, i| {
             if (w != wid) continue;
             if (i == 0) return;
-            var j = i;
-            while (j > 0) : (j -= 1) s.windows.items[j] = s.windows.items[j - 1];
-            s.windows.items[0] = wid;
+            std.mem.rotate(WindowId, s.windows.items[0 .. i + 1], i);
             return;
         }
     }
@@ -85,6 +83,7 @@ pub const State = struct {
         for (s.windows.items, 0..) |w, i| {
             if (w == a) ai = i;
             if (w == b) bi = i;
+            if (ai != null and bi != null) break;
         }
         const ia = ai orelse return false;
         const ib = bi orelse return false;
@@ -97,11 +96,10 @@ pub const State = struct {
     pub fn computeLayout(
         s: *const State,
         frame: Frame,
-        _inner_gap: f64,
+        _: f64,
         out: *std.ArrayList(LayoutEntry),
         allocator: std.mem.Allocator,
     ) !void {
-        _ = _inner_gap;
         for (s.windows.items) |wid| {
             try out.append(allocator, .{ .wid = wid, .frame = frame });
         }

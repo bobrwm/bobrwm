@@ -60,7 +60,7 @@ pub const State = union(LayoutKind) {
     pub fn insert(self: *State, wid: WindowId, opts: InsertOptions, allocator: std.mem.Allocator) !void {
         switch (self.*) {
             .bsp => |*s| try s.insert(wid, opts, allocator),
-            .monocle => |*s| try s.insert(wid, allocator),
+            .monocle => |*s| try s.insert(wid, opts, allocator),
         }
     }
 
