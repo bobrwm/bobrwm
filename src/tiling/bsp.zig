@@ -84,7 +84,7 @@ pub const State = struct {
 
     pub fn remove(s: *State, wid: WindowId, allocator: std.mem.Allocator) void {
         const root = s.root orelse return;
-        s.root = removeWindow(root, wid, allocator);
+        s.root = removeFrom(root, wid, allocator);
     }
 
     pub fn windowCount(s: *const State) usize {
@@ -425,10 +425,6 @@ fn windowCountTree(node: Node) usize {
         .leaf => 1,
         .split => |split| windowCountTree(split.left) + windowCountTree(split.right),
     };
-}
-
-fn removeWindow(root: Node, wid: WindowId, allocator: std.mem.Allocator) ?Node {
-    return removeFrom(root, wid, allocator);
 }
 
 fn swapWindowIds(root: *Node, first_wid: WindowId, second_wid: WindowId) bool {
