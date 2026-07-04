@@ -4,7 +4,7 @@
 
 const std = @import("std");
 const shim = @import("shim_api.zig");
-const layout_mod = @import("layout.zig");
+const tiling = @import("tiling.zig");
 const osutil = @import("osutil.zig");
 
 const log = std.log.scoped(.config);
@@ -17,12 +17,11 @@ pub const Config = struct {
     workspace_names: []const []const u8 = &.{},
     swipe: SwipeConfig = .{},
     gaps: Gaps = .{},
-    layout: layout_mod.LayoutKind = .bsp,
-    bsp_split: layout_mod.SplitMode = .auto,
-    bsp_insert_mode: layout_mod.InsertMode = .split,
-    bsp_insert_point: layout_mod.InsertionPointPolicy = .focused,
+    layout: tiling.LayoutKind = .bsp,
+    bsp_split: tiling.SplitMode = .auto,
+    bsp_insert_point: tiling.InsertionPointPolicy = .focused,
     bsp_split_ratio: f64 = 0.5,
-    new_window_split: layout_mod.InsertChild = .second,
+    new_window_split: tiling.InsertChild = .second,
 
     /// Look up the assigned workspace for a given bundle identifier.
     pub fn workspaceForApp(self: *const Config, bundle_id: []const u8) ?u8 {
@@ -314,12 +313,11 @@ test "default config" {
     try t.expectApproxEqAbs(@as(f64, 0.08), cfg.swipe.distance_pct, 0.0001);
     try t.expectEqual(@as(u16, 0), cfg.gaps.inner);
     try t.expectEqual(@as(u16, 0), cfg.gaps.outer.left);
-    try t.expectEqual(layout_mod.LayoutKind.bsp, cfg.layout);
-    try t.expectEqual(layout_mod.SplitMode.auto, cfg.bsp_split);
-    try t.expectEqual(layout_mod.InsertMode.split, cfg.bsp_insert_mode);
-    try t.expectEqual(layout_mod.InsertionPointPolicy.focused, cfg.bsp_insert_point);
+    try t.expectEqual(tiling.LayoutKind.bsp, cfg.layout);
+    try t.expectEqual(tiling.SplitMode.auto, cfg.bsp_split);
+    try t.expectEqual(tiling.InsertionPointPolicy.focused, cfg.bsp_insert_point);
     try t.expectApproxEqAbs(@as(f64, 0.5), cfg.bsp_split_ratio, 0.0001);
-    try t.expectEqual(layout_mod.InsertChild.second, cfg.new_window_split);
+    try t.expectEqual(tiling.InsertChild.second, cfg.new_window_split);
 }
 
 test "default_keybinds" {
@@ -387,12 +385,11 @@ test "loadFromPath: examples/config.zon" {
 
     try t.expectEqual(@as(usize, 0), cfg.workspace_assignments.len);
     try t.expectEqual(@as(u16, 0), cfg.gaps.inner);
-    try t.expectEqual(layout_mod.LayoutKind.bsp, cfg.layout);
-    try t.expectEqual(layout_mod.SplitMode.auto, cfg.bsp_split);
-    try t.expectEqual(layout_mod.InsertMode.split, cfg.bsp_insert_mode);
-    try t.expectEqual(layout_mod.InsertionPointPolicy.focused, cfg.bsp_insert_point);
+    try t.expectEqual(tiling.LayoutKind.bsp, cfg.layout);
+    try t.expectEqual(tiling.SplitMode.auto, cfg.bsp_split);
+    try t.expectEqual(tiling.InsertionPointPolicy.focused, cfg.bsp_insert_point);
     try t.expectApproxEqAbs(@as(f64, 0.5), cfg.bsp_split_ratio, 0.0001);
-    try t.expectEqual(layout_mod.InsertChild.second, cfg.new_window_split);
+    try t.expectEqual(tiling.InsertChild.second, cfg.new_window_split);
 }
 
 test "loadFromPath: custom zon" {
@@ -413,7 +410,6 @@ test "loadFromPath: custom zon" {
         \\    .gaps = .{ .inner = 8, .outer = .{ .left = 4, .right = 4, .top = 4, .bottom = 4 } },
         \\    .layout = .monocle,
         \\    .bsp_split = .vertical,
-        \\    .bsp_insert_mode = .stack,
         \\    .bsp_insert_point = .last,
         \\    .bsp_split_ratio = 0.6,
         \\    .new_window_split = .first,
@@ -446,10 +442,9 @@ test "loadFromPath: custom zon" {
     try t.expectEqual(@as(u16, 4), cfg.gaps.outer.right);
     try t.expectEqual(@as(u16, 4), cfg.gaps.outer.top);
     try t.expectEqual(@as(u16, 4), cfg.gaps.outer.bottom);
-    try t.expectEqual(layout_mod.LayoutKind.monocle, cfg.layout);
-    try t.expectEqual(layout_mod.SplitMode.vertical, cfg.bsp_split);
-    try t.expectEqual(layout_mod.InsertMode.stack, cfg.bsp_insert_mode);
-    try t.expectEqual(layout_mod.InsertionPointPolicy.last, cfg.bsp_insert_point);
+    try t.expectEqual(tiling.LayoutKind.monocle, cfg.layout);
+    try t.expectEqual(tiling.SplitMode.vertical, cfg.bsp_split);
+    try t.expectEqual(tiling.InsertionPointPolicy.last, cfg.bsp_insert_point);
     try t.expectApproxEqAbs(@as(f64, 0.6), cfg.bsp_split_ratio, 0.0001);
-    try t.expectEqual(layout_mod.InsertChild.first, cfg.new_window_split);
+    try t.expectEqual(tiling.InsertChild.first, cfg.new_window_split);
 }

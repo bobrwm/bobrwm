@@ -11,10 +11,6 @@
     // .horizontal always splits left/right, .vertical always splits top/bottom.
     // .bsp_split = .auto,
 
-    // BSP insertion target policy.
-    // .split creates a new split, .stack adds to target leaf stack.
-    // .bsp_insert_mode = .split,
-    //
     // BSP insertion point policy.
     // .focused, .first, .last, .min_depth
     // .bsp_insert_point = .focused,

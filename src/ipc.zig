@@ -1,7 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const posix = std.posix;
-const layout_mod = @import("layout.zig");
+const tiling = @import("tiling.zig");
 const osutil = @import("osutil.zig");
 
 const log = std.log.scoped(.ipc);
@@ -20,9 +20,8 @@ pub const IpcCommand = union(enum) {
     move_workspace_to_display: DisplayTarget,
     bsp_ratio_rel: f64,
     bsp_ratio_abs: f64,
-    bsp_insert_mode: layout_mod.InsertMode,
-    bsp_insert_point: layout_mod.InsertionPointPolicy,
-    bsp_mirror: layout_mod.Direction,
+    bsp_insert_point: tiling.InsertionPointPolicy,
+    bsp_mirror: tiling.Direction,
     bsp_equalize,
     bsp_balance,
     bsp_rotate: i32,
@@ -79,12 +78,10 @@ pub const IpcCommand = union(enum) {
             return parseFloat(arg, .bsp_ratio_rel);
         if (stripPrefix(cmd, "bsp ratio abs ")) |arg|
             return parseFloat(arg, .bsp_ratio_abs);
-        if (stripPrefix(cmd, "bsp insert-mode ")) |arg|
-            return parseEnum(layout_mod.InsertMode, arg, .bsp_insert_mode);
         if (stripPrefix(cmd, "bsp insert-point ")) |arg|
-            return parseEnum(layout_mod.InsertionPointPolicy, arg, .bsp_insert_point);
+            return parseEnum(tiling.InsertionPointPolicy, arg, .bsp_insert_point);
         if (stripPrefix(cmd, "bsp mirror ")) |arg|
-            return parseEnum(layout_mod.Direction, arg, .bsp_mirror);
+            return parseEnum(tiling.Direction, arg, .bsp_mirror);
         if (stripPrefix(cmd, "bsp rotate ")) |arg|
             return parseInt(i32, arg, .bsp_rotate);
 

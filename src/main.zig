@@ -9,7 +9,8 @@ const skylight = @import("skylight.zig");
 const event_mod = @import("event.zig");
 const window_mod = @import("window.zig");
 const workspace_mod = @import("workspace.zig");
-const layout = @import("layout.zig");
+const tiling = @import("tiling.zig");
+const bsp_mod = tiling.bsp_mod;
 const ipc = @import("ipc.zig");
 const tabgroup = @import("tabgroup.zig");
 const cli = @import("cli.zig");
@@ -770,7 +771,7 @@ fn syncFocusStateForWindowId(focused_wid: u32, source: FocusEventSource) bool {
         ws.focused_wid = leader;
     }
     switchToWindowWorkspaceIfHidden(win);
-    setLayoutLeafActive(win.workspace_id, focused_wid);
+    setTilingActive(win.workspace_id, focused_wid);
 
     return true;
 }
@@ -843,19 +844,17 @@ fn updateStatusBar() void {
     statusbar.setTitleMulti(entries[0..g_display_count]);
 }
 
-fn clearLayoutRoots() void {
+fn clearTilingStates() void {
     for (0..workspace_mod.max_workspaces) |ws_idx| {
-        g_layout_roots[ws_idx] = null;
+        g_tiling_states[ws_idx] = null;
     }
 }
 
-/// Recursively free every workspace's layout tree. Safe to call at any time
-/// after `clearLayoutRoots()` — slots set to null are skipped.
-fn destroyAllLayoutTrees() void {
+fn destroyAllTilingStates() void {
     for (0..workspace_mod.max_workspaces) |ws_idx| {
-        if (g_layout_roots[ws_idx]) |root| {
-            layout.destroyTree(root, g_allocator);
-            g_layout_roots[ws_idx] = null;
+        if (g_tiling_states[ws_idx]) |*st| {
+            st.deinit(g_allocator);
+            g_tiling_states[ws_idx] = null;
         }
     }
 }
@@ -1166,10 +1165,10 @@ var g_sky: ?skylight.SkyLight = null;
 var g_allocator: std.mem.Allocator = undefined;
 var g_store: window_mod.WindowStore = undefined;
 var g_workspaces: workspace_mod.WorkspaceManager = undefined;
-var g_layout_roots: [workspace_mod.max_workspaces]?layout.Node = undefined;
+var g_tiling_states: [workspace_mod.max_workspaces]?tiling.State = undefined;
 var g_displays: [workspace_mod.max_displays]DisplayInfo = undefined;
 var g_display_count: usize = 0;
-var g_bsp_split_mode: layout.SplitMode = .auto;
+var g_bsp_split_mode: tiling.SplitMode = .auto;
 var g_tab_groups: tabgroup.TabGroupManager = undefined;
 var g_pending_role_windows: PendingRoleWindowMap = undefined;
 var g_deferred_window_candidates: DeferredWindowCandidateMap = undefined;
@@ -1198,7 +1197,7 @@ var g_workspace_transition_completion_reason: WorkspaceTransitionCompletionReaso
 var g_pending_focus_entries: [pending_focus_capacity_per_epoch]PendingFocusEntry = undefined;
 var g_pending_focus_count: usize = 0;
 var g_pending_focus_sequence: u64 = 0;
-var g_layout_entries: std.ArrayList(layout.LayoutEntry) = .empty;
+var g_layout_entries: std.ArrayList(tiling.LayoutEntry) = .empty;
 var g_retile_requested_all_displays = false;
 var g_retile_dirty_display_ids: [workspace_mod.max_displays]u32 = [_]u32{0} ** workspace_mod.max_displays;
 var g_retile_dirty_display_count: usize = 0;
@@ -2199,11 +2198,10 @@ pub fn main(init: std.process.Init.Minimal) !void {
         workspace_mod.max_workspaces;
     g_workspaces = workspace_mod.WorkspaceManager.init(g_allocator, ws_count);
     defer g_workspaces.deinit();
-    clearLayoutRoots();
-    // Free per-workspace layout trees on exit. discoverWindows() and later
-    // insertions allocate Split nodes and leaf ArrayLists via g_allocator;
-    // without this, DebugAllocator reports leaks on shutdown error paths.
-    defer destroyAllLayoutTrees();
+    clearTilingStates();
+    // Free per-workspace tiling states on exit. BSP allocates Split nodes and
+    // leaf ArrayLists via g_allocator; without this, DebugAllocator reports leaks.
+    defer destroyAllTilingStates();
     g_tab_groups = tabgroup.TabGroupManager.init(g_allocator);
     defer g_tab_groups.deinit();
     g_pending_role_windows = PendingRoleWindowMap.init(g_allocator);
@@ -2412,36 +2410,40 @@ pub fn bw_retile() void {
     retile();
 }
 
-fn layoutRootPtr(workspace_id: u8) *?layout.Node {
+fn tilingStatePtr(workspace_id: u8) *?tiling.State {
     std.debug.assert(workspace_id > 0 and workspace_id <= workspace_mod.max_workspaces);
-    const ws_idx: usize = workspace_id - 1;
-    return &g_layout_roots[ws_idx];
+    return &g_tiling_states[workspace_id - 1];
 }
 
-fn removeFromLayout(workspace_id: u8, wid: u32) void {
-    const root_ptr = layoutRootPtr(workspace_id);
-    const root = root_ptr.* orelse return;
-    root_ptr.* = layout.removeWindow(root, wid, g_allocator);
+fn removeFromTiling(workspace_id: u8, wid: u32) void {
+    const sp = tilingStatePtr(workspace_id);
+    if (sp.*) |*st| {
+        st.remove(wid, g_allocator);
+        if (st.windowCount() == 0) {
+            st.deinit(g_allocator);
+            sp.* = null;
+        }
+    }
 }
 
-fn insertIntoLayout(workspace_id: u8, wid: u32) void {
-    const root_ptr = layoutRootPtr(workspace_id);
+fn insertIntoTiling(workspace_id: u8, wid: u32) void {
+    const sp = tilingStatePtr(workspace_id);
+    if (sp.* == null) sp.* = tiling.newState(g_config.layout);
     const ws = g_workspaces.get(workspace_id) orelse return;
     const anchor_wid = blk: {
-        const root = root_ptr.* orelse break :blk null;
+        const st = sp.* orelse break :blk null;
         switch (g_config.bsp_insert_point) {
             .focused => {
                 const focused_wid = ws.focused_wid orelse break :blk null;
                 if (focused_wid == wid) break :blk null;
                 break :blk focused_wid;
             },
-            .first => break :blk layout.firstLeafWid(root),
-            .last => break :blk layout.lastLeafWid(root),
+            .first => break :blk st.firstWid(),
+            .last => break :blk st.lastWid(),
             .min_depth => break :blk null,
         }
     };
-    const options: layout.InsertOptions = .{
-        .mode = g_config.bsp_insert_mode,
+    const options: tiling.InsertOptions = .{
         .split_mode = g_bsp_split_mode,
         .child = g_config.new_window_split,
         .anchor_wid = anchor_wid,
@@ -2449,15 +2451,13 @@ fn insertIntoLayout(workspace_id: u8, wid: u32) void {
         .inner_gap = @floatFromInt(g_config.gaps.inner),
         .split_ratio = g_config.bsp_split_ratio,
     };
-    const updated = layout.insertWindow(root_ptr.*, wid, options, g_allocator) catch return;
-    root_ptr.* = updated;
+    sp.*.?.insert(wid, options, g_allocator) catch return;
 }
 
-fn setLayoutLeafActive(workspace_id: u8, wid: u32) void {
-    const root_ptr = layoutRootPtr(workspace_id);
-    if (root_ptr.*) |*root| {
+fn setTilingActive(workspace_id: u8, wid: u32) void {
+    if (tilingStatePtr(workspace_id).*) |*st| {
         const layout_wid = g_tab_groups.resolveLeader(wid);
-        _ = layout.setLeafActive(root, layout_wid);
+        st.setActive(layout_wid);
     }
 }
 
@@ -2472,17 +2472,17 @@ fn replaceManagedWindowId(old_wid: u32, new_wid: u32, frame: window_mod.Window.F
 
     const old = g_store.get(old_wid) orelse return false;
     const ws = g_workspaces.get(old.workspace_id) orelse return false;
-    const root_ptr = layoutRootPtr(old.workspace_id);
+    const sp = tilingStatePtr(old.workspace_id);
     var replaced_in_layout = false;
-    if (root_ptr.*) |*root| {
-        replaced_in_layout = layout.replaceWindowId(root, old_wid, new_wid);
+    if (sp.*) |*st| {
+        replaced_in_layout = st.replaceWid(old_wid, new_wid);
     }
 
     const replaced_in_workspace = ws.replaceWindow(old_wid, new_wid);
     if (!replaced_in_workspace or (old.mode == .tiled and !replaced_in_layout)) {
         if (replaced_in_workspace) _ = ws.replaceWindow(new_wid, old_wid);
         if (replaced_in_layout) {
-            if (root_ptr.*) |*root| _ = layout.replaceWindowId(root, new_wid, old_wid);
+            if (sp.*) |*st| _ = st.replaceWid(new_wid, old_wid);
         }
         log.warn("window id replacement failed old={d} new={d} workspace={d} in_workspace={} in_layout={}", .{
             old_wid,
@@ -2500,7 +2500,7 @@ fn replaceManagedWindowId(old_wid: u32, new_wid: u32, frame: window_mod.Window.F
     g_store.put(updated) catch {
         _ = ws.replaceWindow(new_wid, old_wid);
         if (replaced_in_layout) {
-            if (root_ptr.*) |*root| _ = layout.replaceWindowId(root, new_wid, old_wid);
+            if (sp.*) |*st| _ = st.replaceWid(new_wid, old_wid);
         }
         return false;
     };
@@ -2518,19 +2518,19 @@ fn replaceManagedWindowId(old_wid: u32, new_wid: u32, frame: window_mod.Window.F
 const FocusedLayoutContext = struct {
     focused_wid: u32,
     focused_win: window_mod.Window,
-    root: *layout.Node,
+    state: *tiling.State,
 };
 
 fn focusedLayoutContext() ?FocusedLayoutContext {
     const ws = g_workspaces.active();
     const focused_wid = ws.focused_wid orelse return null;
     const focused_win = g_store.get(focused_wid) orelse return null;
-    const root_ptr = layoutRootPtr(focused_win.workspace_id);
-    if (root_ptr.*) |*root| {
+    const sp = tilingStatePtr(focused_win.workspace_id);
+    if (sp.*) |*st| {
         return .{
             .focused_wid = focused_wid,
             .focused_win = focused_win,
-            .root = root,
+            .state = st,
         };
     }
     return null;
@@ -2563,7 +2563,7 @@ fn frameContainsPoint(frame: window_mod.Window.Frame, point_x: f64, point_y: f64
 }
 
 fn findDropTargetInLayout(
-    node: layout.Node,
+    node: bsp_mod.Node,
     frame: window_mod.Window.Frame,
     inner_gap: f64,
     dragged_wid: u32,
@@ -2575,13 +2575,12 @@ fn findDropTargetInLayout(
     std.debug.assert(inner_gap >= 0);
     switch (node) {
         .leaf => |leaf| {
-            if (leaf.contains(dragged_wid)) return null;
+            if (leaf.wid == dragged_wid) return null;
             if (!frameContainsPoint(frame, center_x, center_y)) return null;
-            const active_wid = leaf.activeWid();
-            const target = g_store.get(active_wid) orelse return null;
+            const target = g_store.get(leaf.wid) orelse return null;
             if (target.mode != .tiled or target.is_fullscreen) return null;
             if (target.workspace_id != workspace_id or target.display_id != display_id) return null;
-            return .{ .wid = active_wid, .frame = frame };
+            return .{ .wid = leaf.wid, .frame = frame };
         },
         .split => |split| {
             const half_gap = inner_gap / 2.0;
@@ -2638,7 +2637,15 @@ fn updateWindowMovePreview(wid: u32) void {
         return;
     }
 
-    const root = layoutRootPtr(win.workspace_id).* orelse {
+    const bsp_state: *bsp_mod.State = blk: {
+        const sp = tilingStatePtr(win.workspace_id);
+        const st: *tiling.State = if (sp.*) |*s| s else { clearDragPreview(); return; };
+        break :blk switch (st.*) {
+            .bsp => |*s| s,
+            else => { clearDragPreview(); return; },
+        };
+    };
+    const bsp_root = bsp_state.root orelse {
         clearDragPreview();
         return;
     };
@@ -2650,7 +2657,7 @@ fn updateWindowMovePreview(wid: u32) void {
     const center_x = win.frame.x + win.frame.width / 2.0;
     const center_y = win.frame.y + win.frame.height / 2.0;
     const target_entry = findDropTargetInLayout(
-        root,
+        bsp_root,
         display_frame,
         @floatFromInt(g_config.gaps.inner),
         wid,
@@ -2700,9 +2707,8 @@ fn commitWindowMovePreview(wid: u32) void {
     if (source.workspace_id != target.workspace_id) return;
     if (source.display_id != target.display_id) return;
 
-    const root_ptr = layoutRootPtr(source.workspace_id);
-    if (root_ptr.*) |*root| {
-        if (layout.swapWindowIds(root, wid, target_wid)) {
+    if (tilingStatePtr(source.workspace_id).*) |*st| {
+        if (st.swapWids(wid, target_wid)) {
             log.info("window move swap wid={d} target={d}", .{ wid, target_wid });
             retile();
         }
@@ -3008,12 +3014,12 @@ fn setWindowMode(wid: u32, target: window_mod.WindowMode) void {
 
     // Leaving tiled → remove from BSP so remaining windows fill the space
     if (old == .tiled) {
-        removeFromLayout(win.workspace_id, wid);
+        removeFromTiling(win.workspace_id, wid);
     }
 
     // Entering tiled → re-insert into BSP
     if (target == .tiled) {
-        insertIntoLayout(win.workspace_id, wid);
+        insertIntoTiling(win.workspace_id, wid);
     }
 
     win.mode = target;
@@ -3594,7 +3600,7 @@ fn discoverWindows() void {
 
         g_store.put(win) catch continue;
         target_ws.addWindow(info.wid) catch continue;
-        insertIntoLayout(target_ws.id, info.wid);
+        insertIntoTiling(target_ws.id, info.wid);
 
         // If assigned to a non-visible workspace, hide immediately
         if (!workspaceVisibleOnDisplay(target_ws.id, managed_display)) {
@@ -3724,7 +3730,7 @@ fn addNewWindowManagedWithAssignment(pid: i32, wid: u32, workspace_id: u8, assig
     g_store.put(win) catch return false;
     ws.addWindow(wid) catch return false;
     if (mode == .tiled) {
-        insertIntoLayout(ws.id, wid);
+        insertIntoTiling(ws.id, wid);
     }
     ws.focused_wid = wid;
 
@@ -4011,14 +4017,14 @@ fn removeWindow(wid: u32) void {
             if (g_workspaces.get(win.workspace_id)) |ws| {
                 ws.removeWindow(wid);
             }
-            removeFromLayout(win.workspace_id, wid);
+            removeFromTiling(win.workspace_id, wid);
         },
         // The group dissolved — restore the solo survivor to workspace and layout.
         .dissolved_solo => |solo_wid| {
             if (g_workspaces.get(win.workspace_id)) |ws| {
                 ws.removeWindow(wid);
             }
-            removeFromLayout(win.workspace_id, wid);
+            removeFromTiling(win.workspace_id, wid);
 
             if (g_workspaces.get(win.workspace_id)) |ws| {
                 var in_ws = false;
@@ -4031,7 +4037,7 @@ fn removeWindow(wid: u32) void {
                 if (!in_ws) {
                     log.info("removeWindow: restoring tab survivor wid={d} to workspace", .{solo_wid});
                     ws.addWindow(solo_wid) catch {};
-                    insertIntoLayout(win.workspace_id, solo_wid);
+                    insertIntoTiling(win.workspace_id, solo_wid);
                 }
             }
         },
@@ -4073,12 +4079,12 @@ fn transferLeaderSlot(workspace_id: u8, old_leader: u32, new_leader: u32) void {
     }
 
     var replaced_in_layout = false;
-    const root_ptr = layoutRootPtr(workspace_id);
-    if (root_ptr.*) |*root| {
-        replaced_in_layout = layout.replaceWindowId(root, old_leader, new_leader);
+    const sp = tilingStatePtr(workspace_id);
+    if (sp.*) |*st| {
+        replaced_in_layout = st.replaceWid(old_leader, new_leader);
     }
     if (!replaced_in_layout) {
-        insertIntoLayout(workspace_id, new_leader);
+        insertIntoTiling(workspace_id, new_leader);
     }
 
     if (replaced_in_workspace and replaced_in_layout) {
@@ -4132,7 +4138,7 @@ fn removeAppWindows(pid: i32) void {
         if (g_workspaces.get(ws_id)) |ws| {
             ws.removeWindow(wid);
         }
-        removeFromLayout(ws_id, wid);
+        removeFromTiling(ws_id, wid);
     }
 }
 
@@ -4298,7 +4304,7 @@ fn adoptOffscreenWindowAsTab(win: window_mod.Window) bool {
     if (g_workspaces.get(win.workspace_id)) |ws| {
         ws.removeWindow(win.wid);
     }
-    removeFromLayout(win.workspace_id, win.wid);
+    removeFromTiling(win.workspace_id, win.wid);
 
     var updated = win;
     updated.frame = frame;
@@ -4347,12 +4353,12 @@ fn updateWindowDisplayAssignment(wid: u32) bool {
         return false;
     }
 
-    removeFromLayout(win.workspace_id, wid);
+    removeFromTiling(win.workspace_id, wid);
     win.frame = frame;
     win.display_id = next_display_id;
     g_store.put(win) catch return false;
     if (win.mode == .tiled) {
-        insertIntoLayout(win.workspace_id, wid);
+        insertIntoTiling(win.workspace_id, wid);
     }
 
     if (!workspaceVisibleOnDisplay(win.workspace_id, win.display_id)) {
@@ -4408,7 +4414,7 @@ fn reconcileDisplayChange() void {
         if (g_workspaces.get(win.workspace_id)) |old_ws| {
             old_ws.removeWindow(win.wid);
         }
-        removeFromLayout(win.workspace_id, win.wid);
+        removeFromTiling(win.workspace_id, win.wid);
 
         const target_display_id = primaryDisplayId();
         const target_workspace_id = activeWorkspaceIdForDisplay(target_display_id);
@@ -4421,14 +4427,14 @@ fn reconcileDisplayChange() void {
             if (target_ws.focused_wid == null) target_ws.focused_wid = win.wid;
         }
         if (win.mode == .tiled) {
-            insertIntoLayout(target_workspace_id, win.wid);
+            insertIntoTiling(target_workspace_id, win.wid);
         }
     }
 }
 
 fn retileDisplay(display_id: u32) void {
     const ws_id = activeWorkspaceIdForDisplay(display_id);
-    const root = layoutRootPtr(ws_id).* orelse return;
+    const st = tilingStatePtr(ws_id).* orelse return;
     const display_slot = displayIndexById(display_id) orelse return;
     const display = g_displays[display_slot].visible;
 
@@ -4440,7 +4446,7 @@ fn retileDisplay(display_id: u32) void {
         .height = display.h - @as(f64, @floatFromInt(@as(u32, outer.top) + @as(u32, outer.bottom))),
     };
 
-    const window_count = layout.windowCount(root);
+    const window_count = st.windowCount();
     std.debug.assert(window_count > 0);
 
     g_layout_entries.clearRetainingCapacity();
@@ -4448,7 +4454,7 @@ fn retileDisplay(display_id: u32) void {
         log.err("retile: layout buffer reserve failed display={d} windows={d}", .{ display_id, window_count });
         return;
     };
-    layout.applyLayout(g_config.layout, root, frame, @floatFromInt(g_config.gaps.inner), &g_layout_entries, g_allocator) catch {
+    st.computeLayout(frame, @floatFromInt(g_config.gaps.inner), &g_layout_entries, g_allocator) catch {
         log.err("retile: layout apply failed display={d} windows={d}", .{ display_id, window_count });
         return;
     };
@@ -4817,7 +4823,7 @@ fn checkTabDragOut(_: i32, wid: u32) void {
     }
     if (!wid_in_ws) {
         ws.addWindow(wid) catch return;
-        insertIntoLayout(win.workspace_id, wid);
+        insertIntoTiling(win.workspace_id, wid);
     }
     ws.focused_wid = wid;
     _ = maybeSetFocusedDisplayForWindow(win, .drag);
@@ -4835,7 +4841,7 @@ fn checkTabDragOut(_: i32, wid: u32) void {
             if (!in_ws) {
                 log.info("drag-out: restoring survivor wid={d} to workspace", .{solo_wid});
                 ws.addWindow(solo_wid) catch {};
-                insertIntoLayout(win.workspace_id, solo_wid);
+                insertIntoTiling(win.workspace_id, solo_wid);
             }
         },
         .none, .leader_changed => {},
@@ -5071,14 +5077,14 @@ fn moveWindowToWorkspace(target_id: u8) void {
 
     // Remove from current workspace BSP + list
     ws.removeWindow(wid);
-    removeFromLayout(ws.id, wid);
+    removeFromTiling(ws.id, wid);
 
     var updated = g_store.get(wid) orelse return;
 
     // Add to target workspace BSP + list
     target_ws.addWindow(wid) catch return;
     if (updated.mode == .tiled) {
-        insertIntoLayout(target_id, wid);
+        insertIntoTiling(target_id, wid);
     }
     if (target_ws.focused_wid == null) {
         target_ws.focused_wid = wid;
@@ -5143,21 +5149,21 @@ fn moveManagedWindowToDisplay(wid: u32, target_display_id: u32) bool {
         };
         updateTabGroupAssignment(wid, target_workspace_id, target_display_id);
 
-        removeFromLayout(source_workspace_id, wid);
+        removeFromTiling(source_workspace_id, wid);
         source_ws.removeWindow(wid);
         target_ws.focused_wid = wid;
         if (updated.mode == .tiled) {
-            insertIntoLayout(target_workspace_id, wid);
+            insertIntoTiling(target_workspace_id, wid);
         }
 
         win = updated;
     } else {
-        removeFromLayout(source_workspace_id, wid);
+        removeFromTiling(source_workspace_id, wid);
         win.display_id = target_display_id;
         g_store.put(win) catch return false;
         updateTabGroupAssignment(wid, source_workspace_id, target_display_id);
         if (win.mode == .tiled) {
-            insertIntoLayout(source_workspace_id, wid);
+            insertIntoTiling(source_workspace_id, wid);
         }
     }
 
@@ -5338,23 +5344,23 @@ fn focusDirection(dir: FocusDir) void {
             _ = shim.bw_ax_focus_window(win.pid, actual_wid);
             ws.focused_wid = wid; // track the leader
             _ = maybeSetFocusedDisplayForWindow(win, .keyboard);
-            setLayoutLeafActive(win.workspace_id, actual_wid);
+            setTilingActive(win.workspace_id, actual_wid);
         }
         return;
     }
 
-    const root_ptr = layoutRootPtr(focused.workspace_id);
-    const root = root_ptr.* orelse return;
+    const sp = tilingStatePtr(focused.workspace_id);
+    const st = sp.* orelse return;
     const stack_forward = switch (dir) {
         .left, .up => false,
         .right, .down => true,
     };
-    if (layout.stackNeighbor(root, focused_wid, stack_forward)) |stack_wid| {
+    if (st.cycleFocus(focused_wid, stack_forward)) |stack_wid| {
         if (g_store.get(stack_wid)) |win| {
             _ = shim.bw_ax_focus_window(win.pid, stack_wid);
             ws.focused_wid = stack_wid;
             _ = maybeSetFocusedDisplayForWindow(win, .keyboard);
-            setLayoutLeafActive(win.workspace_id, stack_wid);
+            setTilingActive(win.workspace_id, stack_wid);
         }
     }
 }
@@ -5439,7 +5445,11 @@ fn ipcDispatch(cmd: []const u8, client_fd: posix.socket_t) void {
                 ipc.writeResponse(client_fd, "err: no focused managed window\n");
                 return;
             };
-            if (!layout.adjustParentRatio(ctx.root, ctx.focused_wid, delta)) {
+            const bsp_state: *bsp_mod.State = switch (ctx.state.*) {
+                .bsp => |*s| s,
+                else => { ipc.writeResponse(client_fd, "err: not in bsp mode\n"); return; },
+            };
+            if (!bsp_state.adjustParentRatio(ctx.focused_wid, delta)) {
                 ipc.writeResponse(client_fd, "err: no parent split\n");
                 return;
             }
@@ -5451,15 +5461,15 @@ fn ipcDispatch(cmd: []const u8, client_fd: posix.socket_t) void {
                 ipc.writeResponse(client_fd, "err: no focused managed window\n");
                 return;
             };
-            if (!layout.setParentRatio(ctx.root, ctx.focused_wid, ratio)) {
+            const bsp_state: *bsp_mod.State = switch (ctx.state.*) {
+                .bsp => |*s| s,
+                else => { ipc.writeResponse(client_fd, "err: not in bsp mode\n"); return; },
+            };
+            if (!bsp_state.setParentRatio(ctx.focused_wid, ratio)) {
                 ipc.writeResponse(client_fd, "err: no parent split\n");
                 return;
             }
             retileDisplay(ctx.focused_win.display_id);
-            ipc.writeResponse(client_fd, "ok\n");
-        },
-        .bsp_insert_mode => |mode| {
-            g_config.bsp_insert_mode = mode;
             ipc.writeResponse(client_fd, "ok\n");
         },
         .bsp_insert_point => |point| {
@@ -5471,42 +5481,39 @@ fn ipcDispatch(cmd: []const u8, client_fd: posix.socket_t) void {
                 ipc.writeResponse(client_fd, "err: no focused managed window\n");
                 return;
             };
-            const root_ptr = layoutRootPtr(ctx.focused_win.workspace_id);
-            if (root_ptr.*) |*root| {
-                layout.mirror(root, axis);
-                retileDisplay(ctx.focused_win.display_id);
-                ipc.writeResponse(client_fd, "ok\n");
-            } else {
-                ipc.writeResponse(client_fd, "err: no layout root\n");
-            }
+            const bsp_state: *bsp_mod.State = switch (ctx.state.*) {
+                .bsp => |*s| s,
+                else => { ipc.writeResponse(client_fd, "err: not in bsp mode\n"); return; },
+            };
+            bsp_state.mirrorTree(axis);
+            retileDisplay(ctx.focused_win.display_id);
+            ipc.writeResponse(client_fd, "ok\n");
         },
         .bsp_equalize => {
             const ctx = focusedLayoutContext() orelse {
                 ipc.writeResponse(client_fd, "err: no focused managed window\n");
                 return;
             };
-            const root_ptr = layoutRootPtr(ctx.focused_win.workspace_id);
-            if (root_ptr.*) |*root| {
-                layout.equalize(root, null, g_config.bsp_split_ratio);
-                retileDisplay(ctx.focused_win.display_id);
-                ipc.writeResponse(client_fd, "ok\n");
-            } else {
-                ipc.writeResponse(client_fd, "err: no layout root\n");
-            }
+            const bsp_state: *bsp_mod.State = switch (ctx.state.*) {
+                .bsp => |*s| s,
+                else => { ipc.writeResponse(client_fd, "err: not in bsp mode\n"); return; },
+            };
+            bsp_state.equalizeTree(null, g_config.bsp_split_ratio);
+            retileDisplay(ctx.focused_win.display_id);
+            ipc.writeResponse(client_fd, "ok\n");
         },
         .bsp_balance => {
             const ctx = focusedLayoutContext() orelse {
                 ipc.writeResponse(client_fd, "err: no focused managed window\n");
                 return;
             };
-            const root_ptr = layoutRootPtr(ctx.focused_win.workspace_id);
-            if (root_ptr.*) |*root| {
-                _ = layout.balance(root, null);
-                retileDisplay(ctx.focused_win.display_id);
-                ipc.writeResponse(client_fd, "ok\n");
-            } else {
-                ipc.writeResponse(client_fd, "err: no layout root\n");
-            }
+            const bsp_state: *bsp_mod.State = switch (ctx.state.*) {
+                .bsp => |*s| s,
+                else => { ipc.writeResponse(client_fd, "err: not in bsp mode\n"); return; },
+            };
+            bsp_state.balanceTree(null);
+            retileDisplay(ctx.focused_win.display_id);
+            ipc.writeResponse(client_fd, "ok\n");
         },
         .bsp_rotate => |degrees| {
             if (!(degrees == 90 or degrees == 180 or degrees == 270)) {
@@ -5517,14 +5524,13 @@ fn ipcDispatch(cmd: []const u8, client_fd: posix.socket_t) void {
                 ipc.writeResponse(client_fd, "err: no focused managed window\n");
                 return;
             };
-            const root_ptr = layoutRootPtr(ctx.focused_win.workspace_id);
-            if (root_ptr.*) |*root| {
-                layout.rotate(root, degrees);
-                retileDisplay(ctx.focused_win.display_id);
-                ipc.writeResponse(client_fd, "ok\n");
-            } else {
-                ipc.writeResponse(client_fd, "err: no layout root\n");
-            }
+            const bsp_state: *bsp_mod.State = switch (ctx.state.*) {
+                .bsp => |*s| s,
+                else => { ipc.writeResponse(client_fd, "err: not in bsp mode\n"); return; },
+            };
+            bsp_state.rotateTree(degrees);
+            retileDisplay(ctx.focused_win.display_id);
+            ipc.writeResponse(client_fd, "ok\n");
         },
         .query_windows => |format| ipcQueryWindows(client_fd, format),
         .query_workspaces => |format| ipcQueryWorkspaces(client_fd, format),
