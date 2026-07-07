@@ -39,6 +39,16 @@
     //     .outer = .{ .left = 4, .right = 4, .top = 4, .bottom = 4 },
     // },
 
+    // Virtual workspaces. If omitted, bobrwm creates 10 workspaces.
+    // If set, the number of names is the workspace count. Workspace IDs
+    // remain 1-based, so this example would create workspaces 1 through 4.
+    // .workspace_names = .{
+    //     "term",
+    //     "web",
+    //     "code",
+    //     "chat",
+    // },
+
     .keybinds = .{
         // alt+1..9 → focus workspace
         .{ .key = "1", .mods = .{ .alt = true }, .action = .focus_workspace, .arg = 1 },

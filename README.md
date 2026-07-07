@@ -106,6 +106,23 @@ Choose the tiling algorithm:
 .layout = .bsp, // .bsp | .monocle
 ```
 
+### Workspaces
+
+bobrwm uses virtual workspaces. They are not native macOS Spaces; hidden workspace windows are parked off-screen and restored when that workspace is focused.
+
+By default, bobrwm creates 10 workspaces. To configure a smaller count, provide `.workspace_names`; the number of names is the workspace count:
+
+```zon
+.workspace_names = .{
+    "term",
+    "web",
+    "code",
+    "chat",
+},
+```
+
+Workspace IDs are still 1-based, so the example above creates workspaces 1 through 4. Keybinds and app assignments should only reference workspaces in that range. The current maximum is 10 workspaces.
+
 ### Workspace Assignments
 
 Pin apps to specific workspaces by bundle ID:
