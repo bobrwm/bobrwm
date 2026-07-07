@@ -72,7 +72,7 @@ pub const State = struct {
     }
 
     pub fn deinit(s: *State, allocator: std.mem.Allocator) void {
-        if (s.root) |root| destroyTree(root, allocator);
+        if (s.root) |*root| destroyTree(root, allocator);
         s.root = null;
     }
 
@@ -88,15 +88,15 @@ pub const State = struct {
     }
 
     pub fn windowCount(s: *const State) usize {
-        return if (s.root) |root| windowCountTree(root) else 0;
+        return if (s.root) |*root| windowCountTree(root) else 0;
     }
 
     pub fn firstWid(s: *const State) ?WindowId {
-        return if (s.root) |root| firstLeafWid(root) else null;
+        return if (s.root) |*root| firstLeafWid(root) else null;
     }
 
     pub fn lastWid(s: *const State) ?WindowId {
-        return if (s.root) |root| lastLeafWid(root) else null;
+        return if (s.root) |*root| lastLeafWid(root) else null;
     }
 
     pub fn cycleFocus(_: *const State, _: WindowId, _: bool) ?WindowId {
@@ -120,8 +120,7 @@ pub const State = struct {
         out: *std.ArrayList(LayoutEntry),
         allocator: std.mem.Allocator,
     ) !void {
-        const root = s.root orelse return;
-        try applyBsp(root, frame, inner_gap, out, allocator);
+        if (s.root) |*root| try applyBsp(root, frame, inner_gap, out, allocator);
     }
 
     // ── BSP-only operations ───────────────────────────────────────────────────
@@ -167,7 +166,7 @@ fn insertWindow(root: ?Node, wid: WindowId, options: InsertOptions, allocator: s
         }
         std.debug.assert(target_leaf != null);
 
-        const split_direction = resolveSplitDirection(updated, target_leaf.?, options);
+        const split_direction = resolveSplitDirection(&updated, target_leaf.?, options);
         const split_ratio = clampedSplitRatio(options.split_ratio);
         try splitLeafNode(target_leaf.?, wid, split_direction, options.child, split_ratio, allocator);
         return updated;
@@ -188,7 +187,7 @@ fn findLeafNode(node: *Node, target_wid: WindowId) ?*Node {
     }
 }
 
-fn resolveSplitDirection(root: Node, target_leaf: *Node, options: InsertOptions) Direction {
+fn resolveSplitDirection(root: *const Node, target_leaf: *Node, options: InsertOptions) Direction {
     const target_wid = switch (target_leaf.*) {
         .leaf => |leaf| leaf.wid,
         .split => unreachable,
@@ -205,8 +204,8 @@ fn resolveSplitDirection(root: Node, target_leaf: *Node, options: InsertOptions)
     }
 }
 
-fn findLeafFrameByWindowId(node: Node, frame: Frame, inner_gap: f64, target_wid: WindowId) ?Frame {
-    return switch (node) {
+fn findLeafFrameByWindowId(node: *const Node, frame: Frame, inner_gap: f64, target_wid: WindowId) ?Frame {
+    return switch (node.*) {
         .leaf => |leaf| if (leaf.wid == target_wid) frame else null,
         .split => |split| {
             const half_gap = inner_gap / 2.0;
@@ -228,8 +227,8 @@ fn findLeafFrameByWindowId(node: Node, frame: Frame, inner_gap: f64, target_wid:
                 },
             }
 
-            if (findLeafFrameByWindowId(split.left, left_frame, inner_gap, target_wid)) |found| return found;
-            return findLeafFrameByWindowId(split.right, right_frame, inner_gap, target_wid);
+            if (findLeafFrameByWindowId(&split.left, left_frame, inner_gap, target_wid)) |found| return found;
+            return findLeafFrameByWindowId(&split.right, right_frame, inner_gap, target_wid);
         },
     };
 }
@@ -284,17 +283,17 @@ fn clampedSplitRatio(value: f64) f64 {
 
 // ── Tree queries ──────────────────────────────────────────────────────────────
 
-fn firstLeafWid(root: Node) WindowId {
-    return switch (root) {
+fn firstLeafWid(root: *const Node) WindowId {
+    return switch (root.*) {
         .leaf => |leaf| leaf.wid,
-        .split => |split| firstLeafWid(split.left),
+        .split => |split| firstLeafWid(&split.left),
     };
 }
 
-fn lastLeafWid(root: Node) WindowId {
-    return switch (root) {
+fn lastLeafWid(root: *const Node) WindowId {
+    return switch (root.*) {
         .leaf => |leaf| leaf.wid,
-        .split => |split| lastLeafWid(split.right),
+        .split => |split| lastLeafWid(&split.right),
     };
 }
 
@@ -402,10 +401,10 @@ fn findParentSplit(node: *Node, wid: WindowId) ?*Split {
     switch (node.*) {
         .leaf => return null,
         .split => |split| {
-            if (nodeContainsWid(split.left, wid)) {
+            if (nodeContainsWid(&split.left, wid)) {
                 return findParentSplit(&split.left, wid) orelse split;
             }
-            if (nodeContainsWid(split.right, wid)) {
+            if (nodeContainsWid(&split.right, wid)) {
                 return findParentSplit(&split.right, wid) orelse split;
             }
             return null;
@@ -413,17 +412,17 @@ fn findParentSplit(node: *Node, wid: WindowId) ?*Split {
     }
 }
 
-fn nodeContainsWid(node: Node, wid: WindowId) bool {
-    return switch (node) {
+fn nodeContainsWid(node: *const Node, wid: WindowId) bool {
+    return switch (node.*) {
         .leaf => |leaf| leaf.wid == wid,
-        .split => |split| nodeContainsWid(split.left, wid) or nodeContainsWid(split.right, wid),
+        .split => |split| nodeContainsWid(&split.left, wid) or nodeContainsWid(&split.right, wid),
     };
 }
 
-fn windowCountTree(node: Node) usize {
-    return switch (node) {
+fn windowCountTree(node: *const Node) usize {
+    return switch (node.*) {
         .leaf => 1,
-        .split => |split| windowCountTree(split.left) + windowCountTree(split.right),
+        .split => |split| windowCountTree(&split.left) + windowCountTree(&split.right),
     };
 }
 
@@ -489,8 +488,8 @@ fn removeFrom(node: Node, wid: WindowId, allocator: std.mem.Allocator) ?Node {
     }
 }
 
-fn applyBsp(node: Node, frame: Frame, inner_gap: f64, output: *std.ArrayList(LayoutEntry), allocator: std.mem.Allocator) !void {
-    switch (node) {
+fn applyBsp(node: *const Node, frame: Frame, inner_gap: f64, output: *std.ArrayList(LayoutEntry), allocator: std.mem.Allocator) !void {
+    switch (node.*) {
         .leaf => |leaf| {
             try output.append(allocator, .{ .wid = leaf.wid, .frame = frame });
         },
@@ -514,18 +513,18 @@ fn applyBsp(node: Node, frame: Frame, inner_gap: f64, output: *std.ArrayList(Lay
                 },
             }
 
-            try applyBsp(split.left, left_frame, inner_gap, output, allocator);
-            try applyBsp(split.right, right_frame, inner_gap, output, allocator);
+            try applyBsp(&split.left, left_frame, inner_gap, output, allocator);
+            try applyBsp(&split.right, right_frame, inner_gap, output, allocator);
         },
     }
 }
 
-fn destroyTree(node: Node, allocator: std.mem.Allocator) void {
-    switch (node) {
+fn destroyTree(node: *const Node, allocator: std.mem.Allocator) void {
+    switch (node.*) {
         .leaf => {},
         .split => |split| {
-            destroyTree(split.left, allocator);
-            destroyTree(split.right, allocator);
+            destroyTree(&split.left, allocator);
+            destroyTree(&split.right, allocator);
             allocator.destroy(split);
         },
     }
