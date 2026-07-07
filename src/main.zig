@@ -2708,10 +2708,16 @@ fn updateWindowMovePreview(wid: u32) void {
 
     const bsp_state: *bsp_mod.State = blk: {
         const sp = tilingStatePtr(win.workspace_id);
-        const st: *tiling.State = if (sp.*) |*s| s else { clearDragPreview(); return; };
+        const st: *tiling.State = if (sp.*) |*s| s else {
+            clearDragPreview();
+            return;
+        };
         break :blk switch (st.*) {
             .bsp => |*s| s,
-            else => { clearDragPreview(); return; },
+            else => {
+                clearDragPreview();
+                return;
+            },
         };
     };
     const bsp_root = bsp_state.root orelse {
@@ -4523,10 +4529,7 @@ fn retileDisplay(display_id: u32) void {
         log.err("retile: layout buffer reserve failed display={d} windows={d}", .{ display_id, window_count });
         return;
     };
-    st.computeLayout(frame, @floatFromInt(g_config.gaps.inner), &g_layout_entries, g_allocator) catch {
-        log.err("retile: layout apply failed display={d} windows={d}", .{ display_id, window_count });
-        return;
-    };
+    st.computeLayout(frame, @floatFromInt(g_config.gaps.inner), &g_layout_entries);
     std.debug.assert(g_layout_entries.items.len == window_count);
 
     for (g_layout_entries.items) |entry| {
@@ -5516,7 +5519,10 @@ fn ipcDispatch(cmd: []const u8, client_fd: posix.socket_t) void {
             };
             const bsp_state: *bsp_mod.State = switch (ctx.state.*) {
                 .bsp => |*s| s,
-                else => { ipc.writeResponse(client_fd, "err: not in bsp mode\n"); return; },
+                else => {
+                    ipc.writeResponse(client_fd, "err: not in bsp mode\n");
+                    return;
+                },
             };
             if (!bsp_state.adjustParentRatio(ctx.focused_wid, delta)) {
                 ipc.writeResponse(client_fd, "err: no parent split\n");
@@ -5532,7 +5538,10 @@ fn ipcDispatch(cmd: []const u8, client_fd: posix.socket_t) void {
             };
             const bsp_state: *bsp_mod.State = switch (ctx.state.*) {
                 .bsp => |*s| s,
-                else => { ipc.writeResponse(client_fd, "err: not in bsp mode\n"); return; },
+                else => {
+                    ipc.writeResponse(client_fd, "err: not in bsp mode\n");
+                    return;
+                },
             };
             if (!bsp_state.setParentRatio(ctx.focused_wid, ratio)) {
                 ipc.writeResponse(client_fd, "err: no parent split\n");
@@ -5552,7 +5561,10 @@ fn ipcDispatch(cmd: []const u8, client_fd: posix.socket_t) void {
             };
             const bsp_state: *bsp_mod.State = switch (ctx.state.*) {
                 .bsp => |*s| s,
-                else => { ipc.writeResponse(client_fd, "err: not in bsp mode\n"); return; },
+                else => {
+                    ipc.writeResponse(client_fd, "err: not in bsp mode\n");
+                    return;
+                },
             };
             bsp_state.mirrorTree(axis);
             retileDisplay(ctx.focused_win.display_id);
@@ -5565,7 +5577,10 @@ fn ipcDispatch(cmd: []const u8, client_fd: posix.socket_t) void {
             };
             const bsp_state: *bsp_mod.State = switch (ctx.state.*) {
                 .bsp => |*s| s,
-                else => { ipc.writeResponse(client_fd, "err: not in bsp mode\n"); return; },
+                else => {
+                    ipc.writeResponse(client_fd, "err: not in bsp mode\n");
+                    return;
+                },
             };
             bsp_state.equalizeTree(null, g_config.bsp_split_ratio);
             retileDisplay(ctx.focused_win.display_id);
@@ -5578,7 +5593,10 @@ fn ipcDispatch(cmd: []const u8, client_fd: posix.socket_t) void {
             };
             const bsp_state: *bsp_mod.State = switch (ctx.state.*) {
                 .bsp => |*s| s,
-                else => { ipc.writeResponse(client_fd, "err: not in bsp mode\n"); return; },
+                else => {
+                    ipc.writeResponse(client_fd, "err: not in bsp mode\n");
+                    return;
+                },
             };
             bsp_state.balanceTree(null);
             retileDisplay(ctx.focused_win.display_id);
@@ -5595,7 +5613,10 @@ fn ipcDispatch(cmd: []const u8, client_fd: posix.socket_t) void {
             };
             const bsp_state: *bsp_mod.State = switch (ctx.state.*) {
                 .bsp => |*s| s,
-                else => { ipc.writeResponse(client_fd, "err: not in bsp mode\n"); return; },
+                else => {
+                    ipc.writeResponse(client_fd, "err: not in bsp mode\n");
+                    return;
+                },
             };
             bsp_state.rotateTree(degrees);
             retileDisplay(ctx.focused_win.display_id);

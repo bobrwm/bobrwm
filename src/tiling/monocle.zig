@@ -93,15 +93,17 @@ pub const State = struct {
         return true;
     }
 
+    /// Precondition: out must have unused capacity for at least windowCount() entries;
+    /// this function appends without allocating.
     pub fn computeLayout(
         s: *const State,
         frame: Frame,
         _: f64,
         out: *std.ArrayList(LayoutEntry),
-        allocator: std.mem.Allocator,
-    ) !void {
+    ) void {
+        std.debug.assert(out.capacity - out.items.len >= s.windows.items.len);
         for (s.windows.items) |wid| {
-            try out.append(allocator, .{ .wid = wid, .frame = frame });
+            out.appendAssumeCapacity(.{ .wid = wid, .frame = frame });
         }
     }
 };

@@ -113,15 +113,17 @@ pub const State = struct {
         return if (s.root) |*root| swapWindowIds(root, a, b) else false;
     }
 
+    /// Precondition: out must have unused capacity for at least windowCount() entries;
+    /// this function appends without allocating.
     pub fn computeLayout(
         s: *const State,
         frame: Frame,
         inner_gap: f64,
         out: *std.ArrayList(LayoutEntry),
-        allocator: std.mem.Allocator,
-    ) !void {
+    ) void {
+        std.debug.assert(out.capacity - out.items.len >= s.windowCount());
         const root = s.root orelse return;
-        try applyBsp(root, frame, inner_gap, out, allocator);
+        applyBsp(root, frame, inner_gap, out);
     }
 
     // ── BSP-only operations ───────────────────────────────────────────────────
@@ -489,10 +491,10 @@ fn removeFrom(node: Node, wid: WindowId, allocator: std.mem.Allocator) ?Node {
     }
 }
 
-fn applyBsp(node: Node, frame: Frame, inner_gap: f64, output: *std.ArrayList(LayoutEntry), allocator: std.mem.Allocator) !void {
+fn applyBsp(node: Node, frame: Frame, inner_gap: f64, output: *std.ArrayList(LayoutEntry)) void {
     switch (node) {
         .leaf => |leaf| {
-            try output.append(allocator, .{ .wid = leaf.wid, .frame = frame });
+            output.appendAssumeCapacity(.{ .wid = leaf.wid, .frame = frame });
         },
         .split => |split| {
             const half_gap = inner_gap / 2.0;
@@ -514,8 +516,8 @@ fn applyBsp(node: Node, frame: Frame, inner_gap: f64, output: *std.ArrayList(Lay
                 },
             }
 
-            try applyBsp(split.left, left_frame, inner_gap, output, allocator);
-            try applyBsp(split.right, right_frame, inner_gap, output, allocator);
+            applyBsp(split.left, left_frame, inner_gap, output);
+            applyBsp(split.right, right_frame, inner_gap, output);
         },
     }
 }

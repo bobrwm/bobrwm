@@ -97,10 +97,9 @@ pub const State = union(LayoutKind) {
         frame: Frame,
         inner_gap: f64,
         out: *std.ArrayList(LayoutEntry),
-        allocator: std.mem.Allocator,
-    ) !void {
+    ) void {
         switch (self.*) {
-            inline else => |*s| try s.computeLayout(frame, inner_gap, out, allocator),
+            inline else => |*s| s.computeLayout(frame, inner_gap, out),
         }
     }
 };
