@@ -257,6 +257,7 @@ const AxStrings = struct {
     floating_window_subrole: c.CFStringRef,
     dialog_subrole: c.CFStringRef,
     unknown_subrole: c.CFStringRef,
+    modal_attr: c.CFStringRef,
     enhanced_ui_attr: c.CFStringRef,
     close_button_attr: c.CFStringRef,
     minimize_button_attr: c.CFStringRef,
@@ -291,6 +292,7 @@ fn ensureAxStrings() ?*const AxStrings {
         "AXFloatingWindow",
         "AXDialog",
         "AXUnknown",
+        "AXModal",
         "AXEnhancedUserInterface",
         "AXCloseButton",
         "AXMinimizeButton",
@@ -325,12 +327,13 @@ fn ensureAxStrings() ?*const AxStrings {
         .floating_window_subrole = refs[11],
         .dialog_subrole = refs[12],
         .unknown_subrole = refs[13],
-        .enhanced_ui_attr = refs[14],
-        .close_button_attr = refs[15],
-        .minimize_button_attr = refs[16],
-        .zoom_button_attr = refs[17],
-        .fullscreen_button_attr = refs[18],
-        .focused_attr = refs[19],
+        .modal_attr = refs[14],
+        .enhanced_ui_attr = refs[15],
+        .close_button_attr = refs[16],
+        .minimize_button_attr = refs[17],
+        .zoom_button_attr = refs[18],
+        .fullscreen_button_attr = refs[19],
+        .focused_attr = refs[20],
     };
     return &g_ax_strings.?;
 }
@@ -344,6 +347,7 @@ fn deinitAxStrings() void {
             strings.minimize_button_attr,
             strings.close_button_attr,
             strings.enhanced_ui_attr,
+            strings.modal_attr,
             strings.unknown_subrole,
             strings.dialog_subrole,
             strings.floating_window_subrole,
@@ -1730,6 +1734,11 @@ fn manageStateForWindow(pid: i32, wid: u32) u8 {
     defer c.CFRelease(@ptrCast(win));
 
     const ax = ensureAxStrings() orelse return shim.BW_MANAGE_PENDING;
+    // Native open/save panels are app-modal AX windows. They expose enough
+    // top-level-window signals to pass the dialog heuristic below, but tiling
+    // them resizes the parent app while the user is choosing a file.
+    if (axBooleanAttributeTrue(win, ax.modal_attr)) return shim.BW_MANAGE_REJECT;
+
     const role_attr = ax.role_attr;
     var role_any: c.CFTypeRef = null;
     const role_err = c.AXUIElementCopyAttributeValue(win, role_attr, @ptrCast(&role_any));
@@ -1789,6 +1798,9 @@ fn manageStateForWindow(pid: i32, wid: u32) u8 {
 /// this guard keeps them from being tiled. Mirrors the button/subrole heuristics
 /// used by yabai, AeroSpace, and OmniWM.
 fn windowHasRealWindowSignal(win: c.AXUIElementRef, ax: *const AxStrings) bool {
+    std.debug.assert(win != null);
+    std.debug.assert(ax.modal_attr != null);
+
     if (axAttributePresent(win, ax.close_button_attr)) return true;
     if (axAttributePresent(win, ax.minimize_button_attr)) return true;
     if (axAttributePresent(win, ax.zoom_button_attr)) return true;
@@ -2708,10 +2720,16 @@ fn updateWindowMovePreview(wid: u32) void {
 
     const bsp_state: *bsp_mod.State = blk: {
         const sp = tilingStatePtr(win.workspace_id);
-        const st: *tiling.State = if (sp.*) |*s| s else { clearDragPreview(); return; };
+        const st: *tiling.State = if (sp.*) |*s| s else {
+            clearDragPreview();
+            return;
+        };
         break :blk switch (st.*) {
             .bsp => |*s| s,
-            else => { clearDragPreview(); return; },
+            else => {
+                clearDragPreview();
+                return;
+            },
         };
     };
     const bsp_root = bsp_state.root orelse {
@@ -5516,7 +5534,10 @@ fn ipcDispatch(cmd: []const u8, client_fd: posix.socket_t) void {
             };
             const bsp_state: *bsp_mod.State = switch (ctx.state.*) {
                 .bsp => |*s| s,
-                else => { ipc.writeResponse(client_fd, "err: not in bsp mode\n"); return; },
+                else => {
+                    ipc.writeResponse(client_fd, "err: not in bsp mode\n");
+                    return;
+                },
             };
             if (!bsp_state.adjustParentRatio(ctx.focused_wid, delta)) {
                 ipc.writeResponse(client_fd, "err: no parent split\n");
@@ -5532,7 +5553,10 @@ fn ipcDispatch(cmd: []const u8, client_fd: posix.socket_t) void {
             };
             const bsp_state: *bsp_mod.State = switch (ctx.state.*) {
                 .bsp => |*s| s,
-                else => { ipc.writeResponse(client_fd, "err: not in bsp mode\n"); return; },
+                else => {
+                    ipc.writeResponse(client_fd, "err: not in bsp mode\n");
+                    return;
+                },
             };
             if (!bsp_state.setParentRatio(ctx.focused_wid, ratio)) {
                 ipc.writeResponse(client_fd, "err: no parent split\n");
@@ -5552,7 +5576,10 @@ fn ipcDispatch(cmd: []const u8, client_fd: posix.socket_t) void {
             };
             const bsp_state: *bsp_mod.State = switch (ctx.state.*) {
                 .bsp => |*s| s,
-                else => { ipc.writeResponse(client_fd, "err: not in bsp mode\n"); return; },
+                else => {
+                    ipc.writeResponse(client_fd, "err: not in bsp mode\n");
+                    return;
+                },
             };
             bsp_state.mirrorTree(axis);
             retileDisplay(ctx.focused_win.display_id);
@@ -5565,7 +5592,10 @@ fn ipcDispatch(cmd: []const u8, client_fd: posix.socket_t) void {
             };
             const bsp_state: *bsp_mod.State = switch (ctx.state.*) {
                 .bsp => |*s| s,
-                else => { ipc.writeResponse(client_fd, "err: not in bsp mode\n"); return; },
+                else => {
+                    ipc.writeResponse(client_fd, "err: not in bsp mode\n");
+                    return;
+                },
             };
             bsp_state.equalizeTree(null, g_config.bsp_split_ratio);
             retileDisplay(ctx.focused_win.display_id);
@@ -5578,7 +5608,10 @@ fn ipcDispatch(cmd: []const u8, client_fd: posix.socket_t) void {
             };
             const bsp_state: *bsp_mod.State = switch (ctx.state.*) {
                 .bsp => |*s| s,
-                else => { ipc.writeResponse(client_fd, "err: not in bsp mode\n"); return; },
+                else => {
+                    ipc.writeResponse(client_fd, "err: not in bsp mode\n");
+                    return;
+                },
             };
             bsp_state.balanceTree(null);
             retileDisplay(ctx.focused_win.display_id);
@@ -5595,7 +5628,10 @@ fn ipcDispatch(cmd: []const u8, client_fd: posix.socket_t) void {
             };
             const bsp_state: *bsp_mod.State = switch (ctx.state.*) {
                 .bsp => |*s| s,
-                else => { ipc.writeResponse(client_fd, "err: not in bsp mode\n"); return; },
+                else => {
+                    ipc.writeResponse(client_fd, "err: not in bsp mode\n");
+                    return;
+                },
             };
             bsp_state.rotateTree(degrees);
             retileDisplay(ctx.focused_win.display_id);
