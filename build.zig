@@ -238,7 +238,7 @@ pub fn build(b: *std.Build) !void {
 
     const run_ipc_tests = b.addRunArtifact(ipc_tests);
 
-    // tabgroup.zig and layout.zig are pure Zig (window.zig types only),
+    // tabgroup.zig and tiling.zig are pure Zig (window.zig types only),
     // so their test modules need no SDK or include wiring either.
     const tabgroup_test_mod = b.createModule(.{
         .root_source_file = b.path("src/tabgroup.zig"),
@@ -253,18 +253,18 @@ pub fn build(b: *std.Build) !void {
 
     const run_tabgroup_tests = b.addRunArtifact(tabgroup_tests);
 
-    const layout_test_mod = b.createModule(.{
-        .root_source_file = b.path("src/layout.zig"),
+    const tiling_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/tiling.zig"),
         .target = target,
         .optimize = optimize,
     });
 
-    const layout_tests = b.addTest(.{
-        .name = "layout-tests",
-        .root_module = layout_test_mod,
+    const tiling_tests = b.addTest(.{
+        .name = "tiling-tests",
+        .root_module = tiling_test_mod,
     });
 
-    const run_layout_tests = b.addRunArtifact(layout_tests);
+    const run_tiling_tests = b.addRunArtifact(tiling_tests);
 
     const swipe_test_mod = b.createModule(.{
         .root_source_file = b.path("packages/bobrwm-swipe/src/main.zig"),
@@ -295,6 +295,6 @@ pub fn build(b: *std.Build) !void {
     test_step.dependOn(&run_tests.step);
     test_step.dependOn(&run_ipc_tests.step);
     test_step.dependOn(&run_tabgroup_tests.step);
-    test_step.dependOn(&run_layout_tests.step);
+    test_step.dependOn(&run_tiling_tests.step);
     test_step.dependOn(&run_swipe_tests.step);
 }
