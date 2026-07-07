@@ -6,6 +6,7 @@ const std = @import("std");
 const shim = @import("shim_api.zig");
 const tiling = @import("tiling.zig");
 const osutil = @import("osutil.zig");
+const animation = @import("animation.zig");
 
 const log = std.log.scoped(.config);
 
@@ -27,6 +28,7 @@ pub const Config = struct {
     bsp_insert_point: tiling.InsertionPointPolicy = .focused,
     bsp_split_ratio: f64 = 0.5,
     new_window_split: tiling.InsertChild = .second,
+    animation: animation.AnimationConfig = .{},
 
     /// Look up the assigned workspace for a given bundle identifier. `app_rules`
     /// take precedence; `workspace_assignments` is a fallback alias.
@@ -501,6 +503,9 @@ test "default config" {
     try t.expectEqual(tiling.InsertionPointPolicy.focused, cfg.bsp_insert_point);
     try t.expectApproxEqAbs(@as(f64, 0.5), cfg.bsp_split_ratio, 0.0001);
     try t.expectEqual(tiling.InsertChild.second, cfg.new_window_split);
+    try t.expect(!cfg.animation.enabled);
+    try t.expectEqual(@as(u64, 200), cfg.animation.duration_ms);
+    try t.expectEqual(animation.Easing.ease_out, cfg.animation.easing);
 }
 
 test "default_keybinds" {

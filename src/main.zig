@@ -22,6 +22,7 @@ const ax_observer = @import("ax_observer.zig");
 const launchd = @import("launchd.zig");
 const osutil = @import("osutil.zig");
 const objc_classes = @import("objc_classes.zig");
+const animation_mod = @import("animation.zig");
 
 extern fn _AXUIElementGetWindow(element: c.AXUIElementRef, wid: *u32) c.AXError;
 
@@ -1281,6 +1282,7 @@ const HideCtx = struct {
 /// Convenience wrapper for single-window hides outside of loops.
 fn hideWindow(pid: i32, wid: u32) void {
     const display_id = if (g_store.get(wid)) |win| win.display_id else focusedDisplayId();
+    g_animator.finish(wid);
     (HideCtx.init(display_id)).hide(pid, wid);
 }
 
@@ -1358,6 +1360,9 @@ var g_event_drain_active = false;
 var g_cleanup_pending_offscreen = false;
 var g_cleanup_pending_pids: [cleanup_pid_capacity_per_drain]i32 = undefined;
 var g_cleanup_pending_pid_count: usize = 0;
+
+var g_animator: animation_mod.Animator = undefined;
+var g_animator_source: c.dispatch_source_t = null;
 
 fn shouldHandleWorkspaceEvent(last_event_at_s: *f64) bool {
     std.debug.assert(last_event_at_s.* >= 0);
@@ -2164,6 +2169,36 @@ fn signalWaker() void {
     }
 }
 
+fn animatorTimerTick(context: ?*anyopaque) callconv(.c) void {
+    _ = context;
+    g_animator.tick();
+    if (!g_animator.isAnimating()) {
+        if (g_animator_source) |source| {
+            c.dispatch_source_cancel(source);
+            g_animator_source = null;
+        }
+    }
+}
+
+fn ensureAnimatorTimer() void {
+    if (g_animator_source != null) return;
+    const source = c.dispatch_source_create(
+        cg_extra.DISPATCH_SOURCE_TYPE_TIMER(),
+        0,
+        0,
+        cg_extra.dispatch_get_main_queue(),
+    ) orelse return;
+    c.dispatch_source_set_timer(
+        source,
+        c.dispatch_time(c.DISPATCH_TIME_NOW, 0),
+        16 * c.NSEC_PER_MSEC,
+        0,
+    );
+    c.dispatch_source_set_event_handler_f(source, animatorTimerTick);
+    c.dispatch_resume(.{ ._ds = source });
+    g_animator_source = source;
+}
+
 fn rolePollTimerTick(context: ?*anyopaque) callconv(.c) void {
     _ = context;
     bw_emit_event(shim.BW_EVENT_ROLE_POLL_TICK, 0, 0);
@@ -2418,6 +2453,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     var keybind_table = try config_mod.KeybindTable.init(config_arena.allocator(), &g_config);
     defer keybind_table.deinit(config_arena.allocator());
     g_config.applyKeybinds(&keybind_table);
+    g_animator.init(g_config.animation);
 
     // Inactive-window dimming via SkyLight (SLSSetWindowListBrightness).
     dim.configure(g_config.dimmed_inactive);
@@ -4705,6 +4741,10 @@ fn retileDisplay(display_id: u32) void {
     const display_slot = displayIndexById(display_id) orelse return;
     const display = g_displays[display_slot].visible;
 
+    if (!g_config.animation.enabled and g_animator.isAnimating()) {
+        g_animator.finishAll();
+    }
+
     const outer = g_config.gaps.outer;
     const frame = window_mod.Window.Frame{
         .x = display.x + @as(f64, @floatFromInt(outer.left)),
@@ -4733,16 +4773,10 @@ fn retileDisplay(display_id: u32) void {
         const target_frame = if (win.is_fullscreen) frame else entry.frame;
 
         if (!framesEqual(win.frame, target_frame)) {
-            _ = shim.bw_ax_set_window_frame(
-                win.pid,
-                entry.wid,
-                target_frame.x,
-                target_frame.y,
-                target_frame.width,
-                target_frame.height,
-            );
-            // Two-pass for fullscreen to handle macOS size clamping
-            if (win.is_fullscreen) {
+            if (g_config.animation.enabled) {
+                g_animator.animate(win.pid, entry.wid, win.frame, target_frame);
+                ensureAnimatorTimer();
+            } else {
                 _ = shim.bw_ax_set_window_frame(
                     win.pid,
                     entry.wid,
@@ -4751,6 +4785,17 @@ fn retileDisplay(display_id: u32) void {
                     target_frame.width,
                     target_frame.height,
                 );
+                // Two-pass for fullscreen to handle macOS size clamping
+                if (win.is_fullscreen) {
+                    _ = shim.bw_ax_set_window_frame(
+                        win.pid,
+                        entry.wid,
+                        target_frame.x,
+                        target_frame.y,
+                        target_frame.width,
+                        target_frame.height,
+                    );
+                }
             }
 
             var updated = win;
@@ -5194,6 +5239,7 @@ fn switchWorkspace(target_id: u8) void {
                     hide_wid,
                 });
             }
+            g_animator.finish(hide_wid);
             hctx.hide(win.pid, hide_wid);
             hidden_count += 1;
         }
@@ -5204,6 +5250,7 @@ fn switchWorkspace(target_id: u8) void {
         const pending = entry.value_ptr.*;
         if (pending.workspace_id != current_id) continue;
         if (pending.display_id != target_display) continue;
+        g_animator.finish(entry.key_ptr.*);
         hctx.hide(pending.pid, entry.key_ptr.*);
         hidden_pending_count += 1;
     }
@@ -5499,6 +5546,7 @@ fn moveWorkspaceToDisplay(target_display_slot: usize) void {
         const hide_wid = if (g_store.get(visible_wid) != null) visible_wid else wid;
         if (g_store.get(hide_wid)) |win| {
             if (win.display_id != target_display_id) continue;
+            g_animator.finish(hide_wid);
             hctx.hide(win.pid, hide_wid);
         }
     }
