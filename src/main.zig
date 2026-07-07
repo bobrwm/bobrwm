@@ -4541,10 +4541,7 @@ fn retileDisplay(display_id: u32) void {
         log.err("retile: layout buffer reserve failed display={d} windows={d}", .{ display_id, window_count });
         return;
     };
-    st.computeLayout(frame, @floatFromInt(g_config.gaps.inner), &g_layout_entries, g_allocator) catch {
-        log.err("retile: layout apply failed display={d} windows={d}", .{ display_id, window_count });
-        return;
-    };
+    st.computeLayout(frame, @floatFromInt(g_config.gaps.inner), &g_layout_entries);
     std.debug.assert(g_layout_entries.items.len == window_count);
 
     for (g_layout_entries.items) |entry| {
