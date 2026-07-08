@@ -40,6 +40,10 @@
     //     .enabled = false,
     //     .level = 0.35,
     // },
+    // Dimming can also be toggled at runtime by binding the `toggle_dimming`
+    // action to a key (see the keybinds section below). This works whether or
+    // not `dimmed_inactive.enabled` is set: `enabled` is the initial state and
+    // the keybind flips it on demand.
 
     // Gaps between windows (pixels). Omit or set to 0 for no gaps.
     // .gaps = .{
@@ -93,6 +97,10 @@
 
         // alt+f → toggle fullscreen
         .{ .key = "f", .mods = .{ .alt = true }, .action = .toggle_fullscreen },
+
+        // alt+d → toggle inactive-window dimming at runtime (opt-in; add this
+        // line to enable it). Pairs with the .dimmed_inactive option above.
+        // .{ .key = "d", .mods = .{ .alt = true }, .action = .toggle_dimming },
 
         // ctrl+left/right → traverse bobrwm workspaces; native Spaces handle the edge
         .{ .key = "left", .mods = .{ .ctrl = true }, .action = .focus_previous_workspace },

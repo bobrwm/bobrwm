@@ -450,11 +450,14 @@ fn isVisibleManaged(win: *const window_mod.Window) bool {
 }
 
 /// Dim every visible managed window except the focused one with black overlay
-/// panels. No-op unless dimming is enabled. Uses the store's settled frames
+/// panels. Callers must gate on `dim.enabled`. Uses the store's settled frames
 /// directly (no WindowServer round-trip): retile and move/resize events have
 /// already synchronized them by the time this runs at the end of the drain.
 fn pushDimSnapshot() void {
-    if (!dim.enabled) return;
+    // Precondition: callers gate on dim.enabled, so the disabled feature never
+    // reaches the window-scan loops below. Assert rather than early-return so
+    // the invariant is documented and compiles out in release builds.
+    std.debug.assert(dim.enabled);
 
     var entries: [256]dim.Entry = undefined;
     var n: usize = 0;
@@ -2479,9 +2482,11 @@ export fn bw_drain_events() void {
         flushRetileRequests();
     }
 
-    // Same settled point: dim inactive windows (diffed, no-op if unchanged or
-    // disabled).
-    pushDimSnapshot();
+    // Same settled point: dim inactive windows (diffed, no-op if unchanged).
+    // Guard at the call site so a disabled feature costs exactly one branch
+    // here and never enters the snapshot path — no call, no loop, no reliance
+    // on the optimizer eliding a no-op body.
+    if (dim.enabled) pushDimSnapshot();
 
     // Honour pending Ctrl-C / SIGTERM by exiting NSApp.run cleanly so the
     // deferred cleanup (IPC socket unlink, layout free, restoreAllWindows)
@@ -3160,6 +3165,13 @@ fn handleEvent(ev: *const event_mod.Event) void {
             const win = g_store.get(focused) orelse return;
             const target: window_mod.WindowMode = if (win.mode != .tiled) .tiled else .floating;
             setWindowMode(focused, target);
+        },
+        .hk_toggle_dimming => {
+            const on = dim.toggle();
+            log.info("hotkey: dimming {s}", .{if (on) "on" else "off"});
+            // Re-apply immediately when enabling so overlays appear without
+            // waiting for the next settled drain. Disabling already hid them.
+            if (on) pushDimSnapshot();
         },
     }
 }

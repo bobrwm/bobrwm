@@ -99,6 +99,15 @@ pub fn apply(focused: []const u32, entries: []const Entry) void {
     }
 }
 
+/// Flip the enabled state at runtime and return the new value. When turning
+/// off, overlays are hidden immediately; when turning on, the caller re-applies
+/// the current snapshot so dimming appears without waiting for the next drain.
+pub fn toggle() bool {
+    enabled = !enabled;
+    if (!enabled) resetAll();
+    return enabled;
+}
+
 /// Hide every overlay. Called on focus loss, feature disable, and shutdown.
 pub fn resetAll() void {
     for (slots[0..slot_count]) |*s| {
@@ -300,6 +309,41 @@ test "isDimTarget with per-display focus set" {
     try t.expect(isDimTarget(&entries, &focused, 3)); // inactive → dim
     try t.expect(!isDimTarget(&entries, &focused, 7)); // focused on display A
     try t.expect(!isDimTarget(&entries, &focused, 8)); // focused on display B
+}
+
+test "apply is a no-op when disabled" {
+    // Guard against a regression where apply() touches AppKit or slot state
+    // while the feature is off. With enabled = false it must return before any
+    // panel work, leaving slot bookkeeping untouched.
+    const saved_enabled = enabled;
+    const saved_slot_count = slot_count;
+    defer {
+        enabled = saved_enabled;
+        slot_count = saved_slot_count;
+    }
+
+    enabled = false;
+    slot_count = 0;
+    const entries = [_]Entry{.{ .wid = 3, .x = 0, .y = 0, .w = 10, .h = 10 }};
+    const focused = [_]u32{7};
+    apply(&focused, &entries);
+    try t.expectEqual(@as(usize, 0), slot_count);
+}
+
+test "toggle flips enabled and returns new state" {
+    const saved_enabled = enabled;
+    const saved_slot_count = slot_count;
+    defer {
+        enabled = saved_enabled;
+        slot_count = saved_slot_count;
+    }
+
+    enabled = false;
+    slot_count = 0; // no live panels, so resetAll on toggle-off stays a no-op
+    try t.expectEqual(true, toggle());
+    try t.expect(enabled);
+    try t.expectEqual(false, toggle());
+    try t.expect(!enabled);
 }
 
 test "contains" {

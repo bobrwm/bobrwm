@@ -94,6 +94,7 @@ pub const Action = enum(u8) {
     move_workspace_to_display = 29,
     focus_previous_workspace = 30,
     focus_next_workspace = 31,
+    toggle_dimming = 32,
 
     // Every Action must map 1:1 to an EventKind (hk_ prefixed).
     comptime {
