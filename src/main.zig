@@ -778,6 +778,18 @@ fn switchToWindowWorkspaceIfHidden(win: window_mod.Window) void {
     switchWorkspace(win.workspace_id);
 }
 
+/// During a workspace transition, AX focus events from non-target
+/// workspaces/displays are lagging or synthetic (hide/retile side effects,
+/// native-tab ID swaps). Recording them would clobber the source workspace's
+/// remembered focus, so switching back would focus the wrong window.
+fn shouldRecordWorkspaceFocusForWindow(win: window_mod.Window) bool {
+    if (!g_workspace_transition.isActive()) return true;
+
+    const transition = g_workspace_transition;
+    return win.workspace_id == transition.target_workspace_id and
+        win.display_id == transition.target_display_id;
+}
+
 fn syncFocusStateForWindowId(focused_wid: u32, source: FocusEventSource) bool {
     std.debug.assert(focused_wid != 0);
 
@@ -791,11 +803,25 @@ fn syncFocusStateForWindowId(focused_wid: u32, source: FocusEventSource) bool {
     // before this point so same-process windows do not overwrite each other.
     g_tab_groups.setActive(focused_wid);
     _ = maybeSetFocusedDisplayForWindow(win, source);
-    if (g_workspaces.get(win.workspace_id)) |ws| {
-        ws.focused_wid = leader;
+    if (shouldRecordWorkspaceFocusForWindow(win)) {
+        if (g_workspaces.get(win.workspace_id)) |ws| {
+            ws.recordFocus(leader);
+        }
+        setTilingActive(win.workspace_id, focused_wid);
+    } else {
+        const transition = g_workspace_transition;
+        log.debug("workspace transition focus memory skipped epoch={d} wid={d} leader={d} source={s} workspace={d} display={d} target_workspace={d} target_display={d}", .{
+            transition.epoch,
+            focused_wid,
+            leader,
+            @tagName(source),
+            win.workspace_id,
+            win.display_id,
+            transition.target_workspace_id,
+            transition.target_display_id,
+        });
     }
     switchToWindowWorkspaceIfHidden(win);
-    setTilingActive(win.workspace_id, focused_wid);
 
     return true;
 }
@@ -1209,8 +1235,10 @@ var g_drag_reconcile_on_drop = false;
 var g_last_focused_pid: i32 = 0;
 var g_last_space_changed_at_s: f64 = 0;
 var g_last_display_changed_at_s: f64 = 0;
-var g_hotkey_bindings: [128]shim.bw_keybind = undefined;
-var g_hotkey_binding_count: u32 = 0;
+/// Compiled keybind table referenced (not copied) by the hotkey event tap.
+/// The caller of bw_set_keybinds owns the storage and must keep it alive for
+/// as long as the event tap can fire; main's KeybindTable guarantees this.
+var g_hotkey_bindings: []const shim.bw_keybind = &.{};
 var g_waker_source: c.CFRunLoopSourceRef = null;
 var g_role_poll_source: c.dispatch_source_t = null;
 var g_ipc_source: c.dispatch_source_t = null;
@@ -2193,36 +2221,23 @@ export fn bw_hotkey_mouse_up() void {
     bw_emit_event(shim.BW_EVENT_MOUSE_UP, 0, 0);
 }
 
-/// Accept keybind table from config and keep it in Zig-owned state.
+/// Accept the keybind table from config. Stores a reference to caller-owned
+/// storage instead of copying, so the table has no fixed size cap. Must be
+/// called on the main thread before the hotkey event tap is installed.
 export fn bw_set_keybinds(binds: ?[*]const shim.bw_keybind, count: u32) void {
-    if (count == 0) {
-        g_hotkey_binding_count = 0;
-        return;
-    }
+    std.debug.assert(g_tap_port == null);
 
     const src = binds orelse {
-        g_hotkey_binding_count = 0;
+        g_hotkey_bindings = &.{};
         return;
     };
 
-    const max_count: u32 = @intCast(g_hotkey_bindings.len);
-    const clamped_count_u32: u32 = @min(count, max_count);
-    const clamped_count: usize = @intCast(clamped_count_u32);
-
-    @memcpy(g_hotkey_bindings[0..clamped_count], src[0..clamped_count]);
-    g_hotkey_binding_count = clamped_count_u32;
-
-    std.debug.assert(g_hotkey_binding_count <= max_count);
+    g_hotkey_bindings = src[0..count];
 }
 
 /// Resolve a key press against current keybinds and emit matching action.
 export fn bw_hotkey_handle_keydown(keycode: u16, mods: u8) bool {
-    const total: usize = @intCast(g_hotkey_binding_count);
-    std.debug.assert(total <= g_hotkey_bindings.len);
-
-    var i: usize = 0;
-    while (i < total) : (i += 1) {
-        const binding = g_hotkey_bindings[i];
+    for (g_hotkey_bindings) |binding| {
         if (binding.keycode != keycode) continue;
         if (binding.mods != mods) continue;
 
@@ -2258,7 +2273,9 @@ pub fn main(init: std.process.Init.Minimal) !void {
     defer config_arena.deinit();
     g_config = config_mod.load(config_arena.allocator(), cli.configPath(result));
     g_bsp_split_mode = g_config.bsp_split;
-    g_config.applyKeybinds();
+    var keybind_table = try config_mod.KeybindTable.init(config_arena.allocator(), &g_config);
+    defer keybind_table.deinit(config_arena.allocator());
+    g_config.applyKeybinds(&keybind_table);
 
     // -- Accessibility check --
     if (!shim.bw_ax_is_trusted()) {
@@ -3698,7 +3715,7 @@ fn discoverWindows() void {
     // Ensure a focused window is set on the active workspace
     const active_ws = g_workspaces.active();
     if (active_ws.focused_wid == null and active_ws.windows.items.len > 0) {
-        active_ws.focused_wid = active_ws.windows.items[0];
+        active_ws.recordFocus(active_ws.windows.items[0]);
     }
 }
 
@@ -3819,7 +3836,7 @@ fn addNewWindowManagedWithAssignment(pid: i32, wid: u32, workspace_id: u8, assig
     if (mode == .tiled) {
         insertIntoTiling(ws.id, wid);
     }
-    ws.focused_wid = wid;
+    ws.recordFocus(wid);
 
     // If assigned to a non-visible workspace, hide immediately
     if (!workspaceVisibleOnDisplay(ws.id, display_id)) {
@@ -4048,7 +4065,7 @@ fn tryFormTabGroupOnCreate(pid: i32, new_wid: u32) bool {
             // Also discover any other background tabs
             discoverBackgroundTabs(pid, group_id, new_frame, ws.id, existing.display_id);
 
-            ws.focused_wid = existing_wid; // leader stays
+            ws.recordFocus(existing_wid); // leader stays
             log.info("tryFormTabGroup: formed group leader={d} active={d} members={d}", .{
                 existing_wid,
                 new_wid,
@@ -4511,7 +4528,7 @@ fn reconcileDisplayChange() void {
 
         if (g_workspaces.get(target_workspace_id)) |target_ws| {
             target_ws.addWindow(win.wid) catch {};
-            if (target_ws.focused_wid == null) target_ws.focused_wid = win.wid;
+            if (target_ws.focused_wid == null) target_ws.recordFocus(win.wid);
         }
         if (win.mode == .tiled) {
             insertIntoTiling(target_workspace_id, win.wid);
@@ -4909,7 +4926,7 @@ fn checkTabDragOut(_: i32, wid: u32) void {
         ws.addWindow(wid) catch return;
         insertIntoTiling(win.workspace_id, wid);
     }
-    ws.focused_wid = wid;
+    ws.recordFocus(wid);
     _ = maybeSetFocusedDisplayForWindow(win, .drag);
 
     // If the group dissolved, verify the survivor is still managed
@@ -5096,7 +5113,7 @@ fn focusWorkspaceWindow(ws: *workspace_mod.Workspace) void {
                 });
             }
             _ = shim.bw_ax_focus_window(win.pid, actual_wid);
-            ws.focused_wid = fwid;
+            ws.recordFocus(fwid);
             _ = maybeSetFocusedDisplayForWindow(win, .keyboard);
         }
     }
@@ -5171,7 +5188,7 @@ fn moveWindowToWorkspace(target_id: u8) void {
         insertIntoTiling(target_id, wid);
     }
     if (target_ws.focused_wid == null) {
-        target_ws.focused_wid = wid;
+        target_ws.recordFocus(wid);
     }
 
     // Update window metadata. Use the target workspace's display so that
@@ -5235,7 +5252,7 @@ fn moveManagedWindowToDisplay(wid: u32, target_display_id: u32) bool {
 
         removeFromTiling(source_workspace_id, wid);
         source_ws.removeWindow(wid);
-        target_ws.focused_wid = wid;
+        target_ws.recordFocus(wid);
         if (updated.mode == .tiled) {
             insertIntoTiling(target_workspace_id, wid);
         }
@@ -5426,7 +5443,7 @@ fn focusDirection(dir: FocusDir) void {
         const actual_wid = g_tab_groups.resolveActive(wid);
         if (g_store.get(actual_wid)) |win| {
             _ = shim.bw_ax_focus_window(win.pid, actual_wid);
-            ws.focused_wid = wid; // track the leader
+            ws.recordFocus(wid); // track the leader
             _ = maybeSetFocusedDisplayForWindow(win, .keyboard);
             setTilingActive(win.workspace_id, actual_wid);
         }
@@ -5442,7 +5459,7 @@ fn focusDirection(dir: FocusDir) void {
     if (st.cycleFocus(focused_wid, stack_forward)) |stack_wid| {
         if (g_store.get(stack_wid)) |win| {
             _ = shim.bw_ax_focus_window(win.pid, stack_wid);
-            ws.focused_wid = stack_wid;
+            ws.recordFocus(stack_wid);
             _ = maybeSetFocusedDisplayForWindow(win, .keyboard);
             setTilingActive(win.workspace_id, stack_wid);
         }

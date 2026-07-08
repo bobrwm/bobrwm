@@ -49,6 +49,8 @@
     //     "chat",
     // },
 
+    // Keybinds merge with built-in defaults. Use the same key + modifiers to
+    // override a default binding, or add new entries for additional shortcuts.
     .keybinds = .{
         // alt+1..9 → focus workspace
         .{ .key = "1", .mods = .{ .alt = true }, .action = .focus_workspace, .arg = 1 },

@@ -59,7 +59,8 @@ If no config file is found, built-in defaults are used. See [`examples/config.zo
 
 ### Keybinds
 
-Map a key + modifiers to an action:
+Map a key + modifiers to an action. Configured keybinds are merged with the
+built-in defaults; use the same key + modifiers to override a default binding.
 
 ```zon
 .keybinds = .{

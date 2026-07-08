@@ -31,36 +31,45 @@ pub const Config = struct {
         return null;
     }
 
-    /// Push the keybind table into the ObjC shim so the CGEventTap
-    /// matches against it instead of hardcoded binds.
-    pub fn applyKeybinds(self: *const Config) void {
-        const max = 128;
-        var c_binds: [max]shim.bw_keybind = undefined;
-        var count: u32 = 0;
-
-        for (self.keybinds) |kb| {
-            const keycode = keyNameToCode(kb.key) orelse {
-                log.warn("unknown key name: {s}", .{kb.key});
-                continue;
-            };
-            var mods: u8 = 0;
-            if (kb.mods.alt) mods |= shim.BW_MOD_ALT;
-            if (kb.mods.shift) mods |= shim.BW_MOD_SHIFT;
-            if (kb.mods.cmd) mods |= shim.BW_MOD_CMD;
-            if (kb.mods.ctrl) mods |= shim.BW_MOD_CTRL;
-
-            c_binds[count] = .{
-                .keycode = keycode,
-                .mods = mods,
-                .action = @intFromEnum(kb.action),
-                .arg = kb.arg,
-            };
-            count += 1;
-            if (count >= max) break;
+    /// Build the effective keybind table without allocating. Defaults are
+    /// applied first; config entries with the same trigger replace them.
+    fn buildKeybinds(self: *const Config, table: *KeybindTable) []const shim.bw_keybind {
+        var count: usize = 0;
+        mergeKeybinds(default_keybinds[0..], table.storage, &count);
+        if (!isDefaultKeybindSlice(self.keybinds)) {
+            mergeKeybinds(self.keybinds, table.storage, &count);
         }
+        return table.storage[0..count];
+    }
 
-        shim.bw_set_keybinds(&c_binds, count);
-        log.info("applied {d} keybinds", .{count});
+    /// Push the keybind table into the hotkey shim so the CGEventTap
+    /// matches against it instead of hardcoded binds. The shim keeps a
+    /// reference to the table (no copy), so `table` must stay alive for as
+    /// long as the event tap can fire.
+    pub fn applyKeybinds(self: *const Config, table: *KeybindTable) void {
+        const binds = self.buildKeybinds(table);
+        shim.bw_set_keybinds(binds.ptr, @intCast(binds.len));
+        log.info("applied {d} keybinds", .{binds.len});
+    }
+};
+
+/// Caller-owned storage for the compiled keybind table referenced by the
+/// hotkey shim. Capacity is computed from the config instead of using a fixed
+/// cap. Must outlive the hotkey event tap; deinit only after the run loop
+/// has exited.
+pub const KeybindTable = struct {
+    storage: []shim.bw_keybind,
+
+    pub fn init(allocator: std.mem.Allocator, config: *const Config) !KeybindTable {
+        const configured_count: usize = if (isDefaultKeybindSlice(config.keybinds)) 0 else config.keybinds.len;
+        return .{
+            .storage = try allocator.alloc(shim.bw_keybind, default_keybind_count + configured_count),
+        };
+    }
+
+    pub fn deinit(self: *KeybindTable, allocator: std.mem.Allocator) void {
+        allocator.free(self.storage);
+        self.* = undefined;
     }
 };
 
@@ -173,6 +182,100 @@ const default_keybinds: [default_keybind_count]Keybind = blk: {
     break :blk binds;
 };
 
+// Runs unconditionally at compile time; a bad default fails the build even
+// if nothing in the current compilation references default_keybinds.
+comptime {
+    assertValidTriggers(&default_keybinds);
+}
+
+/// Comptime-only validation: every keybind must use a known key name and a
+/// unique keycode+mods trigger. The event tap dispatches on first match, so
+/// a duplicate trigger would silently shadow another binding.
+fn assertValidTriggers(comptime binds: []const Keybind) void {
+    // The comptime block forces a compile error if this is ever called in a
+    // runtime context instead of silently generating runtime code.
+    comptime {
+        @setEvalBranchQuota(50_000);
+        var keycodes: [binds.len]u16 = undefined;
+        for (binds, 0..) |bind, i| {
+            keycodes[i] = keyNameToCode(bind.key) orelse
+                @compileError("keybind uses unknown key name: " ++ bind.key);
+        }
+        for (0..binds.len) |a| {
+            for (a + 1..binds.len) |b| {
+                if (keycodes[a] == keycodes[b] and std.meta.eql(binds[a].mods, binds[b].mods))
+                    @compileError(std.fmt.comptimePrint(
+                        "duplicate keybind trigger {s}{s}: {s} shadows {s}",
+                        .{
+                            modsLabel(binds[a].mods),
+                            binds[a].key,
+                            @tagName(binds[a].action),
+                            @tagName(binds[b].action),
+                        },
+                    ));
+            }
+        }
+    }
+}
+
+/// Comptime-only helper for validation diagnostics: renders mods as a
+/// "ctrl+alt+" style prefix.
+fn modsLabel(comptime mods: Mods) []const u8 {
+    comptime {
+        var label: []const u8 = "";
+        if (mods.cmd) label = label ++ "cmd+";
+        if (mods.ctrl) label = label ++ "ctrl+";
+        if (mods.alt) label = label ++ "alt+";
+        if (mods.shift) label = label ++ "shift+";
+        return label;
+    }
+}
+
+fn keybindToShim(keybind: Keybind) ?shim.bw_keybind {
+    const keycode = keyNameToCode(keybind.key) orelse {
+        log.warn("unknown key name: {s}", .{keybind.key});
+        return null;
+    };
+    var mods: u8 = 0;
+    if (keybind.mods.alt) mods |= shim.BW_MOD_ALT;
+    if (keybind.mods.shift) mods |= shim.BW_MOD_SHIFT;
+    if (keybind.mods.cmd) mods |= shim.BW_MOD_CMD;
+    if (keybind.mods.ctrl) mods |= shim.BW_MOD_CTRL;
+
+    return .{
+        .keycode = keycode,
+        .mods = mods,
+        .action = @intFromEnum(keybind.action),
+        .arg = keybind.arg,
+    };
+}
+
+fn mergeKeybinds(keybinds: []const Keybind, storage: []shim.bw_keybind, count: *usize) void {
+    for (keybinds) |keybind| {
+        const c_bind = keybindToShim(keybind) orelse continue;
+        if (keybindIndex(storage[0..count.*], c_bind)) |i| {
+            storage[i] = c_bind;
+            continue;
+        }
+
+        std.debug.assert(count.* < storage.len);
+        storage[count.*] = c_bind;
+        count.* += 1;
+    }
+}
+
+fn keybindIndex(bindings: []const shim.bw_keybind, target: shim.bw_keybind) ?usize {
+    for (bindings, 0..) |keybind, i| {
+        if (keybind.keycode == target.keycode and keybind.mods == target.mods) return i;
+    }
+    return null;
+}
+
+fn isDefaultKeybindSlice(keybinds: []const Keybind) bool {
+    const defaults = default_keybinds[0..];
+    return keybinds.len == defaults.len and keybinds.ptr == defaults.ptr;
+}
+
 // Loading
 
 pub fn load(allocator: std.mem.Allocator, explicit_path: ?[]const u8) Config {
@@ -221,7 +324,7 @@ fn loadFromPath(allocator: std.mem.Allocator, path: []const u8) ?Config {
         return null;
     };
 
-    log.info("loaded config: {d} keybinds, {d} workspace assignments", .{
+    log.info("loaded config: {d} keybind entries, {d} workspace assignments", .{
         parsed.keybinds.len,
         parsed.workspace_assignments.len,
     });
@@ -357,6 +460,80 @@ test "default_keybinds" {
     try t.expectEqual(Action.focus_next_workspace, default_keybinds[24].action);
     try t.expect(default_keybinds[24].mods.ctrl);
     try t.expect(std.mem.eql(u8, "right", default_keybinds[24].key));
+}
+
+test "buildKeybinds merges custom keybinds with defaults" {
+    const custom_keybinds: []const Keybind = &.{
+        .{ .key = "1", .mods = .{ .alt = true }, .action = .focus_workspace, .arg = 9 },
+        .{ .key = "f", .mods = .{ .alt = true }, .action = .toggle_fullscreen },
+    };
+    const cfg: Config = .{ .keybinds = custom_keybinds };
+    var table = try KeybindTable.init(t.allocator, &cfg);
+    defer table.deinit(t.allocator);
+
+    const merged = cfg.buildKeybinds(&table);
+
+    try t.expectEqual(@as(usize, default_keybind_count + custom_keybinds.len), table.storage.len);
+    try t.expectEqual(@as(usize, default_keybind_count + 1), merged.len);
+    try t.expectEqual(keyNameToCode("1").?, merged[0].keycode);
+    try t.expectEqual(shim.BW_MOD_ALT, merged[0].mods);
+    try t.expectEqual(@intFromEnum(Action.focus_workspace), merged[0].action);
+    try t.expectEqual(@as(u32, 9), merged[0].arg);
+    try t.expectEqual(keyNameToCode("f").?, merged[default_keybind_count].keycode);
+    try t.expectEqual(@intFromEnum(Action.toggle_fullscreen), merged[default_keybind_count].action);
+}
+
+test "buildKeybinds: override matches on mods, not just key" {
+    // alt+shift+1 (move_to_workspace, defaults index 9) overridden; alt+1
+    // (focus_workspace, defaults index 0) must be untouched.
+    const custom_keybinds: []const Keybind = &.{
+        .{ .key = "1", .mods = .{ .alt = true, .shift = true }, .action = .toggle_fullscreen },
+    };
+    const cfg: Config = .{ .keybinds = custom_keybinds };
+    var table = try KeybindTable.init(t.allocator, &cfg);
+    defer table.deinit(t.allocator);
+
+    const merged = cfg.buildKeybinds(&table);
+
+    try t.expectEqual(@as(usize, default_keybind_count), merged.len);
+    try t.expectEqual(@intFromEnum(Action.focus_workspace), merged[0].action);
+    try t.expectEqual(@as(u32, 1), merged[0].arg);
+    try t.expectEqual(shim.BW_MOD_ALT | shim.BW_MOD_SHIFT, merged[9].mods);
+    try t.expectEqual(@intFromEnum(Action.toggle_fullscreen), merged[9].action);
+}
+
+test "buildKeybinds: duplicate config triggers collapse, last wins" {
+    const custom_keybinds: []const Keybind = &.{
+        .{ .key = "f", .mods = .{ .alt = true }, .action = .toggle_fullscreen },
+        .{ .key = "f", .mods = .{ .alt = true }, .action = .toggle_split },
+    };
+    const cfg: Config = .{ .keybinds = custom_keybinds };
+    var table = try KeybindTable.init(t.allocator, &cfg);
+    defer table.deinit(t.allocator);
+
+    const merged = cfg.buildKeybinds(&table);
+
+    try t.expectEqual(@as(usize, default_keybind_count + 1), merged.len);
+    try t.expectEqual(keyNameToCode("f").?, merged[default_keybind_count].keycode);
+    try t.expectEqual(@intFromEnum(Action.toggle_split), merged[default_keybind_count].action);
+}
+
+test "buildKeybinds: unknown key name is skipped without consuming a slot" {
+    // The unknown key deliberately triggers the warn log path; raise the
+    // test log threshold so expected output does not pollute `zig build test`.
+    std.testing.log_level = .err;
+    const custom_keybinds: []const Keybind = &.{
+        .{ .key = "hyper", .mods = .{ .alt = true }, .action = .toggle_fullscreen },
+        .{ .key = "f", .mods = .{ .alt = true }, .action = .toggle_fullscreen },
+    };
+    const cfg: Config = .{ .keybinds = custom_keybinds };
+    var table = try KeybindTable.init(t.allocator, &cfg);
+    defer table.deinit(t.allocator);
+
+    const merged = cfg.buildKeybinds(&table);
+
+    try t.expectEqual(@as(usize, default_keybind_count + 1), merged.len);
+    try t.expectEqual(keyNameToCode("f").?, merged[default_keybind_count].keycode);
 }
 
 test "loadFromPath: missing file" {
