@@ -753,6 +753,18 @@ fn switchToWindowWorkspaceIfHidden(win: window_mod.Window) void {
     switchWorkspace(win.workspace_id);
 }
 
+/// During a workspace transition, AX focus events from non-target
+/// workspaces/displays are lagging or synthetic (hide/retile side effects,
+/// native-tab ID swaps). Recording them would clobber the source workspace's
+/// remembered focus, so switching back would focus the wrong window.
+fn shouldRecordWorkspaceFocusForWindow(win: window_mod.Window) bool {
+    if (!g_workspace_transition.isActive()) return true;
+
+    const transition = g_workspace_transition;
+    return win.workspace_id == transition.target_workspace_id and
+        win.display_id == transition.target_display_id;
+}
+
 fn syncFocusStateForWindowId(focused_wid: u32, source: FocusEventSource) bool {
     std.debug.assert(focused_wid != 0);
 
@@ -766,11 +778,25 @@ fn syncFocusStateForWindowId(focused_wid: u32, source: FocusEventSource) bool {
     // before this point so same-process windows do not overwrite each other.
     g_tab_groups.setActive(focused_wid);
     _ = maybeSetFocusedDisplayForWindow(win, source);
-    if (g_workspaces.get(win.workspace_id)) |ws| {
-        ws.focused_wid = leader;
+    if (shouldRecordWorkspaceFocusForWindow(win)) {
+        if (g_workspaces.get(win.workspace_id)) |ws| {
+            ws.recordFocus(leader);
+        }
+        setLayoutLeafActive(win.workspace_id, focused_wid);
+    } else {
+        const transition = g_workspace_transition;
+        log.debug("workspace transition focus memory skipped epoch={d} wid={d} leader={d} source={s} workspace={d} display={d} target_workspace={d} target_display={d}", .{
+            transition.epoch,
+            focused_wid,
+            leader,
+            @tagName(source),
+            win.workspace_id,
+            win.display_id,
+            transition.target_workspace_id,
+            transition.target_display_id,
+        });
     }
     switchToWindowWorkspaceIfHidden(win);
-    setLayoutLeafActive(win.workspace_id, focused_wid);
 
     return true;
 }
@@ -3596,7 +3622,7 @@ fn discoverWindows() void {
     // Ensure a focused window is set on the active workspace
     const active_ws = g_workspaces.active();
     if (active_ws.focused_wid == null and active_ws.windows.items.len > 0) {
-        active_ws.focused_wid = active_ws.windows.items[0];
+        active_ws.recordFocus(active_ws.windows.items[0]);
     }
 }
 
@@ -3717,7 +3743,7 @@ fn addNewWindowManagedWithAssignment(pid: i32, wid: u32, workspace_id: u8, assig
     if (mode == .tiled) {
         insertIntoLayout(ws.id, wid);
     }
-    ws.focused_wid = wid;
+    ws.recordFocus(wid);
 
     // If assigned to a non-visible workspace, hide immediately
     if (!workspaceVisibleOnDisplay(ws.id, display_id)) {
@@ -3946,7 +3972,7 @@ fn tryFormTabGroupOnCreate(pid: i32, new_wid: u32) bool {
             // Also discover any other background tabs
             discoverBackgroundTabs(pid, group_id, new_frame, ws.id, existing.display_id);
 
-            ws.focused_wid = existing_wid; // leader stays
+            ws.recordFocus(existing_wid); // leader stays
             log.info("tryFormTabGroup: formed group leader={d} active={d} members={d}", .{
                 existing_wid,
                 new_wid,
@@ -4409,7 +4435,7 @@ fn reconcileDisplayChange() void {
 
         if (g_workspaces.get(target_workspace_id)) |target_ws| {
             target_ws.addWindow(win.wid) catch {};
-            if (target_ws.focused_wid == null) target_ws.focused_wid = win.wid;
+            if (target_ws.focused_wid == null) target_ws.recordFocus(win.wid);
         }
         if (win.mode == .tiled) {
             insertIntoLayout(target_workspace_id, win.wid);
@@ -4810,7 +4836,7 @@ fn checkTabDragOut(_: i32, wid: u32) void {
         ws.addWindow(wid) catch return;
         insertIntoLayout(win.workspace_id, wid);
     }
-    ws.focused_wid = wid;
+    ws.recordFocus(wid);
     _ = maybeSetFocusedDisplayForWindow(win, .drag);
 
     // If the group dissolved, verify the survivor is still managed
@@ -4997,7 +5023,7 @@ fn focusWorkspaceWindow(ws: *workspace_mod.Workspace) void {
                 });
             }
             _ = shim.bw_ax_focus_window(win.pid, actual_wid);
-            ws.focused_wid = fwid;
+            ws.recordFocus(fwid);
             _ = maybeSetFocusedDisplayForWindow(win, .keyboard);
         }
     }
@@ -5072,7 +5098,7 @@ fn moveWindowToWorkspace(target_id: u8) void {
         insertIntoLayout(target_id, wid);
     }
     if (target_ws.focused_wid == null) {
-        target_ws.focused_wid = wid;
+        target_ws.recordFocus(wid);
     }
 
     // Update window metadata. Use the target workspace's display so that
@@ -5136,7 +5162,7 @@ fn moveManagedWindowToDisplay(wid: u32, target_display_id: u32) bool {
 
         removeFromLayout(source_workspace_id, wid);
         source_ws.removeWindow(wid);
-        target_ws.focused_wid = wid;
+        target_ws.recordFocus(wid);
         if (updated.mode == .tiled) {
             insertIntoLayout(target_workspace_id, wid);
         }
@@ -5327,7 +5353,7 @@ fn focusDirection(dir: FocusDir) void {
         const actual_wid = g_tab_groups.resolveActive(wid);
         if (g_store.get(actual_wid)) |win| {
             _ = shim.bw_ax_focus_window(win.pid, actual_wid);
-            ws.focused_wid = wid; // track the leader
+            ws.recordFocus(wid); // track the leader
             _ = maybeSetFocusedDisplayForWindow(win, .keyboard);
             setLayoutLeafActive(win.workspace_id, actual_wid);
         }
@@ -5343,7 +5369,7 @@ fn focusDirection(dir: FocusDir) void {
     if (layout.stackNeighbor(root, focused_wid, stack_forward)) |stack_wid| {
         if (g_store.get(stack_wid)) |win| {
             _ = shim.bw_ax_focus_window(win.pid, stack_wid);
-            ws.focused_wid = stack_wid;
+            ws.recordFocus(stack_wid);
             _ = maybeSetFocusedDisplayForWindow(win, .keyboard);
             setLayoutLeafActive(win.workspace_id, stack_wid);
         }
