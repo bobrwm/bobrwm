@@ -183,6 +183,55 @@ const default_keybinds: [default_keybind_count]Keybind = blk: {
     break :blk binds;
 };
 
+// Runs unconditionally at compile time; a bad default fails the build even
+// if nothing in the current compilation references default_keybinds.
+comptime {
+    assertValidTriggers(&default_keybinds);
+}
+
+/// Comptime-only validation: every keybind must use a known key name and a
+/// unique keycode+mods trigger. The event tap dispatches on first match, so
+/// a duplicate trigger would silently shadow another binding.
+fn assertValidTriggers(comptime binds: []const Keybind) void {
+    // The comptime block forces a compile error if this is ever called in a
+    // runtime context instead of silently generating runtime code.
+    comptime {
+        @setEvalBranchQuota(50_000);
+        var keycodes: [binds.len]u16 = undefined;
+        for (binds, 0..) |bind, i| {
+            keycodes[i] = keyNameToCode(bind.key) orelse
+                @compileError("keybind uses unknown key name: " ++ bind.key);
+        }
+        for (0..binds.len) |a| {
+            for (a + 1..binds.len) |b| {
+                if (keycodes[a] == keycodes[b] and std.meta.eql(binds[a].mods, binds[b].mods))
+                    @compileError(std.fmt.comptimePrint(
+                        "duplicate keybind trigger {s}{s}: {s} shadows {s}",
+                        .{
+                            modsLabel(binds[a].mods),
+                            binds[a].key,
+                            @tagName(binds[a].action),
+                            @tagName(binds[b].action),
+                        },
+                    ));
+            }
+        }
+    }
+}
+
+/// Comptime-only helper for validation diagnostics: renders mods as a
+/// "ctrl+alt+" style prefix.
+fn modsLabel(comptime mods: Mods) []const u8 {
+    comptime {
+        var label: []const u8 = "";
+        if (mods.cmd) label = label ++ "cmd+";
+        if (mods.ctrl) label = label ++ "ctrl+";
+        if (mods.alt) label = label ++ "alt+";
+        if (mods.shift) label = label ++ "shift+";
+        return label;
+    }
+}
+
 fn keybindToShim(keybind: Keybind) ?shim.bw_keybind {
     const keycode = keyNameToCode(keybind.key) orelse {
         log.warn("unknown key name: {s}", .{keybind.key});
@@ -434,23 +483,6 @@ test "buildKeybinds merges custom keybinds with defaults" {
     try t.expectEqual(@as(u32, 9), merged[0].arg);
     try t.expectEqual(keyNameToCode("f").?, merged[default_keybind_count].keycode);
     try t.expectEqual(@intFromEnum(Action.toggle_fullscreen), merged[default_keybind_count].action);
-}
-
-test "buildKeybinds: default config compiles exactly the defaults, no duplicates" {
-    const cfg: Config = .{};
-    var table = try KeybindTable.init(t.allocator, &cfg);
-    defer table.deinit(t.allocator);
-
-    const merged = cfg.buildKeybinds(&table);
-
-    try t.expectEqual(@as(usize, default_keybind_count), merged.len);
-    // Every trigger (keycode + mods) must be unique; a duplicate would make
-    // the event tap's first-match dispatch ambiguous.
-    for (merged, 0..) |bind, i| {
-        for (merged[i + 1 ..]) |other| {
-            try t.expect(bind.keycode != other.keycode or bind.mods != other.mods);
-        }
-    }
 }
 
 test "buildKeybinds: override matches on mods, not just key" {
