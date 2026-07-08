@@ -43,9 +43,10 @@ pub const Config = struct {
         return table.storage[0..count];
     }
 
-    /// Push the keybind table into the ObjC shim so the CGEventTap
-    /// matches against it instead of hardcoded binds. The caller owns storage
-    /// so config loading does not allocate a second keybind table.
+    /// Push the keybind table into the hotkey shim so the CGEventTap
+    /// matches against it instead of hardcoded binds. The shim keeps a
+    /// reference to the table (no copy), so `table` must stay alive for as
+    /// long as the event tap can fire.
     pub fn applyKeybinds(self: *const Config, table: *KeybindTable) void {
         const binds = self.buildKeybinds(table);
         shim.bw_set_keybinds(binds.ptr, @intCast(binds.len));
@@ -53,8 +54,10 @@ pub const Config = struct {
     }
 };
 
-/// Caller-owned storage for the compiled keybind table passed to the hotkey
-/// shim. Capacity is computed from the config instead of using a fixed cap.
+/// Caller-owned storage for the compiled keybind table referenced by the
+/// hotkey shim. Capacity is computed from the config instead of using a fixed
+/// cap. Must outlive the hotkey event tap; deinit only after the run loop
+/// has exited.
 pub const KeybindTable = struct {
     storage: []shim.bw_keybind,
 

@@ -1186,8 +1186,10 @@ var g_drag_reconcile_on_drop = false;
 var g_last_focused_pid: i32 = 0;
 var g_last_space_changed_at_s: f64 = 0;
 var g_last_display_changed_at_s: f64 = 0;
-var g_hotkey_bindings: [128]shim.bw_keybind = undefined;
-var g_hotkey_binding_count: u32 = 0;
+/// Compiled keybind table referenced (not copied) by the hotkey event tap.
+/// The caller of bw_set_keybinds owns the storage and must keep it alive for
+/// as long as the event tap can fire; main's KeybindTable guarantees this.
+var g_hotkey_bindings: []const shim.bw_keybind = &.{};
 var g_waker_source: c.CFRunLoopSourceRef = null;
 var g_role_poll_source: c.dispatch_source_t = null;
 var g_ipc_source: c.dispatch_source_t = null;
@@ -2113,36 +2115,23 @@ export fn bw_hotkey_mouse_up() void {
     bw_emit_event(shim.BW_EVENT_MOUSE_UP, 0, 0);
 }
 
-/// Accept keybind table from config and keep it in Zig-owned state.
+/// Accept the keybind table from config. Stores a reference to caller-owned
+/// storage instead of copying, so the table has no fixed size cap. Must be
+/// called on the main thread before the hotkey event tap is installed.
 export fn bw_set_keybinds(binds: ?[*]const shim.bw_keybind, count: u32) void {
-    if (count == 0) {
-        g_hotkey_binding_count = 0;
-        return;
-    }
+    std.debug.assert(g_tap_port == null);
 
     const src = binds orelse {
-        g_hotkey_binding_count = 0;
+        g_hotkey_bindings = &.{};
         return;
     };
 
-    const max_count: u32 = @intCast(g_hotkey_bindings.len);
-    const clamped_count_u32: u32 = @min(count, max_count);
-    const clamped_count: usize = @intCast(clamped_count_u32);
-
-    @memcpy(g_hotkey_bindings[0..clamped_count], src[0..clamped_count]);
-    g_hotkey_binding_count = clamped_count_u32;
-
-    std.debug.assert(g_hotkey_binding_count <= max_count);
+    g_hotkey_bindings = src[0..count];
 }
 
 /// Resolve a key press against current keybinds and emit matching action.
 export fn bw_hotkey_handle_keydown(keycode: u16, mods: u8) bool {
-    const total: usize = @intCast(g_hotkey_binding_count);
-    std.debug.assert(total <= g_hotkey_bindings.len);
-
-    var i: usize = 0;
-    while (i < total) : (i += 1) {
-        const binding = g_hotkey_bindings[i];
+    for (g_hotkey_bindings) |binding| {
         if (binding.keycode != keycode) continue;
         if (binding.mods != mods) continue;
 
