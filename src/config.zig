@@ -436,6 +436,76 @@ test "buildKeybinds merges custom keybinds with defaults" {
     try t.expectEqual(@intFromEnum(Action.toggle_fullscreen), merged[default_keybind_count].action);
 }
 
+test "buildKeybinds: default config compiles exactly the defaults, no duplicates" {
+    const cfg: Config = .{};
+    var table = try KeybindTable.init(t.allocator, &cfg);
+    defer table.deinit(t.allocator);
+
+    const merged = cfg.buildKeybinds(&table);
+
+    try t.expectEqual(@as(usize, default_keybind_count), merged.len);
+    // Every trigger (keycode + mods) must be unique; a duplicate would make
+    // the event tap's first-match dispatch ambiguous.
+    for (merged, 0..) |bind, i| {
+        for (merged[i + 1 ..]) |other| {
+            try t.expect(bind.keycode != other.keycode or bind.mods != other.mods);
+        }
+    }
+}
+
+test "buildKeybinds: override matches on mods, not just key" {
+    // alt+shift+1 (move_to_workspace, defaults index 9) overridden; alt+1
+    // (focus_workspace, defaults index 0) must be untouched.
+    const custom_keybinds: []const Keybind = &.{
+        .{ .key = "1", .mods = .{ .alt = true, .shift = true }, .action = .toggle_fullscreen },
+    };
+    const cfg: Config = .{ .keybinds = custom_keybinds };
+    var table = try KeybindTable.init(t.allocator, &cfg);
+    defer table.deinit(t.allocator);
+
+    const merged = cfg.buildKeybinds(&table);
+
+    try t.expectEqual(@as(usize, default_keybind_count), merged.len);
+    try t.expectEqual(@intFromEnum(Action.focus_workspace), merged[0].action);
+    try t.expectEqual(@as(u32, 1), merged[0].arg);
+    try t.expectEqual(shim.BW_MOD_ALT | shim.BW_MOD_SHIFT, merged[9].mods);
+    try t.expectEqual(@intFromEnum(Action.toggle_fullscreen), merged[9].action);
+}
+
+test "buildKeybinds: duplicate config triggers collapse, last wins" {
+    const custom_keybinds: []const Keybind = &.{
+        .{ .key = "f", .mods = .{ .alt = true }, .action = .toggle_fullscreen },
+        .{ .key = "f", .mods = .{ .alt = true }, .action = .toggle_split },
+    };
+    const cfg: Config = .{ .keybinds = custom_keybinds };
+    var table = try KeybindTable.init(t.allocator, &cfg);
+    defer table.deinit(t.allocator);
+
+    const merged = cfg.buildKeybinds(&table);
+
+    try t.expectEqual(@as(usize, default_keybind_count + 1), merged.len);
+    try t.expectEqual(keyNameToCode("f").?, merged[default_keybind_count].keycode);
+    try t.expectEqual(@intFromEnum(Action.toggle_split), merged[default_keybind_count].action);
+}
+
+test "buildKeybinds: unknown key name is skipped without consuming a slot" {
+    // The unknown key deliberately triggers the warn log path; raise the
+    // test log threshold so expected output does not pollute `zig build test`.
+    std.testing.log_level = .err;
+    const custom_keybinds: []const Keybind = &.{
+        .{ .key = "hyper", .mods = .{ .alt = true }, .action = .toggle_fullscreen },
+        .{ .key = "f", .mods = .{ .alt = true }, .action = .toggle_fullscreen },
+    };
+    const cfg: Config = .{ .keybinds = custom_keybinds };
+    var table = try KeybindTable.init(t.allocator, &cfg);
+    defer table.deinit(t.allocator);
+
+    const merged = cfg.buildKeybinds(&table);
+
+    try t.expectEqual(@as(usize, default_keybind_count + 1), merged.len);
+    try t.expectEqual(keyNameToCode("f").?, merged[default_keybind_count].keycode);
+}
+
 test "loadFromPath: missing file" {
     try t.expectEqual(@as(?Config, null), loadFromPath(t.allocator, "/tmp/bobrwm_no_such_file.zon"));
 }
