@@ -484,7 +484,10 @@ fn pushDimSnapshot() void {
         const ws_id = g_workspaces.activeIdForDisplaySlot(slot);
         const ws = g_workspaces.get(ws_id) orelse continue;
         const wid = ws.focused_wid orelse continue;
-        focused[fn_count] = wid;
+        // Workspace focus records the tab-group leader, but the window on
+        // screen (and in `entries`) is the group's active tab. Resolve so a
+        // focused non-leader tab is exempted instead of dimmed.
+        focused[fn_count] = g_tab_groups.resolveActive(wid);
         fn_count += 1;
     }
 
