@@ -547,6 +547,10 @@ fn clearWorkspaceTransition() void {
     };
     g_workspace_transition_completion_reason = .none;
     g_pending_focus_count = 0;
+
+    // Suppression of move/resize events ends here; pick up any frames the
+    // apps clamped (minimum sizes) while their events were being dropped.
+    reconcileVisibleFramesFromWindowServer();
 }
 
 fn markWorkspaceTransitionComplete(reason: WorkspaceTransitionCompletionReason) void {
@@ -875,6 +879,49 @@ fn syncFocusStateForWindowId(focused_wid: u32, source: FocusEventSource) bool {
     switchToWindowWorkspaceIfHidden(win);
 
     return true;
+}
+
+/// Refresh stored frames of visible managed windows from WindowServer bounds.
+///
+/// Move/resize events are suppressed while a workspace transition is active,
+/// so a retile whose target is smaller than an app's minimum size (the app
+/// clamps the resize) leaves the store holding the intended tile frame while
+/// the real window is larger. Nothing re-reads the frame after the transition,
+/// so frame consumers such as the dimming overlays stay mismatched until the
+/// app happens to emit another move/resize. Called when a transition clears —
+/// the moment suppression ends — to converge the store on physical geometry.
+fn reconcileVisibleFramesFromWindowServer() void {
+    const sky = g_sky orelse return;
+    const conn = sky.mainConnectionID();
+
+    var it = g_store.windows.valueIterator();
+    while (it.next()) |win| {
+        if (!isVisibleManaged(win)) continue;
+
+        var rect: skylight.CGRect = undefined;
+        if (sky.getWindowBounds(conn, win.wid, &rect) != 0) continue;
+
+        const frame: window_mod.Window.Frame = .{
+            .x = rect.origin.x,
+            .y = rect.origin.y,
+            .width = rect.size.width,
+            .height = rect.size.height,
+        };
+        if (framesEqual(win.frame, frame)) continue;
+
+        log.debug("frame reconcile wid={d} stored x={d:.0} y={d:.0} w={d:.0} h={d:.0} actual x={d:.0} y={d:.0} w={d:.0} h={d:.0}", .{
+            win.wid,
+            win.frame.x,
+            win.frame.y,
+            win.frame.width,
+            win.frame.height,
+            frame.x,
+            frame.y,
+            frame.width,
+            frame.height,
+        });
+        win.frame = frame;
+    }
 }
 
 fn tickWorkspaceTransitionState() void {
