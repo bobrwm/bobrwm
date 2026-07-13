@@ -33,7 +33,7 @@
     //     .reverse = false,
     // },
 
-    // Dim every visible window except the focused one by drawing a black,
+    // ALPHA: Dim every visible window except the focused one by drawing a black,
     // click-through overlay over each inactive window. Works without disabling
     // SIP. `level` is the overlay opacity in [0, 1] (0 = none, 1 = fully black).
     // .dimmed_inactive = .{
