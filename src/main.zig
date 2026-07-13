@@ -15,6 +15,7 @@ const ipc = @import("ipc.zig");
 const tabgroup = @import("tabgroup.zig");
 const cli = @import("cli.zig");
 const config_mod = @import("config.zig");
+const dim = @import("dim.zig");
 const statusbar = @import("statusbar.zig");
 const tile_preview = @import("tile_preview.zig");
 const ax_observer = @import("ax_observer.zig");
@@ -440,6 +441,59 @@ fn workspaceVisibleAnywhere(workspace_id: u8) bool {
     return false;
 }
 
+/// A managed window is "visible" for borders/dimming when it is on a visible
+/// workspace and is not a suppressed tab member. Shared predicate so the
+/// borders and dimming snapshots stay in agreement about what is on screen.
+fn isVisibleManaged(win: *const window_mod.Window) bool {
+    if (g_tab_groups.isSuppressed(win.wid)) return false;
+    return workspaceVisibleOnDisplay(win.workspace_id, win.display_id);
+}
+
+/// Dim every visible managed window except the focused one with black overlay
+/// panels. Callers must gate on `dim.enabled`. Uses the store's settled frames
+/// directly (no WindowServer round-trip): retile and move/resize events have
+/// already synchronized them by the time this runs at the end of the drain.
+fn pushDimSnapshot() void {
+    // Precondition: callers gate on dim.enabled, so the disabled feature never
+    // reaches the window-scan loops below. Assert rather than early-return so
+    // the invariant is documented and compiles out in release builds.
+    std.debug.assert(dim.enabled);
+
+    var entries: [256]dim.Entry = undefined;
+    var n: usize = 0;
+    var it = g_store.windows.valueIterator();
+    while (it.next()) |win| {
+        if (n >= entries.len) break;
+        if (!isVisibleManaged(win)) continue;
+        entries[n] = .{
+            .wid = win.wid,
+            .x = win.frame.x,
+            .y = win.frame.y,
+            .w = win.frame.width,
+            .h = win.frame.height,
+        };
+        n += 1;
+    }
+
+    // Keep the focused window of every display's visible workspace bright, not
+    // just the single globally-focused one, so a multi-display active window
+    // is not dimmed.
+    var focused: [g_displays.len]u32 = undefined;
+    var fn_count: usize = 0;
+    for (0..g_display_count) |slot| {
+        const ws_id = g_workspaces.activeIdForDisplaySlot(slot);
+        const ws = g_workspaces.get(ws_id) orelse continue;
+        const wid = ws.focused_wid orelse continue;
+        // Workspace focus records the tab-group leader, but the window on
+        // screen (and in `entries`) is the group's active tab. Resolve so a
+        // focused non-leader tab is exempted instead of dimmed.
+        focused[fn_count] = g_tab_groups.resolveActive(wid);
+        fn_count += 1;
+    }
+
+    dim.apply(focused[0..fn_count], entries[0..n]);
+}
+
 fn focusedDisplayId() u32 {
     if (g_display_count == 0) return 1;
     const slot = g_workspaces.focused_display_slot;
@@ -496,6 +550,10 @@ fn clearWorkspaceTransition() void {
     };
     g_workspace_transition_completion_reason = .none;
     g_pending_focus_count = 0;
+
+    // Suppression of move/resize events ends here; pick up any frames the
+    // apps clamped (minimum sizes) while their events were being dropped.
+    reconcileVisibleFramesFromWindowServer();
 }
 
 fn markWorkspaceTransitionComplete(reason: WorkspaceTransitionCompletionReason) void {
@@ -824,6 +882,49 @@ fn syncFocusStateForWindowId(focused_wid: u32, source: FocusEventSource) bool {
     switchToWindowWorkspaceIfHidden(win);
 
     return true;
+}
+
+/// Refresh stored frames of visible managed windows from WindowServer bounds.
+///
+/// Move/resize events are suppressed while a workspace transition is active,
+/// so a retile whose target is smaller than an app's minimum size (the app
+/// clamps the resize) leaves the store holding the intended tile frame while
+/// the real window is larger. Nothing re-reads the frame after the transition,
+/// so frame consumers such as the dimming overlays stay mismatched until the
+/// app happens to emit another move/resize. Called when a transition clears —
+/// the moment suppression ends — to converge the store on physical geometry.
+fn reconcileVisibleFramesFromWindowServer() void {
+    const sky = g_sky orelse return;
+    const conn = sky.mainConnectionID();
+
+    var it = g_store.windows.valueIterator();
+    while (it.next()) |win| {
+        if (!isVisibleManaged(win)) continue;
+
+        var rect: skylight.CGRect = undefined;
+        if (sky.getWindowBounds(conn, win.wid, &rect) != 0) continue;
+
+        const frame: window_mod.Window.Frame = .{
+            .x = rect.origin.x,
+            .y = rect.origin.y,
+            .width = rect.size.width,
+            .height = rect.size.height,
+        };
+        if (framesEqual(win.frame, frame)) continue;
+
+        log.debug("frame reconcile wid={d} stored x={d:.0} y={d:.0} w={d:.0} h={d:.0} actual x={d:.0} y={d:.0} w={d:.0} h={d:.0}", .{
+            win.wid,
+            win.frame.x,
+            win.frame.y,
+            win.frame.width,
+            win.frame.height,
+            frame.x,
+            frame.y,
+            frame.width,
+            frame.height,
+        });
+        win.frame = frame;
+    }
 }
 
 fn tickWorkspaceTransitionState() void {
@@ -2277,6 +2378,9 @@ pub fn main(init: std.process.Init.Minimal) !void {
     defer keybind_table.deinit(config_arena.allocator());
     g_config.applyKeybinds(&keybind_table);
 
+    // Inactive-window dimming via SkyLight (SLSSetWindowListBrightness).
+    dim.configure(g_config.dimmed_inactive);
+
     // -- Accessibility check --
     if (!shim.bw_ax_is_trusted()) {
         log.warn("accessibility not trusted — prompting user", .{});
@@ -2427,6 +2531,12 @@ export fn bw_drain_events() void {
         requestRetileAllDisplays();
         flushRetileRequests();
     }
+
+    // Same settled point: dim inactive windows (diffed, no-op if unchanged).
+    // Guard at the call site so a disabled feature costs exactly one branch
+    // here and never enters the snapshot path — no call, no loop, no reliance
+    // on the optimizer eliding a no-op body.
+    if (dim.enabled) pushDimSnapshot();
 
     // Honour pending Ctrl-C / SIGTERM by exiting NSApp.run cleanly so the
     // deferred cleanup (IPC socket unlink, layout free, restoreAllWindows)
@@ -3105,6 +3215,13 @@ fn handleEvent(ev: *const event_mod.Event) void {
             const win = g_store.get(focused) orelse return;
             const target: window_mod.WindowMode = if (win.mode != .tiled) .tiled else .floating;
             setWindowMode(focused, target);
+        },
+        .hk_toggle_dimming => {
+            const on = dim.toggle();
+            log.info("hotkey: dimming {s}", .{if (on) "on" else "off"});
+            // Re-apply immediately when enabling so overlays appear without
+            // waiting for the next settled drain. Disabling already hid them.
+            if (on) pushDimSnapshot();
         },
     }
 }
@@ -4641,6 +4758,9 @@ fn observeDiscoveredApps() void {
 // Crash / exit recovery — restore all hidden windows to screen center
 
 fn restoreAllWindows() void {
+    // Undo any inactive-window dimming so windows are left undimmed.
+    dim.resetAll();
+
     for (&g_workspaces.workspaces) |*ws| {
         for (ws.windows.items) |wid| {
             if (g_store.get(wid)) |win| {

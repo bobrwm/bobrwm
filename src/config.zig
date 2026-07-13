@@ -16,6 +16,7 @@ pub const Config = struct {
     workspace_assignments: []const WorkspaceAssignment = &.{},
     workspace_names: []const []const u8 = &.{},
     swipe: SwipeConfig = .{},
+    dimmed_inactive: DimConfig = .{},
     gaps: Gaps = .{},
     layout: tiling.LayoutKind = .bsp,
     bsp_split: tiling.SplitMode = .auto,
@@ -93,6 +94,7 @@ pub const Action = enum(u8) {
     move_workspace_to_display = 29,
     focus_previous_workspace = 30,
     focus_next_workspace = 31,
+    toggle_dimming = 32,
 
     // Every Action must map 1:1 to an EventKind (hk_ prefixed).
     comptime {
@@ -127,6 +129,16 @@ pub const SwipeConfig = struct {
     fingers: u8 = 3,
     distance_pct: f64 = 0.08,
     reverse: bool = false,
+};
+
+/// Inactive-window dimming via owned black overlay panels. When enabled, every
+/// visible managed window except the focused one gets a click-through black
+/// overlay at `level` opacity, giving a clean multiplicative darken with no
+/// color shift. Works without SIP disabled.
+pub const DimConfig = struct {
+    enabled: bool = false,
+    /// Overlay opacity in [0, 1] (0 = none, 1 = fully black).
+    level: f32 = 0.35,
 };
 
 pub const OuterGaps = struct {
