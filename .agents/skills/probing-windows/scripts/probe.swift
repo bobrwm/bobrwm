@@ -8,6 +8,10 @@ enum ManageState: String, Codable {
     case reject, ready, pending
 }
 
+struct Bounds: Codable, Equatable {
+    let x: Double, y: Double, w: Double, h: Double
+}
+
 struct WindowSample: Codable {
     let wid: UInt32
     let pid: Int
@@ -18,6 +22,10 @@ struct WindowSample: Codable {
     let role: String?
     let subrole: String?
     let title: String?
+    let axFrame: Bounds?
+    let minimized: Bool?
+    let fullscreen: Bool?
+    let focused: Bool
     let manageState: ManageState
 
     enum CodingKeys: String, CodingKey {
@@ -27,12 +35,10 @@ struct WindowSample: Codable {
         case cgOnscreen = "cg_onscreen"
         case cgBounds = "cg_bounds"
         case role, subrole, title
+        case axFrame = "ax_frame"
+        case minimized, fullscreen, focused
         case manageState = "manage_state"
     }
-}
-
-struct Bounds: Codable {
-    let x: Double, y: Double, w: Double, h: Double
 }
 
 func manageStateFor(role: String?, subrole: String?) -> ManageState {
@@ -43,38 +49,85 @@ func manageStateFor(role: String?, subrole: String?) -> ManageState {
     return .reject
 }
 
-func collectAXMetadata(pid: pid_t) -> [UInt32: (role: String?, subrole: String?, title: String?)] {
-    var result: [UInt32: (role: String?, subrole: String?, title: String?)] = [:]
-    let app = AXUIElementCreateApplication(pid)
-    var windowsRef: CFTypeRef?
-    guard AXUIElementCopyAttributeValue(app, kAXWindowsAttribute as CFString, &windowsRef) == .success,
-          let windows = windowsRef as? [AXUIElement] else { return result }
-
-    for win in windows {
-        var wid: UInt32 = 0
-        _ = _AXUIElementGetWindow(win, &wid)
-
-        var roleRef: CFTypeRef?
-        AXUIElementCopyAttributeValue(win, kAXRoleAttribute as CFString, &roleRef)
-        let role = roleRef as? String
-
-        var subroleRef: CFTypeRef?
-        AXUIElementCopyAttributeValue(win, kAXSubroleAttribute as CFString, &subroleRef)
-        let subrole = subroleRef as? String
-
-        var titleRef: CFTypeRef?
-        AXUIElementCopyAttributeValue(win, kAXTitleAttribute as CFString, &titleRef)
-        let title = titleRef as? String
-
-        if wid != 0 {
-            result[wid] = (role, subrole, title)
-        }
-    }
-    return result
+struct AXWindowMeta {
+    let role: String?
+    let subrole: String?
+    let title: String?
+    let frame: Bounds?
+    let minimized: Bool?
+    let fullscreen: Bool?
 }
 
-func collectSamples(pidFilter: pid_t?, widFilter: UInt32?) -> [WindowSample] {
-    var axMetadataByPid: [pid_t: [UInt32: (role: String?, subrole: String?, title: String?)]] = [:]
+struct AXAppMeta {
+    let windows: [UInt32: AXWindowMeta]
+    let focusedWid: UInt32
+}
+
+func copyString(_ element: AXUIElement, _ attribute: String) -> String? {
+    var ref: CFTypeRef?
+    AXUIElementCopyAttributeValue(element, attribute as CFString, &ref)
+    return ref as? String
+}
+
+func copyBool(_ element: AXUIElement, _ attribute: String) -> Bool? {
+    var ref: CFTypeRef?
+    AXUIElementCopyAttributeValue(element, attribute as CFString, &ref)
+    return ref as? Bool
+}
+
+func copyFrame(_ element: AXUIElement) -> Bounds? {
+    var posRef: CFTypeRef?
+    var sizeRef: CFTypeRef?
+    guard AXUIElementCopyAttributeValue(element, kAXPositionAttribute as CFString, &posRef) == .success,
+          AXUIElementCopyAttributeValue(element, kAXSizeAttribute as CFString, &sizeRef) == .success,
+          let posVal = posRef, let sizeVal = sizeRef,
+          CFGetTypeID(posVal) == AXValueGetTypeID(),
+          CFGetTypeID(sizeVal) == AXValueGetTypeID() else { return nil }
+
+    var point = CGPoint.zero
+    var size = CGSize.zero
+    guard AXValueGetValue(posVal as! AXValue, .cgPoint, &point),
+          AXValueGetValue(sizeVal as! AXValue, .cgSize, &size) else { return nil }
+    return Bounds(x: point.x, y: point.y, w: size.width, h: size.height)
+}
+
+func collectAXMetadata(pid: pid_t) -> AXAppMeta {
+    var windows: [UInt32: AXWindowMeta] = [:]
+    let app = AXUIElementCreateApplication(pid)
+    // Bound each AX message so a hung app AX server cannot stall the sampler.
+    AXUIElementSetMessagingTimeout(app, 0.25)
+
+    var focusedWid: UInt32 = 0
+    var focusedRef: CFTypeRef?
+    if AXUIElementCopyAttributeValue(app, kAXFocusedWindowAttribute as CFString, &focusedRef) == .success,
+       let focusedVal = focusedRef, CFGetTypeID(focusedVal) == AXUIElementGetTypeID() {
+        _ = _AXUIElementGetWindow(focusedVal as! AXUIElement, &focusedWid)
+    }
+
+    var windowsRef: CFTypeRef?
+    guard AXUIElementCopyAttributeValue(app, kAXWindowsAttribute as CFString, &windowsRef) == .success,
+          let axWindows = windowsRef as? [AXUIElement] else {
+        return AXAppMeta(windows: windows, focusedWid: focusedWid)
+    }
+
+    for win in axWindows {
+        var wid: UInt32 = 0
+        _ = _AXUIElementGetWindow(win, &wid)
+        guard wid != 0 else { continue }
+
+        windows[wid] = AXWindowMeta(
+            role: copyString(win, kAXRoleAttribute),
+            subrole: copyString(win, kAXSubroleAttribute),
+            title: copyString(win, kAXTitleAttribute),
+            frame: copyFrame(win),
+            minimized: copyBool(win, kAXMinimizedAttribute),
+            fullscreen: copyBool(win, "AXFullScreen"))
+    }
+    return AXAppMeta(windows: windows, focusedWid: focusedWid)
+}
+
+func collectSamples(pidFilter: pid_t?, widFilter: UInt32?, axPids: Set<pid_t>?) -> [WindowSample] {
+    var axMetadataByPid: [pid_t: AXAppMeta] = [:]
     var samples: [WindowSample] = []
 
     guard let windowList = CGWindowListCopyWindowInfo(.optionAll, kCGNullWindowID) as? [[String: Any]] else {
@@ -99,22 +152,48 @@ func collectSamples(pidFilter: pid_t?, widFilter: UInt32?) -> [WindowSample] {
                 w: boundsDict["Width"] ?? 0, h: boundsDict["Height"] ?? 0)
         }
 
-        if axMetadataByPid[ownerPid] == nil {
+        // Only pay the AX cost for pids the caller cares about; in snapshot
+        // mode that avoids querying every process on the system.
+        let wantAX = axPids == nil || axPids!.contains(ownerPid)
+        if wantAX && axMetadataByPid[ownerPid] == nil {
             axMetadataByPid[ownerPid] = collectAXMetadata(pid: ownerPid)
         }
-        let ax = axMetadataByPid[ownerPid]?[wid]
+        let appMeta = axMetadataByPid[ownerPid]
+        let ax = appMeta?.windows[wid]
         let state = manageStateFor(role: ax?.role, subrole: ax?.subrole)
 
         samples.append(WindowSample(
             wid: wid, pid: infoPid, cgLayer: layer, cgAlpha: alpha, cgOnscreen: onScreen,
             cgBounds: bounds, role: ax?.role, subrole: ax?.subrole,
-            title: ax?.title, manageState: state))
+            title: ax?.title, axFrame: ax?.frame,
+            minimized: ax?.minimized, fullscreen: ax?.fullscreen,
+            focused: appMeta.map { $0.focusedWid == wid } ?? false,
+            manageState: state))
     }
 
     return samples.sorted {
         if $0.pid == $1.pid { return $0.wid < $1.wid }
         return $0.pid < $1.pid
     }
+}
+
+/// Fields whose transitions are worth a `change` event. Frame moves use a 1px
+/// epsilon and alpha a 0.01 epsilon so animation jitter does not flood output.
+func changedFields(_ prev: WindowSample, _ cur: WindowSample) -> [String] {
+    var fields: [String] = []
+    if prev.manageState != cur.manageState { fields.append("manage_state") }
+    if prev.role != cur.role { fields.append("role") }
+    if prev.subrole != cur.subrole { fields.append("subrole") }
+    if prev.cgOnscreen != cur.cgOnscreen { fields.append("cg_onscreen") }
+    if abs(prev.cgAlpha - cur.cgAlpha) > 0.01 { fields.append("cg_alpha") }
+    if abs(prev.cgBounds.x - cur.cgBounds.x) > 1 || abs(prev.cgBounds.y - cur.cgBounds.y) > 1
+        || abs(prev.cgBounds.w - cur.cgBounds.w) > 1 || abs(prev.cgBounds.h - cur.cgBounds.h) > 1 {
+        fields.append("cg_bounds")
+    }
+    if prev.minimized != cur.minimized { fields.append("minimized") }
+    if prev.fullscreen != cur.fullscreen { fields.append("fullscreen") }
+    if prev.focused != cur.focused { fields.append("focused") }
+    return fields
 }
 
 struct Event: Codable {
@@ -128,6 +207,7 @@ struct Event: Codable {
     let windowCount: Int?
     let windows: [WindowSample]?
     let change: String?
+    let fieldsChanged: [String]?
     let wid: UInt32?
     let previous: WindowSample?
     let current: WindowSample?
@@ -137,7 +217,24 @@ struct Event: Codable {
         case type, pid, wallTime = "wall_time", sampleIndex = "sample_index"
         case durationMs = "duration_ms", intervalMs = "interval_ms"
         case elapsedMs = "elapsed_ms", windowCount = "window_count"
-        case windows, change, wid, previous, current, samples
+        case windows, change, fieldsChanged = "fields_changed"
+        case wid, previous, current, samples
+    }
+
+    static func sample(pid: pid_t?, index: UInt64, elapsed: UInt64, windows: [WindowSample]) -> Event {
+        Event(type: "sample", pid: pid.map { Int($0) }, durationMs: nil,
+            intervalMs: nil, wallTime: isoNow(), sampleIndex: index,
+            elapsedMs: elapsed, windowCount: windows.count, windows: windows,
+            change: nil, fieldsChanged: nil, wid: nil, previous: nil, current: nil, samples: nil)
+    }
+
+    static func change(pid: pid_t?, index: UInt64, elapsed: UInt64, change: String,
+                       fields: [String]?, wid: UInt32, previous: WindowSample?, current: WindowSample?) -> Event {
+        Event(type: "change", pid: pid.map { Int($0) }, durationMs: nil,
+            intervalMs: nil, wallTime: isoNow(), sampleIndex: index,
+            elapsedMs: elapsed, windowCount: nil, windows: nil,
+            change: change, fieldsChanged: fields, wid: wid,
+            previous: previous, current: current, samples: nil)
     }
 }
 
@@ -159,7 +256,15 @@ func usage(_ message: String? = nil) -> Never {
     if let message = message {
         fputs("error: \(message)\n", stderr)
     }
-    fputs("usage: probe [--pid <pid>] [--wid <cg-window-id>] [--duration-ms N] [--interval-ms N]\n", stderr)
+    fputs("""
+    usage: probe [--pid <pid>] [--wid <cg-window-id>] [--duration-ms N] [--interval-ms N]
+           probe --snapshot [--ax-pids <pid,pid,...>]
+
+    Sampling mode emits session_start/sample/change/session_end JSONL events.
+    Snapshot mode emits a single sample event covering every CG window on the
+    system; AX attributes are collected only for --ax-pids to stay fast.
+
+    """, stderr)
     exit(2)
 }
 
@@ -170,6 +275,8 @@ var pidArg: pid_t?
 var widArg: UInt32?
 var durationMs: UInt64 = 10000
 var intervalMs: UInt64 = 100
+var snapshotMode = false
+var axPidsArg: Set<pid_t>?
 var i = 1
 while i < args.count {
     switch args[i] {
@@ -197,18 +304,40 @@ while i < args.count {
         }
         widArg = value
         i += 2
+    case "--snapshot":
+        snapshotMode = true
+        i += 1
+    case "--ax-pids":
+        guard i + 1 < args.count else { usage("missing --ax-pids value") }
+        var pids: Set<pid_t> = []
+        for part in args[i + 1].split(separator: ",") {
+            guard let value = Int32(part.trimmingCharacters(in: .whitespaces)), value > 0 else {
+                usage("invalid --ax-pids entry '\(part)'")
+            }
+            pids.insert(pid_t(value))
+        }
+        axPidsArg = pids
+        i += 2
     default:
         usage("unknown argument \(args[i])")
     }
 }
 
+if snapshotMode {
+    // One CG pass over every window; AX only for the requested pids.
+    let windows = collectSamples(pidFilter: pidArg, widFilter: widArg, axPids: axPidsArg ?? [])
+    emitCodable(Event.sample(pid: pidArg, index: 0, elapsed: 0, windows: windows))
+    exit(0)
+}
+
 if pidArg == nil && widArg == nil {
-    usage("either --pid or --wid is required")
+    usage("either --pid or --wid is required (or use --snapshot)")
 }
 
 emitCodable(Event(type: "session_start", pid: pidArg.map { Int($0) }, durationMs: durationMs,
     intervalMs: intervalMs, wallTime: isoNow(), sampleIndex: nil, elapsedMs: nil,
-    windowCount: nil, windows: nil, change: nil, wid: widArg, previous: nil, current: nil, samples: nil))
+    windowCount: nil, windows: nil, change: nil, fieldsChanged: nil, wid: widArg,
+    previous: nil, current: nil, samples: nil))
 
 var previousByWid: [UInt32: WindowSample] = [:]
 let startTime = CFAbsoluteTimeGetCurrent()
@@ -218,36 +347,28 @@ while true {
     let elapsed = UInt64((CFAbsoluteTimeGetCurrent() - startTime) * 1000)
     if elapsed > durationMs { break }
 
-    let current = collectSamples(pidFilter: pidArg, widFilter: widArg)
+    let current = collectSamples(pidFilter: pidArg, widFilter: widArg, axPids: nil)
     let currentByWid = Dictionary(uniqueKeysWithValues: current.map { ($0.wid, $0) })
 
-    emitCodable(Event(type: "sample", pid: pidArg.map { Int($0) }, durationMs: nil,
-        intervalMs: nil, wallTime: isoNow(), sampleIndex: sampleIndex,
-        elapsedMs: elapsed, windowCount: current.count, windows: current,
-        change: nil, wid: nil, previous: nil, current: nil, samples: nil))
+    emitCodable(Event.sample(pid: pidArg, index: sampleIndex, elapsed: elapsed, windows: current))
 
     for s in current {
         if let prev = previousByWid[s.wid] {
-            if prev.manageState != s.manageState || prev.role != s.role || prev.subrole != s.subrole || prev.cgOnscreen != s.cgOnscreen {
-                emitCodable(Event(type: "change", pid: pidArg.map { Int($0) }, durationMs: nil,
-                    intervalMs: nil, wallTime: isoNow(), sampleIndex: sampleIndex,
-                    elapsedMs: elapsed, windowCount: nil, windows: nil,
-                    change: "changed", wid: s.wid, previous: prev, current: s, samples: nil))
+            let fields = changedFields(prev, s)
+            if !fields.isEmpty {
+                emitCodable(Event.change(pid: pidArg, index: sampleIndex, elapsed: elapsed,
+                    change: "changed", fields: fields, wid: s.wid, previous: prev, current: s))
             }
         } else {
-            emitCodable(Event(type: "change", pid: pidArg.map { Int($0) }, durationMs: nil,
-                intervalMs: nil, wallTime: isoNow(), sampleIndex: sampleIndex,
-                elapsedMs: elapsed, windowCount: nil, windows: nil,
-                change: "added", wid: s.wid, previous: nil, current: s, samples: nil))
+            emitCodable(Event.change(pid: pidArg, index: sampleIndex, elapsed: elapsed,
+                change: "added", fields: nil, wid: s.wid, previous: nil, current: s))
         }
     }
 
     for (wid, prev) in previousByWid {
         if currentByWid[wid] == nil {
-            emitCodable(Event(type: "change", pid: pidArg.map { Int($0) }, durationMs: nil,
-                intervalMs: nil, wallTime: isoNow(), sampleIndex: sampleIndex,
-                elapsedMs: elapsed, windowCount: nil, windows: nil,
-                change: "removed", wid: wid, previous: prev, current: nil, samples: nil))
+            emitCodable(Event.change(pid: pidArg, index: sampleIndex, elapsed: elapsed,
+                change: "removed", fields: nil, wid: wid, previous: prev, current: nil))
         }
     }
 
@@ -259,5 +380,5 @@ while true {
 
 emitCodable(Event(type: "session_end", pid: pidArg.map { Int($0) }, durationMs: nil,
     intervalMs: nil, wallTime: isoNow(), sampleIndex: nil, elapsedMs: nil,
-    windowCount: nil, windows: nil, change: nil, wid: nil, previous: nil,
-    current: nil, samples: sampleIndex))
+    windowCount: nil, windows: nil, change: nil, fieldsChanged: nil, wid: nil,
+    previous: nil, current: nil, samples: sampleIndex))
