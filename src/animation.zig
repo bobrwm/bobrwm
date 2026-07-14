@@ -124,8 +124,13 @@ pub const Animator = struct {
                 @as(f64, @floatFromInt(elapsed_ns)) / @as(f64, @floatFromInt(a.duration_ns));
             const t = @min(@max(t_raw, 0), 1);
 
-            const eased = easeValue(a.easing, t);
-            const frame = interpolateFrame(a.start_frame, a.end_frame, eased);
+            // Snap to the exact target on the final tick — easings like
+            // .spring do not evaluate to exactly 1.0 at t == 1, which would
+            // otherwise leave the window resting slightly past end_frame.
+            const frame = if (t >= 1)
+                a.end_frame
+            else
+                interpolateFrame(a.start_frame, a.end_frame, easeValue(a.easing, t));
 
             if (!framesEqual(a.last_displayed_frame, frame)) {
                 _ = shim.bw_ax_set_window_frame(
