@@ -1844,13 +1844,54 @@ export fn bw_ax_focus_window(pid: i32, wid: u32) bool {
         _ = c.usleep(same_process_focus_delay_us);
     }
 
-    const NSRunningApplication = objc.getClass("NSRunningApplication") orelse return true;
-    const app = NSRunningApplication.msgSend(objc.Object, "runningApplicationWithProcessIdentifier:", .{pid});
-    if (app.value != null) {
-        // NSApplicationActivateIgnoringOtherApps == 2.
-        _ = app.msgSend(bool, "activateWithOptions:", .{@as(usize, 2)});
+    return setFrontProcessViaSkylight(pid, wid);
+}
+
+/// Carbon PSN lookup. Deprecated since 10.9 but still exported and functional;
+/// not present in the aggregated C header surface, so declared directly.
+extern fn GetProcessForPID(pid: i32, psn: *skylight.ProcessSerialNumber) c_int;
+
+/// kCPSUserGenerated — marks the activation as user-driven so the WindowServer
+/// honors the focus change. Not a public constant; value from CoreGraphics CPS.
+const kCPSUserGenerated: u32 = 0x200;
+
+/// Move keyboard focus by making the target the front process and posting the
+/// two focus event records SkyLight expects (yabai's mechanism). This actually
+/// moves input focus, unlike NSRunningApplication.activate on modern macOS.
+/// Returns false if the SkyLight symbols or the process's PSN are unavailable.
+fn setFrontProcessViaSkylight(pid: i32, wid: u32) bool {
+    const sky = g_sky orelse return false;
+    const set_front = sky.setFrontProcessWithOptions orelse return false;
+    const post_event = sky.postEventRecordTo orelse return false;
+
+    var psn: skylight.ProcessSerialNumber = .{ .high = 0, .low = 0 };
+    if (GetProcessForPID(pid, &psn) != 0) {
+        log.debug("focus activation: GetProcessForPID failed pid={d}", .{pid});
+        return false;
     }
+
+    if (set_front(&psn, wid, kCPSUserGenerated) != 0) {
+        log.debug("focus activation: SLPSSetFrontProcessWithOptions failed pid={d} wid={d}", .{ pid, wid });
+        return false;
+    }
+
+    var focus_event = focusEventRecord(wid, 0x01);
+    _ = post_event(&psn, &focus_event);
+    var raise_event = focusEventRecord(wid, 0x02);
+    _ = post_event(&psn, &raise_event);
     return true;
+}
+
+/// One 0xF8-byte SkyLight event record targeting `wid`. `kind` is 0x01 for the
+/// focus record and 0x02 for the raise record. Byte offsets are SkyLight's.
+fn focusEventRecord(wid: u32, kind: u8) [0xf8]u8 {
+    var bytes = [_]u8{0} ** 0xf8;
+    bytes[0x04] = 0xf8;
+    bytes[0x08] = kind;
+    bytes[0x3a] = 0x10;
+    @memset(bytes[0x20..0x30], 0xFF);
+    std.mem.writeInt(u32, bytes[0x3c..0x40], wid, .little);
+    return bytes;
 }
 
 fn manageStateForWindow(pid: i32, wid: u32) u8 {
