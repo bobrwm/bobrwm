@@ -215,6 +215,13 @@ pub const Animator = struct {
         }
     }
 
+    pub fn isAnimatingWindow(self: *const Animator, wid: u32) bool {
+        for (0..self.count) |i| {
+            if (self.animations[i].wid == wid) return true;
+        }
+        return false;
+    }
+
     pub fn isAnimating(self: *const Animator) bool {
         for (0..self.count) |i| {
             if (!self.animations[i].done) return true;

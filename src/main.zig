@@ -3197,6 +3197,13 @@ fn handleEvent(ev: *const event_mod.Event) void {
             }
         },
         .window_moved, .window_resized => {
+            // Every animation tick sets the AX frame, which echoes back here
+            // as moved/resized notifications (~60/sec per window). Ignore
+            // them: reacting would overwrite the stored target frame with a
+            // mid-flight position and, for fullscreen windows, trigger a full
+            // retile per tick.
+            if (g_animator.isAnimatingWindow(ev.wid)) return;
+
             if (inWorkspaceTransition() and !g_mouse_left_down) {
                 if (ev.kind == .window_resized) {
                     clearDragPreview();
