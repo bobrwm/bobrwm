@@ -4021,7 +4021,12 @@ fn addNewWindowManaged(pid: i32, wid: u32) bool {
     // display happened to be focused when the window was created.
     const display_id = inferDisplayIdForWindow(wid) orelse focusedDisplayId();
     const ws = resolveWorkspace(pid, display_id);
-    return addNewWindowManagedWithAssignment(pid, wid, ws.id, display_id);
+
+    // A rule-pinned app's transient launch position is meaningless: place it
+    // on the display that currently owns its assigned workspace, not wherever
+    // it happened to launch.
+    const managed_display = ws.display_id orelse display_id;
+    return addNewWindowManagedWithAssignment(pid, wid, ws.id, managed_display);
 }
 
 fn addNewWindow(pid: i32, wid: u32) void {
