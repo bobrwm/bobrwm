@@ -1794,6 +1794,70 @@ export fn bw_ax_set_window_frame(pid: i32, wid: u32, x: f64, y: f64, w: f64, h: 
     return err == c.kAXErrorSuccess;
 }
 
+/// Prepare a window for repeated animation frame writes: resolve and retain
+/// its AX element once so ticks skip the per-call window-list enumeration,
+/// and disable AXEnhancedUserInterface for the animation's duration (some
+/// apps, notably Electron, silently reject geometry writes while it is set).
+/// `restore_enhanced_ui` reports whether bw_ax_animation_end must restore
+/// the flag. Returns null when the window cannot be resolved.
+export fn bw_ax_animation_begin(pid: i32, wid: u32, restore_enhanced_ui: *bool) ?*anyopaque {
+    std.debug.assert(pid > 0);
+    std.debug.assert(wid > 0);
+
+    restore_enhanced_ui.* = false;
+    const win = findAxWindow(pid, wid) orelse return null;
+
+    if (ensureAxStrings()) |ax| {
+        if (c.AXUIElementCreateApplication(pid)) |app| {
+            defer c.CFRelease(@ptrCast(app));
+            if (axEnhancedUserInterface(app, ax)) {
+                _ = c.AXUIElementSetAttributeValue(app, ax.enhanced_ui_attr, c.kCFBooleanFalse);
+                restore_enhanced_ui.* = true;
+            }
+        }
+    }
+
+    return @constCast(@ptrCast(win));
+}
+
+/// Single-pass frame write on a cached AX element from
+/// bw_ax_animation_begin. Skips the clamping-correction passes of
+/// bw_ax_set_window_frame — intermediate animation frames are overwritten
+/// on the next tick anyway, and the final frame goes through the full
+/// three-pass set for exact placement. `set_size` should be false for pure
+/// moves, halving the IPC per tick.
+export fn bw_ax_animation_step(win_ref: *anyopaque, x: f64, y: f64, w: f64, h: f64, set_size: bool) void {
+    if (w <= 0 or h <= 0) return;
+    const win: c.AXUIElementRef = @ptrCast(win_ref);
+    const ax = ensureAxStrings() orelse return;
+
+    if (set_size) {
+        const size: c.CGSize = .{ .width = w, .height = h };
+        const size_value = c.AXValueCreate(c.kAXValueTypeCGSize, &size) orelse return;
+        defer c.CFRelease(@ptrCast(size_value));
+        _ = c.AXUIElementSetAttributeValue(win, ax.size_attr, @ptrCast(size_value));
+    }
+
+    const position: c.CGPoint = .{ .x = x, .y = y };
+    const position_value = c.AXValueCreate(c.kAXValueTypeCGPoint, &position) orelse return;
+    defer c.CFRelease(@ptrCast(position_value));
+    _ = c.AXUIElementSetAttributeValue(win, ax.position_attr, @ptrCast(position_value));
+}
+
+/// Release a cached AX element from bw_ax_animation_begin and restore
+/// AXEnhancedUserInterface if the begin call disabled it.
+export fn bw_ax_animation_end(pid: i32, win_ref: ?*anyopaque, restore_enhanced_ui: bool) void {
+    if (win_ref) |ref| {
+        c.CFRelease(ref);
+    }
+    if (restore_enhanced_ui) {
+        const ax = ensureAxStrings() orelse return;
+        const app = c.AXUIElementCreateApplication(pid) orelse return;
+        defer c.CFRelease(@ptrCast(app));
+        _ = c.AXUIElementSetAttributeValue(app, ax.enhanced_ui_attr, c.kCFBooleanTrue);
+    }
+}
+
 /// Query whether the AXSize attribute is settable (i.e. the window can be resized).
 fn axCanResize(win_ref: c.AXUIElementRef, ax: *const AxStrings) bool {
     var result: c.Boolean = 0;

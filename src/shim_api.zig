@@ -88,6 +88,9 @@ pub extern fn bw_ax_set_window_frame(
     w: f64,
     h: f64,
 ) bool;
+pub extern fn bw_ax_animation_begin(pid: i32, wid: u32, restore_enhanced_ui: *bool) ?*anyopaque;
+pub extern fn bw_ax_animation_step(win_ref: *anyopaque, x: f64, y: f64, w: f64, h: f64, set_size: bool) void;
+pub extern fn bw_ax_animation_end(pid: i32, win_ref: ?*anyopaque, restore_enhanced_ui: bool) void;
 pub extern fn bw_ax_focus_window(pid: i32, wid: u32) bool;
 pub extern fn bw_ax_get_focused_window(pid: i32) u32;
 pub extern fn bw_should_manage_window(pid: i32, wid: u32) bool;

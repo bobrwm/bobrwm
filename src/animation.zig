@@ -1,9 +1,13 @@
 //! Animates window frame changes by stepping AX frame sets from a 16ms
-//! main-queue timer. bw_ax_set_window_frame is synchronous IPC to the
-//! target app, so every animating window costs up to a few milliseconds
-//! per tick on the main thread, and an unresponsive app can stall the
-//! window manager for the AX messaging timeout. Alpha until animation is
-//! moved off the main thread.
+//! main-queue timer. AX writes are synchronous IPC to the target app, so
+//! every animating window costs main-thread time each tick, and an
+//! unresponsive app can stall the window manager for the AX messaging
+//! timeout. To keep the per-tick cost down, each animation resolves and
+//! retains the window's AX element once up front (bw_ax_animation_begin)
+//! and intermediate ticks issue a single-pass position(+size) write; only
+//! the final frame goes through the full three-pass clamping-safe
+//! bw_ax_set_window_frame. Alpha until animation is moved off the main
+//! thread.
 
 const std = @import("std");
 const shim = @import("shim_api.zig");
@@ -31,6 +35,16 @@ const WindowAnimation = struct {
     end_frame: window_mod.Window.Frame,
     last_displayed_frame: window_mod.Window.Frame,
     start_time_ns: i128,
+    /// AX element retained for the animation's lifetime so ticks skip the
+    /// per-call window-list lookup. Released via bw_ax_animation_end.
+    ax_ref: *anyopaque,
+    /// Whether bw_ax_animation_begin disabled AXEnhancedUserInterface and
+    /// bw_ax_animation_end must restore it.
+    restore_enhanced_ui: bool,
+
+    fn end(self: *const WindowAnimation) void {
+        shim.bw_ax_animation_end(self.pid, self.ax_ref, self.restore_enhanced_ui);
+    }
 };
 
 const max_animations = 64;
@@ -78,6 +92,13 @@ pub const Animator = struct {
             return;
         }
 
+        var restore_enhanced_ui = false;
+        const ax_ref = shim.bw_ax_animation_begin(pid, wid, &restore_enhanced_ui) orelse {
+            // Window can't be resolved — place it directly instead.
+            setFrame(pid, wid, target_frame);
+            return;
+        };
+
         self.animations[self.count] = .{
             .wid = wid,
             .pid = pid,
@@ -85,6 +106,8 @@ pub const Animator = struct {
             .end_frame = target_frame,
             .last_displayed_frame = current_frame,
             .start_time_ns = now_ns,
+            .ax_ref = ax_ref,
+            .restore_enhanced_ui = restore_enhanced_ui,
         };
         self.count += 1;
     }
@@ -107,23 +130,28 @@ pub const Animator = struct {
                 @as(f64, @floatFromInt(elapsed_ns)) / @as(f64, @floatFromInt(self.duration_ns));
             const t = @min(@max(t_raw, 0), 1);
 
-            // Snap to the exact target on the final tick — easings like
-            // .spring do not evaluate to exactly 1.0 at t == 1, which would
-            // otherwise leave the window resting slightly past end_frame.
-            const frame = if (t >= 1)
-                a.end_frame
-            else
-                interpolateFrame(a.start_frame, a.end_frame, easeValue(self.easing, t));
+            if (t >= 1) {
+                // Final tick: full clamping-safe set at the exact target —
+                // easings like .spring do not evaluate to exactly 1.0 at
+                // t == 1, and the single-pass steps may have accumulated
+                // clamping drift.
+                setFrame(a.pid, a.wid, a.end_frame);
+                a.end();
+                continue;
+            }
 
-            if (!a.last_displayed_frame.approxEqual(frame, window_mod.Window.Frame.tolerance)) {
-                setFrame(a.pid, a.wid, frame);
+            const tol = window_mod.Window.Frame.tolerance;
+            const frame = interpolateFrame(a.start_frame, a.end_frame, easeValue(self.easing, t));
+            if (!a.last_displayed_frame.approxEqual(frame, tol)) {
+                // Pure moves skip the size write, halving the per-tick IPC.
+                const resizing = @abs(a.end_frame.width - a.start_frame.width) > tol or
+                    @abs(a.end_frame.height - a.start_frame.height) > tol;
+                shim.bw_ax_animation_step(a.ax_ref, frame.x, frame.y, frame.width, frame.height, resizing);
                 a.last_displayed_frame = frame;
             }
 
-            if (t < 1) {
-                if (i != j) self.animations[j] = self.animations[i];
-                j += 1;
-            }
+            if (i != j) self.animations[j] = self.animations[i];
+            j += 1;
         }
         self.count = j;
     }
@@ -134,6 +162,7 @@ pub const Animator = struct {
         for (0..self.count) |i| {
             const a = self.animations[i];
             setFrame(a.pid, a.wid, a.end_frame);
+            a.end();
         }
         self.count = 0;
     }
@@ -143,6 +172,7 @@ pub const Animator = struct {
     pub fn cancel(self: *Animator, wid: u32) void {
         for (0..self.count) |i| {
             if (self.animations[i].wid == wid) {
+                self.animations[i].end();
                 self.count -= 1;
                 if (i < self.count) {
                     self.animations[i] = self.animations[self.count];
@@ -158,6 +188,7 @@ pub const Animator = struct {
             if (self.animations[i].wid == wid) {
                 const a = self.animations[i];
                 setFrame(a.pid, a.wid, a.end_frame);
+                a.end();
                 self.count -= 1;
                 if (i < self.count) {
                     self.animations[i] = self.animations[self.count];
