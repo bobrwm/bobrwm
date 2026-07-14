@@ -105,6 +105,12 @@
         .{ .key = "k", .mods = .{ .alt = true }, .action = .focus_up },
         .{ .key = "l", .mods = .{ .alt = true }, .action = .focus_right },
 
+        // alt+shift+hjkl → swap window with the neighbour in that direction
+        .{ .key = "h", .mods = .{ .alt = true, .shift = true }, .action = .swap_left },
+        .{ .key = "j", .mods = .{ .alt = true, .shift = true }, .action = .swap_down },
+        .{ .key = "k", .mods = .{ .alt = true, .shift = true }, .action = .swap_up },
+        .{ .key = "l", .mods = .{ .alt = true, .shift = true }, .action = .swap_right },
+
         // alt+return → toggle split direction
         .{ .key = "return", .mods = .{ .alt = true }, .action = .toggle_split },
 

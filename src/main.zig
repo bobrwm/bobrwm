@@ -3259,6 +3259,10 @@ fn handleEvent(ev: *const event_mod.Event) void {
         .hk_focus_right => focusDirection(.right),
         .hk_focus_up => focusDirection(.up),
         .hk_focus_down => focusDirection(.down),
+        .hk_swap_left => swapDirection(.left),
+        .hk_swap_right => swapDirection(.right),
+        .hk_swap_up => swapDirection(.up),
+        .hk_swap_down => swapDirection(.down),
         .hk_toggle_split => {
             g_bsp_split_mode = switch (g_bsp_split_mode) {
                 .auto => .horizontal,
@@ -5616,11 +5620,9 @@ fn moveWorkspaceToDisplayPrev() void {
 
 const FocusDir = ipc.IpcCommand.FocusDir;
 
-fn focusDirection(dir: FocusDir) void {
-    const ws = g_workspaces.active();
-    const focused_wid = ws.focused_wid orelse return;
-    const focused = g_store.get(focused_wid) orelse return;
-
+/// Nearest window on the same display whose center lies in the given
+/// direction from `focused`'s center, or null when none exists.
+fn windowInDirection(ws: *const workspace_mod.Workspace, focused: *const window_mod.Window, dir: FocusDir) ?u32 {
     const fc_x = focused.frame.x + focused.frame.width / 2.0;
     const fc_y = focused.frame.y + focused.frame.height / 2.0;
 
@@ -5628,7 +5630,7 @@ fn focusDirection(dir: FocusDir) void {
     var best_dist: f64 = std.math.inf(f64);
 
     for (ws.windows.items) |wid| {
-        if (wid == focused_wid) continue;
+        if (wid == focused.wid) continue;
         const win = g_store.get(wid) orelse continue;
         if (win.display_id != focused.display_id) continue;
 
@@ -5652,6 +5654,32 @@ fn focusDirection(dir: FocusDir) void {
             best_wid = wid;
         }
     }
+    return best_wid;
+}
+
+/// Swap the focused window with its nearest neighbour in the given
+/// direction and retile. No-op when either window is not tiled.
+fn swapDirection(dir: FocusDir) void {
+    const ws = g_workspaces.active();
+    const focused_wid = ws.focused_wid orelse return;
+    const focused = g_store.get(focused_wid) orelse return;
+
+    const target_wid = windowInDirection(ws, &focused, dir) orelse return;
+
+    const sp = tilingStatePtr(focused.workspace_id);
+    if (sp.*) |*st| {
+        if (!st.swapWids(focused_wid, target_wid)) return;
+        log.info("swap {s}: wid={d} <-> wid={d}", .{ @tagName(dir), focused_wid, target_wid });
+        retile();
+    }
+}
+
+fn focusDirection(dir: FocusDir) void {
+    const ws = g_workspaces.active();
+    const focused_wid = ws.focused_wid orelse return;
+    const focused = g_store.get(focused_wid) orelse return;
+
+    const best_wid = windowInDirection(ws, &focused, dir);
 
     if (best_wid) |wid| {
         // If target is a tab group leader, focus the active tab instead

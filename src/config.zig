@@ -121,6 +121,10 @@ pub const Action = enum(u8) {
     focus_previous_workspace = 30,
     focus_next_workspace = 31,
     toggle_dimming = 32,
+    swap_left = 33,
+    swap_right = 34,
+    swap_up = 35,
+    swap_down = 36,
 
     // Every Action must map 1:1 to an EventKind (hk_ prefixed).
     comptime {
@@ -189,44 +193,39 @@ pub const Gaps = struct {
 
 // Default keybinds (matches the previously hardcoded behaviour)
 
-const default_keybind_count = 25;
-
-const default_keybinds: [default_keybind_count]Keybind = blk: {
-    var binds: [default_keybind_count]Keybind = undefined;
-    var i: usize = 0;
+const default_keybinds = blk: {
+    var binds: []const Keybind = &.{};
 
     // alt+1..9 → focus workspace
     for (1..10) |n| {
-        binds[i] = .{ .key = &[1]u8{'0' + @as(u8, @intCast(n))}, .mods = .{ .alt = true }, .action = .focus_workspace, .arg = @intCast(n) };
-        i += 1;
+        binds = binds ++ &[_]Keybind{.{ .key = &[1]u8{'0' + @as(u8, @intCast(n))}, .mods = .{ .alt = true }, .action = .focus_workspace, .arg = @intCast(n) }};
     }
     // alt+shift+1..9 → move to workspace
     for (1..10) |n| {
-        binds[i] = .{ .key = &[1]u8{'0' + @as(u8, @intCast(n))}, .mods = .{ .alt = true, .shift = true }, .action = .move_to_workspace, .arg = @intCast(n) };
-        i += 1;
+        binds = binds ++ &[_]Keybind{.{ .key = &[1]u8{'0' + @as(u8, @intCast(n))}, .mods = .{ .alt = true, .shift = true }, .action = .move_to_workspace, .arg = @intCast(n) }};
     }
-    // alt+hjkl → focus direction
-    binds[i] = .{ .key = "h", .mods = .{ .alt = true }, .action = .focus_left };
-    i += 1;
-    binds[i] = .{ .key = "j", .mods = .{ .alt = true }, .action = .focus_down };
-    i += 1;
-    binds[i] = .{ .key = "k", .mods = .{ .alt = true }, .action = .focus_up };
-    i += 1;
-    binds[i] = .{ .key = "l", .mods = .{ .alt = true }, .action = .focus_right };
-    i += 1;
-    // alt+return → toggle split
-    binds[i] = .{ .key = "return", .mods = .{ .alt = true }, .action = .toggle_split };
-    i += 1;
-    // ctrl+left/right → traverse workspaces, pass through at native Space edges
-    binds[i] = .{ .key = "left", .mods = .{ .ctrl = true }, .action = .focus_previous_workspace };
-    i += 1;
-    binds[i] = .{ .key = "right", .mods = .{ .ctrl = true }, .action = .focus_next_workspace };
-    i += 1;
+    binds = binds ++ &[_]Keybind{
+        // alt+hjkl → focus direction
+        .{ .key = "h", .mods = .{ .alt = true }, .action = .focus_left },
+        .{ .key = "j", .mods = .{ .alt = true }, .action = .focus_down },
+        .{ .key = "k", .mods = .{ .alt = true }, .action = .focus_up },
+        .{ .key = "l", .mods = .{ .alt = true }, .action = .focus_right },
+        // alt+return → toggle split
+        .{ .key = "return", .mods = .{ .alt = true }, .action = .toggle_split },
+        // ctrl+left/right → traverse workspaces, pass through at native Space edges
+        .{ .key = "left", .mods = .{ .ctrl = true }, .action = .focus_previous_workspace },
+        .{ .key = "right", .mods = .{ .ctrl = true }, .action = .focus_next_workspace },
+        // alt+shift+hjkl → swap window with the neighbour in that direction
+        .{ .key = "h", .mods = .{ .alt = true, .shift = true }, .action = .swap_left },
+        .{ .key = "j", .mods = .{ .alt = true, .shift = true }, .action = .swap_down },
+        .{ .key = "k", .mods = .{ .alt = true, .shift = true }, .action = .swap_up },
+        .{ .key = "l", .mods = .{ .alt = true, .shift = true }, .action = .swap_right },
+    };
 
-    if (i != default_keybind_count) @compileError("default_keybind_count does not match initialized keybinds");
-
-    break :blk binds;
+    break :blk binds[0..binds.len].*;
 };
+
+const default_keybind_count = default_keybinds.len;
 
 // Runs unconditionally at compile time; a bad default fails the build even
 // if nothing in the current compilation references default_keybinds.
@@ -490,7 +489,7 @@ test "app_rules take precedence over workspace_assignments alias" {
 
 test "default config" {
     const cfg: Config = .{};
-    try t.expectEqual(@as(usize, 25), cfg.keybinds.len);
+    try t.expectEqual(@as(usize, default_keybind_count), cfg.keybinds.len);
     try t.expectEqual(@as(usize, 0), cfg.workspace_assignments.len);
     try t.expectEqual(@as(usize, 0), cfg.workspace_names.len);
     try t.expect(!cfg.swipe.enabled);
@@ -545,6 +544,14 @@ test "default_keybinds" {
     try t.expectEqual(Action.focus_next_workspace, default_keybinds[24].action);
     try t.expect(default_keybinds[24].mods.ctrl);
     try t.expect(std.mem.eql(u8, "right", default_keybinds[24].key));
+
+    // alt+shift+hjkl directional swap
+    const swap_dirs = [_]Action{ .swap_left, .swap_down, .swap_up, .swap_right };
+    for (swap_dirs, keys, 25..) |action, key, i| {
+        try t.expectEqual(action, default_keybinds[i].action);
+        try t.expect(std.mem.eql(u8, key, default_keybinds[i].key));
+        try t.expect(default_keybinds[i].mods.alt and default_keybinds[i].mods.shift);
+    }
 }
 
 test "buildKeybinds merges custom keybinds with defaults" {
@@ -632,7 +639,7 @@ test "loadFromPath: examples/config.zon" {
     const cfg = loadFromPath(arena.allocator(), "examples/config.zon") orelse
         return error.TestUnexpectedResult;
 
-    try t.expectEqual(@as(usize, 26), cfg.keybinds.len);
+    try t.expectEqual(@as(usize, 30), cfg.keybinds.len);
 
     try t.expectEqual(Action.focus_workspace, cfg.keybinds[0].action);
     try t.expectEqual(@as(u8, 1), cfg.keybinds[0].arg);
@@ -640,10 +647,12 @@ test "loadFromPath: examples/config.zon" {
     try t.expectEqual(Action.move_to_workspace, cfg.keybinds[9].action);
     try t.expect(cfg.keybinds[9].mods.shift);
 
-    try t.expectEqual(Action.toggle_fullscreen, cfg.keybinds[23].action);
-    try t.expect(std.mem.eql(u8, "f", cfg.keybinds[23].key));
-    try t.expectEqual(Action.focus_previous_workspace, cfg.keybinds[24].action);
-    try t.expectEqual(Action.focus_next_workspace, cfg.keybinds[25].action);
+    try t.expectEqual(Action.swap_left, cfg.keybinds[22].action);
+    try t.expect(cfg.keybinds[22].mods.alt and cfg.keybinds[22].mods.shift);
+    try t.expectEqual(Action.toggle_fullscreen, cfg.keybinds[27].action);
+    try t.expect(std.mem.eql(u8, "f", cfg.keybinds[27].key));
+    try t.expectEqual(Action.focus_previous_workspace, cfg.keybinds[28].action);
+    try t.expectEqual(Action.focus_next_workspace, cfg.keybinds[29].action);
 
     try t.expectEqual(@as(usize, 0), cfg.workspace_assignments.len);
     try t.expectEqual(@as(u16, 0), cfg.gaps.inner);
