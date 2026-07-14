@@ -23,6 +23,18 @@ pub const Window = struct {
         y: f64,
         width: f64,
         height: f64,
+
+        /// 1px tolerance absorbs sub-pixel rounding from CG/AX, avoiding
+        /// redundant AX SetAttributeValue calls.
+        pub const tolerance: f64 = 1.0;
+
+        /// Compare frames within a tolerance.
+        pub fn approxEqual(self: Frame, other: Frame, tol: f64) bool {
+            return @abs(self.x - other.x) <= tol and
+                @abs(self.y - other.y) <= tol and
+                @abs(self.width - other.width) <= tol and
+                @abs(self.height - other.height) <= tol;
+        }
     };
 };
 

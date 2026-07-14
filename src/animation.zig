@@ -132,7 +132,7 @@ pub const Animator = struct {
             else
                 interpolateFrame(a.start_frame, a.end_frame, easeValue(a.easing, t));
 
-            if (!framesEqual(a.last_displayed_frame, frame)) {
+            if (!a.last_displayed_frame.approxEqual(frame, window_mod.Window.Frame.tolerance)) {
                 _ = shim.bw_ax_set_window_frame(
                     a.pid,
                     a.wid,
@@ -270,10 +270,3 @@ fn easeSpring(t: f64) f64 {
     return 1.0 - std.math.exp(-6.0 * t) * std.math.cos(10.0 * t);
 }
 
-fn framesEqual(lhs: window_mod.Window.Frame, rhs: window_mod.Window.Frame) bool {
-    const tol: f64 = 0.5;
-    return @abs(lhs.x - rhs.x) <= tol and
-        @abs(lhs.y - rhs.y) <= tol and
-        @abs(lhs.width - rhs.width) <= tol and
-        @abs(lhs.height - rhs.height) <= tol;
-}
