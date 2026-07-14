@@ -4781,10 +4781,16 @@ fn retileDisplay(display_id: u32) void {
         const target_frame = if (win.is_fullscreen) frame else entry.frame;
 
         if (!framesEqual(win.frame, target_frame)) {
-            if (g_config.animation.enabled) {
+            // Fullscreen windows are never animated: macOS clamps their size
+            // mid-flight and they need the two-pass set below to land on the
+            // exact display frame.
+            if (g_config.animation.enabled and !win.is_fullscreen) {
                 g_animator.animate(win.pid, entry.wid, win.frame, target_frame);
                 ensureAnimatorTimer();
             } else {
+                // The window may have entered fullscreen mid-animation; stop
+                // the in-flight animation so it doesn't fight the placement.
+                g_animator.cancel(entry.wid);
                 _ = shim.bw_ax_set_window_frame(
                     win.pid,
                     entry.wid,
