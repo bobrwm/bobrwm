@@ -1,12 +1,12 @@
 ---
 name: probing-windows
-description: "Probes macOS window metadata (CG + AX) for a given app process over time. Use when debugging window management timing, role readiness, focus changes, dim/alpha transitions, or Electron app AX behavior."
+description: "Probes macOS window metadata (CG + AX) for a given app process over time, including bobrwm-owned dimming overlays and global z-order. Use when debugging window management timing, role readiness, focus changes, overlay transitions, or Electron app AX behavior."
 compatibility: "macOS only. Requires Xcode CLI tools and accessibility trust."
 ---
 
 # Probing Windows
 
-Periodically samples CGWindowList and AXUIElement attributes for every window belonging to a target process, emitting structured JSONL with diff events.
+Periodically samples CGWindowList and AXUIElement attributes for every window belonging to a target process, plus bobrwm's dimming overlays by default, emitting structured JSONL with diff events.
 
 - `tb__probe_windows` — sampling and state-timeline capture.
 - `tb__trigger_native_tabs` — repeatable native tab create/close activity while probing.
@@ -17,24 +17,26 @@ For diffing bobrwm's *internal* state against this OS-side truth, use the siblin
 ## Identity fields
 
 - `wid` is the CG window ID from `kCGWindowNumber`. Treat this as the window identity when debugging bobrwm focus, tiling, and workspace state. It equals `window_id` in `bobrwm query ... --json` output.
-- `pid` is the owning process ID from `kCGWindowOwnerPID`. Multiple distinct windows, including Ghostty native tabs, can share one PID.
+- `pid` and `owner_name` identify the owning process. Multiple distinct windows, including Ghostty native tabs, can share one PID. Dimming overlays belong to bobrwm rather than the target app.
+- `window_kind` is `window` or `dimming_overlay`. Bobrwm-owned layer-0 panels are dimming overlays; bobrwm's elevated tile-preview UI is excluded.
+- `cg_order` is the index returned by CG's global window list. Use it to correlate ordering changes, but do not treat its numeric relationship across processes as proof that an AppKit panel is above or below its target.
 - Session-level `pid` is the probe filter. Per-window `pid` is emitted on each window sample so a CG window ID lookup can tell you which process owns it.
 
 ## Per-window fields
 
-Each sample row carries CG data (`cg_layer`, `cg_alpha`, `cg_onscreen`, `cg_bounds`) and AX data (`role`, `subrole`, `title`, `ax_frame`, `minimized`, `fullscreen`, `focused`, `manage_state`):
+Each sample row carries CG data (`owner_name`, `window_name`, `window_kind`, `cg_order`, `cg_layer`, `cg_alpha`, `cg_onscreen`, `cg_bounds`) and AX data (`role`, `subrole`, `title`, `ax_frame`, `minimized`, `fullscreen`, `focused`, `manage_state`):
 
 - `ax_frame` is the frame reported by AX (`kAXPosition`/`kAXSize`). Compare against `cg_bounds`: AX can lag CG after moves/retiles, and a persistent mismatch means the AX server serves stale geometry (or the stored window ID is stale).
 - `focused` is true when the window is its own app's `AXFocusedWindow`. Useful for catching apps that swap the active native-tab CG window ID: the AX focus moves to a `wid` bobrwm does not know yet.
 - `minimized` / `fullscreen` come from `AXMinimized` / `AXFullScreen`. Null when the app did not answer (AX calls are bounded by a 250ms per-app timeout so hung apps cannot stall the sampler).
-- `cg_alpha` is the WindowServer alpha. Inactive-window dimming shows up here; a "fully transparent but still on-screen" window is an Electron close-to-background ghost or a dim bug.
+- `cg_alpha` is the WindowServer alpha. Overlay-based dimming leaves the target window's alpha unchanged; the separate `dimming_overlay` row carries the configured dim level. A fully transparent target that is still on-screen is usually an Electron close-to-background ghost.
 
 ## Workflow
 
 1. Determine the target: either an app name (will be killed and relaunched) or a running PID
 2. Start `tb__probe_windows` against the target app/pid.
 3. While probe is active, generate events: `tb__trigger_native_tabs` for tab lifecycle, `tb__trigger_window_events` for focus/visibility/geometry, or bobrwm IPC commands (`bobrwm focus-workspace next`, `retile`, ...) for workspace transitions.
-4. Analyze the probe output timeline for add/remove, on-screen, role, focus, alpha, and bounds transitions.
+4. Analyze the probe output timeline for target and `dimming_overlay` add/remove, on-screen, focus, alpha, bounds, and `cg_order` transitions.
 
 For same-app multiwindow or native-tab bugs, prefer probing a running PID so the app state is not reset:
 
@@ -93,6 +95,7 @@ Snapshot mode takes one CG pass over *every* window on the system (AX limited to
 | `wid` | integer | — | CG window ID to query directly; can be combined with `pid` to verify ownership |
 | `duration_sec` | integer | 10 | How many seconds to sample |
 | `interval_ms` | integer | 100 | Milliseconds between samples |
+| `include_dimming_overlays` | boolean | `true` | Include bobrwm-owned layer-0 dimming panels alongside the target |
 | `output_file` | string | — | Optional file path for raw JSONL output |
 
 At least one of `app`, `pid`, or `wid` is required.
@@ -126,6 +129,6 @@ At least one of `app`, `pid`, or `wid` is required.
 - **pid** and **wid** columns are the process ID and CG window ID for each sampled window.
 - **onscreen** comes from `kCGWindowIsOnscreen`; for Ghostty native tabs, the selected tab is usually the only ready on-screen member while inactive tabs remain off-screen or pending under the same PID. A probe of a long-lived terminal PID will also show dozens of dead off-screen CG residue windows with no AX data — expect only a handful of `ready` rows.
 - Windows stuck at `pending` after the full duration indicate apps whose AX interface never stabilizes (rare, usually a bug in the app).
-- The change timeline at the bottom shows the exact sequence of transitions with millisecond timestamps; `change` events carry `fields_changed` (`manage_state`, `role`, `subrole`, `cg_onscreen`, `cg_alpha`, `cg_bounds`, `minimized`, `fullscreen`, `focused`) with previous → current values. Alpha changes use a 0.01 epsilon and bounds a 1px epsilon so animation jitter does not flood the output.
-- For dim debugging, run `cycle_focus` during an active probe and watch `cg_alpha` transitions on the inactive window.
+- The change timeline at the bottom shows the exact sequence of transitions with millisecond timestamps; `change` events carry `fields_changed` (`manage_state`, `role`, `subrole`, `cg_order`, `cg_onscreen`, `cg_alpha`, `cg_bounds`, `minimized`, `fullscreen`, `focused`) with previous → current values. Alpha changes use a 0.01 epsilon and bounds a 1px epsilon so animation jitter does not flood the output.
+- For dim debugging, run `cycle_focus` during an active probe. Watch the `dimming_overlay` row move to the inactive window's bounds and carry the configured alpha; do not expect the target's own alpha to change.
 - For native tabs, run `pulse_tabs` during an active probe to generate deterministic create/close bursts; watch `focused` flips to catch active-tab window ID swaps.

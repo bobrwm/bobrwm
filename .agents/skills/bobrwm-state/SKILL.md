@@ -1,6 +1,6 @@
 ---
 name: bobrwm-state
-description: "Introspects and cross-checks the running bobrwm daemon: IPC queries, log capture, debug builds, and divergence detection between bobrwm's internal state and CG/AX ground truth. Use when debugging window management, workspace, focus, tiling, or dimming bugs in bobrwm."
+description: "Introspects and cross-checks the running bobrwm daemon: IPC queries, log capture, dimming-overlay capture, and divergence detection between bobrwm's internal state and CG/AX ground truth. Use when debugging window management, workspace, focus, tiling, or dimming bugs in bobrwm."
 compatibility: "macOS only. Requires a running bobrwm daemon for IPC queries; compare_state additionally needs the probing-windows skill and Xcode CLI tools."
 ---
 
@@ -36,7 +36,8 @@ Mutating IPC commands are also useful as repro drivers: `bobrwm focus-workspace 
 | hidden not parked | hidden-workspace window clearly visible on a display | workspace transition or hide/retile bug |
 | unmanaged visible | visible AX-ready window of a managed app not in any workspace | missed adoption, creation race, suppressed tab member turned visible |
 | focus divergence | workspace `focused_window` ≠ the app's `AXFocusedWindow` | app replaced the active native-tab CG window ID (known bug class) |
-| alpha | managed visible-workspace window fully transparent | dim/restore bug |
+| target alpha | managed visible-workspace window fully transparent | app ghost or restore bug; overlay dimming does not alter target alpha |
+| dimming overlays | bobrwm layer-0 overlay is missing or does not match an inactive target frame | overlay apply/reset/frame bug |
 
 Run it once for a baseline, reproduce the bug, then run it again — the delta tells you which reconciliation path failed. One-off `frame drift` findings can be animation in flight; re-run before trusting them.
 
@@ -46,7 +47,10 @@ Run it once for a baseline, reproduce the bug, then run it again — the delta t
 |---|---|---|---|
 | `bobrwm_bin` | string | PATH, then `<repo>/zig-out/bin/bobrwm` | IPC client binary |
 | `frame_tolerance` | number | 2 | px slack before flagging frame drift |
+| `expect_dimming_overlays` | boolean | `false` | Require overlays even if none are visible; set when dimming is known enabled |
 | `output_file` | string | — | Save raw queries + snapshot JSON for offline diffing |
+
+The raw snapshot includes `window_kind`, `owner_name`, and `cg_order` for every CG window. Visible bobrwm-owned layer-0 panels are classified as `dimming_overlay` and matched to inactive managed windows by frame. With the default `expect_dimming_overlays=false`, an entirely absent overlay set is informational because the tool cannot query the runtime toggle; once any overlay is visible, partial coverage is checked automatically.
 
 ## Logs
 
