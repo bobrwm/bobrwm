@@ -2175,6 +2175,10 @@ fn animatorTimerTick(context: ?*anyopaque) callconv(.c) void {
     if (!g_animator.isAnimating()) {
         if (g_animator_source) |source| {
             c.dispatch_source_cancel(source);
+            // Unlike the long-lived role-poll source, this one is recreated
+            // for every animation burst — drop our reference or each burst
+            // leaks a source. GCD keeps it alive until cancellation completes.
+            c.dispatch_release(.{ ._ds = source });
             g_animator_source = null;
         }
     }
