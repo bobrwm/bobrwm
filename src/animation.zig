@@ -1,3 +1,10 @@
+//! Animates window frame changes by stepping AX frame sets from a 16ms
+//! main-queue timer. bw_ax_set_window_frame is synchronous IPC to the
+//! target app, so every animating window costs up to a few milliseconds
+//! per tick on the main thread, and an unresponsive app can stall the
+//! window manager for the AX messaging timeout. Alpha until animation is
+//! moved off the main thread.
+
 const std = @import("std");
 const shim = @import("shim_api.zig");
 const window_mod = @import("window.zig");

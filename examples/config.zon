@@ -51,7 +51,10 @@
     //     .outer = .{ .left = 4, .right = 4, .top = 4, .bottom = 4 },
     // },
 
-    // Animate window movements during layout changes.
+    // ALPHA: Animate window movements during layout changes.
+    // Animating windows issue synchronous AX calls on every 16ms tick from
+    // the main thread, so slow or unresponsive apps can make animations
+    // (and the window manager itself) stutter.
     // .enabled — set to true to enable animated window movements (default: false)
     // .duration_ms — animation length in milliseconds (default: 200)
     // .easing — one of .linear, .ease_in, .ease_out, .ease_in_out, .spring (default: .ease_out)
