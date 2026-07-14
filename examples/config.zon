@@ -107,8 +107,13 @@
         .{ .key = "right", .mods = .{ .ctrl = true }, .action = .focus_next_workspace },
     },
 
-    .workspace_assignments = .{
+    // Per-app rules keyed by bundle identifier. Each field is optional:
+    // .workspace assigns the app's windows to a workspace, .float opens them
+    // floating instead of tiled. Find a bundle id with:
+    //   osascript -e 'id of app "Safari"'
+    .app_rules = .{
         // .{ .app_id = "com.apple.Safari", .workspace = 2 },
-        // .{ .app_id = "com.apple.MobileSMS", .workspace = 3 },
+        // .{ .app_id = "com.apple.systempreferences", .float = true },
+        // .{ .app_id = "com.apple.MobileSMS", .workspace = 3, .float = true },
     },
 }

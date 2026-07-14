@@ -3922,11 +3922,19 @@ fn addNewWindowManagedWithAssignment(pid: i32, wid: u32, workspace_id: u8, assig
             };
         }
     }
+    // An app_rules entry with .float = true floats every window of that app.
+    const rule_float = blk: {
+        if (g_config.app_rules.len == 0) break :blk false;
+        var id_buf: [256]u8 = undefined;
+        const bundle_id = config_mod.getAppBundleId(pid, &id_buf) orelse break :blk false;
+        break :blk g_config.shouldFloatApp(bundle_id);
+    };
+
     // Non-resizable windows that are undersized (≤500px in either dimension)
     // are floated instead of tiled. This catches transient splash screens and
     // updater dialogs (e.g. Discord Updater at 300x300) that have standard
     // AX roles but are not real application windows.
-    const should_float = blk: {
+    const should_float = rule_float or blk: {
         if (window_frame.width > 500 and window_frame.height > 500) break :blk false;
         const ax_win = findAxWindow(pid, wid) orelse break :blk false;
         defer c.CFRelease(@ptrCast(ax_win));
@@ -3960,11 +3968,8 @@ fn addNewWindowManagedWithAssignment(pid: i32, wid: u32, workspace_id: u8, assig
         hideWindow(pid, wid);
     }
 
-    log.info("addNewWindow: {s} wid={d} on workspace {d}", .{
-        if (mode == .tiled) "tiled" else "floated (undersized+non-resizable)",
-        wid,
-        ws.id,
-    });
+    const float_reason = if (mode == .tiled) "tiled" else if (rule_float) "floated (app rule)" else "floated (undersized+non-resizable)";
+    log.info("addNewWindow: {s} wid={d} on workspace {d}", .{ float_reason, wid, ws.id });
     return true;
 }
 
@@ -5077,7 +5082,7 @@ fn checkTabDragOut(_: i32, wid: u32) void {
 /// config workspace_assignments by bundle ID before falling back
 /// to the active workspace for the target display.
 fn resolveWorkspace(pid: i32, display_id: u32) *workspace_mod.Workspace {
-    if (g_config.workspace_assignments.len > 0) {
+    if (g_config.hasAppWorkspaceRules()) {
         var id_buf: [256]u8 = undefined;
         if (config_mod.getAppBundleId(pid, &id_buf)) |bundle_id| {
             if (g_config.workspaceForApp(bundle_id)) |ws_id| {

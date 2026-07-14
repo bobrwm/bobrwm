@@ -13,6 +13,10 @@ const log = std.log.scoped(.config);
 
 pub const Config = struct {
     keybinds: []const Keybind = &default_keybinds,
+    app_rules: []const AppRule = &.{},
+    /// Deprecated alias for the workspace part of `app_rules`. Entries here are
+    /// merged into the app-rule lookups after `app_rules`, so a matching
+    /// `app_rules` entry wins.
     workspace_assignments: []const WorkspaceAssignment = &.{},
     workspace_names: []const []const u8 = &.{},
     swipe: SwipeConfig = .{},
@@ -24,12 +28,32 @@ pub const Config = struct {
     bsp_split_ratio: f64 = 0.5,
     new_window_split: tiling.InsertChild = .second,
 
-    /// Look up the assigned workspace for a given bundle identifier.
+    /// Look up the assigned workspace for a given bundle identifier. `app_rules`
+    /// take precedence; `workspace_assignments` is a fallback alias.
     pub fn workspaceForApp(self: *const Config, bundle_id: []const u8) ?u8 {
+        for (self.app_rules) |r| {
+            if (std.mem.eql(u8, r.app_id, bundle_id)) {
+                if (r.workspace) |ws| return ws;
+            }
+        }
         for (self.workspace_assignments) |a| {
             if (std.mem.eql(u8, a.app_id, bundle_id)) return a.workspace;
         }
         return null;
+    }
+
+    /// Whether windows of the given bundle identifier should open floating.
+    pub fn shouldFloatApp(self: *const Config, bundle_id: []const u8) bool {
+        for (self.app_rules) |r| {
+            if (std.mem.eql(u8, r.app_id, bundle_id)) return r.float;
+        }
+        return false;
+    }
+
+    /// True when any source could assign an app to a workspace, so callers can
+    /// skip the bundle-id lookup entirely when nothing is configured.
+    pub fn hasAppWorkspaceRules(self: *const Config) bool {
+        return self.app_rules.len > 0 or self.workspace_assignments.len > 0;
     }
 
     /// Build the effective keybind table without allocating. Defaults are
@@ -122,6 +146,14 @@ pub const Keybind = struct {
 pub const WorkspaceAssignment = struct {
     app_id: []const u8,
     workspace: u8,
+};
+
+/// Per-app behavior keyed by bundle identifier. Fields are optional so a rule
+/// can set only what it cares about (float-only, workspace-only, or both).
+pub const AppRule = struct {
+    app_id: []const u8,
+    workspace: ?u8 = null,
+    float: bool = false,
 };
 
 pub const SwipeConfig = struct {
@@ -336,8 +368,9 @@ fn loadFromPath(allocator: std.mem.Allocator, path: []const u8) ?Config {
         return null;
     };
 
-    log.info("loaded config: {d} keybind entries, {d} workspace assignments", .{
+    log.info("loaded config: {d} keybind entries, {d} app rules, {d} workspace assignments", .{
         parsed.keybinds.len,
+        parsed.app_rules.len,
         parsed.workspace_assignments.len,
     });
     return parsed;
@@ -416,6 +449,41 @@ test "workspaceForApp" {
 
     const empty: Config = .{};
     try t.expectEqual(@as(?u8, null), empty.workspaceForApp("com.apple.Safari"));
+}
+
+test "app_rules: float and workspace lookups" {
+    const cfg: Config = .{
+        .app_rules = &.{
+            .{ .app_id = "com.apple.systempreferences", .float = true },
+            .{ .app_id = "com.apple.Safari", .workspace = 2 },
+            .{ .app_id = "com.foo.bar", .workspace = 3, .float = true },
+        },
+    };
+
+    try t.expect(cfg.shouldFloatApp("com.apple.systempreferences"));
+    try t.expect(!cfg.shouldFloatApp("com.apple.Safari"));
+    try t.expect(cfg.shouldFloatApp("com.foo.bar"));
+    try t.expect(!cfg.shouldFloatApp("com.unknown.App"));
+
+    try t.expectEqual(@as(?u8, null), cfg.workspaceForApp("com.apple.systempreferences"));
+    try t.expectEqual(@as(?u8, 2), cfg.workspaceForApp("com.apple.Safari"));
+    try t.expectEqual(@as(?u8, 3), cfg.workspaceForApp("com.foo.bar"));
+}
+
+test "app_rules take precedence over workspace_assignments alias" {
+    const cfg: Config = .{
+        .app_rules = &.{
+            .{ .app_id = "com.apple.Safari", .workspace = 5 },
+        },
+        .workspace_assignments = &.{
+            .{ .app_id = "com.apple.Safari", .workspace = 2 },
+            .{ .app_id = "com.apple.MobileSMS", .workspace = 3 },
+        },
+    };
+
+    try t.expectEqual(@as(?u8, 5), cfg.workspaceForApp("com.apple.Safari"));
+    try t.expectEqual(@as(?u8, 3), cfg.workspaceForApp("com.apple.MobileSMS"));
+    try t.expect(cfg.hasAppWorkspaceRules());
 }
 
 test "default config" {
