@@ -3,8 +3,6 @@ const shim = @import("shim_api.zig");
 const window_mod = @import("window.zig");
 const osutil = @import("osutil.zig");
 
-const log = std.log.scoped(.animation);
-
 pub const Easing = enum {
     linear,
     ease_in,
@@ -26,9 +24,6 @@ const WindowAnimation = struct {
     end_frame: window_mod.Window.Frame,
     last_displayed_frame: window_mod.Window.Frame,
     start_time_ns: i128,
-    duration_ns: i128,
-    easing: Easing,
-    done: bool,
 };
 
 const max_animations = 64;
@@ -47,12 +42,6 @@ pub const Animator = struct {
 
     pub fn deinit(self: *Animator) void {
         self.finishAll();
-        self.count = 0;
-    }
-
-    pub fn reconfigure(self: *Animator, config: AnimationConfig) void {
-        self.duration_ns = @as(i128, config.duration_ms) * std.time.ns_per_ms;
-        self.easing = config.easing;
     }
 
     /// Start or update an animation for a window.
@@ -73,22 +62,12 @@ pub const Animator = struct {
                 a.start_frame = a.last_displayed_frame;
                 a.end_frame = target_frame;
                 a.start_time_ns = now_ns;
-                a.duration_ns = self.duration_ns;
-                a.easing = self.easing;
-                a.done = false;
                 return;
             }
         }
 
         if (self.count >= max_animations) {
-            _ = shim.bw_ax_set_window_frame(
-                pid,
-                wid,
-                target_frame.x,
-                target_frame.y,
-                target_frame.width,
-                target_frame.height,
-            );
+            setFrame(pid, wid, target_frame);
             return;
         }
 
@@ -99,9 +78,6 @@ pub const Animator = struct {
             .end_frame = target_frame,
             .last_displayed_frame = current_frame,
             .start_time_ns = now_ns,
-            .duration_ns = self.duration_ns,
-            .easing = self.easing,
-            .done = false,
         };
         self.count += 1;
     }
@@ -113,15 +89,15 @@ pub const Animator = struct {
 
         const now_ns = osutil.nanoTimestamp();
 
+        var j: usize = 0;
         for (0..self.count) |i| {
             const a = &self.animations[i];
-            if (a.done) continue;
 
             const elapsed_ns = now_ns - a.start_time_ns;
-            const t_raw = if (a.duration_ns == 0)
+            const t_raw = if (self.duration_ns == 0)
                 @as(f64, 1)
             else
-                @as(f64, @floatFromInt(elapsed_ns)) / @as(f64, @floatFromInt(a.duration_ns));
+                @as(f64, @floatFromInt(elapsed_ns)) / @as(f64, @floatFromInt(self.duration_ns));
             const t = @min(@max(t_raw, 0), 1);
 
             // Snap to the exact target on the final tick — easings like
@@ -130,26 +106,14 @@ pub const Animator = struct {
             const frame = if (t >= 1)
                 a.end_frame
             else
-                interpolateFrame(a.start_frame, a.end_frame, easeValue(a.easing, t));
+                interpolateFrame(a.start_frame, a.end_frame, easeValue(self.easing, t));
 
             if (!a.last_displayed_frame.approxEqual(frame, window_mod.Window.Frame.tolerance)) {
-                _ = shim.bw_ax_set_window_frame(
-                    a.pid,
-                    a.wid,
-                    frame.x,
-                    frame.y,
-                    frame.width,
-                    frame.height,
-                );
+                setFrame(a.pid, a.wid, frame);
                 a.last_displayed_frame = frame;
             }
 
-            a.done = t >= 1;
-        }
-
-        var j: usize = 0;
-        for (0..self.count) |i| {
-            if (!self.animations[i].done) {
+            if (t < 1) {
                 if (i != j) self.animations[j] = self.animations[i];
                 j += 1;
             }
@@ -161,18 +125,8 @@ pub const Animator = struct {
     /// their target frames.
     pub fn finishAll(self: *Animator) void {
         for (0..self.count) |i| {
-            const a = &self.animations[i];
-            if (a.done) continue;
-            const frame = a.end_frame;
-            _ = shim.bw_ax_set_window_frame(
-                a.pid,
-                a.wid,
-                frame.x,
-                frame.y,
-                frame.width,
-                frame.height,
-            );
-            a.done = true;
+            const a = self.animations[i];
+            setFrame(a.pid, a.wid, a.end_frame);
         }
         self.count = 0;
     }
@@ -191,21 +145,12 @@ pub const Animator = struct {
         }
     }
 
-    /// Complete animation for a specific window.
+    /// Complete animation for a specific window, placing it at its target.
     pub fn finish(self: *Animator, wid: u32) void {
         for (0..self.count) |i| {
-            if (self.animations[i].wid == wid and !self.animations[i].done) {
-                const a = &self.animations[i];
-                const frame = a.end_frame;
-                _ = shim.bw_ax_set_window_frame(
-                    a.pid,
-                    a.wid,
-                    frame.x,
-                    frame.y,
-                    frame.width,
-                    frame.height,
-                );
-                a.done = true;
+            if (self.animations[i].wid == wid) {
+                const a = self.animations[i];
+                setFrame(a.pid, a.wid, a.end_frame);
                 self.count -= 1;
                 if (i < self.count) {
                     self.animations[i] = self.animations[self.count];
@@ -223,12 +168,20 @@ pub const Animator = struct {
     }
 
     pub fn isAnimating(self: *const Animator) bool {
-        for (0..self.count) |i| {
-            if (!self.animations[i].done) return true;
-        }
-        return false;
+        return self.count > 0;
     }
 };
+
+fn setFrame(pid: i32, wid: u32, frame: window_mod.Window.Frame) void {
+    _ = shim.bw_ax_set_window_frame(
+        pid,
+        wid,
+        frame.x,
+        frame.y,
+        frame.width,
+        frame.height,
+    );
+}
 
 fn interpolateFrame(
     start: window_mod.Window.Frame,
@@ -269,4 +222,3 @@ fn easeInOutCubic(t: f64) f64 {
 fn easeSpring(t: f64) f64 {
     return 1.0 - std.math.exp(-6.0 * t) * std.math.cos(10.0 * t);
 }
-

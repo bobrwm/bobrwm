@@ -4747,10 +4747,6 @@ fn retileDisplay(display_id: u32) void {
     const display_slot = displayIndexById(display_id) orelse return;
     const display = g_displays[display_slot].visible;
 
-    if (!g_config.animation.enabled and g_animator.isAnimating()) {
-        g_animator.finishAll();
-    }
-
     const outer = g_config.gaps.outer;
     const frame = window_mod.Window.Frame{
         .x = display.x + @as(f64, @floatFromInt(outer.left)),
@@ -4789,16 +4785,9 @@ fn retileDisplay(display_id: u32) void {
                 // The window may have entered fullscreen mid-animation; stop
                 // the in-flight animation so it doesn't fight the placement.
                 g_animator.cancel(entry.wid);
-                _ = shim.bw_ax_set_window_frame(
-                    win.pid,
-                    entry.wid,
-                    target_frame.x,
-                    target_frame.y,
-                    target_frame.width,
-                    target_frame.height,
-                );
                 // Two-pass for fullscreen to handle macOS size clamping
-                if (win.is_fullscreen) {
+                const passes: usize = if (win.is_fullscreen) 2 else 1;
+                for (0..passes) |_| {
                     _ = shim.bw_ax_set_window_frame(
                         win.pid,
                         entry.wid,
