@@ -1844,17 +1844,7 @@ export fn bw_ax_focus_window(pid: i32, wid: u32) bool {
         _ = c.usleep(same_process_focus_delay_us);
     }
 
-    if (setFrontProcessViaSkylight(pid, wid)) return true;
-
-    // Fallback for when the private SkyLight symbols are unavailable. Modern
-    // macOS largely ignores this from a background agent, but it is harmless.
-    const NSRunningApplication = objc.getClass("NSRunningApplication") orelse return true;
-    const app = NSRunningApplication.msgSend(objc.Object, "runningApplicationWithProcessIdentifier:", .{pid});
-    if (app.value != null) {
-        // NSApplicationActivateIgnoringOtherApps == 2.
-        _ = app.msgSend(bool, "activateWithOptions:", .{@as(usize, 2)});
-    }
-    return true;
+    return setFrontProcessViaSkylight(pid, wid);
 }
 
 /// Carbon PSN lookup. Deprecated since 10.9 but still exported and functional;
@@ -1876,7 +1866,7 @@ fn setFrontProcessViaSkylight(pid: i32, wid: u32) bool {
 
     var psn: skylight.ProcessSerialNumber = .{ .high = 0, .low = 0 };
     if (GetProcessForPID(pid, &psn) != 0) {
-        log.debug("focus activation: GetProcessForPID failed pid={d}, using Cocoa fallback", .{pid});
+        log.debug("focus activation: GetProcessForPID failed pid={d}", .{pid});
         return false;
     }
 
