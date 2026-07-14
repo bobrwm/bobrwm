@@ -4289,6 +4289,7 @@ fn tryFormTabGroupOnCreate(pid: i32, new_wid: u32) bool {
 }
 
 fn removeWindow(wid: u32) void {
+    g_animator.cancel(wid);
     untrackPendingRoleWindow(wid);
     untrackDeferredWindowCandidate(wid);
     if (g_drag_preview.source_wid == wid or g_drag_preview.target_wid == wid) {

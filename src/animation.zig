@@ -172,6 +172,20 @@ pub const Animator = struct {
         self.count = 0;
     }
 
+    /// Drop the animation for a window without moving it. Used when the
+    /// window is destroyed or minimized and its frame no longer matters.
+    pub fn cancel(self: *Animator, wid: u32) void {
+        for (0..self.count) |i| {
+            if (self.animations[i].wid == wid) {
+                self.count -= 1;
+                if (i < self.count) {
+                    self.animations[i] = self.animations[self.count];
+                }
+                return;
+            }
+        }
+    }
+
     /// Complete animation for a specific window.
     pub fn finish(self: *Animator, wid: u32) void {
         for (0..self.count) |i| {
