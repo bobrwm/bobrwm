@@ -23,6 +23,7 @@ const launchd = @import("launchd.zig");
 const osutil = @import("osutil.zig");
 const objc_classes = @import("objc_classes.zig");
 const animation_mod = @import("animation.zig");
+const ax_mod = @import("ax.zig");
 
 extern fn _AXUIElementGetWindow(element: c.AXUIElementRef, wid: *u32) c.AXError;
 
@@ -244,133 +245,13 @@ fn nsString(str: [*:0]const u8) objc.Object {
     return NSString.msgSend(objc.Object, "stringWithUTF8String:", .{str});
 }
 
-const AxStrings = struct {
-    focused_window_attr: c.CFStringRef,
-    windows_attr: c.CFStringRef,
-    size_attr: c.CFStringRef,
-    position_attr: c.CFStringRef,
-    raise_action: c.CFStringRef,
-    main_attr: c.CFStringRef,
-    role_attr: c.CFStringRef,
-    window_role: c.CFStringRef,
-    unknown_role: c.CFStringRef,
-    subrole_attr: c.CFStringRef,
-    standard_window_subrole: c.CFStringRef,
-    floating_window_subrole: c.CFStringRef,
-    dialog_subrole: c.CFStringRef,
-    unknown_subrole: c.CFStringRef,
-    modal_attr: c.CFStringRef,
-    enhanced_ui_attr: c.CFStringRef,
-    close_button_attr: c.CFStringRef,
-    minimize_button_attr: c.CFStringRef,
-    zoom_button_attr: c.CFStringRef,
-    fullscreen_button_attr: c.CFStringRef,
-    focused_attr: c.CFStringRef,
-};
-
-fn createAxString(raw: [*:0]const u8) ?c.CFStringRef {
-    return c.CFStringCreateWithCString(null, raw, c.kCFStringEncodingUTF8);
-}
-
-fn releaseAxString(value: c.CFStringRef) void {
-    c.CFRelease(@ptrCast(value));
-}
-
-fn ensureAxStrings() ?*const AxStrings {
-    if (g_ax_strings) |*strings| return strings;
-
-    const names = [_][*:0]const u8{
-        "AXFocusedWindow",
-        "AXWindows",
-        "AXSize",
-        "AXPosition",
-        "AXRaise",
-        "AXMain",
-        "AXRole",
-        "AXWindow",
-        "AXUnknown",
-        "AXSubrole",
-        "AXStandardWindow",
-        "AXFloatingWindow",
-        "AXDialog",
-        "AXUnknown",
-        "AXModal",
-        "AXEnhancedUserInterface",
-        "AXCloseButton",
-        "AXMinimizeButton",
-        "AXZoomButton",
-        "AXFullScreenButton",
-        "AXFocused",
-    };
-    var refs: [names.len]c.CFStringRef = undefined;
-
-    for (names, 0..) |name, i| {
-        refs[i] = createAxString(name) orelse {
-            var created_count: usize = i;
-            while (created_count > 0) : (created_count -= 1) {
-                releaseAxString(refs[created_count - 1]);
-            }
-            return null;
-        };
-    }
-
-    g_ax_strings = .{
-        .focused_window_attr = refs[0],
-        .windows_attr = refs[1],
-        .size_attr = refs[2],
-        .position_attr = refs[3],
-        .raise_action = refs[4],
-        .main_attr = refs[5],
-        .role_attr = refs[6],
-        .window_role = refs[7],
-        .unknown_role = refs[8],
-        .subrole_attr = refs[9],
-        .standard_window_subrole = refs[10],
-        .floating_window_subrole = refs[11],
-        .dialog_subrole = refs[12],
-        .unknown_subrole = refs[13],
-        .modal_attr = refs[14],
-        .enhanced_ui_attr = refs[15],
-        .close_button_attr = refs[16],
-        .minimize_button_attr = refs[17],
-        .zoom_button_attr = refs[18],
-        .fullscreen_button_attr = refs[19],
-        .focused_attr = refs[20],
-    };
-    return &g_ax_strings.?;
-}
-
-fn deinitAxStrings() void {
-    if (g_ax_strings) |strings| {
-        const refs = [_]c.CFStringRef{
-            strings.focused_attr,
-            strings.fullscreen_button_attr,
-            strings.zoom_button_attr,
-            strings.minimize_button_attr,
-            strings.close_button_attr,
-            strings.enhanced_ui_attr,
-            strings.modal_attr,
-            strings.unknown_subrole,
-            strings.dialog_subrole,
-            strings.floating_window_subrole,
-            strings.standard_window_subrole,
-            strings.subrole_attr,
-            strings.unknown_role,
-            strings.window_role,
-            strings.role_attr,
-            strings.main_attr,
-            strings.raise_action,
-            strings.position_attr,
-            strings.size_attr,
-            strings.windows_attr,
-            strings.focused_window_attr,
-        };
-        for (refs) |value| {
-            releaseAxString(value);
-        }
-        g_ax_strings = null;
-    }
-}
+// AX attribute strings and window-frame plumbing live in ax.zig; aliases
+// keep the many existing call sites unchanged.
+const AxStrings = ax_mod.AxStrings;
+const ensureAxStrings = ax_mod.strings;
+const deinitAxStrings = ax_mod.deinitStrings;
+const findAxWindow = ax_mod.findWindow;
+const axEnhancedUserInterface = ax_mod.enhancedUserInterface;
 
 fn displayIndexById(display_id: u32) ?usize {
     for (g_displays[0..g_display_count], 0..) |display, i| {
@@ -1200,7 +1081,7 @@ const HideCtx = struct {
                     .bottom_right => self.display.x + self.display.w - hide_peek,
                     .bottom_left => self.display.x - win.frame.width + hide_peek,
                 };
-                const ok = shim.bw_ax_set_window_frame(pid, wid, pos_x, pos_y, win.frame.width, win.frame.height);
+                const ok = ax_mod.setWindowFrame(pid, wid, pos_x, pos_y, win.frame.width, win.frame.height);
                 log.debug("hide window wid={d} pid={d} ok={} x={d:.0} y={d:.0} w={d:.0} h={d:.0}", .{
                     wid,
                     pid,
@@ -1228,7 +1109,7 @@ const HideCtx = struct {
             .bottom_right => self.display.x + self.display.w - hide_peek,
             .bottom_left => self.display.x - 1 + hide_peek,
         };
-        const ok = shim.bw_ax_set_window_frame(pid, wid, pos_x, pos_y, 1, 1);
+        const ok = ax_mod.setWindowFrame(pid, wid, pos_x, pos_y, 1, 1);
         log.debug("hide window wid={d} pid={d} ok={} x={d:.0} y={d:.0} w=1 h=1", .{
             wid,
             pid,
@@ -1256,7 +1137,7 @@ const HideCtx = struct {
         const focused_wid = focusedWindowIdForPid(pid) orelse return false;
         if (focused_wid == failed_wid) return false;
 
-        const ok = shim.bw_ax_set_window_frame(pid, focused_wid, x, y, w, h);
+        const ok = ax_mod.setWindowFrame(pid, focused_wid, x, y, w, h);
         log.debug("hide fallback focused window failed_wid={d} focused_wid={d} pid={d} ok={} x={d:.0} y={d:.0} w={d:.0} h={d:.0}", .{
             failed_wid,
             focused_wid,
@@ -1340,7 +1221,6 @@ var g_waker_source: c.CFRunLoopSourceRef = null;
 var g_role_poll_source: c.dispatch_source_t = null;
 var g_ipc_source: c.dispatch_source_t = null;
 var g_tap_port: c.CFMachPortRef = null;
-var g_ax_strings: ?AxStrings = null;
 var g_workspace_transition: WorkspaceTransitionState = .{};
 var g_workspace_transition_completion_reason: WorkspaceTransitionCompletionReason = .none;
 var g_pending_focus_entries: [pending_focus_capacity_per_epoch]PendingFocusEntry = undefined;
@@ -1711,167 +1591,11 @@ fn isRegularActivationApp(pid: i32) bool {
     return activation_policy == 0;
 }
 
-fn findAxWindow(pid: i32, target_wid: u32) ?c.AXUIElementRef {
-    std.debug.assert(pid > 0);
-    std.debug.assert(target_wid > 0);
-
-    const app = c.AXUIElementCreateApplication(pid) orelse return null;
-    defer c.CFRelease(@ptrCast(app));
-
-    const ax = ensureAxStrings() orelse return null;
-    const windows_attr = ax.windows_attr;
-    var windows: c.CFArrayRef = null;
-    const err = c.AXUIElementCopyAttributeValue(app, windows_attr, @ptrCast(&windows));
-    if (err != c.kAXErrorSuccess or windows == null) return null;
-    const windows_ref = windows orelse return null;
-    defer c.CFRelease(@ptrCast(windows_ref));
-
-    const count = c.CFArrayGetCount(windows_ref);
-    std.debug.assert(count >= 0);
-
-    var i: c.CFIndex = 0;
-    while (i < count) : (i += 1) {
-        const win_any = c.CFArrayGetValueAtIndex(windows_ref, i) orelse continue;
-        const win: c.AXUIElementRef = @ptrCast(win_any);
-
-        var wid: u32 = 0;
-        if (_AXUIElementGetWindow(win, &wid) != c.kAXErrorSuccess) continue;
-        if (wid != target_wid) continue;
-
-        _ = c.CFRetain(@ptrCast(win));
-        return win;
-    }
-
-    return null;
-}
-
-/// Move and resize a window using AX attributes.
-///
-/// Uses a Size-Position-Size three-pass strategy because
-/// macOS clamps window dimensions to the visible screen area at the current
-/// origin. The first resize shrinks or grows the window while it is still at
-/// its old position. The move then places it at the target origin. The second
-/// resize corrects any clamping the intermediate position caused.
-///
-/// The entire sequence is wrapped in an AXEnhancedUserInterface toggle because
-/// some apps (notably Electron) silently reject geometry writes when that flag
-/// is enabled on the application element.
-export fn bw_ax_set_window_frame(pid: i32, wid: u32, x: f64, y: f64, w: f64, h: f64) bool {
-    std.debug.assert(pid > 0);
-    std.debug.assert(wid > 0);
-
-    if (w <= 0 or h <= 0) return false;
-    const win = findAxWindow(pid, wid) orelse return false;
-    defer c.CFRelease(@ptrCast(win));
-
-    const ax = ensureAxStrings() orelse return false;
-    const size_attr = ax.size_attr;
-    const position_attr = ax.position_attr;
-
-    const app = c.AXUIElementCreateApplication(pid) orelse return false;
-    defer c.CFRelease(@ptrCast(app));
-
-    const had_enhanced_ui = axEnhancedUserInterface(app, ax);
-    if (had_enhanced_ui) {
-        _ = c.AXUIElementSetAttributeValue(app, ax.enhanced_ui_attr, c.kCFBooleanFalse);
-    }
-    defer if (had_enhanced_ui) {
-        _ = c.AXUIElementSetAttributeValue(app, ax.enhanced_ui_attr, c.kCFBooleanTrue);
-    };
-
-    const position: c.CGPoint = .{ .x = x, .y = y };
-    const position_value = c.AXValueCreate(c.kAXValueTypeCGPoint, &position) orelse return false;
-    defer c.CFRelease(@ptrCast(position_value));
-
-    const size: c.CGSize = .{ .width = w, .height = h };
-    const size_value = c.AXValueCreate(c.kAXValueTypeCGSize, &size) orelse return false;
-    defer c.CFRelease(@ptrCast(size_value));
-
-    _ = c.AXUIElementSetAttributeValue(win, size_attr, @ptrCast(size_value));
-    _ = c.AXUIElementSetAttributeValue(win, position_attr, @ptrCast(position_value));
-    const err = c.AXUIElementSetAttributeValue(win, size_attr, @ptrCast(size_value));
-
-    return err == c.kAXErrorSuccess;
-}
-
-/// Prepare a window for repeated animation frame writes: resolve and retain
-/// its AX element once so ticks skip the per-call window-list enumeration,
-/// and disable AXEnhancedUserInterface for the animation's duration (some
-/// apps, notably Electron, silently reject geometry writes while it is set).
-/// `restore_enhanced_ui` reports whether bw_ax_animation_end must restore
-/// the flag. Returns null when the window cannot be resolved.
-export fn bw_ax_animation_begin(pid: i32, wid: u32, restore_enhanced_ui: *bool) ?*anyopaque {
-    std.debug.assert(pid > 0);
-    std.debug.assert(wid > 0);
-
-    restore_enhanced_ui.* = false;
-    const win = findAxWindow(pid, wid) orelse return null;
-
-    if (ensureAxStrings()) |ax| {
-        if (c.AXUIElementCreateApplication(pid)) |app| {
-            defer c.CFRelease(@ptrCast(app));
-            if (axEnhancedUserInterface(app, ax)) {
-                _ = c.AXUIElementSetAttributeValue(app, ax.enhanced_ui_attr, c.kCFBooleanFalse);
-                restore_enhanced_ui.* = true;
-            }
-        }
-    }
-
-    return @constCast(@ptrCast(win));
-}
-
-/// Single-pass frame write on a cached AX element from
-/// bw_ax_animation_begin. Skips the clamping-correction passes of
-/// bw_ax_set_window_frame — intermediate animation frames are overwritten
-/// on the next tick anyway, and the final frame goes through the full
-/// three-pass set for exact placement. `set_size` should be false for pure
-/// moves, halving the IPC per tick.
-export fn bw_ax_animation_step(win_ref: *anyopaque, x: f64, y: f64, w: f64, h: f64, set_size: bool) void {
-    if (w <= 0 or h <= 0) return;
-    const win: c.AXUIElementRef = @ptrCast(win_ref);
-    const ax = ensureAxStrings() orelse return;
-
-    if (set_size) {
-        const size: c.CGSize = .{ .width = w, .height = h };
-        const size_value = c.AXValueCreate(c.kAXValueTypeCGSize, &size) orelse return;
-        defer c.CFRelease(@ptrCast(size_value));
-        _ = c.AXUIElementSetAttributeValue(win, ax.size_attr, @ptrCast(size_value));
-    }
-
-    const position: c.CGPoint = .{ .x = x, .y = y };
-    const position_value = c.AXValueCreate(c.kAXValueTypeCGPoint, &position) orelse return;
-    defer c.CFRelease(@ptrCast(position_value));
-    _ = c.AXUIElementSetAttributeValue(win, ax.position_attr, @ptrCast(position_value));
-}
-
-/// Release a cached AX element from bw_ax_animation_begin and restore
-/// AXEnhancedUserInterface if the begin call disabled it.
-export fn bw_ax_animation_end(pid: i32, win_ref: ?*anyopaque, restore_enhanced_ui: bool) void {
-    if (win_ref) |ref| {
-        c.CFRelease(ref);
-    }
-    if (restore_enhanced_ui) {
-        const ax = ensureAxStrings() orelse return;
-        const app = c.AXUIElementCreateApplication(pid) orelse return;
-        defer c.CFRelease(@ptrCast(app));
-        _ = c.AXUIElementSetAttributeValue(app, ax.enhanced_ui_attr, c.kCFBooleanTrue);
-    }
-}
-
 /// Query whether the AXSize attribute is settable (i.e. the window can be resized).
 fn axCanResize(win_ref: c.AXUIElementRef, ax: *const AxStrings) bool {
     var result: c.Boolean = 0;
     const err = c.AXUIElementIsAttributeSettable(win_ref, ax.size_attr, &result);
     return err == c.kAXErrorSuccess and result != 0;
-}
-
-/// Query whether AXEnhancedUserInterface is currently enabled on an app element.
-fn axEnhancedUserInterface(app: c.AXUIElementRef, ax: *const AxStrings) bool {
-    var value: c.CFTypeRef = null;
-    const err = c.AXUIElementCopyAttributeValue(app, ax.enhanced_ui_attr, &value);
-    if (err != c.kAXErrorSuccess or value == null) return false;
-    defer c.CFRelease(value.?);
-    return c.CFEqual(value.?, @ptrCast(c.kCFBooleanTrue)) != 0;
 }
 
 /// Raise and focus a window, then activate its owning app.
@@ -4856,7 +4580,7 @@ fn retileDisplay(display_id: u32) void {
                 // Two-pass for fullscreen to handle macOS size clamping
                 const passes: usize = if (win.is_fullscreen) 2 else 1;
                 for (0..passes) |_| {
-                    _ = shim.bw_ax_set_window_frame(
+                    _ = ax_mod.setWindowFrame(
                         win.pid,
                         entry.wid,
                         target_frame.x,
@@ -4881,7 +4605,7 @@ fn retileDisplay(display_id: u32) void {
                     if (g_store.get(member_wid)) |member| {
                         if (framesEqual(member.frame, entry.frame)) continue;
 
-                        _ = shim.bw_ax_set_window_frame(
+                        _ = ax_mod.setWindowFrame(
                             member.pid,
                             member_wid,
                             entry.frame.x,
@@ -4932,7 +4656,7 @@ fn restoreAllWindows() void {
                 const h = if (win.frame.height > 1) win.frame.height else display.h * 0.5;
                 const x = display.x + (display.w - w) / 2.0;
                 const y = display.y + (display.h - h) / 2.0;
-                _ = shim.bw_ax_set_window_frame(win.pid, wid, x, y, w, h);
+                _ = ax_mod.setWindowFrame(win.pid, wid, x, y, w, h);
             }
         }
     }

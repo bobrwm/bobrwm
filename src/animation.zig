@@ -3,14 +3,13 @@
 //! every animating window costs main-thread time each tick, and an
 //! unresponsive app can stall the window manager for the AX messaging
 //! timeout. To keep the per-tick cost down, each animation resolves and
-//! retains the window's AX element once up front (bw_ax_animation_begin)
-//! and intermediate ticks issue a single-pass position(+size) write; only
-//! the final frame goes through the full three-pass clamping-safe
-//! bw_ax_set_window_frame. Alpha until animation is moved off the main
-//! thread.
+//! retains the window's AX element once up front (ax.animationBegin) and
+//! intermediate ticks issue a single-pass position(+size) write; only the
+//! final frame goes through the full three-pass clamping-safe
+//! ax.setWindowFrame. Alpha until animation is moved off the main thread.
 
 const std = @import("std");
-const shim = @import("shim_api.zig");
+const ax = @import("ax.zig");
 const window_mod = @import("window.zig");
 const osutil = @import("osutil.zig");
 
@@ -35,15 +34,12 @@ const WindowAnimation = struct {
     end_frame: window_mod.Window.Frame,
     last_displayed_frame: window_mod.Window.Frame,
     start_time_ns: i128,
-    /// AX element retained for the animation's lifetime so ticks skip the
-    /// per-call window-list lookup. Released via bw_ax_animation_end.
-    ax_ref: *anyopaque,
-    /// Whether bw_ax_animation_begin disabled AXEnhancedUserInterface and
-    /// bw_ax_animation_end must restore it.
-    restore_enhanced_ui: bool,
+    /// Retains the AX element for the animation's lifetime so ticks skip
+    /// the per-call window-list lookup. Released via ax.animationEnd.
+    handle: ax.AnimationHandle,
 
     fn end(self: *const WindowAnimation) void {
-        shim.bw_ax_animation_end(self.pid, self.ax_ref, self.restore_enhanced_ui);
+        ax.animationEnd(self.handle);
     }
 };
 
@@ -92,8 +88,7 @@ pub const Animator = struct {
             return;
         }
 
-        var restore_enhanced_ui = false;
-        const ax_ref = shim.bw_ax_animation_begin(pid, wid, &restore_enhanced_ui) orelse {
+        const handle = ax.animationBegin(pid, wid) orelse {
             // Window can't be resolved — place it directly instead.
             setFrame(pid, wid, target_frame);
             return;
@@ -106,8 +101,7 @@ pub const Animator = struct {
             .end_frame = target_frame,
             .last_displayed_frame = current_frame,
             .start_time_ns = now_ns,
-            .ax_ref = ax_ref,
-            .restore_enhanced_ui = restore_enhanced_ui,
+            .handle = handle,
         };
         self.count += 1;
     }
@@ -146,7 +140,7 @@ pub const Animator = struct {
                 // Pure moves skip the size write, halving the per-tick IPC.
                 const resizing = @abs(a.end_frame.width - a.start_frame.width) > tol or
                     @abs(a.end_frame.height - a.start_frame.height) > tol;
-                shim.bw_ax_animation_step(a.ax_ref, frame.x, frame.y, frame.width, frame.height, resizing);
+                ax.animationStep(a.handle, frame.x, frame.y, frame.width, frame.height, resizing);
                 a.last_displayed_frame = frame;
             }
 
@@ -211,7 +205,7 @@ pub const Animator = struct {
 };
 
 fn setFrame(pid: i32, wid: u32, frame: window_mod.Window.Frame) void {
-    _ = shim.bw_ax_set_window_frame(
+    _ = ax.setWindowFrame(
         pid,
         wid,
         frame.x,
