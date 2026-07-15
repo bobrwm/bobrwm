@@ -5,7 +5,7 @@
 def describe [] {
     {
         name: "probe_windows"
-        description: "Probe macOS window metadata (CG + AX) for a given app process over time. Samples CGWindowList and AXUIElement attributes periodically, emitting structured JSONL. Use to debug AX role readiness, window creation timing, focus changes, dim/alpha transitions, or Electron app behavior."
+        description: "Probe macOS window metadata (CG + AX) for a given app process over time, including bobrwm-owned dimming overlays. Samples CGWindowList and AXUIElement attributes periodically, emitting structured JSONL. Use to debug AX role readiness, window creation timing, focus changes, overlay transitions, or Electron app behavior."
         inputSchema: {
             type: "object"
             properties: {
@@ -14,6 +14,7 @@ def describe [] {
                 wid: { type: "integer", description: "CG window ID to query directly. Can be combined with pid to verify ownership." }
                 duration_sec: { type: "integer", description: "How many seconds to sample (default: 10)" }
                 interval_ms: { type: "integer", description: "Milliseconds between samples (default: 100)" }
+                include_dimming_overlays: { type: "boolean", description: "Include bobrwm-owned dimming overlay windows (default: true)" }
                 output_file: { type: "string", description: "Optional file path to save raw JSONL output" }
             }
         }
@@ -72,6 +73,7 @@ def execute [] {
     let wid_arg = ($input | get -o wid)
     let duration_sec = ($input | get -o duration_sec | default 10)
     let interval_ms_val = ($input | get -o interval_ms | default 100)
+    let include_dimming_overlays = ($input | get -o include_dimming_overlays | default true)
     let output_file = ($input | get -o output_file)
 
     let duration_ms = $duration_sec * 1000
@@ -129,13 +131,11 @@ def execute [] {
     let probe_bin = (ensure-probe-binary)
 
     # Run probe
-    let raw_output = if $target_pid != null and $wid_arg != null {
-        ^$probe_bin --pid $"($target_pid)" --wid $"($wid_arg)" --duration-ms $"($duration_ms)" --interval-ms $"($interval_ms_val)"
-    } else if $target_pid != null {
-        ^$probe_bin --pid $"($target_pid)" --duration-ms $"($duration_ms)" --interval-ms $"($interval_ms_val)"
-    } else {
-        ^$probe_bin --wid $"($wid_arg)" --duration-ms $"($duration_ms)" --interval-ms $"($interval_ms_val)"
-    }
+    mut probe_args = [--duration-ms $"($duration_ms)" --interval-ms $"($interval_ms_val)"]
+    if $target_pid != null { $probe_args = ($probe_args | append [--pid $"($target_pid)"]) }
+    if $wid_arg != null { $probe_args = ($probe_args | append [--wid $"($wid_arg)"]) }
+    if $include_dimming_overlays { $probe_args = ($probe_args | append "--include-dimming-overlays") }
+    let raw_output = (^$probe_bin ...$probe_args)
 
     # Save raw JSONL if requested
     if $output_file != null {
@@ -168,6 +168,9 @@ def execute [] {
         {
             pid: ($w | get pid)
             wid: $wid
+            kind: ($w | get window_kind)
+            owner: ($w | get -o owner_name | default "")
+            cg_order: ($w | get cg_order)
             onscreen: ($w | get cg_onscreen)
             layer: ($w | get cg_layer)
             alpha: ($w | get cg_alpha)
@@ -177,7 +180,7 @@ def execute [] {
             focused: ($w | get -o focused | default false)
             minimized: ($w | get -o minimized | default "?")
             bounds: ($"x=($w.cg_bounds.x) y=($w.cg_bounds.y) w=($w.cg_bounds.w) h=($w.cg_bounds.h)")
-            title: ($w | get -o title | default "")
+            title: ($w | get -o title | default ($w | get -o window_name | default ""))
             first_seen_ms: $first_seen_ms
             role_ready_ms: $ready_ms
         }
@@ -205,6 +208,7 @@ def execute [] {
             let wid = ($event | get -o wid | default ($event | get -o current | get -o wid | default "?"))
             let pid = ($event | get -o current | get -o pid | default ($event | get -o previous | get -o pid | default "?"))
             let state = ($event | get -o current | get -o manage_state | default "?")
+            let kind = ($event | get -o current | get -o window_kind | default ($event | get -o previous | get -o window_kind | default "window"))
             let onscreen = ($event | get -o current | get -o cg_onscreen | default "?")
             let fields = ($event | get -o fields_changed | default [] | str join ",")
             let detail = if ($fields | is-empty) { "" } else {
@@ -221,7 +225,7 @@ def execute [] {
                     }
                 } | str join "; " | $" [($in)]"
             }
-            print $"  ($event.elapsed_ms)ms: ($event.change) pid=($pid) wid=($wid) onscreen=($onscreen) manage_state=($state)($detail)"
+            print $"  ($event.elapsed_ms)ms: ($event.change) kind=($kind) pid=($pid) wid=($wid) onscreen=($onscreen) manage_state=($state)($detail)"
         }
     }
 }

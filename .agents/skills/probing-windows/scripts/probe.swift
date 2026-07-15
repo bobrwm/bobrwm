@@ -15,6 +15,10 @@ struct Bounds: Codable, Equatable {
 struct WindowSample: Codable {
     let wid: UInt32
     let pid: Int
+    let ownerName: String?
+    let windowName: String?
+    let windowKind: String
+    let cgOrder: Int
     let cgLayer: Int
     let cgAlpha: Double
     let cgOnscreen: Bool
@@ -30,6 +34,10 @@ struct WindowSample: Codable {
 
     enum CodingKeys: String, CodingKey {
         case wid, pid
+        case ownerName = "owner_name"
+        case windowName = "window_name"
+        case windowKind = "window_kind"
+        case cgOrder = "cg_order"
         case cgLayer = "cg_layer"
         case cgAlpha = "cg_alpha"
         case cgOnscreen = "cg_onscreen"
@@ -126,7 +134,8 @@ func collectAXMetadata(pid: pid_t) -> AXAppMeta {
     return AXAppMeta(windows: windows, focusedWid: focusedWid)
 }
 
-func collectSamples(pidFilter: pid_t?, widFilter: UInt32?, axPids: Set<pid_t>?) -> [WindowSample] {
+func collectSamples(pidFilter: pid_t?, widFilter: UInt32?, axPids: Set<pid_t>?,
+                    includeDimmingOverlays: Bool) -> [WindowSample] {
     var axMetadataByPid: [pid_t: AXAppMeta] = [:]
     var samples: [WindowSample] = []
 
@@ -134,16 +143,23 @@ func collectSamples(pidFilter: pid_t?, widFilter: UInt32?, axPids: Set<pid_t>?) 
         return samples
     }
 
-    for info in windowList {
+    for (cgOrder, info) in windowList.enumerated() {
         guard let infoPid = info[kCGWindowOwnerPID as String] as? Int,
               let wid = info[kCGWindowNumber as String] as? UInt32 else { continue }
         let ownerPid = pid_t(infoPid)
-        if let pidFilter = pidFilter, ownerPid != pidFilter { continue }
-        if let widFilter = widFilter, wid != widFilter { continue }
-
         let layer = info[kCGWindowLayer as String] as? Int ?? -1
         let alpha = info[kCGWindowAlpha as String] as? Double ?? 0
         let onScreen = info[kCGWindowIsOnscreen as String] as? Bool ?? false
+        let ownerName = info[kCGWindowOwnerName as String] as? String
+        let windowName = info[kCGWindowName as String] as? String
+
+        // Dimming is implemented with bobrwm-owned, normal-level NSPanels.
+        // Other bobrwm UI (status item and tile preview) uses elevated levels,
+        // so owner + layer identifies the dim panels without AX access.
+        let isDimmingOverlay = ownerName?.lowercased() == "bobrwm" && layer == 0
+        let matchesPid = pidFilter.map { ownerPid == $0 } ?? true
+        let matchesWid = widFilter.map { wid == $0 } ?? true
+        if !(matchesPid && matchesWid) && !(includeDimmingOverlays && isDimmingOverlay) { continue }
 
         var bounds = Bounds(x: 0, y: 0, w: 0, h: 0)
         if let boundsDict = info[kCGWindowBounds as String] as? [String: Double] {
@@ -154,7 +170,7 @@ func collectSamples(pidFilter: pid_t?, widFilter: UInt32?, axPids: Set<pid_t>?) 
 
         // Only pay the AX cost for pids the caller cares about; in snapshot
         // mode that avoids querying every process on the system.
-        let wantAX = axPids == nil || axPids!.contains(ownerPid)
+        let wantAX = !isDimmingOverlay && (axPids == nil || axPids!.contains(ownerPid))
         if wantAX && axMetadataByPid[ownerPid] == nil {
             axMetadataByPid[ownerPid] = collectAXMetadata(pid: ownerPid)
         }
@@ -163,7 +179,9 @@ func collectSamples(pidFilter: pid_t?, widFilter: UInt32?, axPids: Set<pid_t>?) 
         let state = manageStateFor(role: ax?.role, subrole: ax?.subrole)
 
         samples.append(WindowSample(
-            wid: wid, pid: infoPid, cgLayer: layer, cgAlpha: alpha, cgOnscreen: onScreen,
+            wid: wid, pid: infoPid, ownerName: ownerName, windowName: windowName,
+            windowKind: isDimmingOverlay ? "dimming_overlay" : "window", cgOrder: cgOrder,
+            cgLayer: layer, cgAlpha: alpha, cgOnscreen: onScreen,
             cgBounds: bounds, role: ax?.role, subrole: ax?.subrole,
             title: ax?.title, axFrame: ax?.frame,
             minimized: ax?.minimized, fullscreen: ax?.fullscreen,
@@ -171,10 +189,7 @@ func collectSamples(pidFilter: pid_t?, widFilter: UInt32?, axPids: Set<pid_t>?) 
             manageState: state))
     }
 
-    return samples.sorted {
-        if $0.pid == $1.pid { return $0.wid < $1.wid }
-        return $0.pid < $1.pid
-    }
+    return samples.sorted { $0.cgOrder < $1.cgOrder }
 }
 
 /// Fields whose transitions are worth a `change` event. Frame moves use a 1px
@@ -185,6 +200,7 @@ func changedFields(_ prev: WindowSample, _ cur: WindowSample) -> [String] {
     if prev.role != cur.role { fields.append("role") }
     if prev.subrole != cur.subrole { fields.append("subrole") }
     if prev.cgOnscreen != cur.cgOnscreen { fields.append("cg_onscreen") }
+    if prev.cgOrder != cur.cgOrder { fields.append("cg_order") }
     if abs(prev.cgAlpha - cur.cgAlpha) > 0.01 { fields.append("cg_alpha") }
     if abs(prev.cgBounds.x - cur.cgBounds.x) > 1 || abs(prev.cgBounds.y - cur.cgBounds.y) > 1
         || abs(prev.cgBounds.w - cur.cgBounds.w) > 1 || abs(prev.cgBounds.h - cur.cgBounds.h) > 1 {
@@ -257,7 +273,8 @@ func usage(_ message: String? = nil) -> Never {
         fputs("error: \(message)\n", stderr)
     }
     fputs("""
-    usage: probe [--pid <pid>] [--wid <cg-window-id>] [--duration-ms N] [--interval-ms N]
+    usage: probe [--pid <pid>] [--wid <cg-window-id>] [--include-dimming-overlays]
+                 [--duration-ms N] [--interval-ms N]
            probe --snapshot [--ax-pids <pid,pid,...>]
 
     Sampling mode emits session_start/sample/change/session_end JSONL events.
@@ -277,6 +294,7 @@ var durationMs: UInt64 = 10000
 var intervalMs: UInt64 = 100
 var snapshotMode = false
 var axPidsArg: Set<pid_t>?
+var includeDimmingOverlays = false
 var i = 1
 while i < args.count {
     switch args[i] {
@@ -307,6 +325,9 @@ while i < args.count {
     case "--snapshot":
         snapshotMode = true
         i += 1
+    case "--include-dimming-overlays":
+        includeDimmingOverlays = true
+        i += 1
     case "--ax-pids":
         guard i + 1 < args.count else { usage("missing --ax-pids value") }
         var pids: Set<pid_t> = []
@@ -325,7 +346,8 @@ while i < args.count {
 
 if snapshotMode {
     // One CG pass over every window; AX only for the requested pids.
-    let windows = collectSamples(pidFilter: pidArg, widFilter: widArg, axPids: axPidsArg ?? [])
+    let windows = collectSamples(pidFilter: pidArg, widFilter: widArg, axPids: axPidsArg ?? [],
+        includeDimmingOverlays: includeDimmingOverlays)
     emitCodable(Event.sample(pid: pidArg, index: 0, elapsed: 0, windows: windows))
     exit(0)
 }
@@ -347,7 +369,8 @@ while true {
     let elapsed = UInt64((CFAbsoluteTimeGetCurrent() - startTime) * 1000)
     if elapsed > durationMs { break }
 
-    let current = collectSamples(pidFilter: pidArg, widFilter: widArg, axPids: nil)
+    let current = collectSamples(pidFilter: pidArg, widFilter: widArg, axPids: nil,
+        includeDimmingOverlays: includeDimmingOverlays)
     let currentByWid = Dictionary(uniqueKeysWithValues: current.map { ($0.wid, $0) })
 
     emitCodable(Event.sample(pid: pidArg, index: sampleIndex, elapsed: elapsed, windows: current))

@@ -10,12 +10,13 @@
 def describe [] {
     {
         name: "compare_state"
-        description: "Cross-check bobrwm daemon state (query workspaces/displays --json) against a CGWindowList+AX snapshot. Reports stale store entries, frame drift, hidden-workspace windows that are not parked, visible unmanaged windows, focus divergence (stale native-tab window IDs), and fully-transparent managed windows. Run after reproducing a bug to see which state source diverged."
+        description: "Cross-check bobrwm daemon state (query workspaces/displays --json) against a CGWindowList+AX snapshot. Reports stale store entries, frame drift, hidden-workspace windows that are not parked, visible unmanaged windows, focus divergence, fully-transparent managed windows, and missing or unexpected dimming overlays. Run after reproducing a bug to see which state source diverged."
         inputSchema: {
             type: "object"
             properties: {
                 bobrwm_bin: { type: "string", description: "Path to the bobrwm binary (default: PATH, then <repo>/zig-out/bin/bobrwm)" }
                 frame_tolerance: { type: "number", description: "Max px difference between bobrwm frame and CG bounds before flagging drift (default: 2)" }
+                expect_dimming_overlays: { type: "boolean", description: "Require overlays for every inactive visible window, including when none are present (default: false; use when dimming is known enabled)" }
                 output_file: { type: "string", description: "Optional file path to save the raw snapshot + query JSON" }
             }
         }
@@ -89,6 +90,13 @@ def os-window [os_windows, wid: int] {
     $os_windows | where {|w| $w.wid == $wid } | get -o 0
 }
 
+def bounds-match [a, b, tolerance: number] {
+    (($a.x - $b.x | math abs) <= $tolerance)
+    and (($a.y - $b.y | math abs) <= $tolerance)
+    and (($a.w - $b.w | math abs) <= $tolerance)
+    and (($a.h - $b.h | math abs) <= $tolerance)
+}
+
 # Overlap of a CG rect with a display's visible frame, as {w, h}.
 def overlap-with-display [bounds, frame] {
     let right = ([($bounds.x + $bounds.w), ($frame.x + $frame.width)] | math min)
@@ -103,6 +111,7 @@ def overlap-with-display [bounds, frame] {
 def execute [] {
     let input = ($in | from json)
     let tolerance = ($input | get -o frame_tolerance | default 2)
+    let expect_dimming_overlays = ($input | get -o expect_dimming_overlays | default false)
     let output_file = ($input | get -o output_file)
 
     let bobrwm = (find-bobrwm ($input | get -o bobrwm_bin))
@@ -253,7 +262,8 @@ def execute [] {
         }
     }
 
-    # 6. Fully transparent managed windows on visible workspaces (dim bugs).
+    # 6. Fully transparent managed windows indicate an app/restore ghost. The
+    # dimmer does not change target alpha; it draws a separate overlay panel.
     let transparent = ($managed | where ws_visible | each {|m|
         let os = (os-window $os_windows $m.window_id)
         if $os != null and $os.cg_alpha < 0.05 and (($os | get -o minimized | default false) == false) {
@@ -261,11 +271,61 @@ def execute [] {
         } else { null }
     } | compact)
     if ($transparent | is-empty) {
-        print "[ok] alpha: no managed visible-workspace window is fully transparent"
+        print "[ok] target alpha: no managed visible-workspace window is fully transparent"
     } else {
         $issues += ($transparent | length)
-        print $"[ISSUE] alpha: ($transparent | length) managed windows on visible workspaces are fully transparent \(dim/restore bug?\):"
+        print $"[ISSUE] target alpha: ($transparent | length) managed windows on visible workspaces are fully transparent \(app ghost or restore bug?\):"
         $transparent | to md | print
+    }
+
+    # 7. A visible inactive managed window must have one bobrwm-owned layer-0
+    # overlay with the same frame. Focused windows must have no overlay. CG's
+    # global list index is captured for timelines but is not a reliable
+    # cross-process above/below assertion for AppKit panels.
+    let overlays = ($os_windows | where {|w|
+        $w.window_kind == "dimming_overlay" and $w.cg_onscreen and $w.cg_alpha > 0.01
+    })
+    let has_visible_focus = not ($workspaces | where {|ws| $ws.visible and (($ws | get -o focused_window) != null) } | is-empty)
+    let expected_dim_targets = ($managed | where {|m| $has_visible_focus and $m.ws_visible and (not $m.ws_focused) } | each {|m|
+        let os = (os-window $os_windows $m.window_id)
+        if $os == null or (not $os.cg_onscreen) or $os.cg_alpha <= 0.01 or (($os | get -o minimized | default false) == true) {
+            null
+        } else { $m | insert os_window $os }
+    } | compact)
+
+    let missing_overlays = if $expect_dimming_overlays or (not ($overlays | is-empty)) {
+        $expected_dim_targets | where {|m|
+            ($overlays | where {|o| bounds-match $o.cg_bounds $m.os_window.cg_bounds $tolerance } | is-empty)
+        } | each {|m| {
+            window_id: $m.window_id
+            bundle_id: $m.bundle_id
+            target_bounds: $"($m.os_window.cg_bounds.x),($m.os_window.cg_bounds.y) ($m.os_window.cg_bounds.w)x($m.os_window.cg_bounds.h)"
+        }}
+    } else { [] }
+
+    let unexpected_overlays = ($overlays | where {|o|
+        ($expected_dim_targets | where {|m| bounds-match $o.cg_bounds $m.os_window.cg_bounds $tolerance } | is-empty)
+    } | each {|o| {
+        overlay_wid: $o.wid
+        alpha: $o.cg_alpha
+        overlay_bounds: $"($o.cg_bounds.x),($o.cg_bounds.y) ($o.cg_bounds.w)x($o.cg_bounds.h)"
+    }})
+
+    let overlay_issues = ($missing_overlays | length) + ($unexpected_overlays | length)
+    if $overlay_issues == 0 and ($overlays | is-empty) {
+        print "[info] dimming overlays: none visible; pass expect_dimming_overlays=true when dimming is known enabled"
+    } else if $overlay_issues == 0 {
+        print $"[ok] dimming overlays: ($overlays | length) visible overlays match inactive window frames"
+    } else {
+        $issues += $overlay_issues
+        if not ($missing_overlays | is-empty) {
+            print $"[ISSUE] dimming overlays: ($missing_overlays | length) inactive visible windows have no matching overlay:"
+            $missing_overlays | to md | print
+        }
+        if not ($unexpected_overlays | is-empty) {
+            print $"[ISSUE] dimming overlays: ($unexpected_overlays | length) visible overlays do not match an inactive visible window:"
+            $unexpected_overlays | to md | print
+        }
     }
 
     print ""

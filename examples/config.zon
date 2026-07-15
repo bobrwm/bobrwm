@@ -51,6 +51,19 @@
     //     .outer = .{ .left = 4, .right = 4, .top = 4, .bottom = 4 },
     // },
 
+    // ALPHA: Animate window movements during layout changes.
+    // Animating windows issue synchronous AX calls on every 16ms tick from
+    // the main thread, so slow or unresponsive apps can make animations
+    // (and the window manager itself) stutter.
+    // .enabled — set to true to enable animated window movements (default: false)
+    // .duration_ms — animation length in milliseconds (default: 200)
+    // .easing — one of .linear, .ease_in, .ease_out, .ease_in_out, .spring (default: .ease_out)
+    // .animation = .{
+    //     .enabled = true,
+    //     .duration_ms = 200,
+    //     .easing = .ease_out,
+    // },
+
     // Virtual workspaces. If omitted, bobrwm creates 10 workspaces.
     // If set, the number of names is the workspace count. Workspace IDs
     // remain 1-based, so this example would create workspaces 1 through 4.
@@ -91,6 +104,12 @@
         .{ .key = "j", .mods = .{ .alt = true }, .action = .focus_down },
         .{ .key = "k", .mods = .{ .alt = true }, .action = .focus_up },
         .{ .key = "l", .mods = .{ .alt = true }, .action = .focus_right },
+
+        // alt+shift+hjkl → swap window with the neighbour in that direction
+        .{ .key = "h", .mods = .{ .alt = true, .shift = true }, .action = .swap_left },
+        .{ .key = "j", .mods = .{ .alt = true, .shift = true }, .action = .swap_down },
+        .{ .key = "k", .mods = .{ .alt = true, .shift = true }, .action = .swap_up },
+        .{ .key = "l", .mods = .{ .alt = true, .shift = true }, .action = .swap_right },
 
         // alt+return → toggle split direction
         .{ .key = "return", .mods = .{ .alt = true }, .action = .toggle_split },

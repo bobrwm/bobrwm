@@ -30,6 +30,10 @@ pub const EventKind = enum(u8) {
     hk_focus_previous_workspace = 30,
     hk_focus_next_workspace = 31,
     hk_toggle_dimming = 32,
+    hk_swap_left = 33,
+    hk_swap_right = 34,
+    hk_swap_up = 35,
+    hk_swap_down = 36,
 };
 
 pub const Event = extern struct {

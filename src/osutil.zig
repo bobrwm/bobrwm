@@ -107,3 +107,29 @@ pub fn makePath(allocator: std.mem.Allocator, path: []const u8) bool {
     if (std.c.mkdir(path_z, 0o755) == 0) return true;
     return pathExists(path_z);
 }
+
+// App metadata
+
+/// Look up the bundle identifier for a PID via NSRunningApplication.
+/// Copies it into `buf` and returns the written slice, or null when the
+/// PID has no running application or no bundle identifier.
+pub fn appBundleId(pid: i32, buf: []u8) ?[]const u8 {
+    std.debug.assert(pid > 0);
+    if (buf.len == 0) return null;
+
+    const objc = @import("objc");
+    const NSRunningApplication = objc.getClass("NSRunningApplication") orelse return null;
+    const app = NSRunningApplication.msgSend(objc.Object, "runningApplicationWithProcessIdentifier:", .{pid});
+    if (app.value == null) return null;
+
+    const bundle_identifier = app.msgSend(objc.Object, "bundleIdentifier", .{});
+    if (bundle_identifier.value == null) return null;
+
+    const utf8 = bundle_identifier.msgSend(?[*:0]const u8, "UTF8String", .{}) orelse return null;
+    const bundle_id = std.mem.sliceTo(utf8, 0);
+    if (bundle_id.len == 0) return null;
+
+    const copy_len = @min(bundle_id.len, buf.len);
+    @memcpy(buf[0..copy_len], bundle_id[0..copy_len]);
+    return buf[0..copy_len];
+}
