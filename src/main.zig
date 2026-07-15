@@ -4468,11 +4468,25 @@ fn updateWindowDisplayAssignment(wid: u32) bool {
     return true;
 }
 
+/// Lowest workspace id (1-based) not yet claimed as active on a display. Falls
+/// back to 1 when every workspace is claimed (only possible with more displays
+/// than workspaces).
+fn firstUnclaimedWorkspace(claimed: []const bool) u8 {
+    var id: u8 = 1;
+    while (id <= g_workspaces.workspace_count) : (id += 1) {
+        if (!claimed[id]) return id;
+    }
+    return 1;
+}
+
 /// Reconciles workspace/display state after monitor topology changes.
 ///
-/// Existing display IDs keep their active workspace and layout roots. Windows
-/// whose previous display disappeared are moved to the primary display's
-/// active workspace so they remain reachable.
+/// Surviving displays keep their active workspace and layout roots, matched by
+/// stable UUID so a monitor that returns under a new id is recognized. Every
+/// workspace stays homed on a surviving display (re-homed to primary if its
+/// monitor vanished, never left homeless), and each display gets a distinct
+/// active workspace. Windows whose monitor disappeared keep their workspace
+/// membership and follow it to the primary display.
 fn reconcileDisplayChange() void {
     const old_displays = g_displays;
     const old_display_count = g_display_count;
@@ -4488,6 +4502,12 @@ fn reconcileDisplayChange() void {
     var remap_to: [workspace_mod.max_displays]u32 = undefined;
     var remap_count: usize = 0;
 
+    // A workspace can be active on at most one display (assertDisplayCoverage).
+    // Track which workspaces are already claimed so two displays that resolve
+    // to the same one (e.g. two newly-appeared displays both defaulting to 1)
+    // get distinct active workspaces.
+    var active_claimed: [workspace_mod.max_workspaces + 1]bool = @splat(false);
+
     for (g_displays[0..g_display_count], 0..) |display, new_slot| {
         var active_id: u8 = 1;
         if (matchOldDisplaySlot(display, old_displays[0..old_display_count])) |old_slot| {
@@ -4499,6 +4519,9 @@ fn reconcileDisplayChange() void {
                 remap_count += 1;
             }
         }
+        if (active_claimed[active_id]) active_id = firstUnclaimedWorkspace(&active_claimed);
+        active_claimed[active_id] = true;
+
         g_workspaces.setActiveForDisplaySlot(new_slot, active_id);
         if (g_workspaces.get(active_id)) |ws| {
             ws.display_id = display.id;
@@ -4507,27 +4530,29 @@ fn reconcileDisplayChange() void {
 
     remapDisplayIds(remap_from[0..remap_count], remap_to[0..remap_count]);
 
-    // Clear display_id for workspaces whose display did not survive.
+    const home = primaryDisplayId();
+
+    // Keep every workspace homed on a surviving display. If its home vanished,
+    // re-home to primary rather than nulling it — a null home would later let
+    // switchWorkspace drift the workspace onto whatever display is focused,
+    // which is exactly the instability this guards against.
     for (&g_workspaces.workspaces) |*ws| {
-        if (ws.display_id) |did| {
-            if (displayIndexById(did) == null) ws.display_id = null;
-        }
+        const did = ws.display_id orelse {
+            ws.display_id = home;
+            continue;
+        };
+        if (displayIndexById(did) == null) ws.display_id = home;
     }
 
     // Windows on a genuinely-removed monitor: keep their workspace membership
-    // and re-home that workspace to the primary display, instead of merging
-    // the windows into whatever workspace is active there. Switching to the
+    // and let them follow to the primary display, instead of merging the
+    // windows into whatever workspace is active there. Switching to the
     // workspace brings them back intact; retile heals their placement.
-    const home = primaryDisplayId();
     var store_it = g_store.windows.iterator();
     while (store_it.next()) |entry| {
         const win = entry.value_ptr;
         if (displayIndexById(win.display_id) != null) continue;
-
         win.display_id = home;
-        if (g_workspaces.get(win.workspace_id)) |ws| {
-            if (ws.display_id == null) ws.display_id = home;
-        }
     }
 }
 
