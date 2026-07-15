@@ -35,6 +35,13 @@ pub const Window = struct {
                 @abs(self.width - other.width) <= tol and
                 @abs(self.height - other.height) <= tol;
         }
+
+        /// Compare only size within a tolerance. When true, a reposition needs
+        /// no AXSize write, so callers can move without the resize flash.
+        pub fn sizeApproxEqual(self: Frame, other: Frame, tol: f64) bool {
+            return @abs(self.width - other.width) <= tol and
+                @abs(self.height - other.height) <= tol;
+        }
     };
 };
 

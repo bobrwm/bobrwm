@@ -1068,93 +1068,71 @@ const HideCtx = struct {
         };
     }
 
-    /// Move a single window to the chosen bottom corner, preserving its
-    /// stored frame size so there is no layout shift on workspace switch.
-    /// Updates the stored position so retileDisplay detects the move
-    /// and won't skip the window via framesEqual on workspace re-activation.
+    /// Move a single window off-screen by POSITION only — never resizing it.
+    /// Resizing on hide causes a visible flash and a reflow storm in
+    /// size-sensitive apps; the parked size is irrelevant and retile restores
+    /// the real frame on re-activation. Updates the stored position so
+    /// retileDisplay detects the move and re-places the window when its
+    /// workspace becomes visible again.
     fn hide(self: HideCtx, pid: i32, wid: u32) void {
         const pos_y = self.display.y + self.display.h - hide_peek;
 
-        if (g_store.get(wid)) |win| {
-            if (win.frame.width > 1 and win.frame.height > 1) {
-                const pos_x = switch (self.corner) {
-                    .bottom_right => self.display.x + self.display.w - hide_peek,
-                    .bottom_left => self.display.x - win.frame.width + hide_peek,
-                };
-                const ok = ax_mod.setWindowFrame(pid, wid, pos_x, pos_y, win.frame.width, win.frame.height);
-                log.debug("hide window wid={d} pid={d} ok={} x={d:.0} y={d:.0} w={d:.0} h={d:.0}", .{
-                    wid,
-                    pid,
-                    ok,
-                    pos_x,
-                    pos_y,
-                    win.frame.width,
-                    win.frame.height,
-                });
-                if (!ok) {
-                    if (self.hideFocusedFallback(pid, wid, pos_x, pos_y, win.frame.width, win.frame.height)) {
-                        return;
-                    }
-                    log.warn("hide failed wid={d} pid={d}", .{ wid, pid });
-                }
-                var updated = win;
-                updated.frame.x = pos_x;
-                updated.frame.y = pos_y;
-                g_store.put(updated) catch {};
-                return;
-            }
-        }
-        // Window not yet tiled — just move off-screen with minimal size
-        const pos_x = switch (self.corner) {
+        // bottom_left parks the window off the left edge, which needs its
+        // width; without a stored size, fall back to bottom_right, which does
+        // not. The size is never written either way.
+        const width: f64 = if (g_store.get(wid)) |win| win.frame.width else 0;
+        const corner: HideCorner = if (width > 1) self.corner else .bottom_right;
+        const pos_x = switch (corner) {
             .bottom_right => self.display.x + self.display.w - hide_peek,
-            .bottom_left => self.display.x - 1 + hide_peek,
+            .bottom_left => self.display.x - width + hide_peek,
         };
-        const ok = ax_mod.setWindowFrame(pid, wid, pos_x, pos_y, 1, 1);
-        log.debug("hide window wid={d} pid={d} ok={} x={d:.0} y={d:.0} w=1 h=1", .{
-            wid,
-            pid,
-            ok,
-            pos_x,
-            pos_y,
-        });
-        if (!ok) {
-            if (!self.hideFocusedFallback(pid, wid, pos_x, pos_y, 1, 1)) {
-                log.warn("hide failed wid={d} pid={d}", .{ wid, pid });
-            }
+
+        const ok = ax_mod.setWindowPosition(pid, wid, pos_x, pos_y);
+        log.debug("hide window wid={d} pid={d} ok={} x={d:.0} y={d:.0}", .{ wid, pid, ok, pos_x, pos_y });
+        if (!ok and !self.hideFocusedFallback(pid, wid, pos_x, pos_y)) {
+            log.warn("hide failed wid={d} pid={d}", .{ wid, pid });
+        }
+
+        if (g_store.get(wid)) |win| {
+            var updated = win;
+            updated.frame.x = pos_x;
+            updated.frame.y = pos_y;
+            g_store.put(updated) catch {};
         }
     }
 
     /// Ghostty can replace the active native-tab window ID before Bobrwm has
-    /// reconciled focus. If hiding the stored ID fails, hide the app's current
-    /// focused AX window at the same off-screen frame so it cannot leak onto
-    /// the newly activated empty workspace.
-    fn hideFocusedFallback(self: HideCtx, pid: i32, failed_wid: u32, x: f64, y: f64, w: f64, h: f64) bool {
+    /// reconciled focus. If moving the stored ID fails, move the app's current
+    /// focused AX window to the same off-screen position so it cannot leak onto
+    /// the newly activated empty workspace, then reconcile the ID swap.
+    fn hideFocusedFallback(self: HideCtx, pid: i32, failed_wid: u32, x: f64, y: f64) bool {
         _ = self;
         std.debug.assert(pid > 0);
         std.debug.assert(failed_wid > 0);
-        std.debug.assert(w > 0 and h > 0);
 
         const focused_wid = focusedWindowIdForPid(pid) orelse return false;
         if (focused_wid == failed_wid) return false;
 
-        const ok = ax_mod.setWindowFrame(pid, focused_wid, x, y, w, h);
-        log.debug("hide fallback focused window failed_wid={d} focused_wid={d} pid={d} ok={} x={d:.0} y={d:.0} w={d:.0} h={d:.0}", .{
+        const ok = ax_mod.setWindowPosition(pid, focused_wid, x, y);
+        log.debug("hide fallback focused window failed_wid={d} focused_wid={d} pid={d} ok={} x={d:.0} y={d:.0}", .{
             failed_wid,
             focused_wid,
             pid,
             ok,
             x,
             y,
-            w,
-            h,
         });
         if (!ok) return false;
 
+        // Record the ID swap at the parked position using the failed window's
+        // stored size; replaceManagedWindowId needs a non-degenerate frame.
+        const stored = g_store.get(failed_wid) orelse return false;
+        if (stored.frame.width <= 0 or stored.frame.height <= 0) return false;
         const replacement_frame: window_mod.Window.Frame = .{
             .x = x,
             .y = y,
-            .width = w,
-            .height = h,
+            .width = stored.frame.width,
+            .height = stored.frame.height,
         };
         return replaceManagedWindowId(failed_wid, focused_wid, replacement_frame);
     }
@@ -4497,6 +4475,21 @@ fn reconcileDisplayChange() void {
     }
 }
 
+/// Apply a target frame to a window, moving without a resize whenever the size
+/// is unchanged so no AXSize write (and its flash/reflow) fires. `two_pass`
+/// re-issues the resize once to defeat macOS size clamping (fullscreen only).
+fn applyWindowFrame(pid: i32, wid: u32, current: window_mod.Window.Frame, target: window_mod.Window.Frame, two_pass: bool) void {
+    if (current.sizeApproxEqual(target, window_mod.Window.Frame.tolerance)) {
+        _ = ax_mod.setWindowPosition(pid, wid, target.x, target.y);
+        return;
+    }
+
+    const passes: usize = if (two_pass) 2 else 1;
+    for (0..passes) |_| {
+        _ = ax_mod.setWindowFrame(pid, wid, target.x, target.y, target.width, target.height);
+    }
+}
+
 fn retileDisplay(display_id: u32) void {
     const ws_id = activeWorkspaceIdForDisplay(display_id);
     const st = tilingStatePtr(ws_id).* orelse return;
@@ -4553,18 +4546,7 @@ fn retileDisplay(display_id: u32) void {
                 // The window may have entered fullscreen mid-animation; stop
                 // the in-flight animation so it doesn't fight the placement.
                 g_animator.cancel(entry.wid);
-                // Two-pass for fullscreen to handle macOS size clamping
-                const passes: usize = if (win.is_fullscreen) 2 else 1;
-                for (0..passes) |_| {
-                    _ = ax_mod.setWindowFrame(
-                        win.pid,
-                        entry.wid,
-                        target_frame.x,
-                        target_frame.y,
-                        target_frame.width,
-                        target_frame.height,
-                    );
-                }
+                applyWindowFrame(win.pid, entry.wid, win.frame, target_frame, win.is_fullscreen);
             }
 
             var updated = win;
@@ -4581,14 +4563,7 @@ fn retileDisplay(display_id: u32) void {
                     if (g_store.get(member_wid)) |member| {
                         if (framesEqual(member.frame, entry.frame)) continue;
 
-                        _ = ax_mod.setWindowFrame(
-                            member.pid,
-                            member_wid,
-                            entry.frame.x,
-                            entry.frame.y,
-                            entry.frame.width,
-                            entry.frame.height,
-                        );
+                        applyWindowFrame(member.pid, member_wid, member.frame, entry.frame, false);
                         var m_updated = member;
                         m_updated.frame = entry.frame;
                         g_store.put(m_updated) catch {};

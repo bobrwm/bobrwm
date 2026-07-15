@@ -239,6 +239,38 @@ pub fn setWindowFrame(pid: i32, wid: u32, x: f64, y: f64, w: f64, h: f64) bool {
     return err == c.kAXErrorSuccess;
 }
 
+/// Move a window without touching its size. Off-screen parking and pure-move
+/// retiles use this instead of setWindowFrame: writing AXSize when only the
+/// position changes triggers a visible resize flash and a reflow storm in
+/// size-sensitive apps.
+pub fn setWindowPosition(pid: i32, wid: u32, x: f64, y: f64) bool {
+    std.debug.assert(pid > 0);
+    std.debug.assert(wid > 0);
+
+    const win = findWindow(pid, wid) orelse return false;
+    defer c.CFRelease(@ptrCast(win));
+
+    const ax = strings() orelse return false;
+
+    const app = c.AXUIElementCreateApplication(pid) orelse return false;
+    defer c.CFRelease(@ptrCast(app));
+
+    const had_enhanced_ui = enhancedUserInterface(app, ax);
+    if (had_enhanced_ui) {
+        _ = c.AXUIElementSetAttributeValue(app, ax.enhanced_ui_attr, c.kCFBooleanFalse);
+    }
+    defer if (had_enhanced_ui) {
+        _ = c.AXUIElementSetAttributeValue(app, ax.enhanced_ui_attr, c.kCFBooleanTrue);
+    };
+
+    const position: c.CGPoint = .{ .x = x, .y = y };
+    const position_value = c.AXValueCreate(c.kAXValueTypeCGPoint, &position) orelse return false;
+    defer c.CFRelease(@ptrCast(position_value));
+
+    const err = c.AXUIElementSetAttributeValue(win, ax.position_attr, @ptrCast(position_value));
+    return err == c.kAXErrorSuccess;
+}
+
 /// Retained AX element plus the state needed to undo animationBegin.
 pub const AnimationHandle = struct {
     win: c.AXUIElementRef,
