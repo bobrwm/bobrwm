@@ -123,6 +123,10 @@ const workspace_transition_watchdog_interval_s: f64 = 0.4;
 
 const DisplayInfo = struct {
     id: u32,
+    /// Stable per-display identity (CGDisplayCreateUUIDFromDisplayID) used to
+    /// re-match a monitor across sleep/wake and unplug/replug, when macOS may
+    /// hand it a different `id`. Null only for the synthetic fallback display.
+    uuid: ?[16]u8,
     visible: shim.bw_frame,
     full: shim.bw_frame,
     is_primary: bool,
@@ -896,11 +900,62 @@ fn destroyAllTilingStates() void {
 ///
 /// Coordinates are normalized to CG top-left origin so window bounds from
 /// SkyLight/CG can be compared directly against display frames.
+/// Stable UUID bytes for a display id, or null if unavailable.
+fn displayUuidBytes(display_id: u32) ?[16]u8 {
+    const uuid_ref = cg_extra.CGDisplayCreateUUIDFromDisplayID(display_id) orelse return null;
+    defer c.CFRelease(@ptrCast(uuid_ref));
+    const bytes: [16]u8 = @bitCast(c.CFUUIDGetUUIDBytes(uuid_ref));
+    return bytes;
+}
+
+/// Find a display's previous slot by stable UUID, falling back to id equality
+/// (the fallback covers the synthetic display, whose uuid is null).
+fn matchOldDisplaySlot(display: DisplayInfo, old_displays: []const DisplayInfo) ?usize {
+    if (display.uuid) |nu| {
+        for (old_displays, 0..) |od, i| {
+            if (od.uuid) |ou| {
+                if (std.mem.eql(u8, &nu, &ou)) return i;
+            }
+        }
+    }
+    for (old_displays, 0..) |od, i| {
+        if (od.id == display.id) return i;
+    }
+    return null;
+}
+
+/// Rewrite stored display ids old->new across workspace homes and windows, so
+/// references follow a monitor that returned under a different id.
+fn remapDisplayIds(from: []const u32, to: []const u32) void {
+    if (from.len == 0) return;
+
+    for (&g_workspaces.workspaces) |*ws| {
+        const did = ws.display_id orelse continue;
+        for (from, to) |f, t| {
+            if (did == f) {
+                ws.display_id = t;
+                break;
+            }
+        }
+    }
+
+    var it = g_store.windows.iterator();
+    while (it.next()) |entry| {
+        const did = entry.value_ptr.display_id;
+        for (from, to) |f, t| {
+            if (did == f) {
+                entry.value_ptr.display_id = t;
+                break;
+            }
+        }
+    }
+}
+
 fn refreshDisplays() void {
     const NSScreen = objc.getClass("NSScreen") orelse {
         const frame = bw_get_display_frame();
         g_display_count = 1;
-        g_displays[0] = .{ .id = 1, .visible = frame, .full = frame, .is_primary = true };
+        g_displays[0] = .{ .id = 1, .uuid = null, .visible = frame, .full = frame, .is_primary = true };
         g_workspaces.focused_display_slot = 0;
         return;
     };
@@ -910,7 +965,7 @@ fn refreshDisplays() void {
     if (count == 0) {
         const frame = bw_get_display_frame();
         g_display_count = 1;
-        g_displays[0] = .{ .id = 1, .visible = frame, .full = frame, .is_primary = true };
+        g_displays[0] = .{ .id = 1, .uuid = null, .visible = frame, .full = frame, .is_primary = true };
         g_workspaces.focused_display_slot = 0;
         return;
     }
@@ -960,6 +1015,7 @@ fn refreshDisplays() void {
 
         g_displays[next_count] = .{
             .id = display_id,
+            .uuid = displayUuidBytes(display_id),
             .visible = visible_frame,
             .full = full_frame,
             .is_primary = is_primary,
@@ -970,7 +1026,7 @@ fn refreshDisplays() void {
     if (next_count == 0) {
         const frame = bw_get_display_frame();
         g_display_count = 1;
-        g_displays[0] = .{ .id = 1, .visible = frame, .full = frame, .is_primary = true };
+        g_displays[0] = .{ .id = 1, .uuid = null, .visible = frame, .full = frame, .is_primary = true };
         g_workspaces.focused_display_slot = 0;
         return;
     }
@@ -4424,53 +4480,53 @@ fn reconcileDisplayChange() void {
 
     refreshDisplays();
 
-    // Restore workspace-to-display bindings for surviving displays
+    // A monitor can return from sleep/unplug under a new CGDirectDisplayID.
+    // Match each surviving display to its previous slot by stable UUID (id
+    // equality as fallback), restore that slot's active workspace, and record
+    // any id change so stored references can follow the monitor to its new id.
+    var remap_from: [workspace_mod.max_displays]u32 = undefined;
+    var remap_to: [workspace_mod.max_displays]u32 = undefined;
+    var remap_count: usize = 0;
+
     for (g_displays[0..g_display_count], 0..) |display, new_slot| {
         var active_id: u8 = 1;
-        var found = false;
-        for (old_displays[0..old_display_count], 0..) |old_display, old_slot| {
-            if (old_display.id == display.id) {
-                active_id = old_active_ids[old_slot];
-                found = true;
-                break;
+        if (matchOldDisplaySlot(display, old_displays[0..old_display_count])) |old_slot| {
+            active_id = old_active_ids[old_slot];
+            const old_id = old_displays[old_slot].id;
+            if (old_id != display.id) {
+                remap_from[remap_count] = old_id;
+                remap_to[remap_count] = display.id;
+                remap_count += 1;
             }
         }
-        if (!found) active_id = 1;
         g_workspaces.setActiveForDisplaySlot(new_slot, active_id);
         if (g_workspaces.get(active_id)) |ws| {
             ws.display_id = display.id;
         }
     }
 
-    // Clear display_id for workspaces not active on any surviving display
+    remapDisplayIds(remap_from[0..remap_count], remap_to[0..remap_count]);
+
+    // Clear display_id for workspaces whose display did not survive.
     for (&g_workspaces.workspaces) |*ws| {
         if (ws.display_id) |did| {
             if (displayIndexById(did) == null) ws.display_id = null;
         }
     }
 
+    // Windows on a genuinely-removed monitor: keep their workspace membership
+    // and re-home that workspace to the primary display, instead of merging
+    // the windows into whatever workspace is active there. Switching to the
+    // workspace brings them back intact; retile heals their placement.
+    const home = primaryDisplayId();
     var store_it = g_store.windows.iterator();
     while (store_it.next()) |entry| {
-        var win = entry.value_ptr.*;
+        const win = entry.value_ptr;
         if (displayIndexById(win.display_id) != null) continue;
 
-        if (g_workspaces.get(win.workspace_id)) |old_ws| {
-            old_ws.removeWindow(win.wid);
-        }
-        removeFromTiling(win.workspace_id, win.wid);
-
-        const target_display_id = primaryDisplayId();
-        const target_workspace_id = activeWorkspaceIdForDisplay(target_display_id);
-        win.display_id = target_display_id;
-        win.workspace_id = target_workspace_id;
-        entry.value_ptr.* = win;
-
-        if (g_workspaces.get(target_workspace_id)) |target_ws| {
-            target_ws.addWindow(win.wid) catch {};
-            if (target_ws.focused_wid == null) target_ws.recordFocus(win.wid);
-        }
-        if (win.mode == .tiled) {
-            insertIntoTiling(target_workspace_id, win.wid);
+        win.display_id = home;
+        if (g_workspaces.get(win.workspace_id)) |ws| {
+            if (ws.display_id == null) ws.display_id = home;
         }
     }
 }

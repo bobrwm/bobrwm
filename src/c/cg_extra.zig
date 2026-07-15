@@ -60,6 +60,12 @@ pub extern fn CGWindowListCopyWindowInfo(
     relative_to_window: CGWindowID,
 ) c.CFArrayRef;
 
+// CGDirectDisplay.h — excluded from c.h (Aro can't parse the full header).
+// Only the UUID accessor is needed: a per-display identity that survives
+// unplug/replug and sleep/wake, unlike CGDirectDisplayID which macOS reassigns.
+// Returns a +1 CFUUIDRef the caller must CFRelease.
+pub extern fn CGDisplayCreateUUIDFromDisplayID(display: u32) c.CFUUIDRef;
+
 // CFStringRef constants exported by CoreGraphics; resolved at link time.
 pub extern const kCGWindowNumber: c.CFStringRef;
 pub extern const kCGWindowLayer: c.CFStringRef;
