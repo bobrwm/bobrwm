@@ -1174,7 +1174,7 @@ fn isVisibleOnScreen(wid: u32) bool {
     if (g_store.get(wid)) |win| {
         if (!workspaceVisibleOnDisplay(win.workspace_id, win.display_id)) return false;
     }
-    return shim.bw_is_window_on_screen(wid);
+    return bw_is_window_on_screen(wid);
 }
 
 fn framesEqual(lhs: window_mod.Window.Frame, rhs: window_mod.Window.Frame) bool {
@@ -1373,7 +1373,7 @@ fn initWorkspaceObservers() void {
 
 /// Get the usable display frame (menu bar / dock excluded), CG coordinates.
 /// Exported for C callers while implemented in Zig via zig-objc.
-export fn bw_get_display_frame() shim.bw_frame {
+fn bw_get_display_frame() shim.bw_frame {
     const NSScreen = objc.getClass("NSScreen") orelse return .{
         .x = 0,
         .y = 0,
@@ -1408,11 +1408,6 @@ export fn bw_get_display_frame() shim.bw_frame {
     return frame;
 }
 
-/// Accessibility trust check.
-export fn bw_ax_is_trusted() bool {
-    return c.AXIsProcessTrusted() != 0;
-}
-
 /// Prompt for Accessibility permission in System Settings.
 fn axPrompt() void {
     const NSDictionary = objc.getClass("NSDictionary") orelse {
@@ -1436,41 +1431,9 @@ fn axPrompt() void {
     _ = c.AXIsProcessTrustedWithOptions(@ptrCast(options_value));
 }
 
-/// Get the bundle identifier for a PID.
-/// Writes a NUL-terminated string into `out` and returns bytes written.
-export fn bw_get_app_bundle_id(pid: i32, out: ?[*]u8, max_len: u32) u32 {
-    const out_ptr = out orelse return 0;
-    if (max_len == 0) return 0;
-
-    std.debug.assert(pid > 0);
-    std.debug.assert(max_len > 0);
-
-    const max_len_usize: usize = @intCast(max_len);
-    const buffer = out_ptr[0..max_len_usize];
-
-    const NSRunningApplication = objc.getClass("NSRunningApplication") orelse return 0;
-    const app = NSRunningApplication.msgSend(objc.Object, "runningApplicationWithProcessIdentifier:", .{pid});
-    if (app.value == null) return 0;
-
-    const bundle_identifier = app.msgSend(objc.Object, "bundleIdentifier", .{});
-    if (bundle_identifier.value == null) return 0;
-
-    const utf8 = bundle_identifier.msgSend(?[*:0]const u8, "UTF8String", .{}) orelse return 0;
-    const bundle_id = std.mem.sliceTo(utf8, 0);
-    if (bundle_id.len == 0) return 0;
-
-    const copy_len = @min(bundle_id.len, buffer.len - 1);
-    @memcpy(buffer[0..copy_len], bundle_id[0..copy_len]);
-    buffer[copy_len] = 0;
-
-    std.debug.assert(copy_len < buffer.len);
-    std.debug.assert(buffer[copy_len] == 0);
-    return @intCast(copy_len);
-}
-
 /// Get the focused window ID for a given application PID.
 /// Returns 0 when no focused AX window is available.
-export fn bw_ax_get_focused_window(pid: i32) u32 {
+fn bw_ax_get_focused_window(pid: i32) u32 {
     std.debug.assert(pid > 0);
 
     const app = c.AXUIElementCreateApplication(pid) orelse return 0;
@@ -1496,7 +1459,7 @@ export fn bw_ax_get_focused_window(pid: i32) u32 {
 
 /// Check if a window currently appears in the on-screen CG window list.
 /// This excludes desktop elements and naturally filters background tabs.
-export fn bw_is_window_on_screen(target_wid: u32) bool {
+fn bw_is_window_on_screen(target_wid: u32) bool {
     std.debug.assert(target_wid > 0);
 
     const options: cg_extra.CGWindowListOption =
@@ -1535,14 +1498,12 @@ fn cgWindowInfoVisible(info: c.CFDictionaryRef) bool {
 
 /// Get all AX-backed window IDs for an application PID.
 /// Includes windows that may not currently be visible on screen.
-export fn bw_get_app_window_ids(pid: i32, out: ?[*]u32, max_count: u32) u32 {
-    const out_ptr = out orelse return 0;
-    if (max_count == 0) return 0;
+fn bw_get_app_window_ids(pid: i32, out: []u32) usize {
+    if (out.len == 0) return 0;
 
     std.debug.assert(pid > 0);
-    std.debug.assert(max_count > 0);
 
-    const out_buf = out_ptr[0..@as(usize, @intCast(max_count))];
+    const out_buf = out;
     const app = c.AXUIElementCreateApplication(pid) orelse return 0;
     defer c.CFRelease(@ptrCast(app));
 
@@ -1605,7 +1566,7 @@ fn axCanResize(win_ref: c.AXUIElementRef, ax: *const AxStrings) bool {
 /// get confused by instantaneous same-process focus switches and fail to render
 /// the focus ring or route keyboard events to the wrong window. Yabai uses the
 /// same 40ms delay for same-PSN switches.
-export fn bw_ax_focus_window(pid: i32, wid: u32) bool {
+fn bw_ax_focus_window(pid: i32, wid: u32) bool {
     const same_process_focus_delay_us: c_uint = 40_000; // 40ms, matches yabai
 
     std.debug.assert(pid > 0);
@@ -1816,13 +1777,13 @@ fn isUnknownPendingRoleWindow(pid: i32, wid: u32) bool {
 }
 
 /// Legacy management predicate: true for READY or PENDING states.
-export fn bw_should_manage_window(pid: i32, wid: u32) bool {
+fn bw_should_manage_window(pid: i32, wid: u32) bool {
     const state = manageStateForWindow(pid, wid);
     return state != shim.BW_MANAGE_REJECT;
 }
 
 /// Returns management state for a given window.
-export fn bw_window_manage_state(pid: i32, wid: u32) u8 {
+fn bw_window_manage_state(pid: i32, wid: u32) u8 {
     return manageStateForWindow(pid, wid);
 }
 
@@ -1833,12 +1794,9 @@ export fn bw_window_manage_state(pid: i32, wid: u32) u8 {
 /// share the CGWindowList but have Prohibited activation policy. Caching the
 /// accept/reject decision per PID avoids an ObjC message send for every window
 /// belonging to the same rejected process.
-export fn bw_discover_windows(out: ?[*]shim.bw_window_info, max_count: u32) u32 {
-    const out_ptr = out orelse return 0;
-    if (max_count == 0) return 0;
-
-    std.debug.assert(max_count > 0);
-    const out_buf = out_ptr[0..@as(usize, @intCast(max_count))];
+fn bw_discover_windows(out: []shim.bw_window_info) usize {
+    if (out.len == 0) return 0;
+    const out_buf = out;
 
     const options: cg_extra.CGWindowListOption =
         cg_extra.kCGWindowListOptionOnScreenOnly | cg_extra.kCGWindowListExcludeDesktopElements;
@@ -2119,16 +2077,6 @@ fn cancelIpcSource() void {
     }
 }
 
-/// Signal the main run loop to drain queued events.
-export fn bw_signal_waker() void {
-    signalWaker();
-}
-
-/// Enable or disable periodic role polling.
-export fn bw_set_role_polling(enabled: bool) void {
-    setRolePolling(enabled);
-}
-
 // Event bridge (called from ObjC shim)
 
 // Thread-safe: AX observer callbacks run on per-app background threads
@@ -2175,12 +2123,12 @@ pub fn bw_workspace_display_changed() void {
 }
 
 /// Callback target for shim hotkey mouse down events.
-export fn bw_hotkey_mouse_down() void {
+fn bw_hotkey_mouse_down() void {
     bw_emit_event(shim.BW_EVENT_MOUSE_DOWN, 0, 0);
 }
 
 /// Callback target for shim hotkey mouse up events.
-export fn bw_hotkey_mouse_up() void {
+fn bw_hotkey_mouse_up() void {
     bw_emit_event(shim.BW_EVENT_MOUSE_UP, 0, 0);
 }
 
@@ -2199,7 +2147,7 @@ export fn bw_set_keybinds(binds: ?[*]const shim.bw_keybind, count: u32) void {
 }
 
 /// Resolve a key press against current keybinds and emit matching action.
-export fn bw_hotkey_handle_keydown(keycode: u16, mods: u8) bool {
+fn bw_hotkey_handle_keydown(keycode: u16, mods: u8) bool {
     for (g_hotkey_bindings) |binding| {
         if (binding.keycode != keycode) continue;
         if (binding.mods != mods) continue;
@@ -2245,7 +2193,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     dim.configure(g_config.dimmed_inactive);
 
     // -- Accessibility check --
-    if (!shim.bw_ax_is_trusted()) {
+    if (!ax_mod.isTrusted()) {
         log.warn("accessibility not trusted — prompting user", .{});
         log.warn("after granting access, restart with: bobrwm service restart", .{});
         axPrompt();
@@ -2375,7 +2323,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
 // Exported callbacks (called from ObjC shim on main thread)
 
 /// Drain the event ring buffer — called by the CFRunLoopSource waker.
-export fn bw_drain_events() void {
+fn bw_drain_events() void {
     std.debug.assert(!g_event_drain_active);
     g_event_drain_active = true;
     defer g_event_drain_active = false;
@@ -2440,7 +2388,7 @@ fn gracefulStopNSApp() void {
 }
 
 /// Accept and handle one IPC client connection — called by dispatch_source.
-export fn bw_handle_ipc_client(server_fd: c_int) void {
+fn bw_handle_ipc_client(server_fd: c_int) void {
     // std.posix.accept was removed in Zig 0.16; call libc directly.
     const client_fd = std.c.accept(server_fd, null, null);
     if (client_fd < 0) {
@@ -3127,7 +3075,7 @@ fn setWindowMode(wid: u32, target: window_mod.WindowMode) void {
 
 fn windowRoleState(pid: i32, wid: u32) WindowRoleState {
     std.debug.assert(wid != 0);
-    const raw_state = shim.bw_window_manage_state(pid, wid);
+    const raw_state = bw_window_manage_state(pid, wid);
     return switch (raw_state) {
         shim.BW_MANAGE_REJECT => .reject,
         shim.BW_MANAGE_READY => .ready,
@@ -3407,7 +3355,7 @@ fn untrackDeferredWindowCandidatesForPid(pid: i32) void {
 fn addNewWindowLegacyPendingFallback(pid: i32, wid: u32, workspace_id: u8, display_id: u32) bool {
     std.debug.assert(wid != 0);
     if (g_store.get(wid) != null) return false;
-    if (!shim.bw_should_manage_window(pid, wid)) {
+    if (!bw_should_manage_window(pid, wid)) {
         log.debug("pending-role: fallback rejected pid={d} wid={d}", .{ pid, wid });
         return false;
     }
@@ -3625,7 +3573,7 @@ fn processDeferredWindowCandidates() bool {
 
 fn discoverWindows() void {
     var buf: [256]shim.bw_window_info = undefined;
-    const count = shim.bw_discover_windows(&buf, 256);
+    const count = bw_discover_windows(&buf);
     var observed_pids: [128]i32 = undefined;
     var observed_pid_count: usize = 0;
 
@@ -3907,7 +3855,7 @@ fn discoverBackgroundTabs(
     const conn = sky.mainConnectionID();
 
     var ax_wids: [128]u32 = undefined;
-    const ax_count = shim.bw_get_app_window_ids(pid, &ax_wids, 128);
+    const ax_count = bw_get_app_window_ids(pid, &ax_wids);
     log.debug("discoverBackgroundTabs: AX found {d} windows for pid={d}", .{ ax_count, pid });
 
     for (ax_wids[0..ax_count]) |ax_wid| {
@@ -3928,7 +3876,7 @@ fn discoverBackgroundTabs(
         };
 
         const frame_matches = tabgroup.TabGroupManager.framesMatch(f, group_frame);
-        const on_screen = shim.bw_is_window_on_screen(ax_wid);
+        const on_screen = bw_is_window_on_screen(ax_wid);
         log.debug("discoverBackgroundTabs: ax_wid={d} frame=({d:.0},{d:.0},{d:.0},{d:.0}) match={} on_screen={}", .{
             ax_wid, f.x, f.y, f.width, f.height, frame_matches, on_screen,
         });
@@ -4270,7 +4218,7 @@ fn cleanupWorkspaceWindowsForPid(pid: i32) bool {
             if (sky.getWindowBounds(conn, wid, &rect) != 0) {
                 should_remove = true;
                 log.info("cleanup: removing wid={d} pid={d} reason=missing-windowserver", .{ wid, pid });
-            } else if (!shim.bw_should_manage_window(pid, wid)) {
+            } else if (!bw_should_manage_window(pid, wid)) {
                 should_remove = true;
                 log.info("cleanup: removing wid={d} pid={d} reason=should-manage=false", .{ wid, pid });
             }
@@ -4321,7 +4269,7 @@ fn cleanupOffscreenManagedWindows() bool {
             // tab is active; treating them as ghosts causes layout churn.
             if (g_tab_groups.groupOf(wid) != null) continue;
 
-            if (shim.bw_is_window_on_screen(wid)) continue;
+            if (bw_is_window_on_screen(wid)) continue;
 
             if (candidate_count < candidate_wids.len) {
                 candidate_wids[candidate_count] = wid;
@@ -4381,7 +4329,7 @@ fn adoptOffscreenWindowAsTab(win: window_mod.Window) bool {
     };
 
     var ax_wids: [128]u32 = undefined;
-    const ax_count = shim.bw_get_app_window_ids(win.pid, &ax_wids, 128);
+    const ax_count = bw_get_app_window_ids(win.pid, &ax_wids);
     var listed_in_ax = false;
     for (ax_wids[0..ax_count]) |ax_wid| {
         if (ax_wid == win.wid) {
@@ -5118,7 +5066,7 @@ fn focusWorkspaceWindow(ws: *workspace_mod.Workspace) void {
                     actual_wid,
                 });
             }
-            _ = shim.bw_ax_focus_window(win.pid, actual_wid);
+            _ = bw_ax_focus_window(win.pid, actual_wid);
             ws.recordFocus(fwid);
             _ = maybeSetFocusedDisplayForWindow(win, .keyboard);
         }
@@ -5473,7 +5421,7 @@ fn focusDirection(dir: FocusDir) void {
         // If target is a tab group leader, focus the active tab instead
         const actual_wid = g_tab_groups.resolveActive(wid);
         if (g_store.get(actual_wid)) |win| {
-            _ = shim.bw_ax_focus_window(win.pid, actual_wid);
+            _ = bw_ax_focus_window(win.pid, actual_wid);
             ws.recordFocus(wid); // track the leader
             _ = maybeSetFocusedDisplayForWindow(win, .keyboard);
             setTilingActive(win.workspace_id, actual_wid);
@@ -5489,7 +5437,7 @@ fn focusDirection(dir: FocusDir) void {
     };
     if (st.cycleFocus(focused_wid, stack_forward)) |stack_wid| {
         if (g_store.get(stack_wid)) |win| {
-            _ = shim.bw_ax_focus_window(win.pid, stack_wid);
+            _ = bw_ax_focus_window(win.pid, stack_wid);
             ws.recordFocus(stack_wid);
             _ = maybeSetFocusedDisplayForWindow(win, .keyboard);
             setTilingActive(win.workspace_id, stack_wid);
@@ -5701,7 +5649,7 @@ fn ipcQueryWindows(fd: posix.socket_t, format: ipc.IpcCommand.QueryFormat) void 
         .text => for (ws.windows.items) |wid| {
             if (g_store.get(wid)) |win| {
                 var id_buf: [256]u8 = undefined;
-                const id_len = shim.bw_get_app_bundle_id(win.pid, &id_buf, 256);
+                const id_len = if (osutil.appBundleId(win.pid, &id_buf)) |id| id.len else 0;
                 const bundle_id: []const u8 = if (id_len > 0) id_buf[0..id_len] else "(unknown)";
 
                 w.print("{d} {d} {s} {d} {d} {d:.0} {d:.0} {d:.0} {d:.0}\n", .{
@@ -5717,7 +5665,7 @@ fn ipcQueryWindows(fd: posix.socket_t, format: ipc.IpcCommand.QueryFormat) void 
             for (ws.windows.items) |wid| {
                 if (g_store.get(wid)) |win| {
                     var id_buf: [256]u8 = undefined;
-                    const id_len = shim.bw_get_app_bundle_id(win.pid, &id_buf, 256);
+                    const id_len = if (osutil.appBundleId(win.pid, &id_buf)) |id| id.len else 0;
                     const bundle_id: []const u8 = if (id_len > 0) id_buf[0..id_len] else "(unknown)";
 
                     writeWindowJson(&json, win, bundle_id) catch break;
@@ -5765,7 +5713,7 @@ fn ipcQueryApps(fd: posix.socket_t, format: ipc.IpcCommand.QueryFormat) void {
                 seen_count += 1;
 
                 var id_buf: [256]u8 = undefined;
-                const id_len = shim.bw_get_app_bundle_id(win.pid, &id_buf, 256);
+                const id_len = if (osutil.appBundleId(win.pid, &id_buf)) |id| id.len else 0;
                 const bundle_id: []const u8 = if (id_len > 0) id_buf[0..id_len] else "(unknown)";
 
                 switch (format) {
@@ -5827,7 +5775,7 @@ fn ipcQueryWorkspaces(fd: posix.socket_t, format: ipc.IpcCommand.QueryFormat) vo
                 for (ws.windows.items) |wid| {
                     const win = g_store.get(wid) orelse continue;
                     var id_buf: [256]u8 = undefined;
-                    const id_len = shim.bw_get_app_bundle_id(win.pid, &id_buf, 256);
+                    const id_len = if (osutil.appBundleId(win.pid, &id_buf)) |id| id.len else 0;
                     const bundle_id: []const u8 = if (id_len > 0) id_buf[0..id_len] else "(unknown)";
 
                     writeWindowJson(&json, win, bundle_id) catch break;

@@ -140,6 +140,11 @@ pub fn deinitStrings() void {
     }
 }
 
+/// Accessibility trust check.
+pub fn isTrusted() bool {
+    return c.AXIsProcessTrusted() != 0;
+}
+
 /// Resolve a window id to its AX element by scanning the app's window list.
 /// The returned element is retained; the caller must CFRelease it.
 pub fn findWindow(pid: i32, target_wid: u32) ?c.AXUIElementRef {

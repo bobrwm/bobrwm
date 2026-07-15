@@ -380,9 +380,7 @@ fn loadFromPath(allocator: std.mem.Allocator, path: []const u8) ?Config {
 // Bundle ID helper
 
 pub fn getAppBundleId(pid: i32, buf: *[256]u8) ?[]const u8 {
-    const len = shim.bw_get_app_bundle_id(pid, buf, 256);
-    if (len == 0) return null;
-    return buf[0..len];
+    return osutil.appBundleId(pid, buf);
 }
 
 // macOS virtual key code mapping

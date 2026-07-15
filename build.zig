@@ -163,6 +163,8 @@ pub fn build(b: *std.Build) !void {
         .optimize = optimize,
         .link_libc = true,
     });
+    // config.zig reaches osutil.appBundleId, which uses the objc module.
+    swipe_config_mod.addImport("objc", objc_dep.module("objc"));
 
     const swipe_mod = b.createModule(.{
         .root_source_file = b.path("packages/bobrwm-swipe/src/main.zig"),
