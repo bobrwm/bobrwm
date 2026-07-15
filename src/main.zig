@@ -3724,13 +3724,6 @@ fn addNewWindowManagedWithAssignment(pid: i32, wid: u32, workspace_id: u8, assig
         log.info("addNewWindow: deferred pid={d} wid={d} while off-screen", .{ pid, wid });
         return false;
     }
-    defer untrackDeferredWindowCandidate(wid);
-
-    // Check if this new on-screen window replaces an existing same-PID window
-    // that just went off-screen (i.e. a new tab was created and became active,
-    // pushing the old tab to background). If so, form a tab group.
-    if (tryFormTabGroupOnCreate(pid, wid)) return false;
-
     var window_frame: window_mod.Window.Frame = .{ .x = 0, .y = 0, .width = 0, .height = 0 };
     const display_id = assigned_display_id;
     if (g_sky) |sky| {
@@ -3744,6 +3737,24 @@ fn addNewWindowManagedWithAssignment(pid: i32, wid: u32, workspace_id: u8, assig
             };
         }
     }
+
+    // On-screen but no settled SkyLight bounds yet means mid-construction.
+    // Proceeding would store a garbage frame and, for an app assigned to a
+    // hidden workspace, park a zero-size window. Defer for bounded
+    // re-evaluation. Tracked before the untrack-defer below so it survives
+    // this early return.
+    if (window_frame.width <= 1 or window_frame.height <= 1) {
+        trackDeferredWindowCandidate(pid, wid, workspace_id, assigned_display_id);
+        log.info("addNewWindow: deferred pid={d} wid={d} unsettled bounds", .{ pid, wid });
+        return false;
+    }
+
+    defer untrackDeferredWindowCandidate(wid);
+
+    // Check if this new on-screen window replaces an existing same-PID window
+    // that just went off-screen (i.e. a new tab was created and became active,
+    // pushing the old tab to background). If so, form a tab group.
+    if (tryFormTabGroupOnCreate(pid, wid)) return false;
     // An app_rules entry with .float = true floats every window of that app.
     const rule_float = blk: {
         if (g_config.app_rules.len == 0) break :blk false;
@@ -4512,9 +4523,21 @@ fn retileDisplay(display_id: u32) void {
     std.debug.assert(g_layout_entries.items.len == window_count);
 
     for (g_layout_entries.items) |entry| {
-        const win = g_store.get(entry.wid) orelse continue;
-        if (win.display_id != display_id) continue;
-        if (win.workspace_id != ws_id) continue;
+        var win = g_store.get(entry.wid) orelse continue;
+
+        // The workspace's tiling tree is authoritative for placement: a window
+        // in this tree belongs to ws_id, shown on this display. If stored
+        // display/workspace metadata drifted (topology change, move races),
+        // heal it to match the tree instead of skipping — an unplaced window
+        // would otherwise be stranded off-screen with no path back.
+        if (win.display_id != display_id or win.workspace_id != ws_id) {
+            log.warn("retile: healing drifted window wid={d} display {d}->{d} workspace {d}->{d}", .{
+                entry.wid, win.display_id, display_id, win.workspace_id, ws_id,
+            });
+            win.display_id = display_id;
+            win.workspace_id = ws_id;
+            g_store.put(win) catch {};
+        }
 
         // Fullscreen windows fill the outer-gap-inset frame, skipping BSP splits and inner gaps
         const target_frame = if (win.is_fullscreen) frame else entry.frame;
