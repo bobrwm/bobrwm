@@ -118,6 +118,12 @@ const focus_retry_attempts_max: u8 = 10;
 const focus_retry_capacity: usize = 64;
 /// Debounce workspace/display notifications that can fire in short bursts.
 const workspace_event_debounce_interval_s: f64 = 0.05;
+/// Quiet period after the last display notification before the trailing
+/// reconcile runs. macOS emits a burst of display_changed events while a
+/// hotplug/wake arrangement settles; the leading-edge debounce can land us on
+/// an intermediate topology, so a reconcile this long after the final event
+/// converges on the settled arrangement.
+const display_settle_delay_s: f64 = 0.25;
 /// Hard cap for workspace transition convergence before we fail closed.
 const workspace_transition_watchdog_interval_s: f64 = 0.4;
 
@@ -1282,6 +1288,10 @@ var g_drag_reconcile_on_drop = false;
 var g_last_focused_pid: i32 = 0;
 var g_last_space_changed_at_s: f64 = 0;
 var g_last_display_changed_at_s: f64 = 0;
+/// Absolute time at which a trailing display reconcile is due, or 0 when none
+/// is pending. Re-armed on every display_changed so the reconcile fires once,
+/// after the arrangement stops changing.
+var g_display_resettle_at_s: f64 = 0;
 /// Compiled keybind table referenced (not copied) by the hotkey event tap.
 /// The caller of bw_set_keybinds owns the storage and must keep it alive for
 /// as long as the event tap can fire; main's KeybindTable guarantees this.
@@ -2957,18 +2967,19 @@ fn handleEvent(ev: *const event_mod.Event) void {
             retile();
         },
         .display_changed => {
+            // Arm the trailing reconcile on every event, even ones the debounce
+            // drops, so it fires once the burst quiets on the final topology.
+            armDisplayResettle();
             if (!shouldHandleWorkspaceEvent(&g_last_display_changed_at_s)) return;
             log.info("display changed", .{});
-            reconcileDisplayChange();
-            discoverWindows();
-            retile();
-            updateStatusBar();
+            reconcileDisplays();
         },
         .space_changed => {
             if (!shouldHandleWorkspaceEvent(&g_last_space_changed_at_s)) return;
             log.info("space changed", .{});
         },
         .role_poll_tick => {
+            if (processDueDisplayResettle()) return;
             const promoted_pending = processPendingRoleWindows();
             const promoted_deferred = processDeferredWindowCandidates();
             const retried_launch = processAppLaunchRetries();
@@ -3161,8 +3172,39 @@ fn refreshRolePolling() void {
     const has_pending = g_pending_role_windows.count() > 0 or
         g_deferred_window_candidates.count() > 0 or
         g_app_launch_retries.count() > 0 or
-        g_focus_retries.count() > 0;
+        g_focus_retries.count() > 0 or
+        g_display_resettle_at_s != 0;
     setRolePolling(has_pending);
+}
+
+/// Full reconcile after a topology change: rebuild display/workspace state,
+/// pick up windows, retile, refresh the bar.
+fn reconcileDisplays() void {
+    reconcileDisplayChange();
+    discoverWindows();
+    retile();
+    updateStatusBar();
+}
+
+/// (Re-)arm the trailing display reconcile for `display_settle_delay_s` from
+/// now and keep the poll timer alive to service it.
+fn armDisplayResettle() void {
+    g_display_resettle_at_s = c.CFAbsoluteTimeGetCurrent() + display_settle_delay_s;
+    refreshRolePolling();
+}
+
+/// On a role-poll tick, run the trailing reconcile once the arrangement has
+/// been quiet for the settle delay. Returns true when it fired so the tick
+/// skips the rest of its work this round.
+fn processDueDisplayResettle() bool {
+    if (g_display_resettle_at_s == 0) return false;
+    if (c.CFAbsoluteTimeGetCurrent() < g_display_resettle_at_s) return false;
+
+    g_display_resettle_at_s = 0;
+    log.info("display resettle", .{});
+    reconcileDisplays();
+    refreshRolePolling();
+    return true;
 }
 
 /// Track a pid whose AX focused-window query returned nothing. Electron apps
