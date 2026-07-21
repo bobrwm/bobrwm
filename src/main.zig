@@ -2962,6 +2962,7 @@ fn handleEvent(ev: *const event_mod.Event) void {
             reconcileDisplayChange();
             discoverWindows();
             retile();
+            updateStatusBar();
         },
         .space_changed => {
             if (!shouldHandleWorkspaceEvent(&g_last_space_changed_at_s)) return;
@@ -4594,8 +4595,21 @@ fn reconcileDisplayChange() void {
         win.display_id = home;
     }
 
-    // Record the reconciled topology so the next change recalls fresh state.
+    parkHiddenWorkspaceWindows();
     rememberDisplayWorkspaces();
+    assertDisplayCoverage();
+}
+
+/// Park every managed window whose workspace is not visible on its (now valid)
+/// display so a removed monitor never strands windows at dead coordinates.
+fn parkHiddenWorkspaceWindows() void {
+    var it = g_store.windows.iterator();
+    while (it.next()) |entry| {
+        const win = entry.value_ptr;
+        if (workspaceVisibleOnDisplay(win.workspace_id, win.display_id)) continue;
+        if (!bw_is_window_on_screen(win.wid)) continue;
+        hideWindow(win.pid, win.wid);
+    }
 }
 
 /// Apply a target frame to a window, moving without a resize whenever the size
