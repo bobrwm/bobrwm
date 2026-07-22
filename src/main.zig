@@ -965,7 +965,39 @@ fn recallDisplayMemory(uuid: [16]u8) ?DisplayMemoryEntry {
     return null;
 }
 
+/// Re-resolve the focused display slot after g_displays was rebuilt.
+/// NSScreen.screens can reorder across replug and primary-display changes, so
+/// a slot index does not identify a monitor; match by UUID and fall back to
+/// the primary display's slot when the focused monitor vanished.
+fn restoreFocusedDisplaySlot(focused_uuid: ?[16]u8) void {
+    if (focused_uuid) |uuid| {
+        for (g_displays[0..g_display_count], 0..) |display, slot| {
+            const display_uuid = display.uuid orelse continue;
+            if (std.mem.eql(u8, &display_uuid, &uuid)) {
+                g_workspaces.focused_display_slot = slot;
+                return;
+            }
+        }
+        g_workspaces.focused_display_slot = displayIndexById(primaryDisplayId()) orelse 0;
+        return;
+    }
+    // No UUID to match (first refresh, or synthetic fallback display): only
+    // repair an out-of-range slot.
+    if (g_workspaces.focused_display_slot >= g_display_count) {
+        g_workspaces.focused_display_slot = 0;
+    }
+}
+
 fn refreshDisplays() void {
+    // Snapshot before the display table is rebuilt; the slot is meaningless
+    // afterwards.
+    const focused_uuid: ?[16]u8 = blk: {
+        if (g_workspaces.focused_display_slot < g_display_count) {
+            break :blk g_displays[g_workspaces.focused_display_slot].uuid;
+        }
+        break :blk null;
+    };
+
     const NSScreen = objc.getClass("NSScreen") orelse {
         const frame = bw_get_display_frame();
         g_display_count = 1;
@@ -1064,9 +1096,7 @@ fn refreshDisplays() void {
     if (!has_primary) g_displays[0].is_primary = true;
     g_display_count = next_count;
 
-    if (g_workspaces.focused_display_slot >= g_display_count) {
-        g_workspaces.focused_display_slot = 0;
-    }
+    restoreFocusedDisplaySlot(focused_uuid);
 }
 
 /// Resolves a window frame to the best display.
