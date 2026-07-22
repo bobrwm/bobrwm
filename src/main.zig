@@ -4769,8 +4769,12 @@ fn parkHiddenWorkspaceWindows() void {
 
         const ctx = HideCtx.init(home);
         for (ws.windows.items) |wid| {
-            if (g_tab_groups.isSuppressed(wid)) continue;
-            const win = g_store.get(wid) orelse continue;
+            // Workspace lists hold tab-group leaders, but the on-screen
+            // window of a group is its active tab — which may not be the
+            // leader. Park the active tab; suppressed members are already
+            // off-screen behind it.
+            const visible_wid = g_tab_groups.resolveActive(wid);
+            const win = g_store.get(visible_wid) orelse continue;
 
             const park = ctx.parkPosition(win.frame.width);
             const tol = window_mod.Window.Frame.tolerance;
@@ -4780,7 +4784,7 @@ fn parkHiddenWorkspaceWindows() void {
                 log.warn("park: batch truncated at {d} windows", .{targets.len});
                 break :outer;
             }
-            targets[target_count] = .{ .pid = win.pid, .wid = wid };
+            targets[target_count] = .{ .pid = win.pid, .wid = visible_wid };
             target_count += 1;
         }
     }
