@@ -66,13 +66,17 @@ pub const Animator = struct {
     /// Start or update an animation for a window.
     /// If the window is already animating, the animation is redirected to
     /// the new target from its current displayed position.
+    /// Returns whether the target was accepted: an animation was scheduled
+    /// or redirected (it converges on the target on its own), or the direct
+    /// placement fallback's AX write succeeded. Callers must not record the
+    /// target frame when this returns false.
     pub fn animate(
         self: *Animator,
         pid: i32,
         wid: u32,
         current_frame: window_mod.Window.Frame,
         target_frame: window_mod.Window.Frame,
-    ) void {
+    ) bool {
         const now_ns = osutil.nanoTimestamp();
 
         for (0..self.count) |i| {
@@ -81,19 +85,17 @@ pub const Animator = struct {
                 a.start_frame = a.last_displayed_frame;
                 a.end_frame = target_frame;
                 a.start_time_ns = now_ns;
-                return;
+                return true;
             }
         }
 
         if (self.count >= max_animations) {
-            placeFinal(pid, wid, current_frame, target_frame);
-            return;
+            return placeFinal(pid, wid, current_frame, target_frame);
         }
 
         const handle = ax.animationBegin(pid, wid) orelse {
             // Window can't be resolved — place it directly instead.
-            placeFinal(pid, wid, current_frame, target_frame);
-            return;
+            return placeFinal(pid, wid, current_frame, target_frame);
         };
 
         self.animations[self.count] = .{
@@ -106,6 +108,7 @@ pub const Animator = struct {
             .handle = handle,
         };
         self.count += 1;
+        return true;
     }
 
     /// Advance all active animations by one frame. Moves each animated window
@@ -132,7 +135,7 @@ pub const Animator = struct {
                 // resizing single-pass steps may have accumulated clamping
                 // drift. Pure moves never wrote a size, so they finish with
                 // a position-only write.
-                placeFinal(a.pid, a.wid, a.start_frame, a.end_frame);
+                _ = placeFinal(a.pid, a.wid, a.start_frame, a.end_frame);
                 a.end();
                 continue;
             }
@@ -158,7 +161,7 @@ pub const Animator = struct {
     pub fn finishAll(self: *Animator) void {
         for (0..self.count) |i| {
             const a = self.animations[i];
-            placeFinal(a.pid, a.wid, a.start_frame, a.end_frame);
+            _ = placeFinal(a.pid, a.wid, a.start_frame, a.end_frame);
             a.end();
         }
         self.count = 0;
@@ -184,7 +187,7 @@ pub const Animator = struct {
         for (0..self.count) |i| {
             if (self.animations[i].wid == wid) {
                 const a = self.animations[i];
-                placeFinal(a.pid, a.wid, a.start_frame, a.end_frame);
+                _ = placeFinal(a.pid, a.wid, a.start_frame, a.end_frame);
                 a.end();
                 self.count -= 1;
                 if (i < self.count) {
@@ -211,13 +214,13 @@ pub const Animator = struct {
 /// between the animation's endpoints) finishes with a position-only write:
 /// intermediate ticks never wrote a size, so there is no size drift to heal,
 /// and an AXSize write would flash and reflow size-sensitive apps. Resizing
-/// animations keep the full clamping-safe frame write.
-fn placeFinal(pid: i32, wid: u32, from: window_mod.Window.Frame, to: window_mod.Window.Frame) void {
+/// animations keep the full clamping-safe frame write. Returns whether the
+/// AX write was accepted.
+fn placeFinal(pid: i32, wid: u32, from: window_mod.Window.Frame, to: window_mod.Window.Frame) bool {
     if (from.sizeApproxEqual(to, window_mod.Window.Frame.tolerance)) {
-        _ = ax.setWindowPosition(pid, wid, to.x, to.y);
-        return;
+        return ax.setWindowPosition(pid, wid, to.x, to.y);
     }
-    _ = ax.setWindowFrame(
+    return ax.setWindowFrame(
         pid,
         wid,
         to.x,

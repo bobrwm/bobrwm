@@ -4861,7 +4861,7 @@ fn retileDisplay(display_id: u32) void {
             // exact display frame.
             var applied = true;
             if (g_config.animation.enabled and !win.is_fullscreen) {
-                g_animator.animate(win.pid, entry.wid, win.frame, target_frame);
+                applied = g_animator.animate(win.pid, entry.wid, win.frame, target_frame);
                 ensureAnimatorTimer();
             } else {
                 // The window may have entered fullscreen mid-animation; stop
