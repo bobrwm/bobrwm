@@ -3559,7 +3559,21 @@ fn processPendingRoleWindows() bool {
                 continue;
             }
             log.info("pending-role: timeout pid={d} wid={d} after {d}ms, applying legacy fallback", .{ candidate.pid, candidate.wid, timeout_ms });
-            if (addNewWindowLegacyPendingFallback(candidate.pid, candidate.wid, candidate.workspace_id, candidate.display_id)) {
+            // The display captured at tracking time can be gone or renumbered
+            // after a topology change: reconciliation rewrites workspace homes
+            // and stored windows, but not pending-role entries. Re-home the
+            // fallback onto the workspace's current display so the window is
+            // not created with a dead display id.
+            var fallback_display_id = candidate.display_id;
+            if (displayIndexById(fallback_display_id) == null) {
+                fallback_display_id = blk: {
+                    if (g_workspaces.get(candidate.workspace_id)) |ws| {
+                        if (ws.display_id) |did| break :blk did;
+                    }
+                    break :blk primaryDisplayId();
+                };
+            }
+            if (addNewWindowLegacyPendingFallback(candidate.pid, candidate.wid, candidate.workspace_id, fallback_display_id)) {
                 added_any = true;
             }
             continue;
