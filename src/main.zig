@@ -1138,24 +1138,32 @@ const HideCtx = struct {
         };
     }
 
+    /// Off-screen park position for a window of the given stored width.
+    /// bottom_left parks the window off the left edge, which needs its width;
+    /// without a usable width it falls back to bottom_right, which does not.
+    fn parkPosition(self: HideCtx, width: f64) struct { x: f64, y: f64 } {
+        std.debug.assert(width >= 0);
+        const corner: HideCorner = if (width > 1) self.corner else .bottom_right;
+        return .{
+            .x = switch (corner) {
+                .bottom_right => self.display.x + self.display.w - hide_peek,
+                .bottom_left => self.display.x - width + hide_peek,
+            },
+            .y = self.display.y + self.display.h - hide_peek,
+        };
+    }
+
     /// Move a single window off-screen by POSITION only — never resizing it.
     /// Resizing on hide causes a visible flash and a reflow storm in
     /// size-sensitive apps; the parked size is irrelevant and retile restores
     /// the real frame on re-activation. Updates the stored position so
     /// retileDisplay detects the move and re-places the window when its
-    /// workspace becomes visible again.
+    /// workspace becomes visible again. The size is never written.
     fn hide(self: HideCtx, pid: i32, wid: u32) void {
-        const pos_y = self.display.y + self.display.h - hide_peek;
-
-        // bottom_left parks the window off the left edge, which needs its
-        // width; without a stored size, fall back to bottom_right, which does
-        // not. The size is never written either way.
         const width: f64 = if (g_store.get(wid)) |win| win.frame.width else 0;
-        const corner: HideCorner = if (width > 1) self.corner else .bottom_right;
-        const pos_x = switch (corner) {
-            .bottom_right => self.display.x + self.display.w - hide_peek,
-            .bottom_left => self.display.x - width + hide_peek,
-        };
+        const park = self.parkPosition(width);
+        const pos_x = park.x;
+        const pos_y = park.y;
 
         const ok = ax_mod.setWindowPosition(pid, wid, pos_x, pos_y);
         log.debug("hide window wid={d} pid={d} ok={} x={d:.0} y={d:.0}", .{ wid, pid, ok, pos_x, pos_y });
@@ -4642,15 +4650,45 @@ fn reconcileDisplayChange() void {
     assertDisplayCoverage();
 }
 
-/// Park every managed window whose workspace is not visible on its (now valid)
-/// display so a removed monitor never strands windows at dead coordinates.
+/// Park every window of every hidden workspace so a topology change never
+/// leaves windows at coordinates that no longer map to a live display.
+///
+/// Walks workspace membership lists rather than gating on raw CG on-screen
+/// state: parked windows keep peek pixels visible, so CG counts them as
+/// on-screen, while genuinely stranded windows can be fully off-screen — CG
+/// presence distinguishes exactly the wrong ones. Windows already at their
+/// park position are skipped by comparing stored frames. Targets are
+/// collected before any hide because hiding can replace window ids
+/// (native-tab fallback), which mutates the structures being iterated.
 fn parkHiddenWorkspaceWindows() void {
-    var it = g_store.windows.iterator();
-    while (it.next()) |entry| {
-        const win = entry.value_ptr;
-        if (workspaceVisibleOnDisplay(win.workspace_id, win.display_id)) continue;
-        if (!bw_is_window_on_screen(win.wid)) continue;
-        hideWindow(win.pid, win.wid);
+    const ParkTarget = struct { pid: i32, wid: u32 };
+    var targets: [256]ParkTarget = undefined;
+    var target_count: usize = 0;
+
+    outer: for (&g_workspaces.workspaces) |*ws| {
+        const home = ws.display_id orelse continue;
+        if (workspaceVisibleOnDisplay(ws.id, home)) continue;
+
+        const ctx = HideCtx.init(home);
+        for (ws.windows.items) |wid| {
+            if (g_tab_groups.isSuppressed(wid)) continue;
+            const win = g_store.get(wid) orelse continue;
+
+            const park = ctx.parkPosition(win.frame.width);
+            const tol = window_mod.Window.Frame.tolerance;
+            if (@abs(win.frame.x - park.x) <= tol and @abs(win.frame.y - park.y) <= tol) continue;
+
+            if (target_count == targets.len) {
+                log.warn("park: batch truncated at {d} windows", .{targets.len});
+                break :outer;
+            }
+            targets[target_count] = .{ .pid = win.pid, .wid = wid };
+            target_count += 1;
+        }
+    }
+
+    for (targets[0..target_count]) |target| {
+        hideWindow(target.pid, target.wid);
     }
 }
 
