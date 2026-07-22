@@ -4692,19 +4692,24 @@ fn parkHiddenWorkspaceWindows() void {
     }
 }
 
-/// Apply a target frame to a window, moving without a resize whenever the size
-/// is unchanged so no AXSize write (and its flash/reflow) fires. `two_pass`
-/// re-issues the resize once to defeat macOS size clamping (fullscreen only).
-fn applyWindowFrame(pid: i32, wid: u32, current: window_mod.Window.Frame, target: window_mod.Window.Frame, two_pass: bool) void {
-    if (current.sizeApproxEqual(target, window_mod.Window.Frame.tolerance)) {
-        _ = ax_mod.setWindowPosition(pid, wid, target.x, target.y);
-        return;
+/// Apply a target frame to a window, moving without a resize whenever the
+/// stored size already matches so no AXSize write (and its flash/reflow)
+/// fires. `two_pass` (fullscreen) always writes the full frame and re-issues
+/// it once: the stored size records intent, not what macOS actually granted,
+/// and clamped fullscreen sizes must be re-asserted even when the store
+/// believes they already match. Returns whether the final AX write was
+/// accepted so callers can avoid recording frames that were never applied.
+fn applyWindowFrame(pid: i32, wid: u32, current: window_mod.Window.Frame, target: window_mod.Window.Frame, two_pass: bool) bool {
+    if (!two_pass and current.sizeApproxEqual(target, window_mod.Window.Frame.tolerance)) {
+        return ax_mod.setWindowPosition(pid, wid, target.x, target.y);
     }
 
+    var ok = false;
     const passes: usize = if (two_pass) 2 else 1;
     for (0..passes) |_| {
-        _ = ax_mod.setWindowFrame(pid, wid, target.x, target.y, target.width, target.height);
+        ok = ax_mod.setWindowFrame(pid, wid, target.x, target.y, target.width, target.height);
     }
+    return ok;
 }
 
 fn retileDisplay(display_id: u32) void {
@@ -4757,6 +4762,7 @@ fn retileDisplay(display_id: u32) void {
             // Fullscreen windows are never animated: macOS clamps their size
             // mid-flight and they need the two-pass set below to land on the
             // exact display frame.
+            var applied = true;
             if (g_config.animation.enabled and !win.is_fullscreen) {
                 g_animator.animate(win.pid, entry.wid, win.frame, target_frame);
                 ensureAnimatorTimer();
@@ -4764,12 +4770,17 @@ fn retileDisplay(display_id: u32) void {
                 // The window may have entered fullscreen mid-animation; stop
                 // the in-flight animation so it doesn't fight the placement.
                 g_animator.cancel(entry.wid);
-                applyWindowFrame(win.pid, entry.wid, win.frame, target_frame, win.is_fullscreen);
+                applied = applyWindowFrame(win.pid, entry.wid, win.frame, target_frame, win.is_fullscreen);
             }
 
-            var updated = win;
-            updated.frame = target_frame;
-            g_store.put(updated) catch {};
+            // Record the target only when the write was accepted (animation
+            // converges on the target on its own). Recording a rejected frame
+            // would make the next retile's framesEqual check skip the repair.
+            if (applied) {
+                var updated = win;
+                updated.frame = target_frame;
+                g_store.put(updated) catch {};
+            }
         }
 
         // If this is a tab group leader, apply the same frame to all members
@@ -4781,10 +4792,11 @@ fn retileDisplay(display_id: u32) void {
                     if (g_store.get(member_wid)) |member| {
                         if (framesEqual(member.frame, entry.frame)) continue;
 
-                        applyWindowFrame(member.pid, member_wid, member.frame, entry.frame, false);
-                        var m_updated = member;
-                        m_updated.frame = entry.frame;
-                        g_store.put(m_updated) catch {};
+                        if (applyWindowFrame(member.pid, member_wid, member.frame, entry.frame, false)) {
+                            var m_updated = member;
+                            m_updated.frame = entry.frame;
+                            g_store.put(m_updated) catch {};
+                        }
                     }
                 }
             }
