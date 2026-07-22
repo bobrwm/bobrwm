@@ -270,6 +270,17 @@ fn displayIndexById(display_id: u32) ?usize {
     return null;
 }
 
+/// Resolve a display UUID snapshot to the present display's numeric id.
+/// Returns null for a null snapshot or when the monitor is no longer attached.
+fn displayIdForUuid(uuid_opt: ?[16]u8) ?u32 {
+    const uuid = uuid_opt orelse return null;
+    for (g_displays[0..g_display_count]) |display| {
+        const display_uuid = display.uuid orelse continue;
+        if (std.mem.eql(u8, &display_uuid, &uuid)) return display.id;
+    }
+    return null;
+}
+
 fn primaryDisplayId() u32 {
     std.debug.assert(g_display_count > 0);
     for (g_displays[0..g_display_count]) |display| {
@@ -4657,6 +4668,17 @@ fn reconcileDisplayChange() void {
     // reclaims its workspace on return.
     rememberDisplayWorkspaces();
 
+    // Snapshot every workspace home as a display UUID before the table is
+    // rebuilt. Numeric ids cannot be trusted across a topology change: macOS
+    // reuses CGDirectDisplayIDs, so a stale home id can name a different
+    // monitor afterwards while still looking "present".
+    var home_uuids: [workspace_mod.max_workspaces]?[16]u8 = @splat(null);
+    for (&g_workspaces.workspaces, 0..) |*ws, idx| {
+        const did = ws.display_id orelse continue;
+        const slot = displayIndexById(did) orelse continue;
+        home_uuids[idx] = g_displays[slot].uuid;
+    }
+
     refreshDisplays();
 
     // A monitor can return from sleep/unplug under a new CGDirectDisplayID.
@@ -4693,16 +4715,17 @@ fn reconcileDisplayChange() void {
 
     const home = primaryDisplayId();
 
-    // Keep every workspace homed on a surviving display. If its home vanished,
-    // re-home to primary rather than nulling it — a null home would later let
-    // switchWorkspace drift the workspace onto whatever display is focused,
-    // which is exactly the instability this guards against.
-    for (&g_workspaces.workspaces) |*ws| {
-        const did = ws.display_id orelse {
-            ws.display_id = home;
-            continue;
-        };
-        if (displayIndexById(did) == null) ws.display_id = home;
+    // Re-home every non-active workspace by its UUID snapshot. Numeric-id
+    // survival is not enough: after a topology change the old number can be
+    // owned by a different physical monitor, which would silently migrate a
+    // hidden workspace across displays. Follow the monitor if it is still
+    // present (under any numeric id); park on primary if it vanished — a null
+    // home would later let switchWorkspace drift the workspace onto whatever
+    // display is focused, which is exactly the instability this guards
+    // against. Active workspaces keep the home the recall loop above assigned.
+    for (&g_workspaces.workspaces, 0..) |*ws, idx| {
+        if (active_claimed[ws.id]) continue;
+        ws.display_id = displayIdForUuid(home_uuids[idx]) orelse home;
     }
 
     // Derive every window's display from its workspace home, which is now
