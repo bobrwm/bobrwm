@@ -5,8 +5,10 @@
 //! timeout. To keep the per-tick cost down, each animation resolves and
 //! retains the window's AX element once up front (ax.animationBegin) and
 //! intermediate ticks issue a single-pass position(+size) write; only the
-//! final frame goes through the full three-pass clamping-safe
-//! ax.setWindowFrame. Alpha until animation is moved off the main thread.
+//! final frame of a resizing animation goes through the full three-pass
+//! clamping-safe ax.setWindowFrame. Pure moves finish with a position-only
+//! write, since an AXSize write would flash and reflow size-sensitive apps.
+//! Alpha until animation is moved off the main thread.
 
 const std = @import("std");
 const ax = @import("ax.zig");
@@ -84,13 +86,13 @@ pub const Animator = struct {
         }
 
         if (self.count >= max_animations) {
-            setFrame(pid, wid, target_frame);
+            placeFinal(pid, wid, current_frame, target_frame);
             return;
         }
 
         const handle = ax.animationBegin(pid, wid) orelse {
             // Window can't be resolved — place it directly instead.
-            setFrame(pid, wid, target_frame);
+            placeFinal(pid, wid, current_frame, target_frame);
             return;
         };
 
@@ -125,11 +127,12 @@ pub const Animator = struct {
             const t = @min(@max(t_raw, 0), 1);
 
             if (t >= 1) {
-                // Final tick: full clamping-safe set at the exact target —
-                // easings like .spring do not evaluate to exactly 1.0 at
-                // t == 1, and the single-pass steps may have accumulated
-                // clamping drift.
-                setFrame(a.pid, a.wid, a.end_frame);
+                // Final tick: place at the exact target — easings like
+                // .spring do not evaluate to exactly 1.0 at t == 1, and
+                // resizing single-pass steps may have accumulated clamping
+                // drift. Pure moves never wrote a size, so they finish with
+                // a position-only write.
+                placeFinal(a.pid, a.wid, a.start_frame, a.end_frame);
                 a.end();
                 continue;
             }
@@ -155,7 +158,7 @@ pub const Animator = struct {
     pub fn finishAll(self: *Animator) void {
         for (0..self.count) |i| {
             const a = self.animations[i];
-            setFrame(a.pid, a.wid, a.end_frame);
+            placeFinal(a.pid, a.wid, a.start_frame, a.end_frame);
             a.end();
         }
         self.count = 0;
@@ -181,7 +184,7 @@ pub const Animator = struct {
         for (0..self.count) |i| {
             if (self.animations[i].wid == wid) {
                 const a = self.animations[i];
-                setFrame(a.pid, a.wid, a.end_frame);
+                placeFinal(a.pid, a.wid, a.start_frame, a.end_frame);
                 a.end();
                 self.count -= 1;
                 if (i < self.count) {
@@ -204,14 +207,23 @@ pub const Animator = struct {
     }
 };
 
-fn setFrame(pid: i32, wid: u32, frame: window_mod.Window.Frame) void {
+/// Place a window at its animation target. A pure move (size unchanged
+/// between the animation's endpoints) finishes with a position-only write:
+/// intermediate ticks never wrote a size, so there is no size drift to heal,
+/// and an AXSize write would flash and reflow size-sensitive apps. Resizing
+/// animations keep the full clamping-safe frame write.
+fn placeFinal(pid: i32, wid: u32, from: window_mod.Window.Frame, to: window_mod.Window.Frame) void {
+    if (from.sizeApproxEqual(to, window_mod.Window.Frame.tolerance)) {
+        _ = ax.setWindowPosition(pid, wid, to.x, to.y);
+        return;
+    }
     _ = ax.setWindowFrame(
         pid,
         wid,
-        frame.x,
-        frame.y,
-        frame.width,
-        frame.height,
+        to.x,
+        to.y,
+        to.width,
+        to.height,
     );
 }
 
