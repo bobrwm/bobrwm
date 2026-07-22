@@ -3405,8 +3405,12 @@ fn trackDeferredWindowCandidate(pid: i32, wid: u32, workspace_id: u8, display_id
     }
 
     if (g_deferred_window_candidates.getPtr(wid)) |candidate| {
+        // Update metadata but keep the remaining retry budget: re-tracking an
+        // existing candidate is a continuation of the same wait, not a new
+        // window. Resetting here would let a window that repeatedly fails
+        // promotion (e.g. permanently degenerate bounds) re-arm its budget
+        // every cycle and poll forever.
         candidate.pid = pid;
-        candidate.attempts_remaining = role_poll_attempts_max;
         candidate.workspace_id = workspace_id;
         candidate.display_id = display_id;
     } else {
@@ -3601,12 +3605,14 @@ fn processDeferredWindowCandidates() bool {
             },
             .ready => {
                 if (isVisibleOnScreen(wid)) {
-                    if (remove_count == remove_wids.len or promote_count == promote_candidates.len) {
+                    // Do not remove yet: promotion can fail (unsettled
+                    // bounds) and re-defer, and the entry must survive so its
+                    // retry budget keeps depleting. Removal happens after the
+                    // promotion attempt below.
+                    if (promote_count == promote_candidates.len) {
                         truncated = true;
                         break;
                     }
-                    remove_wids[remove_count] = wid;
-                    remove_count += 1;
                     promote_candidates[promote_count] = .{
                         .pid = pid,
                         .wid = wid,
@@ -3634,7 +3640,6 @@ fn processDeferredWindowCandidates() bool {
     for (remove_wids[0..remove_count]) |wid| {
         _ = g_deferred_window_candidates.remove(wid);
     }
-    refreshRolePolling();
 
     if (truncated) {
         log.warn("deferred-window: batch truncated remaining={d}", .{g_deferred_window_candidates.count()});
@@ -3649,10 +3654,30 @@ fn processDeferredWindowCandidates() bool {
         // by promotion time the window is guaranteed on-screen with stable
         // bounds, so addNewWindowManaged's inferDisplayIdForWindow is the
         // authoritative answer.
-        if (addNewWindowManaged(candidate.pid, candidate.wid)) {
+        if (addNewWindowManaged(candidate.pid, candidate.wid) or g_store.get(candidate.wid) != null) {
+            // Managed (or resolved another way, e.g. adopted into a tab
+            // group, which stores the window without returning true).
+            _ = g_deferred_window_candidates.remove(candidate.wid);
             added_any = true;
+        } else if (g_deferred_window_candidates.getPtr(candidate.wid)) |entry| {
+            // Promotion failed and re-deferred (e.g. bounds still unsettled).
+            // Deplete the surviving entry's budget so a window whose bounds
+            // never settle expires instead of cycling forever.
+            if (entry.attempts_remaining == 0) {
+                _ = g_deferred_window_candidates.remove(candidate.wid);
+                log.info("deferred-window: giving up pid={d} wid={d} after {d}ms with unsettled bounds", .{
+                    candidate.pid,
+                    candidate.wid,
+                    timeout_ms,
+                });
+            } else {
+                entry.attempts_remaining -= 1;
+            }
         }
+        // Promotion returned false without re-deferring: the candidate was
+        // rejected or resolved elsewhere and needs no further tracking.
     }
+    refreshRolePolling();
     return added_any;
 }
 
@@ -3827,8 +3852,10 @@ fn addNewWindowManagedWithAssignment(pid: i32, wid: u32, workspace_id: u8, assig
     // Proceeding would store a garbage frame and, for an app assigned to a
     // hidden workspace, park a zero-size window. Defer for bounded
     // re-evaluation. Tracked before the untrack-defer below so it survives
-    // this early return.
-    if (window_frame.width <= 1 or window_frame.height <= 1) {
+    // this early return. Only when SkyLight is available: without it bounds
+    // are always zero, and deferring would leave every new window unmanaged;
+    // keep the legacy zero-frame path in that degraded mode.
+    if (g_sky != null and (window_frame.width <= 1 or window_frame.height <= 1)) {
         trackDeferredWindowCandidate(pid, wid, workspace_id, assigned_display_id);
         log.info("addNewWindow: deferred pid={d} wid={d} unsettled bounds", .{ pid, wid });
         return false;
