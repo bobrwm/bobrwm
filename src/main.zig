@@ -1219,14 +1219,18 @@ const HideCtx = struct {
         if (!ok) return false;
 
         // Record the ID swap at the parked position using the failed window's
-        // stored size; replaceManagedWindowId needs a non-degenerate frame.
+        // stored size. replaceManagedWindowId needs a non-degenerate frame, so
+        // clamp a degenerate stored size (not yet tiled, or discovered
+        // mid-construction) to 1x1 metadata instead of bailing: the focused
+        // window has already been moved off-screen, and skipping the swap
+        // here would leave the stale id managed and the moved window
+        // untracked. Retile restores the real frame on re-activation.
         const stored = g_store.get(failed_wid) orelse return false;
-        if (stored.frame.width <= 0 or stored.frame.height <= 0) return false;
         const replacement_frame: window_mod.Window.Frame = .{
             .x = x,
             .y = y,
-            .width = stored.frame.width,
-            .height = stored.frame.height,
+            .width = @max(stored.frame.width, 1),
+            .height = @max(stored.frame.height, 1),
         };
         return replaceManagedWindowId(failed_wid, focused_wid, replacement_frame);
     }
