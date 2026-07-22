@@ -915,12 +915,13 @@ fn displayUuidBytes(display_id: u32) ?[16]u8 {
 }
 
 /// Remembers, per physical display (keyed by stable UUID), the workspace that
-/// was active on it and its last-seen CGDirectDisplayID. Persists across a
-/// display being absent so a monitor that returns (staggered wake, replug)
-/// reclaims its workspace instead of defaulting. In-memory only.
+/// was active on it. Persists across a display being absent so a monitor that
+/// returns (staggered wake, replug) reclaims its workspace instead of
+/// defaulting. In-memory only. Deliberately does not remember numeric display
+/// ids: macOS reuses CGDirectDisplayIDs, so a remembered id can belong to a
+/// different monitor by the time it is recalled.
 const DisplayMemoryEntry = struct {
     uuid: [16]u8,
-    id: u32,
     active_ws: u8,
 };
 
@@ -932,14 +933,13 @@ var g_display_memory_count: usize = 0;
 fn rememberDisplayWorkspaces() void {
     for (g_displays[0..g_display_count], 0..) |display, slot| {
         const uuid = display.uuid orelse continue;
-        upsertDisplayMemory(uuid, display.id, g_workspaces.active_ids_by_display[slot]);
+        upsertDisplayMemory(uuid, g_workspaces.active_ids_by_display[slot]);
     }
 }
 
-fn upsertDisplayMemory(uuid: [16]u8, id: u32, active_ws: u8) void {
+fn upsertDisplayMemory(uuid: [16]u8, active_ws: u8) void {
     for (g_display_memory[0..g_display_memory_count]) |*entry| {
         if (std.mem.eql(u8, &entry.uuid, &uuid)) {
-            entry.id = id;
             entry.active_ws = active_ws;
             return;
         }
@@ -954,7 +954,7 @@ fn upsertDisplayMemory(uuid: [16]u8, id: u32, active_ws: u8) void {
         );
         g_display_memory_count -= 1;
     }
-    g_display_memory[g_display_memory_count] = .{ .uuid = uuid, .id = id, .active_ws = active_ws };
+    g_display_memory[g_display_memory_count] = .{ .uuid = uuid, .active_ws = active_ws };
     g_display_memory_count += 1;
 }
 
@@ -963,33 +963,6 @@ fn recallDisplayMemory(uuid: [16]u8) ?DisplayMemoryEntry {
         if (std.mem.eql(u8, &entry.uuid, &uuid)) return entry;
     }
     return null;
-}
-
-/// Rewrite stored display ids old->new across workspace homes and windows, so
-/// references follow a monitor that returned under a different id.
-fn remapDisplayIds(from: []const u32, to: []const u32) void {
-    if (from.len == 0) return;
-
-    for (&g_workspaces.workspaces) |*ws| {
-        const did = ws.display_id orelse continue;
-        for (from, to) |f, t| {
-            if (did == f) {
-                ws.display_id = t;
-                break;
-            }
-        }
-    }
-
-    var it = g_store.windows.iterator();
-    while (it.next()) |entry| {
-        const did = entry.value_ptr.display_id;
-        for (from, to) |f, t| {
-            if (did == f) {
-                entry.value_ptr.display_id = t;
-                break;
-            }
-        }
-    }
 }
 
 fn refreshDisplays() void {
@@ -4565,8 +4538,9 @@ fn firstUnclaimedWorkspace(claimed: []const bool) u8 {
 /// workspace it had — even if macOS hands it a new id. Every workspace stays
 /// homed on a surviving display (re-homed to primary if its monitor vanished,
 /// never left homeless), and each display gets a distinct active workspace.
-/// Windows whose monitor disappeared keep their workspace membership and follow
-/// it to the primary display.
+/// Window display assignment is then derived from the workspace home, so
+/// windows always follow their workspace — to the primary display when their
+/// monitor vanished, and back when it returns and reclaims the workspace.
 fn reconcileDisplayChange() void {
     // Snapshot present displays' active workspaces (by UUID) before the
     // topology changes, so a monitor that vanishes keeps its binding and
@@ -4576,11 +4550,13 @@ fn reconcileDisplayChange() void {
     refreshDisplays();
 
     // A monitor can return from sleep/unplug under a new CGDirectDisplayID.
-    // Recall each surviving display by stable UUID, restore the workspace it
-    // last had active, and record any id change so stored references follow it.
-    var remap_from: [workspace_mod.max_displays]u32 = undefined;
-    var remap_to: [workspace_mod.max_displays]u32 = undefined;
-    var remap_count: usize = 0;
+    // Recall each surviving display by stable UUID and restore the workspace
+    // it last had active. Numeric ids are deliberately never remapped
+    // old-to-new: macOS reuses CGDirectDisplayIDs, so an absent monitor's
+    // remembered id can be legitimately owned by a different present display,
+    // and a global rewrite would move that display's workspaces and windows
+    // wholesale. Stored display references are re-derived from workspace
+    // homes below instead.
 
     // A workspace can be active on at most one display (assertDisplayCoverage).
     // Track which workspaces are already claimed so two displays that resolve
@@ -4594,11 +4570,6 @@ fn reconcileDisplayChange() void {
         if (display.uuid) |uuid| {
             if (recallDisplayMemory(uuid)) |mem| {
                 active_id = mem.active_ws;
-                if (mem.id != display.id) {
-                    remap_from[remap_count] = mem.id;
-                    remap_to[remap_count] = display.id;
-                    remap_count += 1;
-                }
             }
         }
         if (active_claimed[active_id]) active_id = firstUnclaimedWorkspace(&active_claimed);
@@ -4609,8 +4580,6 @@ fn reconcileDisplayChange() void {
             ws.display_id = display.id;
         }
     }
-
-    remapDisplayIds(remap_from[0..remap_count], remap_to[0..remap_count]);
 
     const home = primaryDisplayId();
 
@@ -4626,15 +4595,19 @@ fn reconcileDisplayChange() void {
         if (displayIndexById(did) == null) ws.display_id = home;
     }
 
-    // Windows on a genuinely-removed monitor: keep their workspace membership
-    // and let them follow to the primary display, instead of merging the
-    // windows into whatever workspace is active there. Switching to the
-    // workspace brings them back intact; retile heals their placement.
+    // Derive every window's display from its workspace home, which is now
+    // guaranteed to reference a present display. Windows keep their workspace
+    // membership and follow the workspace wherever it was re-homed: to the
+    // primary display when their monitor vanished, and back to the monitor
+    // when it returns and reclaims the workspace. This also heals windows
+    // (floating ones especially) that were parked on primary while their
+    // display was absent — a numeric-id comparison alone would miss them
+    // because primary is a valid display id.
     var store_it = g_store.windows.iterator();
     while (store_it.next()) |entry| {
         const win = entry.value_ptr;
-        if (displayIndexById(win.display_id) != null) continue;
-        win.display_id = home;
+        const ws = g_workspaces.get(win.workspace_id) orelse continue;
+        win.display_id = ws.display_id orelse home;
     }
 
     parkHiddenWorkspaceWindows();
