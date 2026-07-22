@@ -3778,6 +3778,16 @@ fn discoverWindows() void {
             },
             .ready => {
                 untrackPendingRoleWindow(info.wid);
+                // Degenerate discovery bounds mean the window is still
+                // mid-construction. Defer for bounded re-evaluation instead
+                // of storing a garbage frame that would be tiled or parked
+                // at zero size. Deliberately not untracked first: tracking an
+                // existing candidate preserves its remaining retry budget.
+                if (frame.width <= 1 or frame.height <= 1) {
+                    trackDeferredWindowCandidate(info.pid, info.wid, target_ws.id, managed_display);
+                    log.info("discover: deferred pid={d} wid={d} unsettled bounds", .{ info.pid, info.wid });
+                    continue;
+                }
                 untrackDeferredWindowCandidate(info.wid);
             },
         }
