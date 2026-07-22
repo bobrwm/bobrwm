@@ -1227,11 +1227,19 @@ const HideCtx = struct {
             log.warn("hide failed wid={d} pid={d}", .{ wid, pid });
         }
 
-        if (g_store.get(wid)) |win| {
-            var updated = win;
-            updated.frame.x = pos_x;
-            updated.frame.y = pos_y;
-            g_store.put(updated) catch {};
+        // Record the park position only when this window's own AX write was
+        // accepted. The focused-window fallback updates the replacement id's
+        // metadata itself, and recording a failed park would make the stored
+        // frame claim the window is off-screen while it is still visible —
+        // parkHiddenWorkspaceWindows compares stored frames and would never
+        // retry it.
+        if (ok) {
+            if (g_store.get(wid)) |win| {
+                var updated = win;
+                updated.frame.x = pos_x;
+                updated.frame.y = pos_y;
+                g_store.put(updated) catch {};
+            }
         }
     }
 
