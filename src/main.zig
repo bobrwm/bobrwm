@@ -4733,20 +4733,21 @@ fn retileDisplay(display_id: u32) void {
     std.debug.assert(g_layout_entries.items.len == window_count);
 
     for (g_layout_entries.items) |entry| {
-        var win = g_store.get(entry.wid) orelse continue;
+        const win = g_store.get(entry.wid) orelse continue;
 
-        // The workspace's tiling tree is authoritative for placement: a window
-        // in this tree belongs to ws_id, shown on this display. If stored
-        // display/workspace metadata drifted (topology change, move races),
-        // heal it to match the tree instead of skipping — an unplaced window
-        // would otherwise be stranded off-screen with no path back.
+        // Stored display/workspace metadata disagreeing with the tiling tree
+        // means some transition (topology change, window move) is mid-flight
+        // or a bookkeeping bug slipped through. Do not "heal" the store here:
+        // rewriting workspace_id/display_id alone would desync it from
+        // workspace membership lists, focus history, and tab assignments,
+        // which only the full move/reconcile paths update together. Skip and
+        // surface it; reconcileDisplayChange re-derives window display ids
+        // from workspace homes, which repairs the topology-change case.
         if (win.display_id != display_id or win.workspace_id != ws_id) {
-            log.warn("retile: healing drifted window wid={d} display {d}->{d} workspace {d}->{d}", .{
+            log.warn("retile: skipping drifted window wid={d} display {d} (tree {d}) workspace {d} (tree {d})", .{
                 entry.wid, win.display_id, display_id, win.workspace_id, ws_id,
             });
-            win.display_id = display_id;
-            win.workspace_id = ws_id;
-            g_store.put(win) catch {};
+            continue;
         }
 
         // Fullscreen windows fill the outer-gap-inset frame, skipping BSP splits and inner gaps
