@@ -227,7 +227,6 @@ const PendingRoleCandidate = struct {
     wid: u32,
     from_timeout: bool,
     workspace_id: u8,
-    display_id: u32,
 };
 
 const DeferredWindowCandidate = struct {
@@ -3559,7 +3558,6 @@ fn processPendingRoleWindows() bool {
                     .wid = wid,
                     .from_timeout = false,
                     .workspace_id = entry.value_ptr.workspace_id,
-                    .display_id = entry.value_ptr.display_id,
                 };
                 candidate_count += 1;
             },
@@ -3576,7 +3574,6 @@ fn processPendingRoleWindows() bool {
                         .wid = wid,
                         .from_timeout = true,
                         .workspace_id = entry.value_ptr.workspace_id,
-                        .display_id = entry.value_ptr.display_id,
                     };
                     candidate_count += 1;
                 } else {
@@ -3604,20 +3601,18 @@ fn processPendingRoleWindows() bool {
                 continue;
             }
             log.info("pending-role: timeout pid={d} wid={d} after {d}ms, applying legacy fallback", .{ candidate.pid, candidate.wid, timeout_ms });
-            // The display captured at tracking time can be gone or renumbered
-            // after a topology change: reconciliation rewrites workspace homes
-            // and stored windows, but not pending-role entries. Re-home the
-            // fallback onto the workspace's current display so the window is
-            // not created with a dead display id.
-            var fallback_display_id = candidate.display_id;
-            if (displayIndexById(fallback_display_id) == null) {
-                fallback_display_id = blk: {
-                    if (g_workspaces.get(candidate.workspace_id)) |ws| {
-                        if (ws.display_id) |did| break :blk did;
-                    }
-                    break :blk primaryDisplayId();
-                };
-            }
+            // The display captured at tracking time cannot be trusted after a
+            // topology change: the monitor can be gone, or its numeric id can
+            // now belong to a different monitor while still looking present.
+            // The workspace home is reconciled by UUID and is the single
+            // source of truth for where its windows live, so always derive
+            // the fallback display from it.
+            const fallback_display_id = blk: {
+                if (g_workspaces.get(candidate.workspace_id)) |ws| {
+                    if (ws.display_id) |did| break :blk did;
+                }
+                break :blk primaryDisplayId();
+            };
             if (addNewWindowLegacyPendingFallback(candidate.pid, candidate.wid, candidate.workspace_id, fallback_display_id)) {
                 added_any = true;
             }
