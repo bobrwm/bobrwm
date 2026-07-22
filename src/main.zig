@@ -1045,6 +1045,22 @@ fn refreshDisplays() void {
         return;
     }
 
+    // Every display needs a distinct active workspace (assertDisplayCoverage),
+    // so at most workspace_count displays can be managed. Ignore the excess
+    // instead of silently giving two displays the same active workspace,
+    // which corrupts workspace visibility checks everywhere downstream.
+    if (next_count > g_workspaces.workspace_count) {
+        log.warn("{d} displays but only {d} workspaces; ignoring the excess displays", .{
+            next_count,
+            g_workspaces.workspace_count,
+        });
+        next_count = g_workspaces.workspace_count;
+        has_primary = false;
+        for (g_displays[0..next_count]) |display| {
+            if (display.is_primary) has_primary = true;
+        }
+    }
+
     if (!has_primary) g_displays[0].is_primary = true;
     g_display_count = next_count;
 
@@ -4554,15 +4570,16 @@ fn updateWindowDisplayAssignment(wid: u32) bool {
     return true;
 }
 
-/// Lowest workspace id (1-based) not yet claimed as active on a display. Falls
-/// back to 1 when every workspace is claimed (only possible with more displays
-/// than workspaces).
+/// Lowest workspace id (1-based) not yet claimed as active on a display.
+/// refreshDisplays caps the display count at workspace_count, so a caller that
+/// has claimed at most one workspace per display always finds one.
 fn firstUnclaimedWorkspace(claimed: []const bool) u8 {
+    std.debug.assert(g_display_count <= g_workspaces.workspace_count);
     var id: u8 = 1;
     while (id <= g_workspaces.workspace_count) : (id += 1) {
         if (!claimed[id]) return id;
     }
-    return 1;
+    unreachable;
 }
 
 /// Reconciles workspace/display state after monitor topology changes.
