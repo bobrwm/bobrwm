@@ -227,7 +227,6 @@ const PendingRoleCandidate = struct {
     wid: u32,
     from_timeout: bool,
     workspace_id: u8,
-    display_id: u32,
 };
 
 const DeferredWindowCandidate = struct {
@@ -266,6 +265,17 @@ const axEnhancedUserInterface = ax_mod.enhancedUserInterface;
 fn displayIndexById(display_id: u32) ?usize {
     for (g_displays[0..g_display_count], 0..) |display, i| {
         if (display.id == display_id) return i;
+    }
+    return null;
+}
+
+/// Resolve a display UUID snapshot to the present display's numeric id.
+/// Returns null for a null snapshot or when the monitor is no longer attached.
+fn displayIdForUuid(uuid_opt: ?[16]u8) ?u32 {
+    const uuid = uuid_opt orelse return null;
+    for (g_displays[0..g_display_count]) |display| {
+        const display_uuid = display.uuid orelse continue;
+        if (std.mem.eql(u8, &display_uuid, &uuid)) return display.id;
     }
     return null;
 }
@@ -915,12 +925,13 @@ fn displayUuidBytes(display_id: u32) ?[16]u8 {
 }
 
 /// Remembers, per physical display (keyed by stable UUID), the workspace that
-/// was active on it and its last-seen CGDirectDisplayID. Persists across a
-/// display being absent so a monitor that returns (staggered wake, replug)
-/// reclaims its workspace instead of defaulting. In-memory only.
+/// was active on it. Persists across a display being absent so a monitor that
+/// returns (staggered wake, replug) reclaims its workspace instead of
+/// defaulting. In-memory only. Deliberately does not remember numeric display
+/// ids: macOS reuses CGDirectDisplayIDs, so a remembered id can belong to a
+/// different monitor by the time it is recalled.
 const DisplayMemoryEntry = struct {
     uuid: [16]u8,
-    id: u32,
     active_ws: u8,
 };
 
@@ -932,14 +943,13 @@ var g_display_memory_count: usize = 0;
 fn rememberDisplayWorkspaces() void {
     for (g_displays[0..g_display_count], 0..) |display, slot| {
         const uuid = display.uuid orelse continue;
-        upsertDisplayMemory(uuid, display.id, g_workspaces.active_ids_by_display[slot]);
+        upsertDisplayMemory(uuid, g_workspaces.active_ids_by_display[slot]);
     }
 }
 
-fn upsertDisplayMemory(uuid: [16]u8, id: u32, active_ws: u8) void {
+fn upsertDisplayMemory(uuid: [16]u8, active_ws: u8) void {
     for (g_display_memory[0..g_display_memory_count]) |*entry| {
         if (std.mem.eql(u8, &entry.uuid, &uuid)) {
-            entry.id = id;
             entry.active_ws = active_ws;
             return;
         }
@@ -954,7 +964,7 @@ fn upsertDisplayMemory(uuid: [16]u8, id: u32, active_ws: u8) void {
         );
         g_display_memory_count -= 1;
     }
-    g_display_memory[g_display_memory_count] = .{ .uuid = uuid, .id = id, .active_ws = active_ws };
+    g_display_memory[g_display_memory_count] = .{ .uuid = uuid, .active_ws = active_ws };
     g_display_memory_count += 1;
 }
 
@@ -965,34 +975,39 @@ fn recallDisplayMemory(uuid: [16]u8) ?DisplayMemoryEntry {
     return null;
 }
 
-/// Rewrite stored display ids old->new across workspace homes and windows, so
-/// references follow a monitor that returned under a different id.
-fn remapDisplayIds(from: []const u32, to: []const u32) void {
-    if (from.len == 0) return;
-
-    for (&g_workspaces.workspaces) |*ws| {
-        const did = ws.display_id orelse continue;
-        for (from, to) |f, t| {
-            if (did == f) {
-                ws.display_id = t;
-                break;
+/// Re-resolve the focused display slot after g_displays was rebuilt.
+/// NSScreen.screens can reorder across replug and primary-display changes, so
+/// a slot index does not identify a monitor; match by UUID and fall back to
+/// the primary display's slot when the focused monitor vanished.
+fn restoreFocusedDisplaySlot(focused_uuid: ?[16]u8) void {
+    if (focused_uuid) |uuid| {
+        for (g_displays[0..g_display_count], 0..) |display, slot| {
+            const display_uuid = display.uuid orelse continue;
+            if (std.mem.eql(u8, &display_uuid, &uuid)) {
+                g_workspaces.focused_display_slot = slot;
+                return;
             }
         }
+        g_workspaces.focused_display_slot = displayIndexById(primaryDisplayId()) orelse 0;
+        return;
     }
-
-    var it = g_store.windows.iterator();
-    while (it.next()) |entry| {
-        const did = entry.value_ptr.display_id;
-        for (from, to) |f, t| {
-            if (did == f) {
-                entry.value_ptr.display_id = t;
-                break;
-            }
-        }
+    // No UUID to match (first refresh, or synthetic fallback display): only
+    // repair an out-of-range slot.
+    if (g_workspaces.focused_display_slot >= g_display_count) {
+        g_workspaces.focused_display_slot = 0;
     }
 }
 
 fn refreshDisplays() void {
+    // Snapshot before the display table is rebuilt; the slot is meaningless
+    // afterwards.
+    const focused_uuid: ?[16]u8 = blk: {
+        if (g_workspaces.focused_display_slot < g_display_count) {
+            break :blk g_displays[g_workspaces.focused_display_slot].uuid;
+        }
+        break :blk null;
+    };
+
     const NSScreen = objc.getClass("NSScreen") orelse {
         const frame = bw_get_display_frame();
         g_display_count = 1;
@@ -1072,12 +1087,26 @@ fn refreshDisplays() void {
         return;
     }
 
+    // Every display needs a distinct active workspace (assertDisplayCoverage),
+    // so at most workspace_count displays can be managed. Ignore the excess
+    // instead of silently giving two displays the same active workspace,
+    // which corrupts workspace visibility checks everywhere downstream.
+    if (next_count > g_workspaces.workspace_count) {
+        log.warn("{d} displays but only {d} workspaces; ignoring the excess displays", .{
+            next_count,
+            g_workspaces.workspace_count,
+        });
+        next_count = g_workspaces.workspace_count;
+        has_primary = false;
+        for (g_displays[0..next_count]) |display| {
+            if (display.is_primary) has_primary = true;
+        }
+    }
+
     if (!has_primary) g_displays[0].is_primary = true;
     g_display_count = next_count;
 
-    if (g_workspaces.focused_display_slot >= g_display_count) {
-        g_workspaces.focused_display_slot = 0;
-    }
+    restoreFocusedDisplaySlot(focused_uuid);
 }
 
 /// Resolves a window frame to the best display.
@@ -1165,24 +1194,32 @@ const HideCtx = struct {
         };
     }
 
+    /// Off-screen park position for a window of the given stored width.
+    /// bottom_left parks the window off the left edge, which needs its width;
+    /// without a usable width it falls back to bottom_right, which does not.
+    fn parkPosition(self: HideCtx, width: f64) struct { x: f64, y: f64 } {
+        std.debug.assert(width >= 0);
+        const corner: HideCorner = if (width > 1) self.corner else .bottom_right;
+        return .{
+            .x = switch (corner) {
+                .bottom_right => self.display.x + self.display.w - hide_peek,
+                .bottom_left => self.display.x - width + hide_peek,
+            },
+            .y = self.display.y + self.display.h - hide_peek,
+        };
+    }
+
     /// Move a single window off-screen by POSITION only — never resizing it.
     /// Resizing on hide causes a visible flash and a reflow storm in
     /// size-sensitive apps; the parked size is irrelevant and retile restores
     /// the real frame on re-activation. Updates the stored position so
     /// retileDisplay detects the move and re-places the window when its
-    /// workspace becomes visible again.
+    /// workspace becomes visible again. The size is never written.
     fn hide(self: HideCtx, pid: i32, wid: u32) void {
-        const pos_y = self.display.y + self.display.h - hide_peek;
-
-        // bottom_left parks the window off the left edge, which needs its
-        // width; without a stored size, fall back to bottom_right, which does
-        // not. The size is never written either way.
         const width: f64 = if (g_store.get(wid)) |win| win.frame.width else 0;
-        const corner: HideCorner = if (width > 1) self.corner else .bottom_right;
-        const pos_x = switch (corner) {
-            .bottom_right => self.display.x + self.display.w - hide_peek,
-            .bottom_left => self.display.x - width + hide_peek,
-        };
+        const park = self.parkPosition(width);
+        const pos_x = park.x;
+        const pos_y = park.y;
 
         const ok = ax_mod.setWindowPosition(pid, wid, pos_x, pos_y);
         log.debug("hide window wid={d} pid={d} ok={} x={d:.0} y={d:.0}", .{ wid, pid, ok, pos_x, pos_y });
@@ -1190,11 +1227,19 @@ const HideCtx = struct {
             log.warn("hide failed wid={d} pid={d}", .{ wid, pid });
         }
 
-        if (g_store.get(wid)) |win| {
-            var updated = win;
-            updated.frame.x = pos_x;
-            updated.frame.y = pos_y;
-            g_store.put(updated) catch {};
+        // Record the park position only when this window's own AX write was
+        // accepted. The focused-window fallback updates the replacement id's
+        // metadata itself, and recording a failed park would make the stored
+        // frame claim the window is off-screen while it is still visible —
+        // parkHiddenWorkspaceWindows compares stored frames and would never
+        // retry it.
+        if (ok) {
+            if (g_store.get(wid)) |win| {
+                var updated = win;
+                updated.frame.x = pos_x;
+                updated.frame.y = pos_y;
+                g_store.put(updated) catch {};
+            }
         }
     }
 
@@ -1222,14 +1267,18 @@ const HideCtx = struct {
         if (!ok) return false;
 
         // Record the ID swap at the parked position using the failed window's
-        // stored size; replaceManagedWindowId needs a non-degenerate frame.
+        // stored size. replaceManagedWindowId needs a non-degenerate frame, so
+        // clamp a degenerate stored size (not yet tiled, or discovered
+        // mid-construction) to 1x1 metadata instead of bailing: the focused
+        // window has already been moved off-screen, and skipping the swap
+        // here would leave the stale id managed and the moved window
+        // untracked. Retile restores the real frame on re-activation.
         const stored = g_store.get(failed_wid) orelse return false;
-        if (stored.frame.width <= 0 or stored.frame.height <= 0) return false;
         const replacement_frame: window_mod.Window.Frame = .{
             .x = x,
             .y = y,
-            .width = stored.frame.width,
-            .height = stored.frame.height,
+            .width = @max(stored.frame.width, 1),
+            .height = @max(stored.frame.height, 1),
         };
         return replaceManagedWindowId(failed_wid, focused_wid, replacement_frame);
     }
@@ -3432,8 +3481,12 @@ fn trackDeferredWindowCandidate(pid: i32, wid: u32, workspace_id: u8, display_id
     }
 
     if (g_deferred_window_candidates.getPtr(wid)) |candidate| {
+        // Update metadata but keep the remaining retry budget: re-tracking an
+        // existing candidate is a continuation of the same wait, not a new
+        // window. Resetting here would let a window that repeatedly fails
+        // promotion (e.g. permanently degenerate bounds) re-arm its budget
+        // every cycle and poll forever.
         candidate.pid = pid;
-        candidate.attempts_remaining = role_poll_attempts_max;
         candidate.workspace_id = workspace_id;
         candidate.display_id = display_id;
     } else {
@@ -3513,7 +3566,6 @@ fn processPendingRoleWindows() bool {
                     .wid = wid,
                     .from_timeout = false,
                     .workspace_id = entry.value_ptr.workspace_id,
-                    .display_id = entry.value_ptr.display_id,
                 };
                 candidate_count += 1;
             },
@@ -3530,7 +3582,6 @@ fn processPendingRoleWindows() bool {
                         .wid = wid,
                         .from_timeout = true,
                         .workspace_id = entry.value_ptr.workspace_id,
-                        .display_id = entry.value_ptr.display_id,
                     };
                     candidate_count += 1;
                 } else {
@@ -3558,7 +3609,19 @@ fn processPendingRoleWindows() bool {
                 continue;
             }
             log.info("pending-role: timeout pid={d} wid={d} after {d}ms, applying legacy fallback", .{ candidate.pid, candidate.wid, timeout_ms });
-            if (addNewWindowLegacyPendingFallback(candidate.pid, candidate.wid, candidate.workspace_id, candidate.display_id)) {
+            // The display captured at tracking time cannot be trusted after a
+            // topology change: the monitor can be gone, or its numeric id can
+            // now belong to a different monitor while still looking present.
+            // The workspace home is reconciled by UUID and is the single
+            // source of truth for where its windows live, so always derive
+            // the fallback display from it.
+            const fallback_display_id = blk: {
+                if (g_workspaces.get(candidate.workspace_id)) |ws| {
+                    if (ws.display_id) |did| break :blk did;
+                }
+                break :blk primaryDisplayId();
+            };
+            if (addNewWindowLegacyPendingFallback(candidate.pid, candidate.wid, candidate.workspace_id, fallback_display_id)) {
                 added_any = true;
             }
             continue;
@@ -3628,12 +3691,14 @@ fn processDeferredWindowCandidates() bool {
             },
             .ready => {
                 if (isVisibleOnScreen(wid)) {
-                    if (remove_count == remove_wids.len or promote_count == promote_candidates.len) {
+                    // Do not remove yet: promotion can fail (unsettled
+                    // bounds) and re-defer, and the entry must survive so its
+                    // retry budget keeps depleting. Removal happens after the
+                    // promotion attempt below.
+                    if (promote_count == promote_candidates.len) {
                         truncated = true;
                         break;
                     }
-                    remove_wids[remove_count] = wid;
-                    remove_count += 1;
                     promote_candidates[promote_count] = .{
                         .pid = pid,
                         .wid = wid,
@@ -3661,7 +3726,6 @@ fn processDeferredWindowCandidates() bool {
     for (remove_wids[0..remove_count]) |wid| {
         _ = g_deferred_window_candidates.remove(wid);
     }
-    refreshRolePolling();
 
     if (truncated) {
         log.warn("deferred-window: batch truncated remaining={d}", .{g_deferred_window_candidates.count()});
@@ -3676,10 +3740,30 @@ fn processDeferredWindowCandidates() bool {
         // by promotion time the window is guaranteed on-screen with stable
         // bounds, so addNewWindowManaged's inferDisplayIdForWindow is the
         // authoritative answer.
-        if (addNewWindowManaged(candidate.pid, candidate.wid)) {
+        if (addNewWindowManaged(candidate.pid, candidate.wid) or g_store.get(candidate.wid) != null) {
+            // Managed (or resolved another way, e.g. adopted into a tab
+            // group, which stores the window without returning true).
+            _ = g_deferred_window_candidates.remove(candidate.wid);
             added_any = true;
+        } else if (g_deferred_window_candidates.getPtr(candidate.wid)) |entry| {
+            // Promotion failed and re-deferred (e.g. bounds still unsettled).
+            // Deplete the surviving entry's budget so a window whose bounds
+            // never settle expires instead of cycling forever.
+            if (entry.attempts_remaining == 0) {
+                _ = g_deferred_window_candidates.remove(candidate.wid);
+                log.info("deferred-window: giving up pid={d} wid={d} after {d}ms with unsettled bounds", .{
+                    candidate.pid,
+                    candidate.wid,
+                    timeout_ms,
+                });
+            } else {
+                entry.attempts_remaining -= 1;
+            }
         }
+        // Promotion returned false without re-deferring: the candidate was
+        // rejected or resolved elsewhere and needs no further tracking.
     }
+    refreshRolePolling();
     return added_any;
 }
 
@@ -3738,6 +3822,16 @@ fn discoverWindows() void {
             },
             .ready => {
                 untrackPendingRoleWindow(info.wid);
+                // Degenerate discovery bounds mean the window is still
+                // mid-construction. Defer for bounded re-evaluation instead
+                // of storing a garbage frame that would be tiled or parked
+                // at zero size. Deliberately not untracked first: tracking an
+                // existing candidate preserves its remaining retry budget.
+                if (frame.width <= 1 or frame.height <= 1) {
+                    trackDeferredWindowCandidate(info.pid, info.wid, target_ws.id, managed_display);
+                    log.info("discover: deferred pid={d} wid={d} unsettled bounds", .{ info.pid, info.wid });
+                    continue;
+                }
                 untrackDeferredWindowCandidate(info.wid);
             },
         }
@@ -3854,8 +3948,10 @@ fn addNewWindowManagedWithAssignment(pid: i32, wid: u32, workspace_id: u8, assig
     // Proceeding would store a garbage frame and, for an app assigned to a
     // hidden workspace, park a zero-size window. Defer for bounded
     // re-evaluation. Tracked before the untrack-defer below so it survives
-    // this early return.
-    if (window_frame.width <= 1 or window_frame.height <= 1) {
+    // this early return. Only when SkyLight is available: without it bounds
+    // are always zero, and deferring would leave every new window unmanaged;
+    // keep the legacy zero-frame path in that degraded mode.
+    if (g_sky != null and (window_frame.width <= 1 or window_frame.height <= 1)) {
         trackDeferredWindowCandidate(pid, wid, workspace_id, assigned_display_id);
         log.info("addNewWindow: deferred pid={d} wid={d} unsettled bounds", .{ pid, wid });
         return false;
@@ -4546,15 +4642,16 @@ fn updateWindowDisplayAssignment(wid: u32) bool {
     return true;
 }
 
-/// Lowest workspace id (1-based) not yet claimed as active on a display. Falls
-/// back to 1 when every workspace is claimed (only possible with more displays
-/// than workspaces).
+/// Lowest workspace id (1-based) not yet claimed as active on a display.
+/// refreshDisplays caps the display count at workspace_count, so a caller that
+/// has claimed at most one workspace per display always finds one.
 fn firstUnclaimedWorkspace(claimed: []const bool) u8 {
+    std.debug.assert(g_display_count <= g_workspaces.workspace_count);
     var id: u8 = 1;
     while (id <= g_workspaces.workspace_count) : (id += 1) {
         if (!claimed[id]) return id;
     }
-    return 1;
+    unreachable;
 }
 
 /// Reconciles workspace/display state after monitor topology changes.
@@ -4565,22 +4662,36 @@ fn firstUnclaimedWorkspace(claimed: []const bool) u8 {
 /// workspace it had — even if macOS hands it a new id. Every workspace stays
 /// homed on a surviving display (re-homed to primary if its monitor vanished,
 /// never left homeless), and each display gets a distinct active workspace.
-/// Windows whose monitor disappeared keep their workspace membership and follow
-/// it to the primary display.
+/// Window display assignment is then derived from the workspace home, so
+/// windows always follow their workspace — to the primary display when their
+/// monitor vanished, and back when it returns and reclaims the workspace.
 fn reconcileDisplayChange() void {
     // Snapshot present displays' active workspaces (by UUID) before the
     // topology changes, so a monitor that vanishes keeps its binding and
     // reclaims its workspace on return.
     rememberDisplayWorkspaces();
 
+    // Snapshot every workspace home as a display UUID before the table is
+    // rebuilt. Numeric ids cannot be trusted across a topology change: macOS
+    // reuses CGDirectDisplayIDs, so a stale home id can name a different
+    // monitor afterwards while still looking "present".
+    var home_uuids: [workspace_mod.max_workspaces]?[16]u8 = @splat(null);
+    for (&g_workspaces.workspaces, 0..) |*ws, idx| {
+        const did = ws.display_id orelse continue;
+        const slot = displayIndexById(did) orelse continue;
+        home_uuids[idx] = g_displays[slot].uuid;
+    }
+
     refreshDisplays();
 
     // A monitor can return from sleep/unplug under a new CGDirectDisplayID.
-    // Recall each surviving display by stable UUID, restore the workspace it
-    // last had active, and record any id change so stored references follow it.
-    var remap_from: [workspace_mod.max_displays]u32 = undefined;
-    var remap_to: [workspace_mod.max_displays]u32 = undefined;
-    var remap_count: usize = 0;
+    // Recall each surviving display by stable UUID and restore the workspace
+    // it last had active. Numeric ids are deliberately never remapped
+    // old-to-new: macOS reuses CGDirectDisplayIDs, so an absent monitor's
+    // remembered id can be legitimately owned by a different present display,
+    // and a global rewrite would move that display's workspaces and windows
+    // wholesale. Stored display references are re-derived from workspace
+    // homes below instead.
 
     // A workspace can be active on at most one display (assertDisplayCoverage).
     // Track which workspaces are already claimed so two displays that resolve
@@ -4594,11 +4705,6 @@ fn reconcileDisplayChange() void {
         if (display.uuid) |uuid| {
             if (recallDisplayMemory(uuid)) |mem| {
                 active_id = mem.active_ws;
-                if (mem.id != display.id) {
-                    remap_from[remap_count] = mem.id;
-                    remap_to[remap_count] = display.id;
-                    remap_count += 1;
-                }
             }
         }
         if (active_claimed[active_id]) active_id = firstUnclaimedWorkspace(&active_claimed);
@@ -4610,31 +4716,34 @@ fn reconcileDisplayChange() void {
         }
     }
 
-    remapDisplayIds(remap_from[0..remap_count], remap_to[0..remap_count]);
-
     const home = primaryDisplayId();
 
-    // Keep every workspace homed on a surviving display. If its home vanished,
-    // re-home to primary rather than nulling it — a null home would later let
-    // switchWorkspace drift the workspace onto whatever display is focused,
-    // which is exactly the instability this guards against.
-    for (&g_workspaces.workspaces) |*ws| {
-        const did = ws.display_id orelse {
-            ws.display_id = home;
-            continue;
-        };
-        if (displayIndexById(did) == null) ws.display_id = home;
+    // Re-home every non-active workspace by its UUID snapshot. Numeric-id
+    // survival is not enough: after a topology change the old number can be
+    // owned by a different physical monitor, which would silently migrate a
+    // hidden workspace across displays. Follow the monitor if it is still
+    // present (under any numeric id); park on primary if it vanished — a null
+    // home would later let switchWorkspace drift the workspace onto whatever
+    // display is focused, which is exactly the instability this guards
+    // against. Active workspaces keep the home the recall loop above assigned.
+    for (&g_workspaces.workspaces, 0..) |*ws, idx| {
+        if (active_claimed[ws.id]) continue;
+        ws.display_id = displayIdForUuid(home_uuids[idx]) orelse home;
     }
 
-    // Windows on a genuinely-removed monitor: keep their workspace membership
-    // and let them follow to the primary display, instead of merging the
-    // windows into whatever workspace is active there. Switching to the
-    // workspace brings them back intact; retile heals their placement.
+    // Derive every window's display from its workspace home, which is now
+    // guaranteed to reference a present display. Windows keep their workspace
+    // membership and follow the workspace wherever it was re-homed: to the
+    // primary display when their monitor vanished, and back to the monitor
+    // when it returns and reclaims the workspace. This also heals windows
+    // (floating ones especially) that were parked on primary while their
+    // display was absent — a numeric-id comparison alone would miss them
+    // because primary is a valid display id.
     var store_it = g_store.windows.iterator();
     while (store_it.next()) |entry| {
         const win = entry.value_ptr;
-        if (displayIndexById(win.display_id) != null) continue;
-        win.display_id = home;
+        const ws = g_workspaces.get(win.workspace_id) orelse continue;
+        win.display_id = ws.display_id orelse home;
     }
 
     parkHiddenWorkspaceWindows();
@@ -4642,31 +4751,70 @@ fn reconcileDisplayChange() void {
     assertDisplayCoverage();
 }
 
-/// Park every managed window whose workspace is not visible on its (now valid)
-/// display so a removed monitor never strands windows at dead coordinates.
+/// Park every window of every hidden workspace so a topology change never
+/// leaves windows at coordinates that no longer map to a live display.
+///
+/// Walks workspace membership lists rather than gating on raw CG on-screen
+/// state: parked windows keep peek pixels visible, so CG counts them as
+/// on-screen, while genuinely stranded windows can be fully off-screen — CG
+/// presence distinguishes exactly the wrong ones. Windows already at their
+/// park position are skipped by comparing stored frames. Targets are
+/// collected before any hide because hiding can replace window ids
+/// (native-tab fallback), which mutates the structures being iterated.
 fn parkHiddenWorkspaceWindows() void {
-    var it = g_store.windows.iterator();
-    while (it.next()) |entry| {
-        const win = entry.value_ptr;
-        if (workspaceVisibleOnDisplay(win.workspace_id, win.display_id)) continue;
-        if (!bw_is_window_on_screen(win.wid)) continue;
-        hideWindow(win.pid, win.wid);
+    const ParkTarget = struct { pid: i32, wid: u32 };
+    var targets: [256]ParkTarget = undefined;
+    var target_count: usize = 0;
+
+    outer: for (&g_workspaces.workspaces) |*ws| {
+        const home = ws.display_id orelse continue;
+        if (workspaceVisibleOnDisplay(ws.id, home)) continue;
+
+        const ctx = HideCtx.init(home);
+        for (ws.windows.items) |wid| {
+            // Workspace lists hold tab-group leaders, but the on-screen
+            // window of a group is its active tab — which may not be the
+            // leader. Park the active tab; suppressed members are already
+            // off-screen behind it.
+            const visible_wid = g_tab_groups.resolveActive(wid);
+            const win = g_store.get(visible_wid) orelse continue;
+
+            const park = ctx.parkPosition(win.frame.width);
+            const tol = window_mod.Window.Frame.tolerance;
+            if (@abs(win.frame.x - park.x) <= tol and @abs(win.frame.y - park.y) <= tol) continue;
+
+            if (target_count == targets.len) {
+                log.warn("park: batch truncated at {d} windows", .{targets.len});
+                break :outer;
+            }
+            targets[target_count] = .{ .pid = win.pid, .wid = visible_wid };
+            target_count += 1;
+        }
+    }
+
+    for (targets[0..target_count]) |target| {
+        hideWindow(target.pid, target.wid);
     }
 }
 
-/// Apply a target frame to a window, moving without a resize whenever the size
-/// is unchanged so no AXSize write (and its flash/reflow) fires. `two_pass`
-/// re-issues the resize once to defeat macOS size clamping (fullscreen only).
-fn applyWindowFrame(pid: i32, wid: u32, current: window_mod.Window.Frame, target: window_mod.Window.Frame, two_pass: bool) void {
-    if (current.sizeApproxEqual(target, window_mod.Window.Frame.tolerance)) {
-        _ = ax_mod.setWindowPosition(pid, wid, target.x, target.y);
-        return;
+/// Apply a target frame to a window, moving without a resize whenever the
+/// stored size already matches so no AXSize write (and its flash/reflow)
+/// fires. `two_pass` (fullscreen) always writes the full frame and re-issues
+/// it once: the stored size records intent, not what macOS actually granted,
+/// and clamped fullscreen sizes must be re-asserted even when the store
+/// believes they already match. Returns whether the final AX write was
+/// accepted so callers can avoid recording frames that were never applied.
+fn applyWindowFrame(pid: i32, wid: u32, current: window_mod.Window.Frame, target: window_mod.Window.Frame, two_pass: bool) bool {
+    if (!two_pass and current.sizeApproxEqual(target, window_mod.Window.Frame.tolerance)) {
+        return ax_mod.setWindowPosition(pid, wid, target.x, target.y);
     }
 
+    var ok = false;
     const passes: usize = if (two_pass) 2 else 1;
     for (0..passes) |_| {
-        _ = ax_mod.setWindowFrame(pid, wid, target.x, target.y, target.width, target.height);
+        ok = ax_mod.setWindowFrame(pid, wid, target.x, target.y, target.width, target.height);
     }
+    return ok;
 }
 
 fn retileDisplay(display_id: u32) void {
@@ -4695,20 +4843,21 @@ fn retileDisplay(display_id: u32) void {
     std.debug.assert(g_layout_entries.items.len == window_count);
 
     for (g_layout_entries.items) |entry| {
-        var win = g_store.get(entry.wid) orelse continue;
+        const win = g_store.get(entry.wid) orelse continue;
 
-        // The workspace's tiling tree is authoritative for placement: a window
-        // in this tree belongs to ws_id, shown on this display. If stored
-        // display/workspace metadata drifted (topology change, move races),
-        // heal it to match the tree instead of skipping — an unplaced window
-        // would otherwise be stranded off-screen with no path back.
+        // Stored display/workspace metadata disagreeing with the tiling tree
+        // means some transition (topology change, window move) is mid-flight
+        // or a bookkeeping bug slipped through. Do not "heal" the store here:
+        // rewriting workspace_id/display_id alone would desync it from
+        // workspace membership lists, focus history, and tab assignments,
+        // which only the full move/reconcile paths update together. Skip and
+        // surface it; reconcileDisplayChange re-derives window display ids
+        // from workspace homes, which repairs the topology-change case.
         if (win.display_id != display_id or win.workspace_id != ws_id) {
-            log.warn("retile: healing drifted window wid={d} display {d}->{d} workspace {d}->{d}", .{
+            log.warn("retile: skipping drifted window wid={d} display {d} (tree {d}) workspace {d} (tree {d})", .{
                 entry.wid, win.display_id, display_id, win.workspace_id, ws_id,
             });
-            win.display_id = display_id;
-            win.workspace_id = ws_id;
-            g_store.put(win) catch {};
+            continue;
         }
 
         // Fullscreen windows fill the outer-gap-inset frame, skipping BSP splits and inner gaps
@@ -4718,19 +4867,25 @@ fn retileDisplay(display_id: u32) void {
             // Fullscreen windows are never animated: macOS clamps their size
             // mid-flight and they need the two-pass set below to land on the
             // exact display frame.
+            var applied = true;
             if (g_config.animation.enabled and !win.is_fullscreen) {
-                g_animator.animate(win.pid, entry.wid, win.frame, target_frame);
+                applied = g_animator.animate(win.pid, entry.wid, win.frame, target_frame);
                 ensureAnimatorTimer();
             } else {
                 // The window may have entered fullscreen mid-animation; stop
                 // the in-flight animation so it doesn't fight the placement.
                 g_animator.cancel(entry.wid);
-                applyWindowFrame(win.pid, entry.wid, win.frame, target_frame, win.is_fullscreen);
+                applied = applyWindowFrame(win.pid, entry.wid, win.frame, target_frame, win.is_fullscreen);
             }
 
-            var updated = win;
-            updated.frame = target_frame;
-            g_store.put(updated) catch {};
+            // Record the target only when the write was accepted (animation
+            // converges on the target on its own). Recording a rejected frame
+            // would make the next retile's framesEqual check skip the repair.
+            if (applied) {
+                var updated = win;
+                updated.frame = target_frame;
+                g_store.put(updated) catch {};
+            }
         }
 
         // If this is a tab group leader, apply the same frame to all members
@@ -4742,10 +4897,11 @@ fn retileDisplay(display_id: u32) void {
                     if (g_store.get(member_wid)) |member| {
                         if (framesEqual(member.frame, entry.frame)) continue;
 
-                        applyWindowFrame(member.pid, member_wid, member.frame, entry.frame, false);
-                        var m_updated = member;
-                        m_updated.frame = entry.frame;
-                        g_store.put(m_updated) catch {};
+                        if (applyWindowFrame(member.pid, member_wid, member.frame, entry.frame, false)) {
+                            var m_updated = member;
+                            m_updated.frame = entry.frame;
+                            g_store.put(m_updated) catch {};
+                        }
                     }
                 }
             }

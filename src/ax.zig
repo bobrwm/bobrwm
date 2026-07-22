@@ -233,10 +233,13 @@ pub fn setWindowFrame(pid: i32, wid: u32, x: f64, y: f64, w: f64, h: f64) bool {
     defer c.CFRelease(@ptrCast(size_value));
 
     _ = c.AXUIElementSetAttributeValue(win, size_attr, @ptrCast(size_value));
-    _ = c.AXUIElementSetAttributeValue(win, position_attr, @ptrCast(position_value));
-    const err = c.AXUIElementSetAttributeValue(win, size_attr, @ptrCast(size_value));
+    const position_err = c.AXUIElementSetAttributeValue(win, position_attr, @ptrCast(position_value));
+    const size_err = c.AXUIElementSetAttributeValue(win, size_attr, @ptrCast(size_value));
 
-    return err == c.kAXErrorSuccess;
+    // Success means the whole frame was accepted. Reporting only the final
+    // size write would let callers record a target frame whose position write
+    // was rejected, desynchronizing the store from on-screen reality.
+    return position_err == c.kAXErrorSuccess and size_err == c.kAXErrorSuccess;
 }
 
 /// Move a window without touching its size. Off-screen parking and pure-move
