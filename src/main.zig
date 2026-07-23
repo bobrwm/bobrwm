@@ -2184,13 +2184,34 @@ fn applyReloadedConfig(next: ConfigRuntime) void {
     log.info("config reloaded from {s}", .{g_config_path.?});
 }
 
-fn reloadConfig() void {
-    const path = g_config_path orelse return;
+var g_config_error_generation: usize = 0;
+
+fn restoreStatusBarAfterConfigError(context: ?*anyopaque) callconv(.c) void {
+    const generation = @intFromPtr(context orelse return);
+    if (generation == g_config_error_generation) updateStatusBar();
+}
+
+fn notifyConfigReloadFailed() void {
+    statusbar.setMessage("⚠ Config reload failed");
+    g_config_error_generation +%= 1;
+    if (g_config_error_generation == 0) g_config_error_generation = 1;
+    c.dispatch_after_f(
+        c.dispatch_time(c.DISPATCH_TIME_NOW, 4 * c.NSEC_PER_SEC),
+        cg_extra.dispatch_get_main_queue(),
+        @ptrFromInt(g_config_error_generation),
+        restoreStatusBarAfterConfigError,
+    );
+}
+
+fn reloadConfig() bool {
+    const path = g_config_path orelse return false;
     const next = ConfigRuntime.init(g_allocator, path, false) catch |err| {
         log.err("config reload failed, keeping current config: {}", .{err});
-        return;
+        notifyConfigReloadFailed();
+        return false;
     };
     applyReloadedConfig(next);
+    return true;
 }
 
 fn setRolePolling(enabled: bool) void {
@@ -3289,7 +3310,7 @@ fn handleEvent(ev: *const event_mod.Event) void {
             const focused = ws.focused_wid orelse return;
             centerFloatingWindow(focused);
         },
-        .hk_reload_config => reloadConfig(),
+        .hk_reload_config => _ = reloadConfig(),
         .hk_toggle_dimming => {
             const on = dim.toggle();
             log.info("hotkey: dimming {s}", .{if (on) "on" else "off"});
@@ -6009,6 +6030,11 @@ fn ipcDispatch(cmd: []const u8, client_fd: posix.socket_t) void {
         .retile => {
             retile();
             ipc.writeResponse(client_fd, "ok\n");
+        },
+        .reload_config => {
+            if (!reloadConfig()) {
+                ipc.writeResponse(client_fd, "err: config reload failed; current config kept\n");
+            }
         },
         .toggle_split => {
             g_bsp_split_mode = switch (g_bsp_split_mode) {

@@ -109,7 +109,8 @@ pub fn run(result: Result) bool {
             return true;
         },
         .ipc => |cmd| {
-            runClient(cmd);
+            const exit_code = runClient(cmd);
+            if (exit_code != 0) std.process.exit(exit_code);
             return true;
         },
     }
@@ -168,6 +169,7 @@ const help_text =
     \\
     \\Window Commands (IPC):
     \\  retile                    Re-tile all windows on the active workspace
+    \\  reload-config             Reload config, keeping current config on failure
     \\  toggle-split              Cycle BSP split mode (auto, horizontal, vertical)
     \\  focus <direction>         Focus window in direction (left, right, up, down)
     \\  focus-workspace <n|prev|next>
@@ -240,14 +242,16 @@ fn runService(tail: ?[]const u8) void {
 
 // IPC client (sends command to running daemon)
 
-fn runClient(cmd: []const u8) void {
+fn runClient(cmd: []const u8) u8 {
     const started_ns = osutil.nanoTimestamp();
     var response_bytes: usize = 0;
+    var response_is_error = false;
+    var transport_failed = false;
 
     var path_buf: [128]u8 = undefined;
     const path = std.fmt.bufPrintSentinel(&path_buf, "/tmp/bobrwm_{d}.sock", .{std.c.getuid()}, 0) catch {
         writeStderr("error: socket path too long\n");
-        return;
+        return 1;
     };
 
     // Zig 0.16 removed the std.posix.{socket,connect,write,close,shutdown}
@@ -257,7 +261,7 @@ fn runClient(cmd: []const u8) void {
     const fd = std.c.socket(posix.AF.UNIX, posix.SOCK.STREAM, 0);
     if (fd < 0) {
         writeStderr("error: could not create socket\n");
-        return;
+        return 1;
     }
     defer _ = std.c.close(fd);
     const no_sigpipe: i32 = 1;
@@ -273,12 +277,12 @@ fn runClient(cmd: []const u8) void {
 
     if (std.c.connect(fd, @ptrCast(&addr), @sizeOf(posix.sockaddr.un)) != 0) {
         writeStderr("error: bobrwm is not running\n");
-        return;
+        return 1;
     }
 
     if (std.c.write(fd, cmd.ptr, cmd.len) < 0) {
         writeStderr("error: write failed\n");
-        return;
+        return 1;
     }
     _ = std.c.shutdown(fd, std.c.SHUT.WR);
 
@@ -290,21 +294,33 @@ fn runClient(cmd: []const u8) void {
         }};
         const ready = posix.poll(&poll_fds, 2000) catch {
             writeStderr("error: IPC poll failed\n");
+            transport_failed = true;
             break;
         };
         if (ready == 0) {
             writeStderr("error: IPC response timeout\n");
             log.warn("ipc client timeout waiting for response cmd={s}", .{cmd});
+            transport_failed = true;
             break;
         }
 
         var buf: [4096]u8 = undefined;
-        const n = posix.read(fd, &buf) catch break;
+        const n = posix.read(fd, &buf) catch {
+            writeStderr("error: IPC response read failed\n");
+            transport_failed = true;
+            break;
+        };
         if (n == 0) break;
+        if (response_bytes == 0) response_is_error = std.mem.startsWith(u8, buf[0..n], "err:");
         response_bytes += n;
-        writeStdout(buf[0..n]);
+        if (response_is_error) {
+            writeStderr(buf[0..n]);
+        } else {
+            writeStdout(buf[0..n]);
+        }
     }
 
     const elapsed_ms = @divTrunc(osutil.nanoTimestamp() - started_ns, std.time.ns_per_ms);
     log.debug("[trace] ipc client completed bytes={} elapsed_ms={}", .{ response_bytes, elapsed_ms });
+    return if (transport_failed or response_is_error) 1 else 0;
 }
