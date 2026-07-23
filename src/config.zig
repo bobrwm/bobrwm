@@ -126,6 +126,7 @@ pub const Action = enum(u8) {
     swap_up = 35,
     swap_down = 36,
     center_float = 37,
+    reload_config = 38,
 
     // Every Action must map 1:1 to an EventKind (hk_ prefixed).
     comptime {
@@ -221,6 +222,8 @@ const default_keybinds = blk: {
         .{ .key = "j", .mods = .{ .alt = true, .shift = true }, .action = .swap_down },
         .{ .key = "k", .mods = .{ .alt = true, .shift = true }, .action = .swap_up },
         .{ .key = "l", .mods = .{ .alt = true, .shift = true }, .action = .swap_right },
+        // alt+shift+r → reload config
+        .{ .key = "r", .mods = .{ .alt = true, .shift = true }, .action = .reload_config },
     };
 
     break :blk binds[0..binds.len].*;
@@ -325,32 +328,33 @@ fn isDefaultKeybindSlice(keybinds: []const Keybind) bool {
 // Loading
 
 pub fn load(allocator: std.mem.Allocator, explicit_path: ?[]const u8) Config {
-    if (explicit_path) |p| {
-        return loadFromPath(allocator, p) orelse {
-            log.err("failed to load config from {s}, using defaults", .{p});
-            return .{};
-        };
-    }
-
-    // XDG_CONFIG_HOME / ~/.config
-    var path_buf: [2048]u8 = undefined;
-    const path = blk: {
-        if (osutil.getenv("XDG_CONFIG_HOME")) |config_home| {
-            break :blk std.fmt.bufPrint(&path_buf, "{s}/bobrwm/config.zon", .{config_home}) catch return .{};
-        }
-
-        const home = osutil.getenv("HOME") orelse return .{};
-        break :blk std.fmt.bufPrint(&path_buf, "{s}/.config/bobrwm/config.zon", .{home}) catch return .{};
-    };
-    std.debug.assert(path.len > 0);
+    const path = resolvePath(allocator, explicit_path) catch return .{};
+    defer allocator.free(path);
 
     return loadFromPath(allocator, path) orelse {
-        log.info("no config file found, using defaults", .{});
+        if (explicit_path != null) {
+            log.err("failed to load config from {s}, using defaults", .{path});
+        } else {
+            log.info("no config file found, using defaults", .{});
+        }
         return .{};
     };
 }
 
-fn loadFromPath(allocator: std.mem.Allocator, path: []const u8) ?Config {
+/// Resolve the configured path even when it does not exist yet, allowing the
+/// daemon to notice a config file created after startup.
+pub fn resolvePath(allocator: std.mem.Allocator, explicit_path: ?[]const u8) ![:0]u8 {
+    if (explicit_path) |path| return allocator.dupeZ(u8, path);
+
+    if (osutil.getenv("XDG_CONFIG_HOME")) |config_home| {
+        return std.fmt.allocPrintSentinel(allocator, "{s}/bobrwm/config.zon", .{config_home}, 0);
+    }
+
+    const home = osutil.getenv("HOME") orelse return error.MissingHome;
+    return std.fmt.allocPrintSentinel(allocator, "{s}/.config/bobrwm/config.zon", .{home}, 0);
+}
+
+pub fn loadFromPath(allocator: std.mem.Allocator, path: []const u8) ?Config {
     log.info("loading config from {s}", .{path});
 
     // libc-based read; std.fs.cwd was removed in Zig 0.16. Caller paths
@@ -551,6 +555,10 @@ test "default_keybinds" {
         try t.expect(std.mem.eql(u8, key, default_keybinds[i].key));
         try t.expect(default_keybinds[i].mods.alt and default_keybinds[i].mods.shift);
     }
+
+    try t.expectEqual(Action.reload_config, default_keybinds[29].action);
+    try t.expect(std.mem.eql(u8, "r", default_keybinds[29].key));
+    try t.expect(default_keybinds[29].mods.alt and default_keybinds[29].mods.shift);
 }
 
 test "buildKeybinds merges custom keybinds with defaults" {
@@ -638,7 +646,7 @@ test "loadFromPath: examples/config.zon" {
     const cfg = loadFromPath(arena.allocator(), "examples/config.zon") orelse
         return error.TestUnexpectedResult;
 
-    try t.expectEqual(@as(usize, 30), cfg.keybinds.len);
+    try t.expectEqual(@as(usize, 31), cfg.keybinds.len);
 
     try t.expectEqual(Action.focus_workspace, cfg.keybinds[0].action);
     try t.expectEqual(@as(u8, 1), cfg.keybinds[0].arg);

@@ -23,7 +23,8 @@ const config = @import("config.zig");
 
 const log = std.log.scoped(.dim);
 
-/// Set from `config.dimmed_inactive` at startup. When false, apply() is a no-op.
+/// Set from `config.dimmed_inactive` at startup and on config reload.
+/// When false, apply() is a no-op.
 pub var enabled: bool = false;
 /// Overlay opacity in [0, 1] (0 = transparent, 1 = fully black).
 pub var level: f64 = 0.35;
@@ -68,6 +69,10 @@ var slot_count: usize = 0; // number of lazily created panels
 pub fn configure(cfg: config.DimConfig) void {
     enabled = cfg.enabled;
     level = std.math.clamp(@as(f64, cfg.level), 0.0, 1.0);
+    for (slots[0..slot_count]) |*slot| {
+        slot.panel.msgSend(void, "setAlphaValue:", .{level});
+    }
+    if (!enabled) resetAll();
 }
 
 /// Show/position overlays so every entry except a focused window is dimmed.
@@ -222,8 +227,8 @@ fn createPanel() ?objc.Object {
         }
     }
 
-    // Opacity is fixed for the process lifetime (set once from config), so it
-    // is applied here rather than on every apply().
+    // configure() updates existing panels when config is hot-reloaded; newly
+    // allocated panels start at the current level here.
     panel.msgSend(void, "setAlphaValue:", .{level});
 
     const collection_behavior =

@@ -128,6 +128,9 @@
         // ctrl+left/right → traverse bobrwm workspaces; native Spaces handle the edge
         .{ .key = "left", .mods = .{ .ctrl = true }, .action = .focus_previous_workspace },
         .{ .key = "right", .mods = .{ .ctrl = true }, .action = .focus_next_workspace },
+
+        // alt+shift+r → reload this config after saving it
+        .{ .key = "r", .mods = .{ .alt = true, .shift = true }, .action = .reload_config },
     },
 
     // Per-app rules keyed by bundle identifier. Each field is optional:
