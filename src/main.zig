@@ -1216,6 +1216,8 @@ const HideCtx = struct {
     /// retileDisplay detects the move and re-places the window when its
     /// workspace becomes visible again. The size is never written.
     fn hide(self: HideCtx, pid: i32, wid: u32) void {
+        self.captureFloatFrame(wid);
+
         const width: f64 = if (g_store.get(wid)) |win| win.frame.width else 0;
         const park = self.parkPosition(width);
         const pos_x = park.x;
@@ -1241,6 +1243,36 @@ const HideCtx = struct {
                 g_store.put(updated) catch {};
             }
         }
+    }
+
+    /// Snapshot a floating window's live on-screen frame before it is parked in
+    /// the corner. retileDisplay only restores tiled windows from BSP, so a
+    /// floating window would otherwise stay parked when its workspace is shown.
+    /// Reads WindowServer bounds directly because floating frames are not kept
+    /// in the store on user drags. Skips capture when the window is already
+    /// off-screen (center outside the display) so a re-hide cannot overwrite the
+    /// remembered position with the parked corner.
+    fn captureFloatFrame(self: HideCtx, wid: u32) void {
+        var win = g_store.get(wid) orelse return;
+        if (win.mode != .floating) return;
+
+        const sky = g_sky orelse return;
+        var rect: skylight.CGRect = undefined;
+        if (sky.getWindowBounds(sky.mainConnectionID(), wid, &rect) != 0) return;
+
+        const center_x = rect.origin.x + rect.size.width / 2.0;
+        const center_y = rect.origin.y + rect.size.height / 2.0;
+        const on_x = center_x >= self.display.x and center_x <= self.display.x + self.display.w;
+        const on_y = center_y >= self.display.y and center_y <= self.display.y + self.display.h;
+        if (!on_x or !on_y) return;
+
+        win.float_frame = .{
+            .x = rect.origin.x,
+            .y = rect.origin.y,
+            .width = rect.size.width,
+            .height = rect.size.height,
+        };
+        g_store.put(win) catch {};
     }
 
     /// Ghostty can replace the active native-tab window ID before Bobrwm has
@@ -4817,11 +4849,72 @@ fn applyWindowFrame(pid: i32, wid: u32, current: window_mod.Window.Frame, target
     return ok;
 }
 
+fn clampFrameToDisplay(frame: window_mod.Window.Frame, display: shim.bw_frame) window_mod.Window.Frame {
+    const max_x = display.x + display.w - frame.width;
+    const max_y = display.y + display.h - frame.height;
+    return .{
+        .x = std.math.clamp(frame.x, display.x, @max(display.x, max_x)),
+        .y = std.math.clamp(frame.y, display.y, @max(display.y, max_y)),
+        .width = frame.width,
+        .height = frame.height,
+    };
+}
+
+fn centeredFrame(width: f64, height: f64, display: shim.bw_frame) window_mod.Window.Frame {
+    return .{
+        .x = display.x + (display.w - width) / 2.0,
+        .y = display.y + (display.h - height) / 2.0,
+        .width = width,
+        .height = height,
+    };
+}
+
+/// Restore floating windows of a shown workspace to their remembered on-screen
+/// position. Only acts on windows whose live bounds are currently off-screen —
+/// parked on hide, or drifted by the app — so it never fights a placement the
+/// user set while the workspace was visible. Centers as a fallback when no
+/// position was captured.
+fn restoreFloatingWindows(ws_id: u8, display_id: u32, display: shim.bw_frame) void {
+    const ws = g_workspaces.get(ws_id) orelse return;
+    const sky = g_sky orelse return;
+    const conn = sky.mainConnectionID();
+
+    for (ws.windows.items) |wid| {
+        var win = g_store.get(wid) orelse continue;
+        if (win.mode != .floating or win.is_fullscreen) continue;
+        if (win.display_id != display_id) continue;
+
+        var rect: skylight.CGRect = undefined;
+        if (sky.getWindowBounds(conn, wid, &rect) != 0) continue;
+
+        const center_x = rect.origin.x + rect.size.width / 2.0;
+        const center_y = rect.origin.y + rect.size.height / 2.0;
+        const on_x = center_x >= display.x and center_x <= display.x + display.w;
+        const on_y = center_y >= display.y and center_y <= display.y + display.h;
+        if (on_x and on_y) continue;
+
+        const target = if (win.float_frame) |f|
+            clampFrameToDisplay(f, display)
+        else
+            centeredFrame(rect.size.width, rect.size.height, display);
+
+        _ = ax_mod.setWindowFrame(win.pid, wid, target.x, target.y, target.width, target.height);
+        win.frame = target;
+        g_store.put(win) catch {};
+        log.debug("restore floating wid={d} → x={d:.0} y={d:.0} w={d:.0} h={d:.0}", .{
+            wid, target.x, target.y, target.width, target.height,
+        });
+    }
+}
+
 fn retileDisplay(display_id: u32) void {
     const ws_id = activeWorkspaceIdForDisplay(display_id);
-    const st = tilingStatePtr(ws_id).* orelse return;
     const display_slot = displayIndexById(display_id) orelse return;
     const display = g_displays[display_slot].visible;
+
+    restoreFloatingWindows(ws_id, display_id, display);
+
+    const st = tilingStatePtr(ws_id).* orelse return;
 
     const outer = g_config.gaps.outer;
     const frame = window_mod.Window.Frame{
