@@ -12,6 +12,7 @@ pub const DispatchFn = *const fn (cmd: []const u8, client_fd: posix.socket_t) vo
 
 pub const IpcCommand = union(enum) {
     retile,
+    reload_config,
     toggle_split,
     focus: FocusDir,
     focus_workspace: WorkspaceTarget,
@@ -51,6 +52,7 @@ pub const IpcCommand = union(enum) {
     pub fn parse(cmd: []const u8) ?IpcCommand {
         // Exact-match commands (no arguments)
         if (std.mem.eql(u8, cmd, "retile")) return .retile;
+        if (std.mem.eql(u8, cmd, "reload-config")) return .reload_config;
         if (std.mem.eql(u8, cmd, "toggle-split")) return .toggle_split;
         if (std.mem.eql(u8, cmd, "bsp equalize")) return .bsp_equalize;
         if (std.mem.eql(u8, cmd, "bsp balance")) return .bsp_balance;
@@ -264,6 +266,13 @@ test "parse query format" {
     try t.expectEqual(IpcCommand{ .query_displays = .json }, IpcCommand.parse("query displays --json").?);
     try t.expectEqual(IpcCommand{ .query_apps = .json }, IpcCommand.parse("query apps --json").?);
     try t.expectEqual(@as(?IpcCommand, null), IpcCommand.parse("query windows --json extra"));
+}
+
+test "parse reload config" {
+    const t = std.testing;
+
+    try t.expectEqual(IpcCommand.reload_config, IpcCommand.parse("reload-config").?);
+    try t.expectEqual(@as(?IpcCommand, null), IpcCommand.parse("reload-config extra"));
 }
 
 test "parse focus workspace target" {

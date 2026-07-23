@@ -57,6 +57,22 @@ Config is loaded from (in order):
 
 If no config file is found, built-in defaults are used. See [`examples/config.zon`](examples/config.zon) for a full example.
 
+Press `Alt+Shift+R` (the default `reload_config` binding) to apply changes
+without restarting. If the file contains invalid ZON, bobrwm keeps the last
+valid configuration and shows a temporary error in its menu-bar item; parser
+details remain in the error log.
+
+The same reload is available from the command line:
+
+```bash
+bobrwm reload-config
+```
+
+The command is silent on success and exits non-zero with an error message when
+the new config cannot be loaded.
+Changing the number of workspaces still requires a restart; other settings,
+including keybinds, rules, layouts, gaps, animation, and dimming, reload live.
+
 ### Keybinds
 
 Map a key + modifiers to an action. Configured keybinds are merged with the
@@ -87,6 +103,7 @@ built-in defaults; use the same key + modifiers to override a default binding.
 | `toggle_split` | Toggle next split direction | — |
 | `toggle_fullscreen` | Toggle focused window fullscreen | — |
 | `toggle_float` | Toggle focused window floating | — |
+| `reload_config` | Reload the config file, keeping the current config if parsing fails | — |
 
 ### Gaps
 

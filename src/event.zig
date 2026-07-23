@@ -35,6 +35,7 @@ pub const EventKind = enum(u8) {
     hk_swap_up = 35,
     hk_swap_down = 36,
     hk_center_float = 37,
+    hk_reload_config = 38,
 };
 
 pub const Event = extern struct {

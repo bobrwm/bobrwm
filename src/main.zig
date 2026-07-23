@@ -1361,6 +1361,8 @@ var g_focus_retries: FocusRetryMap = undefined;
 var g_workspace_observer: ?objc.Object = null;
 var g_ipc: ipc.Server = undefined;
 var g_config: config_mod.Config = .{};
+var g_config_runtime: ?ConfigRuntime = null;
+var g_config_path: ?[:0]const u8 = null;
 var g_drag_preview: DragPreviewState = .{};
 var g_mouse_left_down = false;
 var g_drag_reconcile_on_drop = false;
@@ -1397,6 +1399,31 @@ var g_cleanup_pending_pid_count: usize = 0;
 
 var g_animator: animation_mod.Animator = undefined;
 var g_animator_source: c.dispatch_source_t = null;
+
+const ConfigRuntime = struct {
+    arena: std.heap.ArenaAllocator,
+    config: config_mod.Config,
+    keybind_table: config_mod.KeybindTable,
+
+    fn init(parent_allocator: std.mem.Allocator, path: ?[]const u8, use_defaults_on_error: bool) !ConfigRuntime {
+        var arena = std.heap.ArenaAllocator.init(parent_allocator);
+        errdefer arena.deinit();
+        const allocator = arena.allocator();
+        const config = if (path) |p| blk: {
+            break :blk config_mod.loadFromPath(allocator, p) orelse {
+                if (!use_defaults_on_error) return error.InvalidConfig;
+                break :blk config_mod.Config{};
+            };
+        } else config_mod.Config{};
+        const keybind_table = try config_mod.KeybindTable.init(allocator, &config);
+        return .{ .arena = arena, .config = config, .keybind_table = keybind_table };
+    }
+
+    fn deinit(self: *ConfigRuntime) void {
+        self.arena.deinit();
+        self.* = undefined;
+    }
+};
 
 fn shouldHandleWorkspaceEvent(last_event_at_s: *f64) bool {
     std.debug.assert(last_event_at_s.* >= 0);
@@ -2108,6 +2135,85 @@ fn rolePollTimerTick(context: ?*anyopaque) callconv(.c) void {
     bw_emit_event(shim.BW_EVENT_ROLE_POLL_TICK, 0, 0);
 }
 
+fn rebuildTilingStatesForConfig() void {
+    destroyAllTilingStates();
+    for (g_workspaces.workspaces[0..g_workspaces.workspace_count]) |*ws| {
+        for (ws.windows.items) |wid| {
+            const win = g_store.get(wid) orelse continue;
+            // Workspace lists contain only tab-group leaders; a leader may be
+            // "suppressed" while another native tab is active but still owns
+            // the group's one layout slot.
+            if (win.mode != .tiled) continue;
+            insertIntoTiling(ws.id, wid);
+        }
+        if (ws.focused_wid) |focused_wid| setTilingActive(ws.id, focused_wid);
+    }
+}
+
+fn applyReloadedConfig(next: ConfigRuntime) void {
+    var replacement = next;
+    replacement.config.applyKeybinds(&replacement.keybind_table);
+
+    var previous = g_config_runtime.?;
+    const layout_changed = previous.config.layout != replacement.config.layout;
+    g_config_runtime = replacement;
+    g_config = replacement.config;
+    g_bsp_split_mode = g_config.bsp_split;
+    g_animator.finishAll();
+    g_animator.init(g_config.animation);
+    dim.configure(g_config.dimmed_inactive);
+
+    for (g_workspaces.workspaces[0..g_workspaces.workspace_count], 0..) |*ws, i| {
+        ws.name = if (i < g_config.workspace_names.len) g_config.workspace_names[i] else "";
+    }
+    if (g_config.workspace_names.len > 0 and g_config.workspace_names.len != g_workspaces.workspace_count) {
+        log.warn("config reload cannot change workspace count ({d} running, {d} configured); restart to apply the new count", .{
+            g_workspaces.workspace_count,
+            g_config.workspace_names.len,
+        });
+    }
+
+    // Preserve BSP topology and runtime split edits for ordinary config saves.
+    // Only changing the layout algorithm requires reconstructing state.
+    if (layout_changed) rebuildTilingStatesForConfig();
+    updateStatusBar();
+    retile();
+    if (dim.enabled) pushDimSnapshot();
+
+    previous.deinit();
+    log.info("config reloaded from {s}", .{g_config_path.?});
+}
+
+var g_config_error_generation: usize = 0;
+
+fn restoreStatusBarAfterConfigError(context: ?*anyopaque) callconv(.c) void {
+    const generation = @intFromPtr(context orelse return);
+    if (generation == g_config_error_generation) updateStatusBar();
+}
+
+fn notifyConfigReloadFailed() void {
+    statusbar.setMessage("⚠ Config reload failed");
+    g_config_error_generation +%= 1;
+    if (g_config_error_generation == 0) g_config_error_generation = 1;
+    c.dispatch_after_f(
+        c.dispatch_time(c.DISPATCH_TIME_NOW, 4 * c.NSEC_PER_SEC),
+        cg_extra.dispatch_get_main_queue(),
+        @ptrFromInt(g_config_error_generation),
+        restoreStatusBarAfterConfigError,
+    );
+}
+
+fn reloadConfig() bool {
+    const path = g_config_path orelse return false;
+    const next = ConfigRuntime.init(g_allocator, path, false) catch |err| {
+        log.err("config reload failed, keeping current config: {}", .{err});
+        notifyConfigReloadFailed();
+        return false;
+    };
+    applyReloadedConfig(next);
+    return true;
+}
+
 fn setRolePolling(enabled: bool) void {
     if (!enabled) {
         if (g_role_poll_source) |source| {
@@ -2293,11 +2399,9 @@ fn bw_hotkey_mouse_up() void {
 }
 
 /// Accept the keybind table from config. Stores a reference to caller-owned
-/// storage instead of copying, so the table has no fixed size cap. Must be
-/// called on the main thread before the hotkey event tap is installed.
+/// storage instead of copying, so the table has no fixed size cap. Called on
+/// the main thread both at startup and when config is hot-reloaded.
 export fn bw_set_keybinds(binds: ?[*]const shim.bw_keybind, count: u32) void {
-    std.debug.assert(g_tap_port == null);
-
     const src = binds orelse {
         g_hotkey_bindings = &.{};
         return;
@@ -2340,13 +2444,14 @@ pub fn main(init: std.process.Init.Minimal) !void {
     defer deinitAxStrings();
 
     // -- Config --
-    var config_arena = std.heap.ArenaAllocator.init(g_allocator);
-    defer config_arena.deinit();
-    g_config = config_mod.load(config_arena.allocator(), cli.configPath(result));
+    const config_path = config_mod.resolvePath(g_allocator, cli.configPath(result)) catch null;
+    defer if (config_path) |path| g_allocator.free(path);
+    g_config_path = config_path;
+    g_config_runtime = try ConfigRuntime.init(g_allocator, config_path, true);
+    defer g_config_runtime.?.deinit();
+    g_config = g_config_runtime.?.config;
     g_bsp_split_mode = g_config.bsp_split;
-    var keybind_table = try config_mod.KeybindTable.init(config_arena.allocator(), &g_config);
-    defer keybind_table.deinit(config_arena.allocator());
-    g_config.applyKeybinds(&keybind_table);
+    g_config.applyKeybinds(&g_config_runtime.?.keybind_table);
     g_animator.init(g_config.animation);
 
     // Inactive-window dimming via SkyLight (SLSSetWindowListBrightness).
@@ -3205,6 +3310,7 @@ fn handleEvent(ev: *const event_mod.Event) void {
             const focused = ws.focused_wid orelse return;
             centerFloatingWindow(focused);
         },
+        .hk_reload_config => _ = reloadConfig(),
         .hk_toggle_dimming => {
             const on = dim.toggle();
             log.info("hotkey: dimming {s}", .{if (on) "on" else "off"});
@@ -5924,6 +6030,11 @@ fn ipcDispatch(cmd: []const u8, client_fd: posix.socket_t) void {
         .retile => {
             retile();
             ipc.writeResponse(client_fd, "ok\n");
+        },
+        .reload_config => {
+            if (!reloadConfig()) {
+                ipc.writeResponse(client_fd, "err: config reload failed; current config kept\n");
+            }
         },
         .toggle_split => {
             g_bsp_split_mode = switch (g_bsp_split_mode) {

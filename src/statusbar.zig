@@ -116,6 +116,12 @@ pub fn setTitle(name: []const u8, id: u8) void {
     setTitleMulti(&.{.{ .name = name, .id = id, .focused = true }});
 }
 
+/// Temporarily replace the workspace title with a caller-managed status
+/// message. AppKit copies the NSString, so the input need not outlive the call.
+pub fn setMessage(message: [*:0]const u8) void {
+    g_button.msgSend(void, "setTitle:", .{nsString(message)});
+}
+
 fn nsString(str: [*:0]const u8) objc.Object {
     const NSString = objc.getClass("NSString") orelse
         @panic("NSString class not found");
