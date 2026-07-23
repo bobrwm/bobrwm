@@ -117,6 +117,10 @@
         // alt+f → toggle fullscreen
         .{ .key = "f", .mods = .{ .alt = true }, .action = .toggle_fullscreen },
 
+        // alt+c → center the focused floating window on its display (opt-in;
+        // add this line to enable it). No effect on tiled/fullscreen windows.
+        // .{ .key = "c", .mods = .{ .alt = true }, .action = .center_float },
+
         // alt+d → toggle inactive-window dimming at runtime (opt-in; add this
         // line to enable it). Pairs with the .dimmed_inactive option above.
         // .{ .key = "d", .mods = .{ .alt = true }, .action = .toggle_dimming },

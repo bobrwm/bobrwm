@@ -3200,6 +3200,11 @@ fn handleEvent(ev: *const event_mod.Event) void {
             const target: window_mod.WindowMode = if (win.mode != .tiled) .tiled else .floating;
             setWindowMode(focused, target);
         },
+        .hk_center_float => {
+            const ws = g_workspaces.active();
+            const focused = ws.focused_wid orelse return;
+            centerFloatingWindow(focused);
+        },
         .hk_toggle_dimming => {
             const on = dim.toggle();
             log.info("hotkey: dimming {s}", .{if (on) "on" else "off"});
@@ -3231,6 +3236,31 @@ fn setWindowMode(wid: u32, target: window_mod.WindowMode) void {
     g_store.put(win) catch {};
     log.info("window {d} mode: {s} → {s}", .{ wid, @tagName(old), @tagName(target) });
     retile();
+}
+
+/// Center a floating window on its display and remember the centered position
+/// so a later hide/show restores it there. No-op for tiled or fullscreen
+/// windows, whose geometry is owned by the layout.
+fn centerFloatingWindow(wid: u32) void {
+    var win = g_store.get(wid) orelse return;
+    if (win.mode != .floating or win.is_fullscreen) return;
+
+    const display_slot = displayIndexById(win.display_id) orelse return;
+    const display = g_displays[display_slot].visible;
+
+    var rect: skylight.CGRect = undefined;
+    const size: window_mod.Window.Frame = blk: {
+        const sky = g_sky orelse break :blk win.frame;
+        if (sky.getWindowBounds(sky.mainConnectionID(), wid, &rect) != 0) break :blk win.frame;
+        break :blk .{ .x = 0, .y = 0, .width = rect.size.width, .height = rect.size.height };
+    };
+
+    const target = centeredFrame(size.width, size.height, display);
+    _ = ax_mod.setWindowFrame(win.pid, wid, target.x, target.y, target.width, target.height);
+    win.frame = target;
+    win.float_frame = target;
+    g_store.put(win) catch {};
+    log.info("center floating wid={d} → x={d:.0} y={d:.0}", .{ wid, target.x, target.y });
 }
 
 // Window management helpers

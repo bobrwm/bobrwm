@@ -125,6 +125,7 @@ pub const Action = enum(u8) {
     swap_right = 34,
     swap_up = 35,
     swap_down = 36,
+    center_float = 37,
 
     // Every Action must map 1:1 to an EventKind (hk_ prefixed).
     comptime {
