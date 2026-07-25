@@ -168,6 +168,13 @@ const WorkspaceTraversalDirection = enum {
     next,
 };
 
+pub const StatusBarAction = union(enum) {
+    open_config,
+    previous_workspace,
+    next_workspace,
+    workspace: workspace_mod.WorkspaceId,
+};
+
 const HotkeyEvent = struct {
     kind: u8,
     arg: u32,
@@ -2176,6 +2183,7 @@ fn applyReloadedConfig(next: ConfigRuntime) void {
     // Preserve BSP topology and runtime split edits for ordinary config saves.
     // Only changing the layout algorithm requires reconstructing state.
     if (layout_changed) rebuildTilingStatesForConfig();
+    statusbar.updateWorkspaceMenu(g_workspaces.workspaces[0..g_workspaces.workspace_count]);
     updateStatusBar();
     retile();
     if (dim.enabled) pushDimSnapshot();
@@ -2450,6 +2458,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     g_config_runtime = try ConfigRuntime.init(g_allocator, config_path, true);
     defer g_config_runtime.?.deinit();
     g_config = g_config_runtime.?.config;
+
     g_bsp_split_mode = g_config.bsp_split;
     g_config.applyKeybinds(&g_config_runtime.?.keybind_table);
     g_animator.init(g_config.animation);
@@ -2573,8 +2582,9 @@ pub fn main(init: std.process.Init.Minimal) !void {
     refreshRolePolling();
     observeDiscoveredApps();
 
-    // -- Status bar (zig-objc) --
-    statusbar.init();
+    // Status bar (zig-objc) --
+    statusbar.init(g_workspaces.workspaces[0..g_workspaces.workspace_count]);
+    defer statusbar.deinit();
     updateStatusBar();
 
     // -- Enter NSApp run loop --
@@ -2692,6 +2702,44 @@ pub fn bw_will_quit() void {
 /// Retile — called from BWStatusBarDelegate.retile:.
 pub fn bw_retile() void {
     retile();
+}
+
+/// Dispatch a BWStatusBarDelegate action on the main thread.
+pub fn bw_status_bar_action(action: StatusBarAction) void {
+    switch (action) {
+        .open_config => openConfigFile(),
+        .previous_workspace => switchAdjacentWorkspace(.previous),
+        .next_workspace => switchAdjacentWorkspace(.next),
+        .workspace => |workspace_id| switchWorkspace(workspace_id),
+    }
+}
+
+fn openConfigFile() void {
+    const path = g_config_path orelse {
+        log.warn("cannot open config file because its path could not be resolved", .{});
+        return;
+    };
+    const NSWorkspace = objc.getClass("NSWorkspace") orelse return;
+    const NSString = objc.getClass("NSString") orelse return;
+    const NSURL = objc.getClass("NSURL") orelse return;
+    const workspace = NSWorkspace.msgSend(objc.Object, "sharedWorkspace", .{});
+    if (workspace.value == null) {
+        log.warn("cannot open config file at {s}", .{path});
+        return;
+    }
+    const ns_path = NSString.msgSend(objc.Object, "stringWithUTF8String:", .{path.ptr});
+    if (ns_path.value == null) {
+        log.warn("cannot open config file at {s}", .{path});
+        return;
+    }
+    const url = NSURL.msgSend(objc.Object, "fileURLWithPath:", .{ns_path});
+    if (url.value == null) {
+        log.warn("cannot open config file at {s}", .{path});
+        return;
+    }
+    if (!workspace.msgSend(bool, "openURL:", .{url})) {
+        log.warn("failed to open config file at {s}", .{path});
+    }
 }
 
 fn tilingStatePtr(workspace_id: u8) *?tiling.State {
