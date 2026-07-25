@@ -3,7 +3,7 @@
 //! Three BW* classes are registered with the ObjC runtime via zig-objc's
 //! `allocateClassPair` / `addMethod` helpers:
 //!
-//!   - `BWStatusBarDelegate` — Retile / Quit menu actions
+//!   - `BWStatusBarDelegate` — menu actions
 //!   - `BWObserver` — NSWorkspace + NSApplication notification target
 //!   - `BWLaunchGate` — per-pid KVO gate that defers app-launched events
 //!     until the process is finished launching AND has Regular activation
@@ -42,11 +42,34 @@ fn registerStatusBarDelegate() void {
     var cls = objc.allocateClassPair(NSObject, "BWStatusBarDelegate").?;
     _ = cls.addMethod("retile:", statusBarRetile);
     _ = cls.addMethod("quit:", statusBarQuit);
+    _ = cls.addMethod("openConfigFile:", statusBarOpenConfig);
+    _ = cls.addMethod("nextWorkspace:", statusBarNextWorkspace);
+    _ = cls.addMethod("previousWorkspace:", statusBarPreviousWorkspace);
+    _ = cls.addMethod("switchToWorkspace:", statusBarSwitchToWorkspace);
     objc.registerClassPair(cls);
 }
 
 fn statusBarRetile(_: c.id, _: c.SEL, _: c.id) callconv(.c) void {
     main.bw_retile();
+}
+
+fn statusBarOpenConfig(_: c.id, _: c.SEL, _: c.id) callconv(.c) void {
+    main.bw_status_bar_action(.open_config);
+}
+
+fn statusBarNextWorkspace(_: c.id, _: c.SEL, _: c.id) callconv(.c) void {
+    main.bw_status_bar_action(.next_workspace);
+}
+
+fn statusBarPreviousWorkspace(_: c.id, _: c.SEL, _: c.id) callconv(.c) void {
+    main.bw_status_bar_action(.previous_workspace);
+}
+
+fn statusBarSwitchToWorkspace(_: c.id, _: c.SEL, sender_id: c.id) callconv(.c) void {
+    const sender: objc.Object = .{ .value = sender_id };
+    const tag = sender.msgSend(i64, "tag", .{});
+    if (tag <= 0 or tag > std.math.maxInt(u8)) return;
+    main.bw_status_bar_action(.{ .workspace = @intCast(tag) });
 }
 
 fn statusBarQuit(_: c.id, _: c.SEL, _: c.id) callconv(.c) void {
