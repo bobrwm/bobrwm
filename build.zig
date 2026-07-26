@@ -1,4 +1,6 @@
 const std = @import("std");
+const AppVersion = @import("src/build/AppVersion.zig");
+const app_zon_version = @import("build.zig.zon").version;
 
 fn parseLogLevelEnv(raw: []const u8) ?std.log.Level {
     const trimmed = std.mem.trim(u8, raw, &.{ ' ', '\t', '\r', '\n' });
@@ -13,14 +15,14 @@ fn parseLogLevelEnv(raw: []const u8) ?std.log.Level {
     return null;
 }
 
-const version = "0.1.0";
-
 pub fn build(b: *std.Build) !void {
     const target = b.resolveTargetQuery(.{
         .cpu_arch = .aarch64,
         .os_tag = .macos,
     });
     const optimize = b.standardOptimizeOption(.{});
+    const app_version = try AppVersion.resolve(b, app_zon_version);
+    const version_string = b.fmt("{f}", .{app_version});
     // Process environment is already captured by the build graph; query
     // it directly rather than re-fetching.
     const env = &b.graph.environ_map;
@@ -72,7 +74,7 @@ pub fn build(b: *std.Build) !void {
     // std.log.Level can't be serialized directly; pass as backing int.
     const log_level_int: ?u3 = if (log_level) |l| @intFromEnum(l) else null;
     build_options.addOption(?u3, "log_level_int", log_level_int);
-    build_options.addOption([]const u8, "version", version);
+    build_options.addOption([]const u8, "version", version_string);
     exe_mod.addImport("build_options", build_options.createModule());
 
     const objc_dep = b.dependency("zig_objc", .{ .target = target, .optimize = optimize });

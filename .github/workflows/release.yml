@@ -16,6 +16,8 @@ permissions:
 jobs:
   build:
     runs-on: macos-15
+    environment: release
+    timeout-minutes: 45
     steps:
       - name: Checkout
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
@@ -23,13 +25,115 @@ jobs:
       - name: Install Zig
         run: brew install zig
 
+      - name: Configure artifact
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          if [[ "$GITHUB_EVENT_NAME" == "push" ]]; then
+            version=tip
+            build_version=
+          else
+            version="$RELEASE_TAG"
+            build_version="${RELEASE_TAG#v}"
+          fi
+
+          {
+            echo "INSTALL_PREFIX=$RUNNER_TEMP/bobrwm"
+            echo "ARTIFACT_NAME=bobrwm-${version}-aarch64-macos.zip"
+            echo "ARTIFACT_PATH=$RUNNER_TEMP/bobrwm-${version}-aarch64-macos.zip"
+            echo "BUILD_VERSION=$build_version"
+          } >> "$GITHUB_ENV"
+
       - name: Build
-        run: zig build -Doptimize=ReleaseFast --prefix /tmp/bobrwm
+        run: |
+          build_args=(-Doptimize=ReleaseFast --prefix "$INSTALL_PREFIX")
+          if [[ -n "$BUILD_VERSION" ]]; then
+            build_args+=("-Dversion-string=$BUILD_VERSION")
+          fi
+          zig build "${build_args[@]}"
+
+      - name: Import Developer ID certificate
+        env:
+          MACOS_CERTIFICATE: ${{ secrets.PROD_MACOS_CERTIFICATE }}
+          MACOS_CERTIFICATE_PASSWORD: ${{ secrets.PROD_MACOS_CERTIFICATE_PWD }}
+          MACOS_KEYCHAIN_PASSWORD: ${{ secrets.PROD_MACOS_CI_KEYCHAIN_PWD }}
+        run: |
+          certificate_path="$RUNNER_TEMP/developer-id.p12"
+          keychain_path="$RUNNER_TEMP/signing.keychain-db"
+
+          printf '%s' "$MACOS_CERTIFICATE" | base64 --decode > "$certificate_path"
+          security create-keychain -p "$MACOS_KEYCHAIN_PASSWORD" "$keychain_path"
+          security set-keychain-settings -lut 21600 "$keychain_path"
+          security unlock-keychain -p "$MACOS_KEYCHAIN_PASSWORD" "$keychain_path"
+          security import "$certificate_path" \
+            -k "$keychain_path" \
+            -P "$MACOS_CERTIFICATE_PASSWORD" \
+            -T /usr/bin/codesign
+          security set-key-partition-list \
+            -S apple-tool:,apple:,codesign: \
+            -s \
+            -k "$MACOS_KEYCHAIN_PASSWORD" \
+            "$keychain_path"
+          security default-keychain -d user -s "$keychain_path"
+
+      - name: Sign binaries
+        env:
+          MACOS_CERTIFICATE_NAME: ${{ secrets.PROD_MACOS_CERTIFICATE_NAME }}
+        run: |
+          codesign \
+            --force \
+            --sign "$MACOS_CERTIFICATE_NAME" \
+            --identifier com.bobrwm.bobrwm \
+            --options runtime \
+            --timestamp \
+            "$INSTALL_PREFIX/bin/bobrwm"
+          codesign \
+            --force \
+            --sign "$MACOS_CERTIFICATE_NAME" \
+            --identifier com.bobrwm.swipe \
+            --options runtime \
+            --timestamp \
+            "$INSTALL_PREFIX/bin/bobrwm-swipe"
+
+      - name: Verify signatures
+        run: |
+          codesign --verify --strict --verbose=4 "$INSTALL_PREFIX/bin/bobrwm"
+          codesign --verify --strict --verbose=4 "$INSTALL_PREFIX/bin/bobrwm-swipe"
+
+          test "$(codesign -dvv "$INSTALL_PREFIX/bin/bobrwm" 2>&1 | sed -n 's/^Identifier=//p')" = \
+            "com.bobrwm.bobrwm"
+          test "$(codesign -dvv "$INSTALL_PREFIX/bin/bobrwm-swipe" 2>&1 | sed -n 's/^Identifier=//p')" = \
+            "com.bobrwm.swipe"
+
+      - name: Package signed binaries
+        run: ditto -c -k --keepParent "$INSTALL_PREFIX/bin" "$ARTIFACT_PATH"
+
+      - name: Notarize artifact
+        env:
+          APPLE_NOTARIZATION_ISSUER: ${{ secrets.APPLE_NOTARIZATION_ISSUER }}
+          APPLE_NOTARIZATION_KEY: ${{ secrets.APPLE_NOTARIZATION_KEY }}
+          APPLE_NOTARIZATION_KEY_ID: ${{ secrets.APPLE_NOTARIZATION_KEY_ID }}
+        run: |
+          notarization_key_path="$RUNNER_TEMP/notarization-key.p8"
+          printf '%s' "$APPLE_NOTARIZATION_KEY" > "$notarization_key_path"
+
+          xcrun notarytool submit "$ARTIFACT_PATH" \
+            --key "$notarization_key_path" \
+            --key-id "$APPLE_NOTARIZATION_KEY_ID" \
+            --issuer "$APPLE_NOTARIZATION_ISSUER" \
+            --wait \
+            --timeout 30m
+
+      - name: Generate checksum
+        run: |
+          artifact_sha256="$(shasum -a 256 "$ARTIFACT_PATH" | awk '{print $1}')"
+          printf '%s  %s\n' "$artifact_sha256" "$ARTIFACT_NAME" > "$ARTIFACT_PATH.sha256"
+          echo "ARTIFACT_SHA256=$artifact_sha256" >> "$GITHUB_ENV"
 
       - name: Move tip tag
         if: github.event_name == 'push'
         env:
-          GH_TOKEN: ${{ secrets.RELEASE_TOKEN || github.token }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
@@ -40,9 +144,8 @@ jobs:
       - name: Upload binary to tip release
         if: github.event_name == 'push'
         env:
-          GH_TOKEN: ${{ secrets.RELEASE_TOKEN || github.token }}
+          GH_TOKEN: ${{ github.token }}
         run: |
-          tar -czf /tmp/bobrwm-tip-aarch64-macos.tar.gz -C /tmp/bobrwm .
           gh release view tip >/dev/null 2>&1 || \
             gh release create tip \
               --title 'bobrwm tip' \
@@ -54,16 +157,14 @@ jobs:
             --notes 'Latest continuous build from main.' \
             --prerelease \
             --target "$GITHUB_SHA"
-          gh release upload tip /tmp/bobrwm-tip-aarch64-macos.tar.gz --clobber
+          gh release upload tip "$ARTIFACT_PATH" "$ARTIFACT_PATH.sha256" --clobber
 
       - name: Upload binary to release
         if: github.event_name == 'release'
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ github.event.release.tag_name }}
-        run: |
-          tar -czf "/tmp/bobrwm-${TAG}-aarch64-macos.tar.gz" -C /tmp/bobrwm .
-          gh release upload "$TAG" "/tmp/bobrwm-${TAG}-aarch64-macos.tar.gz"
+        run: gh release upload "$TAG" "$ARTIFACT_PATH" "$ARTIFACT_PATH.sha256"
 
       - name: Dispatch to homebrew-tap
         if: github.event_name == 'release'
@@ -73,4 +174,14 @@ jobs:
         run: |
           gh api repos/bobrwm/homebrew-tap/dispatches \
             -f event_type=bottle \
-            -f "client_payload[tag]=$TAG"
+            -f "client_payload[tag]=$TAG" \
+            -f "client_payload[artifact]=$ARTIFACT_NAME" \
+            -f "client_payload[sha256]=$ARTIFACT_SHA256"
+
+      - name: Remove signing material
+        if: always()
+        run: |
+          security delete-keychain "$RUNNER_TEMP/signing.keychain-db" 2>/dev/null || true
+          rm -f \
+            "$RUNNER_TEMP/developer-id.p12" \
+            "$RUNNER_TEMP/notarization-key.p8"
