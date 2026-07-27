@@ -195,7 +195,7 @@ jobs:
           TAG: ${{ github.event.release.tag_name }}
         run: |
           gh api repos/bobrwm/homebrew-tap/dispatches \
-            -f event_type=bottle \
+            -f event_type=cask \
             -f "client_payload[tag]=$TAG" \
             -f "client_payload[artifact]=$ARTIFACT_NAME" \
             -f "client_payload[sha256]=$ARTIFACT_SHA256"
