@@ -3,18 +3,60 @@
 A tiling window manager for macOS, written in Zig.
 
 ## Installation
-Bobrwm is still in early development, meaning you'll need to build it from source.
-There's also a release available on Homebrew that'll build from source for you:
 
 ```
-brew install --HEAD bobrwm/tap/bobrwm
+brew trust bobrwm/tap
+brew install --cask bobrwm/tap/bobrwm
 ```
+
+Homebrew 6 refuses to load casks from third-party taps until you trust them, so
+the first command is required rather than advisory.
+
+This installs `Bobrwm.app` and symlinks the `bobrwm` client onto your `PATH`.
+The build is signed, notarized and stapled, so Gatekeeper lets it run without
+a detour through System Settings.
+
+The cask tracks `main`: every push publishes a fresh build and updates the
+cask, so `brew upgrade` picks it up. There are no tagged releases to wait for.
+
+Bobrwm is still in early development. To build it yourself, see
+[Development](#development); `zig build` produces `zig-out/Bobrwm.app`.
+
+### Upgrading from the formula
+
+bobrwm used to install as a formula that built from source. It ships as an app
+bundle now, so replace it.
+
+If you ran `bobrwm service install`, remove that launchd agent first. It points
+at the old binary and `bobrwm service uninstall` is gone, so it has to go by
+hand — otherwise launchd keeps trying to start a binary Homebrew is about to
+delete:
+
+```
+launchctl bootout gui/$(id -u)/com.bobrwm.bobrwm
+rm ~/Library/LaunchAgents/com.bobrwm.bobrwm.plist
+```
+
+Then swap the package:
+
+```
+brew uninstall --formula bobrwm
+brew trust bobrwm/tap
+brew install --cask bobrwm/tap/bobrwm
+```
+
+macOS ties Accessibility grants to a code signature, and the bundle is a
+different subject than the old bare binary, so you will have to grant access
+once more in System Settings > Privacy & Security > Accessibility.
 
 ## Usage
 
+`bobrwm` is a client. It never starts the window manager itself — that is
+`Bobrwm.app`, which runs as a menu-bar agent. Every command below is forwarded
+to the running app over a unix socket.
+
 ```
-bobrwm                    # start daemon
-bobrwm -c /path/to/config.zon  # start with explicit config
+bobrwm                    # show help
 bobrwm query windows      # IPC: list managed windows
 bobrwm query windows --json  # IPC: list managed windows as JSON
 bobrwm query workspaces   # IPC: list workspaces
@@ -37,9 +79,39 @@ bobrwm bsp rotate 90                  # IPC: 90 | 180 | 270
 bobrwm-swipe                          # optional trackpad swipe companion
 ```
 
+### Starting and stopping
+
+Launch `Bobrwm.app` from Finder or Spotlight, or with `open -a Bobrwm`. Quit
+from the menu-bar item. There is no launchd agent to install by hand: to run it
+at login, set
+
+```zon
+.start_at_login = true,
+```
+
+which the app reconciles against ServiceManagement on startup and on every
+config reload. macOS may hold the first registration pending your approval in
+System Settings under General > Login Items; bobrwm logs a warning when it is
+waiting on that.
+
+That registers a LaunchAgent bundled inside the app, so launchd supervises the
+process and restarts it if it crashes — but not when you quit from the menu bar.
+Supervision only exists while the agent is registered: an app launched by hand
+without `start_at_login` runs unsupervised.
+
 ### Logging
 
-Log level is compile-time configurable. Default follows build mode (`debug` in Debug, `info` otherwise).
+The window manager writes to `/tmp/bobrwm_$(id -u).log` as well as stderr, so
+logs are there however it was started — from Finder there is no terminal to
+read. The file is appended across restarts, which keeps the tail that explains
+a crash, and is truncated at startup once it passes 8 MiB.
+
+```bash
+tail -f "/tmp/bobrwm_$(id -u).log"
+```
+
+Log level is compile-time configurable and applies to both binaries. Default
+follows build mode (`debug` in Debug, `info` otherwise).
 
 ```bash
 zig build -Dlog_level=debug
@@ -170,3 +242,44 @@ The optional `bobrwm-swipe` companion reads its opt-in flag from the main bobrwm
 Core bobrwm does not start a gesture listener from this flag. It only defines the shared config shape and exposes `focus-workspace next|prev` over IPC. Run `bobrwm-swipe` as the companion process after enabling the field. macOS grants Accessibility permissions per executable, so `bobrwm-swipe` needs its own grant even if bobrwm is already trusted.
 
 When bobrwm has an adjacent workspace, the swipe listener consumes the matching macOS gesture. At the first or last bobrwm workspace, it passes the gesture through so native Spaces can handle it.
+
+## Development
+
+`zig build` assembles `zig-out/Bobrwm.app`. The build system writes the bundle
+tree itself, so no Xcode project is involved. `zig build run` execs the
+executable inside the bundle rather than `open`ing the app, which keeps logs on
+the terminal while still giving the process its bundle identity.
+
+```
+Bobrwm.app/Contents/MacOS/
+  Bobrwm         # the window manager; links AppKit, AX, SkyLight
+  bobrwm-cli     # the client; links libSystem only
+  bobrwm-swipe   # optional trackpad companion
+```
+
+The two binaries share nothing at runtime but the socket, so the client starts
+in roughly a third of the time the combined binary took. `bobrwm-cli` is what
+the Homebrew cask symlinks into `PATH` as `bobrwm`. The window manager accepts
+only `-c` / `--config`.
+
+macOS ties Accessibility grants to a binary's code signature. Ad-hoc and
+unsigned builds get a signature derived from the code hash, so every rebuild
+looks like a new application and loses the grant you just approved. Create a
+stable self-signed identity once:
+
+```bash
+script/dev-identity.sh
+```
+
+The script prompts for keychain authorization while marking the certificate as
+trusted for code signing. The first build that signs with it also raises a
+keychain prompt — choose *Always Allow* so later builds run unattended.
+
+Then point builds at it:
+
+```bash
+zig build -Dcodesign-identity="bobrwm Development"
+```
+
+The grant survives from then on. Builds without `-Dcodesign-identity` are left
+unsigned and need re-approval in System Settings after every rebuild.
