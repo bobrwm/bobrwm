@@ -170,3 +170,27 @@ The optional `bobrwm-swipe` companion reads its opt-in flag from the main bobrwm
 Core bobrwm does not start a gesture listener from this flag. It only defines the shared config shape and exposes `focus-workspace next|prev` over IPC. Run `bobrwm-swipe` as the companion process after enabling the field. macOS grants Accessibility permissions per executable, so `bobrwm-swipe` needs its own grant even if bobrwm is already trusted.
 
 When bobrwm has an adjacent workspace, the swipe listener consumes the matching macOS gesture. At the first or last bobrwm workspace, it passes the gesture through so native Spaces can handle it.
+
+## Development
+
+macOS ties Accessibility grants to a binary's code signature. Ad-hoc and
+unsigned builds get a signature derived from the code hash, so every rebuild
+looks like a new application and loses the grant you just approved. Create a
+stable self-signed identity once:
+
+```bash
+script/dev-identity.sh
+```
+
+The script prompts for keychain authorization while marking the certificate as
+trusted for code signing. The first build that signs with it also raises a
+keychain prompt — choose *Always Allow* so later builds run unattended.
+
+Then point builds at it:
+
+```bash
+zig build -Dcodesign-identity="bobrwm Development"
+```
+
+The grant survives from then on. Builds without `-Dcodesign-identity` are left
+unsigned and need re-approval in System Settings after every rebuild.
