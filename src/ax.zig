@@ -181,6 +181,33 @@ pub fn findWindow(pid: i32, target_wid: u32) ?c.AXUIElementRef {
     return null;
 }
 
+/// Resolve a window id via the app's AXFocusedWindow attribute. Open/save
+/// panels are remote-hosted by openAndSavePanelService and can be the app's
+/// focused window without ever appearing in its AXWindows array, so the list
+/// scan in findWindow misses them. Returns the element only when its window id
+/// matches `target_wid`. The returned element is retained; the caller must
+/// CFRelease it.
+pub fn focusedWindowIfMatches(pid: i32, target_wid: u32) ?c.AXUIElementRef {
+    std.debug.assert(pid > 0);
+    std.debug.assert(target_wid > 0);
+
+    const app = c.AXUIElementCreateApplication(pid) orelse return null;
+    defer c.CFRelease(@ptrCast(app));
+
+    const ax = strings() orelse return null;
+    var focused: c.AXUIElementRef = null;
+    const err = c.AXUIElementCopyAttributeValue(app, ax.focused_window_attr, @ptrCast(&focused));
+    if (err != c.kAXErrorSuccess or focused == null) return null;
+    const focused_ref = focused orelse return null;
+
+    var wid: u32 = 0;
+    if (_AXUIElementGetWindow(focused_ref, &wid) != c.kAXErrorSuccess or wid != target_wid) {
+        c.CFRelease(@ptrCast(focused_ref));
+        return null;
+    }
+    return focused_ref;
+}
+
 /// Query whether AXEnhancedUserInterface is currently enabled on an app element.
 pub fn enhancedUserInterface(app: c.AXUIElementRef, ax: *const AxStrings) bool {
     var value: c.CFTypeRef = null;
