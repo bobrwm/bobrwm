@@ -1926,7 +1926,11 @@ fn manageStateForWindow(pid: i32, wid: u32) u8 {
 
     if (!isRegularActivationApp(pid)) return shim.BW_MANAGE_REJECT;
 
-    const win = findAxWindow(pid, wid) orelse return shim.BW_MANAGE_PENDING;
+    // Remote-hosted panels (open/save dialogs) can be the app's focused window
+    // without appearing in AXWindows; without the focused-window fallback they
+    // stay PENDING and never reach the AXModal rejection below.
+    const win = findAxWindow(pid, wid) orelse
+        ax_mod.focusedWindowIfMatches(pid, wid) orelse return shim.BW_MANAGE_PENDING;
     defer c.CFRelease(@ptrCast(win));
 
     const ax = ensureAxStrings() orelse return shim.BW_MANAGE_PENDING;
@@ -2024,14 +2028,16 @@ fn axBooleanAttributeTrue(win: c.AXUIElementRef, attr: c.CFStringRef) bool {
     return c.CFEqual(value.?, @ptrCast(c.kCFBooleanTrue)) != 0;
 }
 
-/// Returns true when a still-pending window has AXUnknown role/subrole metadata.
-/// These windows are often transient host placeholders that should not be tiled
-/// by the timeout fallback path.
-fn isUnknownPendingRoleWindow(pid: i32, wid: u32) bool {
+/// Returns true when a still-pending window must not be tiled by the timeout
+/// fallback: no AX element resolved after the full poll budget (a window
+/// invisible to AX for that long is never a tileable standard window), or the
+/// role/subrole is AXUnknown (transient host placeholders).
+fn isUntileablePendingRoleWindow(pid: i32, wid: u32) bool {
     std.debug.assert(pid > 0);
     std.debug.assert(wid > 0);
 
-    const win = findAxWindow(pid, wid) orelse return false;
+    const win = findAxWindow(pid, wid) orelse
+        ax_mod.focusedWindowIfMatches(pid, wid) orelse return true;
     defer c.CFRelease(@ptrCast(win));
 
     const ax = ensureAxStrings() orelse return false;
@@ -3919,8 +3925,8 @@ fn processPendingRoleWindows() bool {
     for (candidates[0..candidate_count]) |candidate| {
         if (candidate.from_timeout) {
             const timeout_ms = @as(u64, role_poll_attempts_max) * role_poll_interval_ms;
-            if (isUnknownPendingRoleWindow(candidate.pid, candidate.wid)) {
-                log.info("pending-role: timeout pid={d} wid={d} after {d}ms with AXUnknown metadata, skipping legacy fallback", .{ candidate.pid, candidate.wid, timeout_ms });
+            if (isUntileablePendingRoleWindow(candidate.pid, candidate.wid)) {
+                log.info("pending-role: timeout pid={d} wid={d} after {d}ms unresolved or AXUnknown, skipping legacy fallback", .{ candidate.pid, candidate.wid, timeout_ms });
                 continue;
             }
             log.info("pending-role: timeout pid={d} wid={d} after {d}ms, applying legacy fallback", .{ candidate.pid, candidate.wid, timeout_ms });
