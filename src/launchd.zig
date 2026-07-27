@@ -1,8 +1,8 @@
 //! Manage bobrwm as a launchd user agent.
 //!
-//! The Info.plist is embedded in the binary's __TEXT,__info_plist section
-//! so macOS binds accessibility grants to CFBundleIdentifier rather than
-//! the binary path — no app bundle needed.
+//! The agent runs the executable inside Bobrwm.app, so the process picks up
+//! the bundle's CFBundleIdentifier and macOS binds accessibility grants to
+//! that rather than to the binary path.
 
 const std = @import("std");
 const posix = std.posix;

@@ -1,7 +1,7 @@
 .DS_Store
 
 **/.zig-cache
-**/zig-out/bin
+**/zig-out
 /result
 /.agents/skills/probing-windows/scripts/probe
 

@@ -2,6 +2,12 @@ const std = @import("std");
 const AppVersion = @import("src/build/AppVersion.zig");
 const app_zon_version = @import("build.zig.zon").version;
 
+// An .app is only a directory tree with an Info.plist, so the build system
+// assembles it directly and no Xcode project is involved.
+const bundle_name = "Bobrwm.app";
+const bundle_contents = bundle_name ++ "/Contents";
+const bundle_macos = bundle_contents ++ "/MacOS";
+
 fn parseLogLevelEnv(raw: []const u8) ?std.log.Level {
     const trimmed = std.mem.trim(u8, raw, &.{ ' ', '\t', '\r', '\n' });
     if (trimmed.len == 0) return null;
@@ -149,7 +155,6 @@ pub fn build(b: *std.Build) !void {
     exe_mod.addAnonymousImport("launchd_plist", .{
         .root_source_file = b.path("res/com.bobrwm.bobrwm.plist"),
     });
-    exe_mod.addAssemblyFile(b.path("src/info_plist.s"));
 
     exe_mod.linkFramework("ApplicationServices", .{});
     exe_mod.linkFramework("CoreGraphics", .{});
@@ -167,7 +172,7 @@ pub fn build(b: *std.Build) !void {
         .root_module = exe_mod,
     });
 
-    b.installArtifact(exe);
+    installBundleArtifact(b, exe);
 
     const swipe_config_mod = b.createModule(.{
         .root_source_file = b.path("src/config.zig"),
@@ -202,39 +207,39 @@ pub fn build(b: *std.Build) !void {
         .root_module = swipe_mod,
     });
 
-    b.installArtifact(swipe_exe);
+    installBundleArtifact(b, swipe_exe);
+
+    installBundleFile(b, bundleInfoPlist(b, app_version), "Contents", "Info.plist");
+    // Classic-era type/creator record. LaunchServices no longer needs it, but
+    // some tooling still probes for it and it costs eight bytes.
+    installBundleFile(b, b.addWriteFiles().add("PkgInfo", "APPL????"), "Contents", "PkgInfo");
 
     const sign_step: ?*std.Build.Step = if (codesign_identity) |identity| blk: {
-        const step = b.step("codesign", "Code-sign installed binaries");
-        for ([_][2][]const u8{
-            .{ "bobrwm", "com.bobrwm.bobrwm" },
-            .{ "bobrwm-swipe", "com.bobrwm.swipe" },
-        }) |entry| {
-            const sign = b.addSystemCommand(&.{
-                "codesign",
-                "--force",
-                "--sign",
-                identity,
-                "--identifier",
-                entry[1],
-                // A self-signed identity has no timestamp authority, and the
-                // hardened runtime blocks lldb without get-task-allow. Both
-                // are release-only concerns.
-                "--timestamp=none",
-            });
-            sign.addArg(b.getInstallPath(.bin, entry[0]));
-            // The argument list never changes, but its input does.
-            sign.has_side_effects = true;
-            sign.step.dependOn(b.getInstallStep());
-            step.dependOn(&sign.step);
-        }
+        const step = b.step("codesign", "Code-sign the app bundle");
+
+        // Nested code must be sealed before the enclosing bundle, otherwise
+        // the outer signature covers a helper that is about to change.
+        const sign_swipe = devCodesign(b, identity);
+        sign_swipe.addArgs(&.{ "--identifier", "com.bobrwm.swipe" });
+        sign_swipe.addArg(b.getInstallPath(.prefix, bundle_macos ++ "/bobrwm-swipe"));
+        sign_swipe.step.dependOn(b.getInstallStep());
+
+        // The app takes its identifier from CFBundleIdentifier.
+        const sign_app = devCodesign(b, identity);
+        sign_app.addArg(b.getInstallPath(.prefix, bundle_name));
+        sign_app.step.dependOn(&sign_swipe.step);
+
+        step.dependOn(&sign_app.step);
         b.default_step = step;
         break :blk step;
     } else null;
 
-    // Run the installed copies rather than the cache artifacts: only the
-    // installed ones carry the signature that TCC matches against.
-    const run_cmd = b.addSystemCommand(&.{b.getInstallPath(.bin, "bobrwm")});
+    // Run the installed bundle rather than the cache artifacts: only the
+    // installed copy carries both the signature TCC matches against and the
+    // surrounding bundle that gives the process its identity. Exec'ing the
+    // binary directly instead of `open`ing the app keeps stdio on the
+    // terminal, which the log-driven debugging workflow depends on.
+    const run_cmd = b.addSystemCommand(&.{b.getInstallPath(.prefix, bundle_macos ++ "/bobrwm")});
     run_cmd.has_side_effects = true;
     run_cmd.step.dependOn(sign_step orelse b.getInstallStep());
     if (b.args) |args| {
@@ -244,7 +249,9 @@ pub fn build(b: *std.Build) !void {
     const run_step = b.step("run", "Run bobrwm");
     run_step.dependOn(&run_cmd.step);
 
-    const run_swipe_cmd = b.addSystemCommand(&.{b.getInstallPath(.bin, "bobrwm-swipe")});
+    const run_swipe_cmd = b.addSystemCommand(&.{
+        b.getInstallPath(.prefix, bundle_macos ++ "/bobrwm-swipe"),
+    });
     run_swipe_cmd.has_side_effects = true;
     run_swipe_cmd.step.dependOn(sign_step orelse b.getInstallStep());
     if (b.args) |args| {
@@ -383,4 +390,74 @@ pub fn build(b: *std.Build) !void {
     test_step.dependOn(&run_workspace_tests.step);
     test_step.dependOn(&run_dim_tests.step);
     test_step.dependOn(&run_swipe_tests.step);
+}
+
+fn installBundleArtifact(b: *std.Build, artifact: *std.Build.Step.Compile) void {
+    b.getInstallStep().dependOn(&b.addInstallArtifact(artifact, .{
+        .dest_dir = .{ .override = .{ .custom = bundle_macos } },
+    }).step);
+}
+
+fn installBundleFile(
+    b: *std.Build,
+    source: std.Build.LazyPath,
+    sub_dir: []const u8,
+    dest_name: []const u8,
+) void {
+    const dir: std.Build.InstallDir = .{ .custom = b.fmt("{s}/{s}", .{ bundle_name, sub_dir }) };
+    b.getInstallStep().dependOn(&b.addInstallFileWithDir(source, dir, dest_name).step);
+}
+
+fn bundleInfoPlist(b: *std.Build, version: std.SemanticVersion) std.Build.LazyPath {
+    // Both version keys must be dotted integers. The pre-release and build
+    // metadata that AppVersion carries for `--version` would make
+    // LaunchServices reject them, so they get the numeric triple only.
+    const short_version = b.fmt("{d}.{d}.{d}", .{ version.major, version.minor, version.patch });
+
+    return b.addWriteFiles().add("Info.plist", b.fmt(
+        \\<?xml version="1.0" encoding="UTF-8"?>
+        \\<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+        \\  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+        \\<plist version="1.0">
+        \\<dict>
+        \\    <key>CFBundleDevelopmentRegion</key>
+        \\    <string>en</string>
+        \\    <key>CFBundleExecutable</key>
+        \\    <string>bobrwm</string>
+        \\    <key>CFBundleIdentifier</key>
+        \\    <string>com.bobrwm.bobrwm</string>
+        \\    <key>CFBundleInfoDictionaryVersion</key>
+        \\    <string>6.0</string>
+        \\    <key>CFBundleName</key>
+        \\    <string>bobrwm</string>
+        \\    <key>CFBundlePackageType</key>
+        \\    <string>APPL</string>
+        \\    <key>CFBundleShortVersionString</key>
+        \\    <string>{[version]s}</string>
+        \\    <key>CFBundleVersion</key>
+        \\    <string>{[version]s}</string>
+        \\    <key>LSMinimumSystemVersion</key>
+        \\    <string>13.0</string>
+        \\    <key>LSUIElement</key>
+        \\    <true/>
+        \\</dict>
+        \\</plist>
+        \\
+    , .{ .version = short_version }));
+}
+
+fn devCodesign(b: *std.Build, identity: []const u8) *std.Build.Step.Run {
+    const run = b.addSystemCommand(&.{
+        "codesign",
+        "--force",
+        "--sign",
+        identity,
+        // A self-signed identity has no timestamp authority, and the hardened
+        // runtime blocks lldb without get-task-allow. Both are release-only
+        // concerns.
+        "--timestamp=none",
+    });
+    // The argument list never changes, but its input does.
+    run.has_side_effects = true;
+    return run;
 }
