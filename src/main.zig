@@ -219,6 +219,16 @@ const PendingFocusEntry = struct {
     display_id: u32,
 };
 
+/// A focus event that wanted to follow its window into a hidden workspace but
+/// arrived while a workspace transition was still in flight. Replayed verbatim
+/// once the transition clears, so `wid` is the originally focused window id
+/// (which may be a tab member) rather than its group leader.
+const DeferredFollowFocus = struct {
+    pid: i32,
+    wid: u32,
+    source: FocusEventSource,
+};
+
 const pending_focus_capacity_per_epoch: usize = 16;
 const cleanup_pid_capacity_per_drain: usize = 16;
 
@@ -498,6 +508,12 @@ fn startWorkspaceTransition(kind: WorkspaceTransitionKind, target_workspace_id: 
     };
     g_workspace_transition_completion_reason = .none;
     g_pending_focus_count = 0;
+
+    // A newly started transition is the current intent; whatever an older one
+    // deferred (an explicit hotkey switch supersedes a followed focus) is now
+    // stale and must not replay on top of it.
+    g_deferred_follow_focus = null;
+
     log.debug("workspace transition started epoch={d} kind={s} workspace={d} display={d}", .{
         next_epoch,
         @tagName(kind),
@@ -734,15 +750,84 @@ fn maybeSetFocusedDisplayForWindow(win: window_mod.Window, source: FocusEventSou
     return true;
 }
 
-fn switchToWindowWorkspaceIfHidden(win: window_mod.Window) void {
+/// Follow focus into a hidden workspace. `focused_wid` is the window the AX
+/// event named; `win` is its group leader, which owns the workspace slot.
+///
+/// A transition that has already been marked complete is only serving out its
+/// settle tail (synthetic move/resize suppression), so following focus through
+/// it is no different from a workspace hotkey pressed at the same moment. One
+/// still in flight must not be fought, but the intent cannot be dropped
+/// either: a fast Cmd+Tab back to the app you just left lands inside that
+/// window, and dropping it leaves the app focused with its window parked
+/// off-screen until something else happens to move focus.
+fn switchToWindowWorkspaceIfHidden(win: window_mod.Window, focused_wid: u32, source: FocusEventSource) void {
     std.debug.assert(win.wid != 0);
+    std.debug.assert(focused_wid != 0);
     std.debug.assert(win.workspace_id > 0 and win.workspace_id <= workspace_mod.max_workspaces);
     std.debug.assert(win.display_id != 0);
 
-    if (g_workspace_transition.isActive()) return;
+    if (g_workspace_transition.isActive() and g_workspace_transition_completion_reason == .none) {
+        g_deferred_follow_focus = .{ .pid = win.pid, .wid = focused_wid, .source = source };
+        refreshRolePolling();
+        log.debug("follow focus deferred wid={d} leader={d} pid={d} workspace={d} display={d} epoch={d} target_workspace={d}", .{
+            focused_wid,
+            win.wid,
+            win.pid,
+            win.workspace_id,
+            win.display_id,
+            g_workspace_transition.epoch,
+            g_workspace_transition.target_workspace_id,
+        });
+        return;
+    }
+
+    // This focus event resolved without waiting, so anything an earlier
+    // transition deferred is stale intent the user has already moved past.
+    g_deferred_follow_focus = null;
+
     if (workspaceVisibleOnDisplay(win.workspace_id, win.display_id)) return;
 
+    log.debug("follow focus switching wid={d} leader={d} pid={d} workspace={d} display={d}", .{
+        focused_wid,
+        win.wid,
+        win.pid,
+        win.workspace_id,
+        win.display_id,
+    });
     switchWorkspace(win.workspace_id);
+}
+
+/// Replay a follow-focus intent that a mid-flight transition deferred. Called
+/// the moment the transition clears. Bails when the window is gone, already
+/// visible, or no longer owns app focus — by then the intent is stale.
+fn applyDeferredFollowFocus() void {
+    std.debug.assert(!g_workspace_transition.isActive());
+
+    const deferred = g_deferred_follow_focus orelse return;
+    g_deferred_follow_focus = null;
+    refreshRolePolling();
+
+    const leader = g_store.get(g_tab_groups.resolveLeader(deferred.wid)) orelse return;
+    if (leader.pid != deferred.pid) return;
+    if (workspaceVisibleOnDisplay(leader.workspace_id, leader.display_id)) return;
+
+    const front_pid = frontmostApplicationPid() orelse return;
+    if (front_pid != deferred.pid) {
+        log.debug("follow focus replay dropped wid={d} pid={d} reason=focus-moved front_pid={d}", .{
+            deferred.wid,
+            deferred.pid,
+            front_pid,
+        });
+        return;
+    }
+
+    log.debug("follow focus replaying wid={d} pid={d} workspace={d} display={d}", .{
+        deferred.wid,
+        deferred.pid,
+        leader.workspace_id,
+        leader.display_id,
+    });
+    _ = syncFocusStateForWindowId(deferred.wid, deferred.source);
 }
 
 /// During a workspace transition, AX focus events from non-target
@@ -788,7 +873,7 @@ fn syncFocusStateForWindowId(focused_wid: u32, source: FocusEventSource) bool {
             transition.target_display_id,
         });
     }
-    switchToWindowWorkspaceIfHidden(win);
+    switchToWindowWorkspaceIfHidden(win, focused_wid, source);
 
     return true;
 }
@@ -851,6 +936,7 @@ fn tickWorkspaceTransitionState() void {
             @tagName(g_workspace_transition_completion_reason),
         });
         clearWorkspaceTransition();
+        applyDeferredFollowFocus();
         return;
     }
 
@@ -872,6 +958,7 @@ fn tickWorkspaceTransitionState() void {
         },
     );
     clearWorkspaceTransition();
+    applyDeferredFollowFocus();
 }
 
 /// Debug-only: verify every display slot has a valid active workspace
@@ -1395,6 +1482,7 @@ var g_workspace_transition_completion_reason: WorkspaceTransitionCompletionReaso
 var g_pending_focus_entries: [pending_focus_capacity_per_epoch]PendingFocusEntry = undefined;
 var g_pending_focus_count: usize = 0;
 var g_pending_focus_sequence: u64 = 0;
+var g_deferred_follow_focus: ?DeferredFollowFocus = null;
 var g_layout_entries: std.ArrayList(tiling.LayoutEntry) = .empty;
 var g_retile_requested_all_displays = false;
 var g_retile_dirty_display_ids: [workspace_mod.max_displays]u32 = [_]u32{0} ** workspace_mod.max_displays;
@@ -3438,6 +3526,7 @@ fn refreshRolePolling() void {
         g_deferred_window_candidates.count() > 0 or
         g_app_launch_retries.count() > 0 or
         g_focus_retries.count() > 0 or
+        g_deferred_follow_focus != null or
         g_display_resettle_at_s != 0;
     setRolePolling(has_pending);
 }
@@ -5066,7 +5155,16 @@ fn restoreFloatingWindows(ws_id: u8, display_id: u32, display: shim.bw_frame) vo
     for (ws.windows.items) |wid| {
         var win = g_store.get(wid) orelse continue;
         if (win.mode != .floating or win.is_fullscreen) continue;
-        if (win.display_id != display_id) continue;
+        if (win.display_id != display_id) {
+            // Mirrors the tiled-path warning in retileDisplay: a floating
+            // window whose stored display disagrees with its visible
+            // workspace's display is never restored, so a parked one stays
+            // parked with no other trace.
+            log.warn("restore floating: skipping drifted window wid={d} display {d} (workspace {d} on display {d})", .{
+                wid, win.display_id, ws_id, display_id,
+            });
+            continue;
+        }
 
         var rect: skylight.CGRect = undefined;
         if (sky.getWindowBounds(conn, wid, &rect) != 0) continue;
