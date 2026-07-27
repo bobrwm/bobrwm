@@ -19,6 +19,7 @@ const statusbar = @import("statusbar.zig");
 const tile_preview = @import("tile_preview.zig");
 const ax_observer = @import("ax_observer.zig");
 const osutil = @import("osutil.zig");
+const loginitem = @import("loginitem.zig");
 const objc_classes = @import("objc_classes.zig");
 const animation_mod = @import("animation.zig");
 const ax_mod = @import("ax.zig");
@@ -2255,6 +2256,7 @@ fn applyReloadedConfig(next: ConfigRuntime) void {
     g_animator.finishAll();
     g_animator.init(g_config.animation);
     dim.configure(g_config.dimmed_inactive);
+    loginitem.reconcile(g_config.start_at_login);
 
     for (g_workspaces.workspaces[0..g_workspaces.workspace_count], 0..) |*ws, i| {
         ws.name = if (i < g_config.workspace_names.len) g_config.workspace_names[i] else "";
@@ -2561,11 +2563,12 @@ pub fn main(init: std.process.Init.Minimal) !void {
 
     // Inactive-window dimming via SkyLight (SLSSetWindowListBrightness).
     dim.configure(g_config.dimmed_inactive);
+    loginitem.reconcile(g_config.start_at_login);
 
     // -- Accessibility check --
     if (!ax_mod.isTrusted()) {
         log.warn("accessibility not trusted — prompting user", .{});
-        log.warn("after granting access, restart with: bobrwm service restart", .{});
+        log.warn("after granting access, quit from the menu bar and relaunch Bobrwm.app", .{});
         axPrompt();
     }
 

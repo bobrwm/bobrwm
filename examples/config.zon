@@ -1,6 +1,10 @@
 // bobrwm config — place at ~/.config/bobrwm/config.zon
-// or pass via: bobrwm -c /path/to/config.zon
 .{
+    // Register Bobrwm.app as a login item. Applied on startup and on every
+    // reload; the first enable may need approval in System Settings under
+    // General > Login Items.
+    // .start_at_login = true,
+
     // Layout algorithm.
     // .layout = .bsp,
     // Or fullscreen-per-window tiling:
