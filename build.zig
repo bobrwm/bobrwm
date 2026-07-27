@@ -8,6 +8,13 @@ const bundle_name = "Bobrwm.app";
 const bundle_contents = bundle_name ++ "/Contents";
 const bundle_macos = bundle_contents ++ "/MacOS";
 
+// The window manager and the client ship side by side in Contents/MacOS, so
+// their names have to differ by more than case: APFS is case-insensitive by
+// default and `Bobrwm` would collide with `bobrwm`. The Homebrew cask
+// symlinks the client into PATH as plain `bobrwm`.
+const server_exe_name = "Bobrwm";
+const cli_exe_name = "bobrwm-cli";
+
 fn parseLogLevelEnv(raw: []const u8) ?std.log.Level {
     const trimmed = std.mem.trim(u8, raw, &.{ ' ', '\t', '\r', '\n' });
     if (trimmed.len == 0) return null;
@@ -168,11 +175,32 @@ pub fn build(b: *std.Build) !void {
     exe_mod.addLibraryPath(.{ .cwd_relative = sdk_lib });
 
     const exe = b.addExecutable(.{
-        .name = "bobrwm",
+        .name = server_exe_name,
         .root_module = exe_mod,
     });
 
     installBundleArtifact(b, exe);
+
+    // The client links no frameworks at all: it only parses arguments and
+    // talks to the daemon over a unix socket. Loading AppKit and friends here
+    // would cost every `bobrwm query ...` invocation for nothing.
+    const cli_mod = b.createModule(.{
+        .root_source_file = b.path("src/cli.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    cli_mod.addImport("build_options", build_options.createModule());
+    cli_mod.addAnonymousImport("launchd_plist", .{
+        .root_source_file = b.path("res/com.bobrwm.bobrwm.plist"),
+    });
+
+    const cli_exe = b.addExecutable(.{
+        .name = cli_exe_name,
+        .root_module = cli_mod,
+    });
+
+    installBundleArtifact(b, cli_exe);
 
     const swipe_config_mod = b.createModule(.{
         .root_source_file = b.path("src/config.zig"),
@@ -217,17 +245,22 @@ pub fn build(b: *std.Build) !void {
     const sign_step: ?*std.Build.Step = if (codesign_identity) |identity| blk: {
         const step = b.step("codesign", "Code-sign the app bundle");
 
-        // Nested code must be sealed before the enclosing bundle, otherwise
-        // the outer signature covers a helper that is about to change.
-        const sign_swipe = devCodesign(b, identity);
-        sign_swipe.addArgs(&.{ "--identifier", "com.bobrwm.swipe" });
-        sign_swipe.addArg(b.getInstallPath(.prefix, bundle_macos ++ "/bobrwm-swipe"));
-        sign_swipe.step.dependOn(b.getInstallStep());
-
         // The app takes its identifier from CFBundleIdentifier.
         const sign_app = devCodesign(b, identity);
         sign_app.addArg(b.getInstallPath(.prefix, bundle_name));
-        sign_app.step.dependOn(&sign_swipe.step);
+
+        // Nested code must be sealed before the enclosing bundle, otherwise
+        // the outer signature covers a helper that is about to change.
+        for ([_][2][]const u8{
+            .{ cli_exe_name, "com.bobrwm.cli" },
+            .{ "bobrwm-swipe", "com.bobrwm.swipe" },
+        }) |entry| {
+            const sign_helper = devCodesign(b, identity);
+            sign_helper.addArgs(&.{ "--identifier", entry[1] });
+            sign_helper.addArg(b.getInstallPath(.prefix, b.fmt("{s}/{s}", .{ bundle_macos, entry[0] })));
+            sign_helper.step.dependOn(b.getInstallStep());
+            sign_app.step.dependOn(&sign_helper.step);
+        }
 
         step.dependOn(&sign_app.step);
         b.default_step = step;
@@ -239,7 +272,9 @@ pub fn build(b: *std.Build) !void {
     // surrounding bundle that gives the process its identity. Exec'ing the
     // binary directly instead of `open`ing the app keeps stdio on the
     // terminal, which the log-driven debugging workflow depends on.
-    const run_cmd = b.addSystemCommand(&.{b.getInstallPath(.prefix, bundle_macos ++ "/bobrwm")});
+    const run_cmd = b.addSystemCommand(&.{
+        b.getInstallPath(.prefix, bundle_macos ++ "/" ++ server_exe_name),
+    });
     run_cmd.has_side_effects = true;
     run_cmd.step.dependOn(sign_step orelse b.getInstallStep());
     if (b.args) |args| {
@@ -423,7 +458,7 @@ fn bundleInfoPlist(b: *std.Build, version: std.SemanticVersion) std.Build.LazyPa
         \\    <key>CFBundleDevelopmentRegion</key>
         \\    <string>en</string>
         \\    <key>CFBundleExecutable</key>
-        \\    <string>bobrwm</string>
+        \\    <string>{[server]s}</string>
         \\    <key>CFBundleIdentifier</key>
         \\    <string>com.bobrwm.bobrwm</string>
         \\    <key>CFBundleInfoDictionaryVersion</key>
@@ -443,7 +478,7 @@ fn bundleInfoPlist(b: *std.Build, version: std.SemanticVersion) std.Build.LazyPa
         \\</dict>
         \\</plist>
         \\
-    , .{ .version = short_version }));
+    , .{ .server = server_exe_name, .version = short_version }));
 }
 
 fn devCodesign(b: *std.Build, identity: []const u8) *std.Build.Step.Run {
