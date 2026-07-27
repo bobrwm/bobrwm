@@ -3,12 +3,17 @@
 A tiling window manager for macOS, written in Zig.
 
 ## Installation
-Bobrwm is still in early development, meaning you'll need to build it from source.
-There's also a release available on Homebrew that'll build from source for you:
 
 ```
-brew install --HEAD bobrwm/tap/bobrwm
+brew install --cask bobrwm/tap/bobrwm
 ```
+
+This installs `Bobrwm.app` and symlinks the `bobrwm` client onto your `PATH`.
+The build is signed, notarized and stapled, so Gatekeeper lets it run without
+a detour through System Settings.
+
+Bobrwm is still in early development. To build it yourself, see
+[Development](#development); `zig build` produces `zig-out/Bobrwm.app`.
 
 ## Usage
 
