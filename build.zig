@@ -70,6 +70,16 @@ pub fn build(b: *std.Build) !void {
     else
         null;
 
+    // macOS keys Accessibility grants to a binary's designated requirement.
+    // Unsigned builds derive one from the code hash, so each rebuild reads as
+    // a new application and drops the grant. Signing against a fixed identity
+    // holds the requirement steady. See script/dev-identity.sh.
+    const codesign_identity = b.option(
+        []const u8,
+        "codesign-identity",
+        "Code-signing identity to sign installed binaries with",
+    );
+
     const build_options = b.addOptions();
     // std.log.Level can't be serialized directly; pass as backing int.
     const log_level_int: ?u3 = if (log_level) |l| @intFromEnum(l) else null;
@@ -194,8 +204,39 @@ pub fn build(b: *std.Build) !void {
 
     b.installArtifact(swipe_exe);
 
-    const run_cmd = b.addRunArtifact(exe);
-    run_cmd.step.dependOn(b.getInstallStep());
+    const sign_step: ?*std.Build.Step = if (codesign_identity) |identity| blk: {
+        const step = b.step("codesign", "Code-sign installed binaries");
+        for ([_][2][]const u8{
+            .{ "bobrwm", "com.bobrwm.bobrwm" },
+            .{ "bobrwm-swipe", "com.bobrwm.swipe" },
+        }) |entry| {
+            const sign = b.addSystemCommand(&.{
+                "codesign",
+                "--force",
+                "--sign",
+                identity,
+                "--identifier",
+                entry[1],
+                // A self-signed identity has no timestamp authority, and the
+                // hardened runtime blocks lldb without get-task-allow. Both
+                // are release-only concerns.
+                "--timestamp=none",
+            });
+            sign.addArg(b.getInstallPath(.bin, entry[0]));
+            // The argument list never changes, but its input does.
+            sign.has_side_effects = true;
+            sign.step.dependOn(b.getInstallStep());
+            step.dependOn(&sign.step);
+        }
+        b.default_step = step;
+        break :blk step;
+    } else null;
+
+    // Run the installed copies rather than the cache artifacts: only the
+    // installed ones carry the signature that TCC matches against.
+    const run_cmd = b.addSystemCommand(&.{b.getInstallPath(.bin, "bobrwm")});
+    run_cmd.has_side_effects = true;
+    run_cmd.step.dependOn(sign_step orelse b.getInstallStep());
     if (b.args) |args| {
         run_cmd.addArgs(args);
     }
@@ -203,8 +244,9 @@ pub fn build(b: *std.Build) !void {
     const run_step = b.step("run", "Run bobrwm");
     run_step.dependOn(&run_cmd.step);
 
-    const run_swipe_cmd = b.addRunArtifact(swipe_exe);
-    run_swipe_cmd.step.dependOn(b.getInstallStep());
+    const run_swipe_cmd = b.addSystemCommand(&.{b.getInstallPath(.bin, "bobrwm-swipe")});
+    run_swipe_cmd.has_side_effects = true;
+    run_swipe_cmd.step.dependOn(sign_step orelse b.getInstallStep());
     if (b.args) |args| {
         run_swipe_cmd.addArgs(args);
     }
