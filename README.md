@@ -12,6 +12,9 @@ This installs `Bobrwm.app` and symlinks the `bobrwm` client onto your `PATH`.
 The build is signed, notarized and stapled, so Gatekeeper lets it run without
 a detour through System Settings.
 
+The cask tracks `main`: every push publishes a fresh build and updates the
+cask, so `brew upgrade` picks it up. There are no tagged releases to wait for.
+
 Bobrwm is still in early development. To build it yourself, see
 [Development](#development); `zig build` produces `zig-out/Bobrwm.app`.
 
