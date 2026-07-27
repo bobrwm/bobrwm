@@ -1,6 +1,6 @@
 const std = @import("std");
 const posix = std.posix;
-const build_options = @import("build_options");
+const log_options = @import("log_options.zig");
 const c = @import("c");
 const cg_extra = @import("cg_extra");
 const objc = @import("objc");
@@ -46,12 +46,7 @@ const NSRect = extern struct {
 };
 
 pub const std_options = std.Options{
-    .log_level = if (build_options.log_level_int) |l|
-        @enumFromInt(l)
-    else switch (@import("builtin").mode) {
-        .Debug => .debug,
-        else => .info,
-    },
+    .log_level = log_options.level,
 };
 
 const log = std.log.scoped(.bobrwm);
