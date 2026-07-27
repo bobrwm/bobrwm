@@ -25,7 +25,19 @@ Bobrwm is still in early development. To build it yourself, see
 ### Upgrading from the formula
 
 bobrwm used to install as a formula that built from source. It ships as an app
-bundle now, so replace it:
+bundle now, so replace it.
+
+If you ran `bobrwm service install`, remove that launchd agent first. It points
+at the old binary and `bobrwm service uninstall` is gone, so it has to go by
+hand — otherwise launchd keeps trying to start a binary Homebrew is about to
+delete:
+
+```
+launchctl bootout gui/$(id -u)/com.bobrwm.bobrwm
+rm ~/Library/LaunchAgents/com.bobrwm.bobrwm.plist
+```
+
+Then swap the package:
 
 ```
 brew uninstall --formula bobrwm
@@ -70,8 +82,8 @@ bobrwm-swipe                          # optional trackpad swipe companion
 ### Starting and stopping
 
 Launch `Bobrwm.app` from Finder or Spotlight, or with `open -a Bobrwm`. Quit
-from the menu-bar item. There is no launchd agent to install: to run it at
-login, set
+from the menu-bar item. There is no launchd agent to install by hand: to run it
+at login, set
 
 ```zon
 .start_at_login = true,
@@ -82,9 +94,24 @@ config reload. macOS may hold the first registration pending your approval in
 System Settings under General > Login Items; bobrwm logs a warning when it is
 waiting on that.
 
+That registers a LaunchAgent bundled inside the app, so launchd supervises the
+process and restarts it if it crashes — but not when you quit from the menu bar.
+Supervision only exists while the agent is registered: an app launched by hand
+without `start_at_login` runs unsupervised.
+
 ### Logging
 
-Log level is compile-time configurable. Default follows build mode (`debug` in Debug, `info` otherwise).
+The window manager writes to `/tmp/bobrwm_$(id -u).log` as well as stderr, so
+logs are there however it was started — from Finder there is no terminal to
+read. The file is appended across restarts, which keeps the tail that explains
+a crash, and is truncated at startup once it passes 8 MiB.
+
+```bash
+tail -f "/tmp/bobrwm_$(id -u).log"
+```
+
+Log level is compile-time configurable and applies to both binaries. Default
+follows build mode (`debug` in Debug, `info` otherwise).
 
 ```bash
 zig build -Dlog_level=debug
