@@ -39,6 +39,7 @@ jobs:
 
           {
             echo "INSTALL_PREFIX=$RUNNER_TEMP/bobrwm"
+            echo "APP_PATH=$RUNNER_TEMP/bobrwm/Bobrwm.app"
             echo "ARTIFACT_NAME=bobrwm-${version}-aarch64-macos.zip"
             echo "ARTIFACT_PATH=$RUNNER_TEMP/bobrwm-${version}-aarch64-macos.zip"
             echo "BUILD_VERSION=$build_version"
@@ -76,39 +77,45 @@ jobs:
             "$keychain_path"
           security default-keychain -d user -s "$keychain_path"
 
-      - name: Sign binaries
+      - name: Sign app bundle
         env:
           MACOS_CERTIFICATE_NAME: ${{ secrets.PROD_MACOS_CERTIFICATE_NAME }}
         run: |
-          codesign \
-            --force \
-            --sign "$MACOS_CERTIFICATE_NAME" \
-            --identifier com.bobrwm.bobrwm \
-            --options runtime \
-            --timestamp \
-            "$INSTALL_PREFIX/bin/bobrwm"
-          codesign \
-            --force \
-            --sign "$MACOS_CERTIFICATE_NAME" \
-            --identifier com.bobrwm.swipe \
-            --options runtime \
-            --timestamp \
-            "$INSTALL_PREFIX/bin/bobrwm-swipe"
+          # Nested code first. Signing the bundle seals the helpers as they
+          # are at that moment, so re-signing one afterwards would invalidate
+          # the enclosing signature. --deep would sign them for us but applies
+          # the app's options to every nested binary, which is why Apple
+          # deprecated it.
+          for helper in bobrwm-cli:com.bobrwm.cli bobrwm-swipe:com.bobrwm.swipe; do
+            codesign \
+              --force \
+              --sign "$MACOS_CERTIFICATE_NAME" \
+              --identifier "${helper#*:}" \
+              --options runtime \
+              --timestamp \
+              "$APP_PATH/Contents/MacOS/${helper%%:*}"
+          done
 
-      - name: Verify signatures
+          # The app takes its identifier from CFBundleIdentifier.
+          codesign \
+            --force \
+            --sign "$MACOS_CERTIFICATE_NAME" \
+            --options runtime \
+            --timestamp \
+            "$APP_PATH"
+
+      - name: Verify signature
         run: |
-          codesign --verify --strict --verbose=4 "$INSTALL_PREFIX/bin/bobrwm"
-          codesign --verify --strict --verbose=4 "$INSTALL_PREFIX/bin/bobrwm-swipe"
+          codesign --verify --deep --strict --verbose=2 "$APP_PATH"
 
-          test "$(codesign -dvv "$INSTALL_PREFIX/bin/bobrwm" 2>&1 | sed -n 's/^Identifier=//p')" = \
+          test "$(codesign -dvv "$APP_PATH" 2>&1 | sed -n 's/^Identifier=//p')" = \
             "com.bobrwm.bobrwm"
-          test "$(codesign -dvv "$INSTALL_PREFIX/bin/bobrwm-swipe" 2>&1 | sed -n 's/^Identifier=//p')" = \
+          test "$(codesign -dvv "$APP_PATH/Contents/MacOS/bobrwm-cli" 2>&1 | sed -n 's/^Identifier=//p')" = \
+            "com.bobrwm.cli"
+          test "$(codesign -dvv "$APP_PATH/Contents/MacOS/bobrwm-swipe" 2>&1 | sed -n 's/^Identifier=//p')" = \
             "com.bobrwm.swipe"
 
-      - name: Package signed binaries
-        run: ditto -c -k --keepParent "$INSTALL_PREFIX/bin" "$ARTIFACT_PATH"
-
-      - name: Notarize artifact
+      - name: Notarize and staple
         env:
           APPLE_NOTARIZATION_ISSUER: ${{ secrets.APPLE_NOTARIZATION_ISSUER }}
           APPLE_NOTARIZATION_KEY: ${{ secrets.APPLE_NOTARIZATION_KEY }}
@@ -117,12 +124,27 @@ jobs:
           notarization_key_path="$RUNNER_TEMP/notarization-key.p8"
           printf '%s' "$APPLE_NOTARIZATION_KEY" > "$notarization_key_path"
 
+          ditto -c -k --keepParent "$APP_PATH" "$ARTIFACT_PATH"
+
           xcrun notarytool submit "$ARTIFACT_PATH" \
             --key "$notarization_key_path" \
             --key-id "$APPLE_NOTARIZATION_KEY_ID" \
             --issuer "$APPLE_NOTARIZATION_ISSUER" \
             --wait \
             --timeout 30m
+
+          # The ticket staples to the .app, never to the zip that carried it
+          # to Apple, so the bundle has to be repackaged afterwards. A release
+          # that skips this still launches, but only for users who can reach
+          # Apple's notarization service at first launch.
+          xcrun stapler staple "$APP_PATH"
+          rm -f "$ARTIFACT_PATH"
+          ditto -c -k --keepParent "$APP_PATH" "$ARTIFACT_PATH"
+
+      - name: Verify Gatekeeper acceptance
+        run: |
+          xcrun stapler validate "$APP_PATH"
+          spctl --assess --type exec --verbose=4 "$APP_PATH"
 
       - name: Generate checksum
         run: |
