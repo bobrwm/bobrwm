@@ -13,13 +13,11 @@ const tiling = @import("tiling.zig");
 const bsp_mod = tiling.bsp_mod;
 const ipc = @import("ipc.zig");
 const tabgroup = @import("tabgroup.zig");
-const cli = @import("cli.zig");
 const config_mod = @import("config.zig");
 const dim = @import("dim.zig");
 const statusbar = @import("statusbar.zig");
 const tile_preview = @import("tile_preview.zig");
 const ax_observer = @import("ax_observer.zig");
-const launchd = @import("launchd.zig");
 const osutil = @import("osutil.zig");
 const objc_classes = @import("objc_classes.zig");
 const animation_mod = @import("animation.zig");
@@ -2525,13 +2523,23 @@ fn bw_hotkey_handle_keydown(keycode: u16, mods: u8) bool {
 
 // Entry point
 
-pub fn main(init: std.process.Init.Minimal) !void {
-    // -- CLI dispatch (help, version, service, IPC client) --
-    var cmd_buf: [512]u8 = undefined;
-    const result = cli.parse(init.args, &cmd_buf);
-    if (cli.run(result)) return;
+/// Read `-c` / `--config` off the command line. The window manager takes no
+/// other arguments; everything users type goes to the `bobrwm` client, which
+/// forwards it over IPC.
+fn parseConfigPath(process_args: std.process.Args) ?[]const u8 {
+    var args = process_args.iterate();
+    defer args.deinit();
+    _ = args.skip(); // program name
 
-    // -- Daemon mode --
+    while (args.next()) |arg| {
+        if (std.mem.eql(u8, arg, "-c") or std.mem.eql(u8, arg, "--config")) {
+            return args.next();
+        }
+    }
+    return null;
+}
+
+pub fn main(init: std.process.Init.Minimal) !void {
     log.info("bobrwm starting (log_level={s})...", .{@tagName(std_options.log_level)});
 
     var gpa: std.heap.DebugAllocator(.{}) = .init;
@@ -2540,7 +2548,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     defer deinitAxStrings();
 
     // -- Config --
-    const config_path = config_mod.resolvePath(g_allocator, cli.configPath(result)) catch null;
+    const config_path = config_mod.resolvePath(g_allocator, parseConfigPath(init.args)) catch null;
     defer if (config_path) |path| g_allocator.free(path);
     g_config_path = config_path;
     g_config_runtime = try ConfigRuntime.init(g_allocator, config_path, true);

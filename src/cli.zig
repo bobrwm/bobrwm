@@ -1,8 +1,11 @@
-//! Unified CLI for bobrwm.
+//! The `bobrwm` client CLI.
 //!
-//! Handles argument parsing, help/version output, service management dispatch,
-//! and IPC client communication with the running daemon. All CLI concerns live
-//! here so main.zig only needs to call `cli.run()`.
+//! This is the root module of a binary separate from the window manager
+//! itself: it parses arguments, prints help and version, dispatches service
+//! management, and forwards everything else to the running daemon over the
+//! IPC socket. Keeping it out of the daemon binary means the client links
+//! none of AppKit, ApplicationServices or Carbon, so a `bobrwm query windows`
+//! does not pay to load the framework graph the window manager needs.
 
 const std = @import("std");
 const posix = std.posix;
@@ -12,21 +15,13 @@ const osutil = @import("osutil.zig");
 
 const log = std.log.scoped(.cli);
 
-// Action — locally handled commands (everything else is IPC)
-
-const Action = enum {
-    help,
-    version,
-    service,
-};
-
 // Parse result
 
 pub const Result = union(enum) {
-    /// Start the daemon, optionally with an explicit config path.
-    daemon: struct { config_path: ?[]const u8 = null },
-    /// Run a local action (help, version, service) and exit.
-    action: struct { kind: Action, tail: ?[]const u8 = null, config_path: ?[]const u8 = null },
+    help,
+    version,
+    /// Service subcommand, or null when none was given.
+    service: ?[]const u8,
     /// Forward an IPC command string to the running daemon.
     ipc: []const u8,
 };
@@ -35,27 +30,20 @@ pub const Result = union(enum) {
 /// `cmd_buf` is scratch space for assembling the IPC command string from
 /// positional arguments.
 pub fn parse(process_args: std.process.Args, cmd_buf: []u8) Result {
-    var config_path: ?[]const u8 = null;
     var pos: usize = 0;
     var args = process_args.iterate();
     defer args.deinit();
     _ = args.skip(); // program name
 
     while (args.next()) |arg| {
-        // Flags: -c / --config
-        if (std.mem.eql(u8, arg, "-c") or std.mem.eql(u8, arg, "--config")) {
-            config_path = args.next();
-            continue;
-        }
-
         // Flags: --help / -h
         if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
-            return .{ .action = .{ .kind = .help, .config_path = config_path } };
+            return .help;
         }
 
         // Flags: --version
         if (std.mem.eql(u8, arg, "--version")) {
-            return .{ .action = .{ .kind = .version } };
+            return .version;
         }
 
         // Positional arg — accumulate into cmd_buf
@@ -68,25 +56,25 @@ pub fn parse(process_args: std.process.Args, cmd_buf: []u8) Result {
         pos += copy_len;
     }
 
-    if (pos == 0) {
-        return .{ .daemon = .{ .config_path = config_path } };
-    }
+    // A bare invocation no longer starts the window manager; that is the app
+    // bundle's job.
+    if (pos == 0) return .help;
 
     const command = cmd_buf[0..pos];
 
     // Check for known local commands
     if (std.mem.eql(u8, command, "help")) {
-        return .{ .action = .{ .kind = .help, .config_path = config_path } };
+        return .help;
     }
     if (std.mem.eql(u8, command, "version")) {
-        return .{ .action = .{ .kind = .version } };
+        return .version;
     }
     if (std.mem.eql(u8, command, "service") or std.mem.startsWith(u8, command, "service ")) {
         const tail: ?[]const u8 = if (command.len > "service ".len)
             command["service ".len..]
         else
             null;
-        return .{ .action = .{ .kind = .service, .tail = tail, .config_path = config_path } };
+        return .{ .service = tail };
     }
 
     // Everything else is an IPC command
@@ -95,34 +83,29 @@ pub fn parse(process_args: std.process.Args, cmd_buf: []u8) Result {
 
 // Action dispatch
 
-/// Run a parsed CLI result. Returns `true` if main should exit (action or
-/// IPC handled), `false` if the daemon should start.
-pub fn run(result: Result) bool {
+/// Run a parsed CLI result and return the process exit code.
+pub fn run(result: Result) u8 {
     switch (result) {
-        .daemon => return false,
-        .action => |a| {
-            switch (a.kind) {
-                .help => printHelp(),
-                .version => printVersion(),
-                .service => runService(a.tail),
-            }
-            return true;
+        .help => {
+            printHelp();
+            return 0;
         },
-        .ipc => |cmd| {
-            const exit_code = runClient(cmd);
-            if (exit_code != 0) std.process.exit(exit_code);
-            return true;
+        .version => {
+            printVersion();
+            return 0;
         },
+        .service => |tail| {
+            runService(tail);
+            return 0;
+        },
+        .ipc => |cmd| return runClient(cmd),
     }
 }
 
-/// Extract the config path from any result variant.
-pub fn configPath(result: Result) ?[]const u8 {
-    return switch (result) {
-        .daemon => |d| d.config_path,
-        .action => |a| a.config_path,
-        .ipc => null,
-    };
+pub fn main(init: std.process.Init.Minimal) !void {
+    var cmd_buf: [512]u8 = undefined;
+    const exit_code = run(parse(init.args, &cmd_buf));
+    if (exit_code != 0) std.process.exit(exit_code);
 }
 
 // Help
@@ -196,11 +179,9 @@ const help_text =
     \\  query apps [--json]       List managed applications
     \\
     \\Options:
-    \\  -c, --config <path>       Use a specific config file
     \\  -h, --help                Show this help message
     \\  --version                 Show version information
     \\
-    \\Running without arguments starts the daemon.
     \\Configuration is read from $XDG_CONFIG_HOME/bobrwm/config.zon
     \\or ~/.config/bobrwm/config.zon by default.
     \\

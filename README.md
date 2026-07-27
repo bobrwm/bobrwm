@@ -12,9 +12,12 @@ brew install --HEAD bobrwm/tap/bobrwm
 
 ## Usage
 
+`bobrwm` is a client. It never starts the window manager itself — that is
+`Bobrwm.app`, which runs as a menu-bar agent. Every command below is forwarded
+to the running app over a unix socket.
+
 ```
-bobrwm                    # start daemon
-bobrwm -c /path/to/config.zon  # start with explicit config
+bobrwm                    # show help
 bobrwm query windows      # IPC: list managed windows
 bobrwm query windows --json  # IPC: list managed windows as JSON
 bobrwm query workspaces   # IPC: list workspaces
@@ -177,6 +180,18 @@ When bobrwm has an adjacent workspace, the swipe listener consumes the matching 
 tree itself, so no Xcode project is involved. `zig build run` execs the
 executable inside the bundle rather than `open`ing the app, which keeps logs on
 the terminal while still giving the process its bundle identity.
+
+```
+Bobrwm.app/Contents/MacOS/
+  Bobrwm         # the window manager; links AppKit, AX, SkyLight
+  bobrwm-cli     # the client; links libSystem only
+  bobrwm-swipe   # optional trackpad companion
+```
+
+The two binaries share nothing at runtime but the socket, so the client starts
+in roughly a third of the time the combined binary took. `bobrwm-cli` is what
+the Homebrew cask symlinks into `PATH` as `bobrwm`. The window manager accepts
+only `-c` / `--config`.
 
 macOS ties Accessibility grants to a binary's code signature. Ad-hoc and
 unsigned builds get a signature derived from the code hash, so every rebuild
