@@ -15,6 +15,10 @@ const bundle_macos = bundle_contents ++ "/MacOS";
 const server_exe_name = "Bobrwm";
 const cli_exe_name = "bobrwm-cli";
 
+// launchd requires Label to match the plist's basename. src/loginitem.zig
+// registers this same name through SMAppService.
+const launchd_label = "com.bobrwm.bobrwm";
+
 fn parseLogLevelEnv(raw: []const u8) ?std.log.Level {
     const trimmed = std.mem.trim(u8, raw, &.{ ' ', '\t', '\r', '\n' });
     if (trimmed.len == 0) return null;
@@ -235,6 +239,12 @@ pub fn build(b: *std.Build) !void {
     // Classic-era type/creator record. LaunchServices no longer needs it, but
     // some tooling still probes for it and it costs eight bytes.
     installBundleFile(b, b.addWriteFiles().add("PkgInfo", "APPL????"), "Contents", "PkgInfo");
+    installBundleFile(
+        b,
+        bundleLaunchAgentPlist(b),
+        "Contents/Library/LaunchAgents",
+        launchd_label ++ ".plist",
+    );
 
     const sign_step: ?*std.Build.Step = if (codesign_identity) |identity| blk: {
         const step = b.step("codesign", "Code-sign the app bundle");
@@ -473,6 +483,42 @@ fn bundleInfoPlist(b: *std.Build, version: std.SemanticVersion) std.Build.LazyPa
         \\</plist>
         \\
     , .{ .server = server_exe_name, .version = short_version }));
+}
+
+/// LaunchAgent registered via SMAppService, which is what keeps launchd
+/// supervising the process so a crash gets restarted.
+fn bundleLaunchAgentPlist(b: *std.Build) std.Build.LazyPath {
+    return b.addWriteFiles().add(launchd_label ++ ".plist", std.fmt.comptimePrint(
+        \\<?xml version="1.0" encoding="UTF-8"?>
+        \\<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+        \\  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+        \\<plist version="1.0">
+        \\<dict>
+        \\    <key>Label</key>
+        \\    <string>{[label]s}</string>
+        \\    <!-- Bundle-relative, so registration survives the app moving.
+        \\         Only honoured for plists installed via SMAppService. -->
+        \\    <key>BundleProgram</key>
+        \\    <string>Contents/MacOS/{[server]s}</string>
+        \\    <key>RunAtLoad</key>
+        \\    <true/>
+        \\    <!-- Come back from a crash, but stay down after the user quits
+        \\         from the menu bar. -->
+        \\    <key>KeepAlive</key>
+        \\    <dict>
+        \\        <key>SuccessfulExit</key>
+        \\        <false/>
+        \\        <key>Crashed</key>
+        \\        <true/>
+        \\    </dict>
+        \\    <key>LimitLoadToSessionType</key>
+        \\    <string>Aqua</string>
+        \\    <key>ProcessType</key>
+        \\    <string>Interactive</string>
+        \\</dict>
+        \\</plist>
+        \\
+    , .{ .label = launchd_label, .server = server_exe_name }));
 }
 
 fn devCodesign(b: *std.Build, identity: []const u8) *std.Build.Step.Run {

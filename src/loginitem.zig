@@ -1,17 +1,27 @@
 //! Login-item registration through ServiceManagement.
 //!
-//! SMAppService replaces the LaunchAgent plist bobrwm used to write into
-//! ~/Library/LaunchAgents: macOS owns the registration, it appears in System
-//! Settings under General > Login Items, and nothing has to be kept in sync
-//! with the executable's path when the app moves.
+//! Registers the LaunchAgent bundled at
+//! `Contents/Library/LaunchAgents/com.bobrwm.bobrwm.plist`, which replaces the
+//! plist bobrwm used to hand-write into ~/Library/LaunchAgents: macOS owns the
+//! registration, it shows up in System Settings under General > Login Items,
+//! and the plist's `BundleProgram` is bundle-relative so nothing breaks when
+//! the app moves.
 //!
-//! Registration is keyed to the enclosing app bundle, so this is inert when
-//! the binary runs outside Bobrwm.app.
+//! Registering an agent rather than the app itself is what keeps launchd
+//! supervising the process, so a crash still gets restarted. That supervision
+//! only exists while the agent is registered — a manually launched app that
+//! never opted into `start_at_login` runs unsupervised.
+//!
+//! The plist lives in the app bundle, so this is inert when the executable
+//! runs outside one.
 
 const std = @import("std");
 const objc = @import("objc");
 
 const log = std.log.scoped(.loginitem);
+
+/// Must match the basename installed under Contents/Library/LaunchAgents.
+const plist_name = "com.bobrwm.bobrwm.plist";
 
 /// SMAppServiceStatus. Non-exhaustive: macOS may add cases.
 pub const Status = enum(i64) {
@@ -23,27 +33,38 @@ pub const Status = enum(i64) {
 };
 
 pub fn status() Status {
-    const service = mainAppService() orelse return .not_found;
+    const service = agentService() orelse return .not_found;
     return @enumFromInt(service.msgSend(i64, "status", .{}));
 }
 
 /// Bring the registration in line with `enabled`.
 ///
-/// Called on every config load, so it must stay idempotent: each transition
-/// is guarded on current status rather than issued unconditionally.
+/// Called on every config load, so it must stay idempotent: each transition is
+/// guarded on current status rather than issued unconditionally.
 pub fn reconcile(enabled: bool) void {
     const current = status();
+
+    // No service definition to act on: either the executable is running
+    // outside Bobrwm.app or the bundle is missing its LaunchAgent. Registering
+    // would fail, so say why instead.
+    if (current == .not_found) {
+        if (enabled) {
+            log.warn("start_at_login is set but {s} is not in the app bundle; " ++
+                "run bobrwm from Bobrwm.app to manage the login item", .{plist_name});
+        }
+        return;
+    }
 
     if (enabled) {
         switch (current) {
             .enabled => return,
-            // The user revoked approval in System Settings. Re-registering
-            // cannot override that, and retrying on every reload would just
-            // spam the log.
-            .requires_approval => {
-                log.warn("start_at_login is set but the login item awaits approval in System Settings", .{});
-                return;
-            },
+            // The user denied or revoked approval in System Settings.
+            // Re-registering cannot override that, and retrying on every
+            // reload would just spam the log.
+            .requires_approval => log.warn(
+                "start_at_login is set but the login item awaits approval in System Settings",
+                .{},
+            ),
             else => setRegistered(true),
         }
         return;
@@ -56,7 +77,7 @@ pub fn reconcile(enabled: bool) void {
 }
 
 fn setRegistered(register: bool) void {
-    const service = mainAppService() orelse return;
+    const service = agentService() orelse return;
     const selector = if (register) "registerAndReturnError:" else "unregisterAndReturnError:";
 
     var err_id: ?*anyopaque = null;
@@ -71,12 +92,15 @@ fn setRegistered(register: bool) void {
     });
 }
 
-fn mainAppService() ?objc.Object {
+fn agentService() ?objc.Object {
     const SMAppService = objc.getClass("SMAppService") orelse {
         log.warn("SMAppService unavailable; not managing the login item", .{});
         return null;
     };
-    return SMAppService.msgSend(objc.Object, "mainAppService", .{});
+    const NSString = objc.getClass("NSString") orelse return null;
+    const name = NSString.msgSend(objc.Object, "stringWithUTF8String:", .{plist_name.ptr});
+
+    return SMAppService.msgSend(objc.Object, "agentServiceWithPlistName:", .{name});
 }
 
 /// Borrowed description of an NSError out-parameter. The string belongs to the
