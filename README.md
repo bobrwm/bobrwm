@@ -5,8 +5,12 @@ A tiling window manager for macOS, written in Zig.
 ## Installation
 
 ```
+brew trust bobrwm/tap
 brew install --cask bobrwm/tap/bobrwm
 ```
+
+Homebrew 6 refuses to load casks from third-party taps until you trust them, so
+the first command is required rather than advisory.
 
 This installs `Bobrwm.app` and symlinks the `bobrwm` client onto your `PATH`.
 The build is signed, notarized and stapled, so Gatekeeper lets it run without
@@ -17,6 +21,21 @@ cask, so `brew upgrade` picks it up. There are no tagged releases to wait for.
 
 Bobrwm is still in early development. To build it yourself, see
 [Development](#development); `zig build` produces `zig-out/Bobrwm.app`.
+
+### Upgrading from the formula
+
+bobrwm used to install as a formula that built from source. It ships as an app
+bundle now, so replace it:
+
+```
+brew uninstall --formula bobrwm
+brew trust bobrwm/tap
+brew install --cask bobrwm/tap/bobrwm
+```
+
+macOS ties Accessibility grants to a code signature, and the bundle is a
+different subject than the old bare binary, so you will have to grant access
+once more in System Settings > Privacy & Security > Accessibility.
 
 ## Usage
 
