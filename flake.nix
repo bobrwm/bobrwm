@@ -44,7 +44,15 @@
           zig build -Doptimize=ReleaseSafe --prefix $out
         '';
 
-        dontInstall = true;
+        # The build installs Bobrwm.app; expose the client and the swipe
+        # companion on PATH the way the Homebrew cask's binary stanza does.
+        # Bobrwm itself is deliberately not linked: it needs to run from
+        # inside the bundle to pick up its CFBundleIdentifier.
+        installPhase = ''
+          mkdir -p $out/bin
+          ln -s $out/Bobrwm.app/Contents/MacOS/bobrwm-cli $out/bin/bobrwm
+          ln -s $out/Bobrwm.app/Contents/MacOS/bobrwm-swipe $out/bin/bobrwm-swipe
+        '';
       };
     });
 
