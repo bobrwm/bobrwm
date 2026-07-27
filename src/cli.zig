@@ -10,7 +10,6 @@
 const std = @import("std");
 const posix = std.posix;
 const build_options = @import("build_options");
-const launchd = @import("launchd.zig");
 const osutil = @import("osutil.zig");
 
 const log = std.log.scoped(.cli);
@@ -20,8 +19,6 @@ const log = std.log.scoped(.cli);
 pub const Result = union(enum) {
     help,
     version,
-    /// Service subcommand, or null when none was given.
-    service: ?[]const u8,
     /// Forward an IPC command string to the running daemon.
     ipc: []const u8,
 };
@@ -69,13 +66,6 @@ pub fn parse(process_args: std.process.Args, cmd_buf: []u8) Result {
     if (std.mem.eql(u8, command, "version")) {
         return .version;
     }
-    if (std.mem.eql(u8, command, "service") or std.mem.startsWith(u8, command, "service ")) {
-        const tail: ?[]const u8 = if (command.len > "service ".len)
-            command["service ".len..]
-        else
-            null;
-        return .{ .service = tail };
-    }
 
     // Everything else is an IPC command
     return .{ .ipc = command };
@@ -92,10 +82,6 @@ pub fn run(result: Result) u8 {
         },
         .version => {
             printVersion();
-            return 0;
-        },
-        .service => |tail| {
-            runService(tail);
             return 0;
         },
         .ipc => |cmd| return runClient(cmd),
@@ -143,13 +129,6 @@ const help_text =
     \\  help                     Show this help message
     \\  version                  Show version information
     \\
-    \\Service Commands:
-    \\  service install           Install the launchd agent
-    \\  service uninstall         Uninstall the launchd agent
-    \\  service start             Start the service
-    \\  service stop              Stop the service
-    \\  service restart           Restart the service
-    \\
     \\Window Commands (IPC):
     \\  retile                    Re-tile all windows on the active workspace
     \\  reload-config             Reload config, keeping current config on failure
@@ -191,34 +170,6 @@ const help_text =
 
 fn printVersion() void {
     writeStdout("bobrwm " ++ build_options.version ++ "\n");
-}
-
-// Service
-
-fn runService(tail: ?[]const u8) void {
-    const sub = tail orelse {
-        writeStderr(
-            \\Usage: bobrwm service <action>
-            \\
-            \\Actions:
-            \\  install      Install the launchd agent
-            \\  uninstall    Uninstall the launchd agent
-            \\  start        Start the service
-            \\  stop         Stop the service
-            \\  restart      Restart the service
-            \\
-        );
-        return;
-    };
-
-    const cmd = std.meta.stringToEnum(launchd.Command, sub) orelse {
-        var buf: [256]u8 = undefined;
-        const msg = std.fmt.bufPrint(&buf, "error: unknown service action '{s}'\n", .{sub}) catch return;
-        writeStderr(msg);
-        return;
-    };
-
-    launchd.run(cmd);
 }
 
 // IPC client (sends command to running daemon)

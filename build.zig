@@ -159,15 +159,12 @@ pub fn build(b: *std.Build) !void {
     // are registered at runtime by src/objc_classes.zig via zig-objc's
     // allocateClassPair. No clang-compiled translation unit is required.
 
-    exe_mod.addAnonymousImport("launchd_plist", .{
-        .root_source_file = b.path("res/com.bobrwm.bobrwm.plist"),
-    });
-
     exe_mod.linkFramework("ApplicationServices", .{});
     exe_mod.linkFramework("CoreGraphics", .{});
     exe_mod.linkFramework("Carbon", .{});
     exe_mod.linkFramework("AppKit", .{});
     exe_mod.linkFramework("CoreFoundation", .{});
+    exe_mod.linkFramework("ServiceManagement", .{});
 
     exe_mod.addSystemFrameworkPath(.{ .cwd_relative = sdk_frameworks });
     exe_mod.addSystemFrameworkPath(.{ .cwd_relative = sdk_private_frameworks });
@@ -191,9 +188,6 @@ pub fn build(b: *std.Build) !void {
         .link_libc = true,
     });
     cli_mod.addImport("build_options", build_options.createModule());
-    cli_mod.addAnonymousImport("launchd_plist", .{
-        .root_source_file = b.path("res/com.bobrwm.bobrwm.plist"),
-    });
 
     const cli_exe = b.addExecutable(.{
         .name = cli_exe_name,

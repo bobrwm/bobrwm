@@ -40,6 +40,21 @@ bobrwm bsp rotate 90                  # IPC: 90 | 180 | 270
 bobrwm-swipe                          # optional trackpad swipe companion
 ```
 
+### Starting and stopping
+
+Launch `Bobrwm.app` from Finder or Spotlight, or with `open -a Bobrwm`. Quit
+from the menu-bar item. There is no launchd agent to install: to run it at
+login, set
+
+```zon
+.start_at_login = true,
+```
+
+which the app reconciles against ServiceManagement on startup and on every
+config reload. macOS may hold the first registration pending your approval in
+System Settings under General > Login Items; bobrwm logs a warning when it is
+waiting on that.
+
 ### Logging
 
 Log level is compile-time configurable. Default follows build mode (`debug` in Debug, `info` otherwise).
