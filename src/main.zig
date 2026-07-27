@@ -6478,7 +6478,7 @@ fn ipcQueryWorkspaces(fd: posix.socket_t, format: ipc.IpcCommand.QueryFormat) vo
     const w = &out.writer;
 
     switch (format) {
-        .text => for (&g_workspaces.workspaces) |*ws| {
+        .text => for (g_workspaces.workspaces[0..g_workspaces.workspace_count]) |*ws| {
             const focused: u32 = ws.focused_wid orelse 0;
             w.print("{d} {s} {d} {d}\n", .{
                 ws.id,
@@ -6490,7 +6490,7 @@ fn ipcQueryWorkspaces(fd: posix.socket_t, format: ipc.IpcCommand.QueryFormat) vo
         .json => {
             var json: std.json.Stringify = .{ .writer = w };
             json.beginArray() catch {};
-            for (&g_workspaces.workspaces) |*ws| {
+            for (g_workspaces.workspaces[0..g_workspaces.workspace_count]) |*ws| {
                 json.beginObject() catch break;
                 json.objectField("workspace_id") catch break;
                 json.write(ws.id) catch break;
@@ -6519,7 +6519,7 @@ fn ipcQueryWorkspaces(fd: posix.socket_t, format: ipc.IpcCommand.QueryFormat) vo
     const payload = out.written();
     ipc.writeResponse(fd, payload);
     const elapsed_ms = @divTrunc(nanoTimestamp() - started_ns, std.time.ns_per_ms);
-    log.debug("[trace] query workspaces rows={} bytes={} elapsed_ms={}", .{ g_workspaces.workspaces.len, payload.len, elapsed_ms });
+    log.debug("[trace] query workspaces rows={} bytes={} elapsed_ms={}", .{ g_workspaces.workspace_count, payload.len, elapsed_ms });
 }
 
 fn ipcQueryDisplays(fd: posix.socket_t, format: ipc.IpcCommand.QueryFormat) void {
