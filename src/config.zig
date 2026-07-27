@@ -29,6 +29,9 @@ pub const Config = struct {
     bsp_split_ratio: f64 = 0.5,
     new_window_split: tiling.InsertChild = .second,
     animation: animation.AnimationConfig = .{},
+    /// Register Bobrwm.app as a login item. Reconciled against
+    /// ServiceManagement on startup and on every reload.
+    start_at_login: bool = false,
 
     /// Look up the assigned workspace for a given bundle identifier. `app_rules`
     /// take precedence; `workspace_assignments` is a fallback alias.

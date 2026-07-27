@@ -2,6 +2,23 @@ const std = @import("std");
 const AppVersion = @import("src/build/AppVersion.zig");
 const app_zon_version = @import("build.zig.zon").version;
 
+// An .app is only a directory tree with an Info.plist, so the build system
+// assembles it directly and no Xcode project is involved.
+const bundle_name = "Bobrwm.app";
+const bundle_contents = bundle_name ++ "/Contents";
+const bundle_macos = bundle_contents ++ "/MacOS";
+
+// The window manager and the client ship side by side in Contents/MacOS, so
+// their names have to differ by more than case: APFS is case-insensitive by
+// default and `Bobrwm` would collide with `bobrwm`. The Homebrew cask
+// symlinks the client into PATH as plain `bobrwm`.
+const server_exe_name = "Bobrwm";
+const cli_exe_name = "bobrwm-cli";
+
+// launchd requires Label to match the plist's basename. src/loginitem.zig
+// registers this same name through SMAppService.
+const launchd_label = "com.bobrwm.bobrwm";
+
 fn parseLogLevelEnv(raw: []const u8) ?std.log.Level {
     const trimmed = std.mem.trim(u8, raw, &.{ ' ', '\t', '\r', '\n' });
     if (trimmed.len == 0) return null;
@@ -70,6 +87,16 @@ pub fn build(b: *std.Build) !void {
     else
         null;
 
+    // macOS keys Accessibility grants to a binary's designated requirement.
+    // Unsigned builds derive one from the code hash, so each rebuild reads as
+    // a new application and drops the grant. Signing against a fixed identity
+    // holds the requirement steady. See script/dev-identity.sh.
+    const codesign_identity = b.option(
+        []const u8,
+        "codesign-identity",
+        "Code-signing identity to sign installed binaries with",
+    );
+
     const build_options = b.addOptions();
     // std.log.Level can't be serialized directly; pass as backing int.
     const log_level_int: ?u3 = if (log_level) |l| @intFromEnum(l) else null;
@@ -136,16 +163,12 @@ pub fn build(b: *std.Build) !void {
     // are registered at runtime by src/objc_classes.zig via zig-objc's
     // allocateClassPair. No clang-compiled translation unit is required.
 
-    exe_mod.addAnonymousImport("launchd_plist", .{
-        .root_source_file = b.path("res/com.bobrwm.bobrwm.plist"),
-    });
-    exe_mod.addAssemblyFile(b.path("src/info_plist.s"));
-
     exe_mod.linkFramework("ApplicationServices", .{});
     exe_mod.linkFramework("CoreGraphics", .{});
     exe_mod.linkFramework("Carbon", .{});
     exe_mod.linkFramework("AppKit", .{});
     exe_mod.linkFramework("CoreFoundation", .{});
+    exe_mod.linkFramework("ServiceManagement", .{});
 
     exe_mod.addSystemFrameworkPath(.{ .cwd_relative = sdk_frameworks });
     exe_mod.addSystemFrameworkPath(.{ .cwd_relative = sdk_private_frameworks });
@@ -153,11 +176,29 @@ pub fn build(b: *std.Build) !void {
     exe_mod.addLibraryPath(.{ .cwd_relative = sdk_lib });
 
     const exe = b.addExecutable(.{
-        .name = "bobrwm",
+        .name = server_exe_name,
         .root_module = exe_mod,
     });
 
-    b.installArtifact(exe);
+    installBundleArtifact(b, exe);
+
+    // The client links no frameworks at all: it only parses arguments and
+    // talks to the daemon over a unix socket. Loading AppKit and friends here
+    // would cost every `bobrwm query ...` invocation for nothing.
+    const cli_mod = b.createModule(.{
+        .root_source_file = b.path("src/cli.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    cli_mod.addImport("build_options", build_options.createModule());
+
+    const cli_exe = b.addExecutable(.{
+        .name = cli_exe_name,
+        .root_module = cli_mod,
+    });
+
+    installBundleArtifact(b, cli_exe);
 
     const swipe_config_mod = b.createModule(.{
         .root_source_file = b.path("src/config.zig"),
@@ -192,10 +233,54 @@ pub fn build(b: *std.Build) !void {
         .root_module = swipe_mod,
     });
 
-    b.installArtifact(swipe_exe);
+    installBundleArtifact(b, swipe_exe);
 
-    const run_cmd = b.addRunArtifact(exe);
-    run_cmd.step.dependOn(b.getInstallStep());
+    installBundleFile(b, bundleInfoPlist(b, app_version), "Contents", "Info.plist");
+    // Classic-era type/creator record. LaunchServices no longer needs it, but
+    // some tooling still probes for it and it costs eight bytes.
+    installBundleFile(b, b.addWriteFiles().add("PkgInfo", "APPL????"), "Contents", "PkgInfo");
+    installBundleFile(
+        b,
+        bundleLaunchAgentPlist(b),
+        "Contents/Library/LaunchAgents",
+        launchd_label ++ ".plist",
+    );
+
+    const sign_step: ?*std.Build.Step = if (codesign_identity) |identity| blk: {
+        const step = b.step("codesign", "Code-sign the app bundle");
+
+        // The app takes its identifier from CFBundleIdentifier.
+        const sign_app = devCodesign(b, identity);
+        sign_app.addArg(b.getInstallPath(.prefix, bundle_name));
+
+        // Nested code must be sealed before the enclosing bundle, otherwise
+        // the outer signature covers a helper that is about to change.
+        for ([_][2][]const u8{
+            .{ cli_exe_name, "com.bobrwm.cli" },
+            .{ "bobrwm-swipe", "com.bobrwm.swipe" },
+        }) |entry| {
+            const sign_helper = devCodesign(b, identity);
+            sign_helper.addArgs(&.{ "--identifier", entry[1] });
+            sign_helper.addArg(b.getInstallPath(.prefix, b.fmt("{s}/{s}", .{ bundle_macos, entry[0] })));
+            sign_helper.step.dependOn(b.getInstallStep());
+            sign_app.step.dependOn(&sign_helper.step);
+        }
+
+        step.dependOn(&sign_app.step);
+        b.default_step = step;
+        break :blk step;
+    } else null;
+
+    // Run the installed bundle rather than the cache artifacts: only the
+    // installed copy carries both the signature TCC matches against and the
+    // surrounding bundle that gives the process its identity. Exec'ing the
+    // binary directly instead of `open`ing the app keeps stdio on the
+    // terminal, which the log-driven debugging workflow depends on.
+    const run_cmd = b.addSystemCommand(&.{
+        b.getInstallPath(.prefix, bundle_macos ++ "/" ++ server_exe_name),
+    });
+    run_cmd.has_side_effects = true;
+    run_cmd.step.dependOn(sign_step orelse b.getInstallStep());
     if (b.args) |args| {
         run_cmd.addArgs(args);
     }
@@ -203,8 +288,11 @@ pub fn build(b: *std.Build) !void {
     const run_step = b.step("run", "Run bobrwm");
     run_step.dependOn(&run_cmd.step);
 
-    const run_swipe_cmd = b.addRunArtifact(swipe_exe);
-    run_swipe_cmd.step.dependOn(b.getInstallStep());
+    const run_swipe_cmd = b.addSystemCommand(&.{
+        b.getInstallPath(.prefix, bundle_macos ++ "/bobrwm-swipe"),
+    });
+    run_swipe_cmd.has_side_effects = true;
+    run_swipe_cmd.step.dependOn(sign_step orelse b.getInstallStep());
     if (b.args) |args| {
         run_swipe_cmd.addArgs(args);
     }
@@ -341,4 +429,110 @@ pub fn build(b: *std.Build) !void {
     test_step.dependOn(&run_workspace_tests.step);
     test_step.dependOn(&run_dim_tests.step);
     test_step.dependOn(&run_swipe_tests.step);
+}
+
+fn installBundleArtifact(b: *std.Build, artifact: *std.Build.Step.Compile) void {
+    b.getInstallStep().dependOn(&b.addInstallArtifact(artifact, .{
+        .dest_dir = .{ .override = .{ .custom = bundle_macos } },
+    }).step);
+}
+
+fn installBundleFile(
+    b: *std.Build,
+    source: std.Build.LazyPath,
+    sub_dir: []const u8,
+    dest_name: []const u8,
+) void {
+    const dir: std.Build.InstallDir = .{ .custom = b.fmt("{s}/{s}", .{ bundle_name, sub_dir }) };
+    b.getInstallStep().dependOn(&b.addInstallFileWithDir(source, dir, dest_name).step);
+}
+
+fn bundleInfoPlist(b: *std.Build, version: std.SemanticVersion) std.Build.LazyPath {
+    // Both version keys must be dotted integers. The pre-release and build
+    // metadata that AppVersion carries for `--version` would make
+    // LaunchServices reject them, so they get the numeric triple only.
+    const short_version = b.fmt("{d}.{d}.{d}", .{ version.major, version.minor, version.patch });
+
+    return b.addWriteFiles().add("Info.plist", b.fmt(
+        \\<?xml version="1.0" encoding="UTF-8"?>
+        \\<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+        \\  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+        \\<plist version="1.0">
+        \\<dict>
+        \\    <key>CFBundleDevelopmentRegion</key>
+        \\    <string>en</string>
+        \\    <key>CFBundleExecutable</key>
+        \\    <string>{[server]s}</string>
+        \\    <key>CFBundleIdentifier</key>
+        \\    <string>com.bobrwm.bobrwm</string>
+        \\    <key>CFBundleInfoDictionaryVersion</key>
+        \\    <string>6.0</string>
+        \\    <key>CFBundleName</key>
+        \\    <string>bobrwm</string>
+        \\    <key>CFBundlePackageType</key>
+        \\    <string>APPL</string>
+        \\    <key>CFBundleShortVersionString</key>
+        \\    <string>{[version]s}</string>
+        \\    <key>CFBundleVersion</key>
+        \\    <string>{[version]s}</string>
+        \\    <key>LSMinimumSystemVersion</key>
+        \\    <string>13.0</string>
+        \\    <key>LSUIElement</key>
+        \\    <true/>
+        \\</dict>
+        \\</plist>
+        \\
+    , .{ .server = server_exe_name, .version = short_version }));
+}
+
+/// LaunchAgent registered via SMAppService, which is what keeps launchd
+/// supervising the process so a crash gets restarted.
+fn bundleLaunchAgentPlist(b: *std.Build) std.Build.LazyPath {
+    return b.addWriteFiles().add(launchd_label ++ ".plist", std.fmt.comptimePrint(
+        \\<?xml version="1.0" encoding="UTF-8"?>
+        \\<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+        \\  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+        \\<plist version="1.0">
+        \\<dict>
+        \\    <key>Label</key>
+        \\    <string>{[label]s}</string>
+        \\    <!-- Bundle-relative, so registration survives the app moving.
+        \\         Only honoured for plists installed via SMAppService. -->
+        \\    <key>BundleProgram</key>
+        \\    <string>Contents/MacOS/{[server]s}</string>
+        \\    <key>RunAtLoad</key>
+        \\    <true/>
+        \\    <!-- Come back from a crash, but stay down after the user quits
+        \\         from the menu bar. -->
+        \\    <key>KeepAlive</key>
+        \\    <dict>
+        \\        <key>SuccessfulExit</key>
+        \\        <false/>
+        \\        <key>Crashed</key>
+        \\        <true/>
+        \\    </dict>
+        \\    <key>LimitLoadToSessionType</key>
+        \\    <string>Aqua</string>
+        \\    <key>ProcessType</key>
+        \\    <string>Interactive</string>
+        \\</dict>
+        \\</plist>
+        \\
+    , .{ .label = launchd_label, .server = server_exe_name }));
+}
+
+fn devCodesign(b: *std.Build, identity: []const u8) *std.Build.Step.Run {
+    const run = b.addSystemCommand(&.{
+        "codesign",
+        "--force",
+        "--sign",
+        identity,
+        // A self-signed identity has no timestamp authority, and the hardened
+        // runtime blocks lldb without get-task-allow. Both are release-only
+        // concerns.
+        "--timestamp=none",
+    });
+    // The argument list never changes, but its input does.
+    run.has_side_effects = true;
+    return run;
 }
