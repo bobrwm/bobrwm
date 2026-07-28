@@ -1320,6 +1320,17 @@ const HideCtx = struct {
         };
     }
 
+    /// Whether a stored frame already sits at its park position. Park
+    /// positions are only recorded for AX writes the app accepted, so this is
+    /// a reliable "already hidden" signal and the write can be skipped —
+    /// worth doing because the skipped write is synchronous IPC into an app
+    /// that may be slow or hung.
+    fn isParked(self: HideCtx, frame: window_mod.Window.Frame) bool {
+        const park = self.parkPosition(frame.width);
+        const tol = window_mod.Window.Frame.tolerance;
+        return @abs(frame.x - park.x) <= tol and @abs(frame.y - park.y) <= tol;
+    }
+
     /// Move a single window off-screen by POSITION only — never resizing it.
     /// Resizing on hide causes a visible flash and a reflow storm in
     /// size-sensitive apps; the parked size is irrelevant and retile restores
@@ -1329,7 +1340,10 @@ const HideCtx = struct {
     fn hide(self: HideCtx, pid: i32, wid: u32) void {
         self.captureFloatFrame(wid);
 
-        const width: f64 = if (g_store.get(wid)) |win| win.frame.width else 0;
+        const width: f64 = if (g_store.get(wid)) |win| blk: {
+            if (self.isParked(win.frame)) return;
+            break :blk win.frame.width;
+        } else 0;
         const park = self.parkPosition(width);
         const pos_x = park.x;
         const pos_y = park.y;
@@ -5167,9 +5181,7 @@ fn parkHiddenWorkspaceWindows() void {
             const visible_wid = g_tab_groups.resolveActive(wid);
             const win = g_store.get(visible_wid) orelse continue;
 
-            const park = ctx.parkPosition(win.frame.width);
-            const tol = window_mod.Window.Frame.tolerance;
-            if (@abs(win.frame.x - park.x) <= tol and @abs(win.frame.y - park.y) <= tol) continue;
+            if (ctx.isParked(win.frame)) continue;
 
             if (target_count == targets.len) {
                 log.warn("park: batch truncated at {d} windows", .{targets.len});
