@@ -1241,16 +1241,24 @@ fn displayIdForFrame(frame: window_mod.Window.Frame) u32 {
 /// assigned to the correct display+workspace instead of inheriting whichever
 /// display happened to be focused at creation time.
 fn inferDisplayIdForWindow(wid: u32) ?u32 {
+    const frame = liveWindowFrame(wid) orelse return null;
+    if (frame.width <= 0 or frame.height <= 0) return null;
+    return displayIdForFrame(frame);
+}
+
+/// Live WindowServer bounds for a window. Floating geometry is not kept in the
+/// store on user drags, so callers that need where a window actually *is* must
+/// ask WindowServer rather than trust `Window.frame`.
+fn liveWindowFrame(wid: u32) ?window_mod.Window.Frame {
     const sky = g_sky orelse return null;
     var rect: skylight.CGRect = undefined;
     if (sky.getWindowBounds(sky.mainConnectionID(), wid, &rect) != 0) return null;
-    if (rect.size.width <= 0 or rect.size.height <= 0) return null;
-    return displayIdForFrame(.{
+    return .{
         .x = rect.origin.x,
         .y = rect.origin.y,
         .width = rect.size.width,
         .height = rect.size.height,
-    });
+    };
 }
 
 /// Pick the bottom corner that does not border an adjacent monitor.
@@ -1345,6 +1353,10 @@ const HideCtx = struct {
     fn captureFloatFrame(self: HideCtx, wid: u32) void {
         var win = g_store.get(wid) orelse return;
         if (win.mode != .floating) return;
+        // A fullscreen window's bounds are Bobrwm's own placement, not a user
+        // one. Capturing them would overwrite the pre-fullscreen frame that
+        // toggling fullscreen off has to restore.
+        if (win.is_fullscreen) return;
 
         const sky = g_sky orelse return;
         var rect: skylight.CGRect = undefined;
@@ -2862,6 +2874,11 @@ fn removeFromTiling(workspace_id: u8, wid: u32) void {
     }
 }
 
+fn windowIsTiled(wid: u32) bool {
+    const win = g_store.get(wid) orelse return false;
+    return win.mode == .tiled;
+}
+
 fn insertIntoTiling(workspace_id: u8, wid: u32) void {
     const sp = tilingStatePtr(workspace_id);
     if (sp.* == null) sp.* = tiling.newState(g_config.layout);
@@ -3429,13 +3446,7 @@ fn handleEvent(ev: *const event_mod.Event) void {
         .hk_toggle_fullscreen => {
             const ws = g_workspaces.active();
             const focused = ws.focused_wid orelse return;
-            var win = g_store.get(focused) orelse return;
-            win.is_fullscreen = !win.is_fullscreen;
-            g_store.put(win) catch {};
-            log.info("fullscreen {s} wid={d}", .{
-                if (win.is_fullscreen) "on" else "off", focused,
-            });
-            retile();
+            toggleWindowFullscreen(focused);
         },
         .hk_move_workspace_to_display => {
             const arg: u8 = @intCast(ev.wid);
@@ -3496,6 +3507,48 @@ fn setWindowMode(wid: u32, target: window_mod.WindowMode) void {
     retile();
 }
 
+/// Toggle fullscreen for a window. A tiled window gets its non-fullscreen
+/// frame back from the BSP tree, but a floating window has no layout slot to
+/// fall back to: capture where it was on the way in and write it back on the
+/// way out, because retile only ever re-asserts the fullscreen frame.
+///
+/// `wid` is a tab-group leader when the window is grouped — the leader carries
+/// the fullscreen intent because it owns the workspace slot, but the pixels
+/// belong to the active tab.
+fn toggleWindowFullscreen(wid: u32) void {
+    var win = g_store.get(wid) orelse return;
+    win.is_fullscreen = !win.is_fullscreen;
+
+    const visible_wid = g_tab_groups.resolveActive(wid);
+    const restore_to: ?window_mod.Window.Frame = blk: {
+        if (win.mode != .floating) break :blk null;
+        if (!win.is_fullscreen) break :blk win.float_frame;
+
+        win.float_frame = liveWindowFrame(visible_wid) orelse win.frame;
+        break :blk null;
+    };
+
+    g_store.put(win) catch {};
+
+    if (restore_to) |target| {
+        if (g_store.get(visible_wid)) |visible| {
+            if (applyWindowFrame(visible.pid, visible_wid, visible.frame, target, false)) {
+                var updated = visible;
+                updated.frame = target;
+                g_store.put(updated) catch {};
+            }
+        }
+        applyFrameToTabGroup(wid, target);
+    }
+
+    log.info("fullscreen {s} wid={d} mode={s}", .{
+        if (win.is_fullscreen) "on" else "off",
+        wid,
+        @tagName(win.mode),
+    });
+    retile();
+}
+
 /// Center a floating window on its display and remember the centered position
 /// so a later hide/show restores it there. No-op for tiled or fullscreen
 /// windows, whose geometry is owned by the layout.
@@ -3506,13 +3559,7 @@ fn centerFloatingWindow(wid: u32) void {
     const display_slot = displayIndexById(win.display_id) orelse return;
     const display = g_displays[display_slot].visible;
 
-    var rect: skylight.CGRect = undefined;
-    const size: window_mod.Window.Frame = blk: {
-        const sky = g_sky orelse break :blk win.frame;
-        if (sky.getWindowBounds(sky.mainConnectionID(), wid, &rect) != 0) break :blk win.frame;
-        break :blk .{ .x = 0, .y = 0, .width = rect.size.width, .height = rect.size.height };
-    };
-
+    const size = liveWindowFrame(wid) orelse win.frame;
     const target = centeredFrame(size.width, size.height, display);
     _ = ax_mod.setWindowFrame(win.pid, wid, target.x, target.y, target.width, target.height);
     win.frame = target;
@@ -4391,6 +4438,7 @@ fn discoverBackgroundTabs(
     group_frame: window_mod.Window.Frame,
     workspace_id: u8,
     display_id: u32,
+    mode: window_mod.WindowMode,
 ) void {
     std.debug.assert(pid > 0);
     std.debug.assert(group_id != 0);
@@ -4440,7 +4488,7 @@ fn discoverBackgroundTabs(
             .title = null,
             .frame = f,
             .is_minimized = false,
-            .mode = .tiled,
+            .mode = mode,
             .workspace_id = workspace_id,
             .display_id = display_id,
         }) catch continue;
@@ -4539,20 +4587,23 @@ fn tryFormTabGroupOnCreate(pid: i32, new_wid: u32) bool {
             g_tab_groups.addMember(group_id, new_wid) catch break :outer;
             g_tab_groups.setActive(new_wid);
 
-            // Store the new window (suppressed — not in workspace/layout)
+            // Store the new window (suppressed — not in workspace/layout).
+            // Members inherit the leader's mode: a member that claims to be
+            // tiled under a floating leader gets inserted into the BSP tree
+            // the moment it inherits the group's workspace slot.
             g_store.put(.{
                 .wid = new_wid,
                 .pid = pid,
                 .title = null,
                 .frame = new_frame,
                 .is_minimized = false,
-                .mode = .tiled,
+                .mode = existing.mode,
                 .workspace_id = ws.id,
                 .display_id = existing.display_id,
             }) catch break :outer;
 
             // Also discover any other background tabs
-            discoverBackgroundTabs(pid, group_id, new_frame, ws.id, existing.display_id);
+            discoverBackgroundTabs(pid, group_id, new_frame, ws.id, existing.display_id, existing.mode);
 
             ws.recordFocus(existing_wid); // leader stays
             log.info("tryFormTabGroup: formed group leader={d} active={d} members={d}", .{
@@ -4631,7 +4682,7 @@ fn removeWindow(wid: u32) void {
                 if (!in_ws) {
                     log.info("removeWindow: restoring tab survivor wid={d} to workspace", .{solo_wid});
                     ws.addWindow(solo_wid) catch {};
-                    insertIntoTiling(win.workspace_id, solo_wid);
+                    if (windowIsTiled(solo_wid)) insertIntoTiling(win.workspace_id, solo_wid);
                 }
             }
         },
@@ -4677,11 +4728,14 @@ fn transferLeaderSlot(workspace_id: u8, old_leader: u32, new_leader: u32) void {
     if (sp.*) |*st| {
         replaced_in_layout = st.replaceWid(old_leader, new_leader);
     }
-    if (!replaced_in_layout) {
+    // A floating group never held a layout slot, so a missing replacement is
+    // expected there and inserting would tile a window the user floated.
+    const wants_layout = windowIsTiled(new_leader);
+    if (!replaced_in_layout and wants_layout) {
         insertIntoTiling(workspace_id, new_leader);
     }
 
-    if (replaced_in_workspace and replaced_in_layout) {
+    if (replaced_in_workspace and (replaced_in_layout or !wants_layout)) {
         log.info("leader succession: wid={d} slot handed to wid={d} ws={d}", .{
             old_leader, new_leader, workspace_id,
         });
@@ -5163,22 +5217,52 @@ fn centeredFrame(width: f64, height: f64, display: shim.bw_frame) window_mod.Win
 /// parked on hide, or drifted by the app — so it never fights a placement the
 /// user set while the workspace was visible. Centers as a fallback when no
 /// position was captured.
-fn restoreFloatingWindows(ws_id: u8, display_id: u32, display: shim.bw_frame) void {
+///
+/// Fullscreen floating windows are the exception: they own the whole content
+/// frame, so they are placed regardless of where they currently sit. `content`
+/// is the display frame inset by the outer gaps, matching what retileDisplay
+/// hands tiled fullscreen windows.
+fn restoreFloatingWindows(ws_id: u8, display_id: u32, display: shim.bw_frame, content: window_mod.Window.Frame) void {
     const ws = g_workspaces.get(ws_id) orelse return;
     const sky = g_sky orelse return;
     const conn = sky.mainConnectionID();
 
-    for (ws.windows.items) |wid| {
-        var win = g_store.get(wid) orelse continue;
-        if (win.mode != .floating or win.is_fullscreen) continue;
-        if (win.display_id != display_id) {
+    for (ws.windows.items) |leader_wid| {
+        const leader = g_store.get(leader_wid) orelse continue;
+        if (leader.mode != .floating) continue;
+        if (leader.display_id != display_id) {
             // Mirrors the tiled-path warning in retileDisplay: a floating
             // window whose stored display disagrees with its visible
             // workspace's display is never restored, so a parked one stays
             // parked with no other trace.
             log.warn("restore floating: skipping drifted window wid={d} display {d} (workspace {d} on display {d})", .{
-                wid, win.display_id, ws_id, display_id,
+                leader_wid, leader.display_id, ws_id, display_id,
             });
+            continue;
+        }
+
+        // The leader owns the workspace slot and the mode/fullscreen intent,
+        // but the window park moved off-screen is the group's active tab.
+        // Reading the leader's bounds here would leave a group whose active
+        // tab is not its leader parked forever.
+        const wid = g_tab_groups.resolveActive(leader_wid);
+        var win = g_store.get(wid) orelse continue;
+
+        // Mirrors the tiled fullscreen path in retileDisplay: gate on the
+        // stored frame so our own AX write echoing back as a resize does not
+        // re-enter here forever, but write two-pass because macOS clamps
+        // fullscreen sizes mid-flight.
+        if (leader.is_fullscreen) {
+            if (!framesEqual(win.frame, content)) {
+                if (applyWindowFrame(win.pid, wid, win.frame, content, true)) {
+                    win.frame = content;
+                    g_store.put(win) catch {};
+                }
+                log.debug("fullscreen floating wid={d} → x={d:.0} y={d:.0} w={d:.0} h={d:.0}", .{
+                    wid, content.x, content.y, content.width, content.height,
+                });
+            }
+            applyFrameToTabGroup(leader_wid, content);
             continue;
         }
 
@@ -5199,9 +5283,33 @@ fn restoreFloatingWindows(ws_id: u8, display_id: u32, display: shim.bw_frame) vo
         _ = ax_mod.setWindowFrame(win.pid, wid, target.x, target.y, target.width, target.height);
         win.frame = target;
         g_store.put(win) catch {};
+        applyFrameToTabGroup(leader_wid, target);
         log.debug("restore floating wid={d} → x={d:.0} y={d:.0} w={d:.0} h={d:.0}", .{
             wid, target.x, target.y, target.width, target.height,
         });
+    }
+}
+
+/// Push a leader's frame onto every member of its tab group. Members hold no
+/// workspace or layout slot, so nothing else ever places them, and a member
+/// left at a stale frame surfaces at the wrong geometry the moment the app
+/// makes it the active tab. Members already at the frame — normally whichever
+/// one the caller just wrote — are skipped. No-op when wid does not lead a
+/// group.
+fn applyFrameToTabGroup(leader_wid: u32, frame: window_mod.Window.Frame) void {
+    const g = g_tab_groups.groupOfMut(leader_wid) orelse return;
+    if (g.leader_wid != leader_wid) return;
+
+    g.canonical_frame = frame;
+    for (g.members.items) |member_wid| {
+        const member = g_store.get(member_wid) orelse continue;
+        if (framesEqual(member.frame, frame)) continue;
+
+        if (applyWindowFrame(member.pid, member_wid, member.frame, frame, false)) {
+            var updated = member;
+            updated.frame = frame;
+            g_store.put(updated) catch {};
+        }
     }
 }
 
@@ -5210,10 +5318,6 @@ fn retileDisplay(display_id: u32) void {
     const display_slot = displayIndexById(display_id) orelse return;
     const display = g_displays[display_slot].visible;
 
-    restoreFloatingWindows(ws_id, display_id, display);
-
-    const st = tilingStatePtr(ws_id).* orelse return;
-
     const outer = g_config.gaps.outer;
     const frame = window_mod.Window.Frame{
         .x = display.x + @as(f64, @floatFromInt(outer.left)),
@@ -5221,6 +5325,10 @@ fn retileDisplay(display_id: u32) void {
         .width = display.w - @as(f64, @floatFromInt(@as(u32, outer.left) + @as(u32, outer.right))),
         .height = display.h - @as(f64, @floatFromInt(@as(u32, outer.top) + @as(u32, outer.bottom))),
     };
+
+    restoreFloatingWindows(ws_id, display_id, display, frame);
+
+    const st = tilingStatePtr(ws_id).* orelse return;
 
     const window_count = st.windowCount();
     std.debug.assert(window_count > 0);
@@ -5279,24 +5387,7 @@ fn retileDisplay(display_id: u32) void {
             }
         }
 
-        // If this is a tab group leader, apply the same frame to all members
-        if (g_tab_groups.groupOfMut(entry.wid)) |g| {
-            if (g.leader_wid == entry.wid) {
-                g.canonical_frame = entry.frame;
-                for (g.members.items) |member_wid| {
-                    if (member_wid == entry.wid) continue;
-                    if (g_store.get(member_wid)) |member| {
-                        if (framesEqual(member.frame, entry.frame)) continue;
-
-                        if (applyWindowFrame(member.pid, member_wid, member.frame, entry.frame, false)) {
-                            var m_updated = member;
-                            m_updated.frame = entry.frame;
-                            g_store.put(m_updated) catch {};
-                        }
-                    }
-                }
-            }
-        }
+        applyFrameToTabGroup(entry.wid, target_frame);
     }
 }
 
@@ -5478,6 +5569,7 @@ fn reconcileFocusedWindow(pid: i32, focused_wid: u32) void {
     var matching_wid: ?u32 = null;
     var matching_ws_id: u8 = 0;
     var matching_display_id: u32 = 0;
+    var matching_mode: window_mod.WindowMode = .tiled;
     for (&g_workspaces.workspaces) |*ws| {
         for (ws.windows.items) |wid| {
             if (g_store.get(wid)) |win| {
@@ -5498,6 +5590,7 @@ fn reconcileFocusedWindow(pid: i32, focused_wid: u32) void {
                         matching_wid = wid;
                         matching_ws_id = ws.id;
                         matching_display_id = win.display_id;
+                        matching_mode = win.mode;
                         break;
                     }
                 }
@@ -5525,13 +5618,13 @@ fn reconcileFocusedWindow(pid: i32, focused_wid: u32) void {
             .title = null,
             .frame = focused_frame,
             .is_minimized = false,
-            .mode = .tiled,
+            .mode = matching_mode,
             .workspace_id = matching_ws_id,
             .display_id = matching_display_id,
         }) catch return;
 
         // Discover additional background tabs
-        discoverBackgroundTabs(pid, group_id, focused_frame, matching_ws_id, matching_display_id);
+        discoverBackgroundTabs(pid, group_id, focused_frame, matching_ws_id, matching_display_id, matching_mode);
 
         const leader = g_tab_groups.resolveLeader(focused_wid);
         _ = syncFocusStateForWindowId(focused_wid, .ax);
