@@ -5180,6 +5180,8 @@ fn parkHiddenWorkspaceWindows() void {
         }
     }
 
+    ax_mod.beginGeometryBatch();
+    defer ax_mod.endGeometryBatch();
     for (targets[0..target_count]) |target| {
         hideWindow(target.pid, target.wid);
     }
@@ -5330,6 +5332,9 @@ fn retileDisplay(display_id: u32) void {
     const ws_id = activeWorkspaceIdForDisplay(display_id);
     const display_slot = displayIndexById(display_id) orelse return;
     const display = g_displays[display_slot].visible;
+
+    ax_mod.beginGeometryBatch();
+    defer ax_mod.endGeometryBatch();
 
     const outer = g_config.gaps.outer;
     const frame = window_mod.Window.Frame{
@@ -5793,6 +5798,8 @@ fn switchWorkspace(target_id: u8) void {
 
     // Hide current workspace windows (only those on target_display)
     const hctx = HideCtx.init(target_display);
+    ax_mod.beginGeometryBatch();
+    defer ax_mod.endGeometryBatch();
     var hidden_count: usize = 0;
     for (old_ws.windows.items) |wid| {
         const visible_wid = g_tab_groups.resolveActive(wid);

@@ -291,6 +291,73 @@ pub fn enhancedUserInterface(app: c.AXUIElementRef, ax: *const AxStrings) bool {
     return c.CFEqual(value.?, @ptrCast(c.kCFBooleanTrue)) != 0;
 }
 
+/// The app whose AXEnhancedUserInterface is suspended for the open batch, if
+/// any. Only ever one: a batch suspends lazily, on the first write to a pid,
+/// and restores as soon as a write for a different pid arrives.
+var g_enhanced_ui_batch: ?struct { pid: i32, was_enabled: bool } = null;
+/// Batch nesting depth. Batches nest because the operations that want one
+/// compose: a workspace switch opens one around hide-then-retile, and retile
+/// opens its own for the callers that reach it directly.
+var g_geometry_batch_depth: u32 = 0;
+
+/// Suspend the per-write AXEnhancedUserInterface dance for a run of geometry
+/// writes. Every write otherwise reads the attribute and restores it — three
+/// IPC round-trips per window on top of the write itself, paid once per window
+/// during a workspace switch even though nothing between them can change it.
+/// Inside a batch that cost is paid once per run of writes to the same app.
+///
+/// Callers must pair this with `endGeometryBatch` under `defer`: an
+/// unterminated batch leaves an app's enhanced-user-interface flag off, which
+/// degrades it for real assistive clients.
+pub fn beginGeometryBatch() void {
+    g_geometry_batch_depth += 1;
+}
+
+pub fn endGeometryBatch() void {
+    std.debug.assert(g_geometry_batch_depth > 0);
+    g_geometry_batch_depth -= 1;
+    if (g_geometry_batch_depth > 0) return;
+
+    restoreEnhancedUiBatch();
+}
+
+/// Disable AXEnhancedUserInterface for the duration of one write, or arrange
+/// for the open batch to hold it disabled across writes to this app. Returns
+/// whether the caller owns the restore.
+fn suspendEnhancedUi(app: c.AXUIElementRef, pid: i32, ax: *const AxStrings) bool {
+    if (g_geometry_batch_depth == 0) {
+        const was_enabled = enhancedUserInterface(app, ax);
+        if (was_enabled) {
+            _ = c.AXUIElementSetAttributeValue(app, ax.enhanced_ui_attr, c.kCFBooleanFalse);
+        }
+        return was_enabled;
+    }
+
+    if (g_enhanced_ui_batch) |batch| {
+        if (batch.pid == pid) return false;
+        restoreEnhancedUiBatch();
+    }
+
+    const was_enabled = enhancedUserInterface(app, ax);
+    if (was_enabled) {
+        _ = c.AXUIElementSetAttributeValue(app, ax.enhanced_ui_attr, c.kCFBooleanFalse);
+    }
+    g_enhanced_ui_batch = .{ .pid = pid, .was_enabled = was_enabled };
+    return false;
+}
+
+fn restoreEnhancedUiBatch() void {
+    const batch = g_enhanced_ui_batch orelse return;
+    g_enhanced_ui_batch = null;
+    if (!batch.was_enabled) return;
+
+    const ax = strings() orelse return;
+    const app = c.AXUIElementCreateApplication(batch.pid) orelse return;
+    defer c.CFRelease(@ptrCast(app));
+
+    _ = c.AXUIElementSetAttributeValue(app, ax.enhanced_ui_attr, c.kCFBooleanTrue);
+}
+
 /// Move and resize a window using AX attributes.
 ///
 /// Uses a Size-Position-Size three-pass strategy because
@@ -322,14 +389,14 @@ pub fn setWindowFrame(pid: i32, wid: u32, x: f64, y: f64, w: f64, h: f64) bool {
     defer c.CFRelease(@ptrCast(size_value));
 
     if (cachedElement(pid, wid)) |element| {
-        const err = writeFrame(app, element, ax, position_value, size_value);
+        const err = writeFrame(app, pid, element, ax, position_value, size_value);
         if (err == c.kAXErrorSuccess) return true;
         if (!isStaleElementError(err)) return false;
         invalidateWindow(wid);
     }
 
     const element = resolveElement(pid, wid) orelse return false;
-    return writeFrame(app, element, ax, position_value, size_value) == c.kAXErrorSuccess;
+    return writeFrame(app, pid, element, ax, position_value, size_value) == c.kAXErrorSuccess;
 }
 
 /// Size-Position-Size against a resolved element. Returns kAXErrorSuccess only
@@ -338,16 +405,14 @@ pub fn setWindowFrame(pid: i32, wid: u32, x: f64, y: f64, w: f64, h: f64) bool {
 /// desynchronizing the store from on-screen reality.
 fn writeFrame(
     app: c.AXUIElementRef,
+    pid: i32,
     element: c.AXUIElementRef,
     ax: *const AxStrings,
     position_value: c.AXValueRef,
     size_value: c.AXValueRef,
 ) c.AXError {
-    const had_enhanced_ui = enhancedUserInterface(app, ax);
-    if (had_enhanced_ui) {
-        _ = c.AXUIElementSetAttributeValue(app, ax.enhanced_ui_attr, c.kCFBooleanFalse);
-    }
-    defer if (had_enhanced_ui) {
+    const owns_restore = suspendEnhancedUi(app, pid, ax);
+    defer if (owns_restore) {
         _ = c.AXUIElementSetAttributeValue(app, ax.enhanced_ui_attr, c.kCFBooleanTrue);
     };
 
@@ -377,27 +442,25 @@ pub fn setWindowPosition(pid: i32, wid: u32, x: f64, y: f64) bool {
     defer c.CFRelease(@ptrCast(position_value));
 
     if (cachedElement(pid, wid)) |element| {
-        const err = writePosition(app, element, ax, position_value);
+        const err = writePosition(app, pid, element, ax, position_value);
         if (err == c.kAXErrorSuccess) return true;
         if (!isStaleElementError(err)) return false;
         invalidateWindow(wid);
     }
 
     const element = resolveElement(pid, wid) orelse return false;
-    return writePosition(app, element, ax, position_value) == c.kAXErrorSuccess;
+    return writePosition(app, pid, element, ax, position_value) == c.kAXErrorSuccess;
 }
 
 fn writePosition(
     app: c.AXUIElementRef,
+    pid: i32,
     element: c.AXUIElementRef,
     ax: *const AxStrings,
     position_value: c.AXValueRef,
 ) c.AXError {
-    const had_enhanced_ui = enhancedUserInterface(app, ax);
-    if (had_enhanced_ui) {
-        _ = c.AXUIElementSetAttributeValue(app, ax.enhanced_ui_attr, c.kCFBooleanFalse);
-    }
-    defer if (had_enhanced_ui) {
+    const owns_restore = suspendEnhancedUi(app, pid, ax);
+    defer if (owns_restore) {
         _ = c.AXUIElementSetAttributeValue(app, ax.enhanced_ui_attr, c.kCFBooleanTrue);
     };
 
