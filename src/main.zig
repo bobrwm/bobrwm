@@ -5808,54 +5808,8 @@ fn switchWorkspace(target_id: u8) void {
         target_ws.windows.items.len,
     });
 
-    // Hide current workspace windows (only those on target_display)
-    const hctx = HideCtx.init(target_display);
     ax_mod.beginGeometryBatch();
     defer ax_mod.endGeometryBatch();
-    var hidden_count: usize = 0;
-    for (old_ws.windows.items) |wid| {
-        const visible_wid = g_tab_groups.resolveActive(wid);
-        const hide_wid = if (g_store.get(visible_wid) != null) visible_wid else wid;
-        if (g_store.get(hide_wid)) |win| {
-            if (win.display_id != target_display) continue;
-            if (g_tab_groups.groupOf(wid)) |group| {
-                log.debug("workspace switch hiding window workspace={d} layout_wid={d} hide_wid={d} group_leader={d} group_active={d} members={d}", .{
-                    current_id,
-                    wid,
-                    hide_wid,
-                    group.leader_wid,
-                    group.active_wid,
-                    group.members.items.len,
-                });
-            } else {
-                log.debug("workspace switch hiding window workspace={d} layout_wid={d} hide_wid={d} group=none", .{
-                    current_id,
-                    wid,
-                    hide_wid,
-                });
-            }
-            g_animator.finish(hide_wid);
-            hctx.hide(win.pid, hide_wid);
-            hidden_count += 1;
-        }
-    }
-    var hidden_pending_count: usize = 0;
-    var pending_it = g_pending_role_windows.iterator();
-    while (pending_it.next()) |entry| {
-        const pending = entry.value_ptr.*;
-        if (pending.workspace_id != current_id) continue;
-        if (pending.display_id != target_display) continue;
-        g_animator.finish(entry.key_ptr.*);
-        hctx.hide(pending.pid, entry.key_ptr.*);
-        hidden_pending_count += 1;
-    }
-    log.debug("workspace switch hid current windows current_workspace={d} target_workspace={d} display={d} hidden={d} hidden_pending={d}", .{
-        current_id,
-        target_id,
-        target_display,
-        hidden_count,
-        hidden_pending_count,
-    });
 
     // Activate target; old workspace keeps its display_id (just hidden).
     g_workspaces.setActiveForDisplaySlot(display_slot, target_id);
@@ -5886,6 +5840,71 @@ fn switchWorkspace(target_id: u8) void {
     updateStatusBar();
 
     focusWorkspaceWindow(target_ws);
+
+    parkOutgoingWorkspace(old_ws, target_id, target_display);
+}
+
+/// Park every window the outgoing workspace has on `display_id`.
+///
+/// Runs last, after the incoming workspace has been placed and focused, so the
+/// outgoing windows keep covering the display until there is something to
+/// replace them. Parking first exposes the desktop for as long as the outgoing
+/// AX writes take — every one a synchronous round-trip into an app — which is
+/// what the switch flash was.
+///
+/// Safe to defer: the workspace transition stays active until its settle
+/// deadline even once focus lands, so the synthetic AX move events these writes
+/// generate are still suppressed.
+fn parkOutgoingWorkspace(ws: *workspace_mod.Workspace, target_workspace_id: u8, display_id: u32) void {
+    const hctx = HideCtx.init(display_id);
+
+    var hidden_count: usize = 0;
+    for (ws.windows.items) |wid| {
+        const visible_wid = g_tab_groups.resolveActive(wid);
+        const hide_wid = if (g_store.get(visible_wid) != null) visible_wid else wid;
+        const win = g_store.get(hide_wid) orelse continue;
+        if (win.display_id != display_id) continue;
+
+        if (g_tab_groups.groupOf(wid)) |group| {
+            log.debug("workspace switch hiding window workspace={d} layout_wid={d} hide_wid={d} group_leader={d} group_active={d} members={d}", .{
+                ws.id,
+                wid,
+                hide_wid,
+                group.leader_wid,
+                group.active_wid,
+                group.members.items.len,
+            });
+        } else {
+            log.debug("workspace switch hiding window workspace={d} layout_wid={d} hide_wid={d} group=none", .{
+                ws.id,
+                wid,
+                hide_wid,
+            });
+        }
+
+        g_animator.finish(hide_wid);
+        hctx.hide(win.pid, hide_wid);
+        hidden_count += 1;
+    }
+
+    var hidden_pending_count: usize = 0;
+    var pending_it = g_pending_role_windows.iterator();
+    while (pending_it.next()) |entry| {
+        const pending = entry.value_ptr.*;
+        if (pending.workspace_id != ws.id) continue;
+        if (pending.display_id != display_id) continue;
+        g_animator.finish(entry.key_ptr.*);
+        hctx.hide(pending.pid, entry.key_ptr.*);
+        hidden_pending_count += 1;
+    }
+
+    log.debug("workspace switch hid current windows current_workspace={d} target_workspace={d} display={d} hidden={d} hidden_pending={d}", .{
+        ws.id,
+        target_workspace_id,
+        display_id,
+        hidden_count,
+        hidden_pending_count,
+    });
 }
 
 /// Focus the remembered (or first available) window on a workspace.
