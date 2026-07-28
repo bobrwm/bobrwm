@@ -459,6 +459,19 @@ fn focusedManagedLeaderWindow() ?window_mod.Window {
     return leader;
 }
 
+/// Window a hotkey that acts on "the focused window" should target. Asks AX
+/// first: the per-workspace cache only advances on focus notifications that
+/// survive the transition filters, so with two windows of one app it lags a
+/// click and the hotkey lands on the wrong window. Falls back to the cache
+/// when the frontmost app's focused window is unmanaged or sits on a workspace
+/// that is not currently visible, where retile would never place it.
+fn hotkeyTargetWindowId() ?u32 {
+    if (focusedManagedLeaderWindow()) |win| {
+        if (workspaceVisibleOnDisplay(win.workspace_id, win.display_id)) return win.wid;
+    }
+    return g_workspaces.active().focused_wid;
+}
+
 fn clearWorkspaceTransition() void {
     g_workspace_transition = .{
         .epoch = g_workspace_transition.epoch,
@@ -3444,8 +3457,7 @@ fn handleEvent(ev: *const event_mod.Event) void {
             log.info("split mode: {s}", .{@tagName(g_bsp_split_mode)});
         },
         .hk_toggle_fullscreen => {
-            const ws = g_workspaces.active();
-            const focused = ws.focused_wid orelse return;
+            const focused = hotkeyTargetWindowId() orelse return;
             toggleWindowFullscreen(focused);
         },
         .hk_move_workspace_to_display => {
@@ -3462,15 +3474,13 @@ fn handleEvent(ev: *const event_mod.Event) void {
             }
         },
         .hk_toggle_float => {
-            const ws = g_workspaces.active();
-            const focused = ws.focused_wid orelse return;
+            const focused = hotkeyTargetWindowId() orelse return;
             const win = g_store.get(focused) orelse return;
             const target: window_mod.WindowMode = if (win.mode != .tiled) .tiled else .floating;
             setWindowMode(focused, target);
         },
         .hk_center_float => {
-            const ws = g_workspaces.active();
-            const focused = ws.focused_wid orelse return;
+            const focused = hotkeyTargetWindowId() orelse return;
             centerFloatingWindow(focused);
         },
         .hk_reload_config => _ = reloadConfig(),
