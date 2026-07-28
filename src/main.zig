@@ -2578,6 +2578,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     defer _ = gpa.deinit();
     g_allocator = gpa.allocator();
     defer deinitAxStrings();
+    defer ax_mod.deinitElementCache();
 
     // -- Config --
     const config_path = config_mod.resolvePath(g_allocator, parseConfigPath(init.args)) catch null;
@@ -2971,6 +2972,7 @@ fn replaceManagedWindowId(old_wid: u32, new_wid: u32, frame: window_mod.Window.F
         return false;
     };
     g_store.remove(old_wid);
+    ax_mod.invalidateWindow(old_wid);
     log.info("window id replaced old={d} new={d} pid={d} workspace={d} display={d}", .{
         old_wid,
         new_wid,
@@ -4641,6 +4643,7 @@ fn tryFormTabGroupOnCreate(pid: i32, new_wid: u32) bool {
 
 fn removeWindow(wid: u32) void {
     g_animator.cancel(wid);
+    ax_mod.invalidateWindow(wid);
     untrackPendingRoleWindow(wid);
     untrackDeferredWindowCandidate(wid);
     if (g_drag_preview.source_wid == wid or g_drag_preview.target_wid == wid) {

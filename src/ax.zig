@@ -181,6 +181,80 @@ pub fn findWindow(pid: i32, target_wid: u32) ?c.AXUIElementRef {
     return null;
 }
 
+/// Direct-mapped cache of resolved AX window elements, keyed by window id.
+/// findWindow costs one AXWindows copy plus an _AXUIElementGetWindow per
+/// element in the app's list — for a workspace switch, which moves every
+/// window of both workspaces, that dominates the whole operation and is
+/// visible as the desktop showing between hide and show. Elements stay valid
+/// for a window's lifetime, so resolve each one once.
+///
+/// Main thread only: every caller runs on the main queue, either during event
+/// drain or from the animator's dispatch timer.
+///
+/// A slot collision or a stale entry costs one re-resolve, never a write to
+/// the wrong window: entries are matched on both pid and wid, and geometry
+/// writes that a cached element rejects as stale re-resolve and retry.
+const element_cache_slots = 128;
+
+const CachedElement = struct {
+    pid: i32,
+    wid: u32,
+    element: c.AXUIElementRef,
+};
+
+var g_element_cache: [element_cache_slots]?CachedElement = @splat(null);
+
+fn elementCacheSlot(wid: u32) usize {
+    return wid % element_cache_slots;
+}
+
+/// Cached element for (pid, wid), or null on a miss. Borrowed — the cache owns
+/// the reference, callers must not release it.
+fn cachedElement(pid: i32, wid: u32) ?c.AXUIElementRef {
+    const entry = g_element_cache[elementCacheSlot(wid)] orelse return null;
+    if (entry.pid != pid or entry.wid != wid) return null;
+    return entry.element;
+}
+
+/// Resolve (pid, wid) through findWindow and cache it, evicting whatever
+/// shared its slot. Borrowed — the cache owns the reference.
+fn resolveElement(pid: i32, wid: u32) ?c.AXUIElementRef {
+    const element = findWindow(pid, wid) orelse return null;
+
+    const slot = elementCacheSlot(wid);
+    if (g_element_cache[slot]) |evicted| c.CFRelease(@ptrCast(evicted.element));
+    g_element_cache[slot] = .{ .pid = pid, .wid = wid, .element = element };
+    return element;
+}
+
+/// Drop a window's cached element. WindowServer recycles window ids, so
+/// callers must invalidate when a window is destroyed or its id replaced
+/// rather than leave the retry path to discover it.
+pub fn invalidateWindow(wid: u32) void {
+    const slot = elementCacheSlot(wid);
+    const entry = g_element_cache[slot] orelse return;
+    if (entry.wid != wid) return;
+
+    c.CFRelease(@ptrCast(entry.element));
+    g_element_cache[slot] = null;
+}
+
+pub fn deinitElementCache() void {
+    for (&g_element_cache) |*slot| {
+        const entry = slot.* orelse continue;
+        c.CFRelease(@ptrCast(entry.element));
+        slot.* = null;
+    }
+}
+
+/// Whether a geometry write failed because the cached element no longer refers
+/// to a live window — the window was destroyed and its id recycled, or the app
+/// replaced its AX element. Any other error is the app refusing the write, and
+/// re-resolving would not change the outcome.
+fn isStaleElementError(err: c.AXError) bool {
+    return err == c.kAXErrorInvalidUIElement or err == c.kAXErrorCannotComplete;
+}
+
 /// Resolve a window id via the app's AXFocusedWindow attribute. Open/save
 /// panels are remote-hosted by openAndSavePanelService and can be the app's
 /// focused window without ever appearing in its AXWindows array, so the list
@@ -233,23 +307,11 @@ pub fn setWindowFrame(pid: i32, wid: u32, x: f64, y: f64, w: f64, h: f64) bool {
     std.debug.assert(wid > 0);
 
     if (w <= 0 or h <= 0) return false;
-    const win = findWindow(pid, wid) orelse return false;
-    defer c.CFRelease(@ptrCast(win));
 
     const ax = strings() orelse return false;
-    const size_attr = ax.size_attr;
-    const position_attr = ax.position_attr;
 
     const app = c.AXUIElementCreateApplication(pid) orelse return false;
     defer c.CFRelease(@ptrCast(app));
-
-    const had_enhanced_ui = enhancedUserInterface(app, ax);
-    if (had_enhanced_ui) {
-        _ = c.AXUIElementSetAttributeValue(app, ax.enhanced_ui_attr, c.kCFBooleanFalse);
-    }
-    defer if (had_enhanced_ui) {
-        _ = c.AXUIElementSetAttributeValue(app, ax.enhanced_ui_attr, c.kCFBooleanTrue);
-    };
 
     const position: c.CGPoint = .{ .x = x, .y = y };
     const position_value = c.AXValueCreate(c.kAXValueTypeCGPoint, &position) orelse return false;
@@ -259,14 +321,42 @@ pub fn setWindowFrame(pid: i32, wid: u32, x: f64, y: f64, w: f64, h: f64) bool {
     const size_value = c.AXValueCreate(c.kAXValueTypeCGSize, &size) orelse return false;
     defer c.CFRelease(@ptrCast(size_value));
 
-    _ = c.AXUIElementSetAttributeValue(win, size_attr, @ptrCast(size_value));
-    const position_err = c.AXUIElementSetAttributeValue(win, position_attr, @ptrCast(position_value));
-    const size_err = c.AXUIElementSetAttributeValue(win, size_attr, @ptrCast(size_value));
+    if (cachedElement(pid, wid)) |element| {
+        const err = writeFrame(app, element, ax, position_value, size_value);
+        if (err == c.kAXErrorSuccess) return true;
+        if (!isStaleElementError(err)) return false;
+        invalidateWindow(wid);
+    }
 
-    // Success means the whole frame was accepted. Reporting only the final
-    // size write would let callers record a target frame whose position write
-    // was rejected, desynchronizing the store from on-screen reality.
-    return position_err == c.kAXErrorSuccess and size_err == c.kAXErrorSuccess;
+    const element = resolveElement(pid, wid) orelse return false;
+    return writeFrame(app, element, ax, position_value, size_value) == c.kAXErrorSuccess;
+}
+
+/// Size-Position-Size against a resolved element. Returns kAXErrorSuccess only
+/// when the whole frame was accepted: reporting just the final size write
+/// would let callers record a target frame whose position write was rejected,
+/// desynchronizing the store from on-screen reality.
+fn writeFrame(
+    app: c.AXUIElementRef,
+    element: c.AXUIElementRef,
+    ax: *const AxStrings,
+    position_value: c.AXValueRef,
+    size_value: c.AXValueRef,
+) c.AXError {
+    const had_enhanced_ui = enhancedUserInterface(app, ax);
+    if (had_enhanced_ui) {
+        _ = c.AXUIElementSetAttributeValue(app, ax.enhanced_ui_attr, c.kCFBooleanFalse);
+    }
+    defer if (had_enhanced_ui) {
+        _ = c.AXUIElementSetAttributeValue(app, ax.enhanced_ui_attr, c.kCFBooleanTrue);
+    };
+
+    _ = c.AXUIElementSetAttributeValue(element, ax.size_attr, @ptrCast(size_value));
+    const position_err = c.AXUIElementSetAttributeValue(element, ax.position_attr, @ptrCast(position_value));
+    const size_err = c.AXUIElementSetAttributeValue(element, ax.size_attr, @ptrCast(size_value));
+
+    if (position_err != c.kAXErrorSuccess) return position_err;
+    return size_err;
 }
 
 /// Move a window without touching its size. Off-screen parking and pure-move
@@ -277,14 +367,32 @@ pub fn setWindowPosition(pid: i32, wid: u32, x: f64, y: f64) bool {
     std.debug.assert(pid > 0);
     std.debug.assert(wid > 0);
 
-    const win = findWindow(pid, wid) orelse return false;
-    defer c.CFRelease(@ptrCast(win));
-
     const ax = strings() orelse return false;
 
     const app = c.AXUIElementCreateApplication(pid) orelse return false;
     defer c.CFRelease(@ptrCast(app));
 
+    const position: c.CGPoint = .{ .x = x, .y = y };
+    const position_value = c.AXValueCreate(c.kAXValueTypeCGPoint, &position) orelse return false;
+    defer c.CFRelease(@ptrCast(position_value));
+
+    if (cachedElement(pid, wid)) |element| {
+        const err = writePosition(app, element, ax, position_value);
+        if (err == c.kAXErrorSuccess) return true;
+        if (!isStaleElementError(err)) return false;
+        invalidateWindow(wid);
+    }
+
+    const element = resolveElement(pid, wid) orelse return false;
+    return writePosition(app, element, ax, position_value) == c.kAXErrorSuccess;
+}
+
+fn writePosition(
+    app: c.AXUIElementRef,
+    element: c.AXUIElementRef,
+    ax: *const AxStrings,
+    position_value: c.AXValueRef,
+) c.AXError {
     const had_enhanced_ui = enhancedUserInterface(app, ax);
     if (had_enhanced_ui) {
         _ = c.AXUIElementSetAttributeValue(app, ax.enhanced_ui_attr, c.kCFBooleanFalse);
@@ -293,12 +401,7 @@ pub fn setWindowPosition(pid: i32, wid: u32, x: f64, y: f64) bool {
         _ = c.AXUIElementSetAttributeValue(app, ax.enhanced_ui_attr, c.kCFBooleanTrue);
     };
 
-    const position: c.CGPoint = .{ .x = x, .y = y };
-    const position_value = c.AXValueCreate(c.kAXValueTypeCGPoint, &position) orelse return false;
-    defer c.CFRelease(@ptrCast(position_value));
-
-    const err = c.AXUIElementSetAttributeValue(win, ax.position_attr, @ptrCast(position_value));
-    return err == c.kAXErrorSuccess;
+    return c.AXUIElementSetAttributeValue(element, ax.position_attr, @ptrCast(position_value));
 }
 
 /// Retained AX element plus the state needed to undo animationBegin.
