@@ -108,9 +108,7 @@ pub fn updateWorkspaceMenu(
         std.debug.assert(workspace.id > 0 and workspace.id <= workspace_mod.max_workspaces);
 
         const name_storage = &g_name_storage[index];
-        const length = @min(workspace.name.len, name_storage.len - 1);
-        @memcpy(name_storage[0..length], workspace.name[0..length]);
-        name_storage[length] = 0;
+        _ = encodeWorkspaceName(workspace.name, name_storage);
 
         const keybind = config.findKeybind(.focus_workspace, workspace.id);
         rows[index] = .{
@@ -168,6 +166,30 @@ fn shortcutPtr(keybind: ?config_mod.Keybind, storage: []u8) ?[*:0]const u8 {
     const bind = keybind orelse return null;
     const rendered = bind.displayForm(storage) orelse return null;
     return rendered.ptr;
+}
+
+/// Copy a workspace name into the sentinel-terminated representation consumed
+/// by the menu bar library.
+fn encodeWorkspaceName(name: []const u8, storage: []u8) [:0]const u8 {
+    std.debug.assert(storage.len > 0);
+
+    const length = @min(name.len, storage.len - 1);
+    @memcpy(storage[0..length], name[0..length]);
+    storage[length] = 0;
+    return storage[0..length :0];
+}
+
+test "workspace ABI name truncation preserves valid UTF-8" {
+    var name: [66]u8 = undefined;
+    @memset(name[0..62], 'a');
+    @memcpy(name[62..], "😀");
+
+    var storage: [max_name_bytes]u8 = undefined;
+    const encoded = encodeWorkspaceName(&name, &storage);
+
+    try std.testing.expect(std.unicode.utf8ValidateSlice(encoded));
+    try std.testing.expectEqual(@as(usize, 62), encoded.len);
+    try std.testing.expectEqualSlices(u8, name[0..62], encoded);
 }
 
 // Menu callbacks. These run on the main thread while the menu dismisses, so
