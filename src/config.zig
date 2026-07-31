@@ -269,6 +269,18 @@ test "findKeybind prefers config entries over defaults" {
     try std.testing.expectEqualStrings("⌥1", workspace_one.displayForm(&storage).?);
 }
 
+test "findKeybind omits a default whose trigger was reassigned" {
+    const overrides = [_]Keybind{
+        .{ .key = "1", .mods = .{ .alt = true }, .action = .toggle_float },
+    };
+    const config: Config = .{ .keybinds = &overrides };
+
+    try std.testing.expectEqual(
+        @as(?Keybind, null),
+        config.findKeybind(.focus_workspace, 1),
+    );
+}
+
 pub const WorkspaceAssignment = struct {
     app_id: []const u8,
     workspace: u8,
