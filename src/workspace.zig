@@ -5,6 +5,24 @@ pub const WorkspaceId = u8;
 pub const max_workspaces = 10;
 pub const max_displays = 8;
 
+pub const FollowFocusAction = enum {
+    ignore,
+    defer_until_settled,
+    switch_workspace,
+};
+
+/// Decide how a focus event should affect workspace visibility.
+///
+/// A transition remains active during its settle tail, after target focus has
+/// already been accepted. Hidden-window AX events in that interval can still
+/// be synthetic fallout from parking the old workspace, so they must wait for
+/// frontmost-app validation rather than immediately reversing the transition.
+pub fn followFocusAction(workspace_visible: bool, transition_active: bool) FollowFocusAction {
+    if (workspace_visible) return .ignore;
+    if (transition_active) return .defer_until_settled;
+    return .switch_workspace;
+}
+
 /// Bounded so focus bookkeeping never allocates. Entries beyond the cap are
 /// the least recently focused windows; losing them only degrades the
 /// focus-after-close fallback to the first-window heuristic.
@@ -309,4 +327,12 @@ test "recordFocus drops oldest entry when history is full" {
         @as(Window.WindowId, max_focus_history + 1),
         ws.focus_history[max_focus_history - 1],
     );
+}
+
+test "follow focus defers hidden windows through the transition settle tail" {
+    const t = std.testing;
+
+    try t.expectEqual(FollowFocusAction.ignore, followFocusAction(true, true));
+    try t.expectEqual(FollowFocusAction.defer_until_settled, followFocusAction(false, true));
+    try t.expectEqual(FollowFocusAction.switch_workspace, followFocusAction(false, false));
 }
