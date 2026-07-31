@@ -305,10 +305,8 @@ fn appTrackWindow(pid: i32, wid: u32) bool {
     const index = appObserverIndex(pid) orelse return false;
     var entry = &g_app_observers[index];
 
-    var i: u32 = 0;
-    while (i < entry.known_window_count) : (i += 1) {
-        if (entry.known_windows[i] == wid) return false;
-    }
+    const known_windows = entry.known_windows[0..entry.known_window_count];
+    if (std.mem.findScalar(u32, known_windows, wid) != null) return false;
 
     if (entry.known_window_count < max_known_windows_per_app) {
         entry.known_windows[entry.known_window_count] = wid;
@@ -334,13 +332,10 @@ fn appUntrackWindow(pid: i32, wid: u32) void {
     const index = appObserverIndex(pid) orelse return;
     var entry = &g_app_observers[index];
 
-    var i: u32 = 0;
-    while (i < entry.known_window_count) : (i += 1) {
-        if (entry.known_windows[i] != wid) continue;
-        entry.known_windows[i] = entry.known_windows[entry.known_window_count - 1];
-        entry.known_window_count -= 1;
-        return;
-    }
+    const known_windows = entry.known_windows[0..entry.known_window_count];
+    const window_index = std.mem.findScalar(u32, known_windows, wid) orelse return;
+    entry.known_windows[window_index] = entry.known_windows[entry.known_window_count - 1];
+    entry.known_window_count -= 1;
 }
 
 fn observeRetryIndex(pid: i32) ?u32 {
