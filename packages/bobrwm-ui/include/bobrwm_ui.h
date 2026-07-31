@@ -23,16 +23,27 @@ typedef struct {
 
 typedef struct {
   const char *name;
+  const char *shortcut;
+  uint8_t id;
+} BWWorkspace;
+
+typedef struct {
   uint32_t window_count;
   uint8_t id;
+  bool is_active;
   bool is_focused;
-} BWWorkspaceRow;
+} BWWorkspaceState;
+
+typedef struct {
+  const char *previous_workspace;
+  const char *next_workspace;
+} BWActionShortcuts;
 
 void bw_menubar_init(BWMenuBarCallbacks callbacks);
 void bw_menubar_deinit(void);
-void bw_menubar_set_workspaces(const BWWorkspaceRow *rows, size_t count);
-void bw_menubar_set_active_workspaces(const uint8_t *workspace_ids,
-                                      size_t count);
-void bw_menubar_set_title(const char *title);
+void bw_menubar_set_workspaces(const BWWorkspace *workspaces, size_t count,
+                               BWActionShortcuts shortcuts);
+void bw_menubar_set_state(const BWWorkspaceState *states, size_t count);
+void bw_menubar_set_message(const char *message);
 
 #endif // BOBRWM_UI_H

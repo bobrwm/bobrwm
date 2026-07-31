@@ -87,7 +87,7 @@ const foo = Type{ .field = value };     // Avoid
 
 ## ObjC Interop
 
-Use zig-objc (`@import("objc")`) for all Objective-C runtime calls from Zig. There is no clang-compiled shim: custom ObjC classes (`BWStatusBarDelegate`, `BWObserver`, `BWLaunchGate`) are defined at runtime in `src/objc_classes.zig` via `allocateClassPair` / `addMethod`. New BW* classes go there.
+Use zig-objc (`@import("objc")`) for all Objective-C runtime calls from Zig. There is no clang-compiled shim: custom ObjC classes (`BWObserver`, `BWLaunchGate`) are defined at runtime in `src/objc_classes.zig` via `allocateClassPair` / `addMethod`. New BW* classes go there.
 
 Message sends, class lookups, and NSApp lifecycle use zig-objc. AX, CoreFoundation, CoreGraphics, dispatch, and WindowServer/SkyLight interop live in Zig through translated C declarations plus hand-written declarations in `src/c/cg_extra.zig` when Aro cannot translate an API cleanly.
 
@@ -100,6 +100,22 @@ _ = app.msgSend(bool, "setActivationPolicy:", .{@as(i64, 1)});
 ```
 
 **Architecture:** The main thread runs `[NSApp run]` via zig-objc and owns Bobrwm state mutation, layout, workspace state, IPC, status bar, and event draining. AX observer callbacks run on a dedicated background observer thread so slow or hung app AX servers cannot stall the main CFRunLoop. Background AX callbacks must only enqueue events or update observer bookkeeping protected by the AX lock; Bobrwm state mutations happen on the main thread during event drain.
+
+## Menu Bar UI (Swift)
+
+The status item and its menu live in `packages/bobrwm-ui/`, built by `build.zig` with `swiftc` from the Command Line Tools into `Contents/Frameworks/libbobrwm-ui.dylib`. No Xcode project, and the Swift runtime is OS-provided (`/usr/lib/swift`), so nothing ships alongside the dylib. Zig keeps `[NSApp run]` and the main-thread event drain; SwiftUI only renders.
+
+**ABI:** `packages/bobrwm-ui/include/bobrwm_ui.h` is the single source of truth. Swift imports it through `module.modulemap` so its structs get guaranteed C layout; `src/statusbar.zig` mirrors it with `extern struct`. Changing a declaration means changing both sides. Strings are borrowed for the duration of the call, so `statusbar.zig` keeps names and shortcuts in static storage — a whole row array crosses at once and every pointer in it must be live simultaneously.
+
+**Split:** `bw_menubar_set_workspaces` rebuilds the menu and is for identity (names, keybinds). `bw_menubar_set_state` updates counts and active/focused in place and is safe while the menu is open. Focus moves while the menu is open, so never route it through the rebuild path.
+
+**Preview:** `zig build ui-preview` renders the real views to `zig-out/ui-preview/menu-{light,dark}.png`. `MenuRow.swift` has no dependency on the C ABI module, so the harness in `packages/bobrwm-ui/preview/` links it standalone. Use it to iterate on the design instead of rebuilding bobrwm and asking the operator to screenshot, which disrupts their running window manager. It cannot reproduce AppKit's menu vibrancy or real menu bar width — confirm those with `zig build run`.
+
+**Gotchas:**
+- `NSHostingView` applies model changes on the next runloop turn. Measuring `fittingSize` inline after mutating an `ObservableObject` reports the *previous* content's width and SwiftUI renders truncated. Defer the measure, and keep `.fixedSize` on content that must never compress.
+- Do not constrain the status item's hosting view to its button: the button's width comes from `statusItem.length`, which is set from the view's fitting size, so pinning the edges feeds that measurement back into itself.
+- `NSMenuItem` with a custom `view` does not fire its action and gets no highlight drawing. Both are hand-rolled in `MenuRowHostView` (mouse-up → `cancelTracking` + `performActionForItem`) and via `NSMenuDelegate.menu(_:willHighlight:)`, which unlike mouse tracking also covers keyboard navigation.
+- `.primary`/`.secondary` are NSColor-backed and resolve against the drawing appearance, not SwiftUI's `colorScheme`. Offscreen renders must set an `NSAppearance` explicitly.
 
 ## Window Management Invariants
 
@@ -136,6 +152,8 @@ zig build -Doptimize=ReleaseFast
 ```
 
 When behavior depends on macOS event ordering, also perform a manual repro with the relevant app class, for example Ghostty native tabs or Discord/Electron close-to-background behavior.
+
+For menu bar UI changes, also run `zig build ui-preview` and look at the rendered PNGs before reporting the change as done.
 
 ## Safety Conventions
 

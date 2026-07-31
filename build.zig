@@ -329,6 +329,30 @@ pub fn build(b: *std.Build) !void {
     const run_step = b.step("run", "Run bobrwm");
     run_step.dependOn(&run_cmd.step);
 
+    // Renders the menu bar views to PNGs so the UI can be iterated on without
+    // rebuilding bobrwm and interrupting a running window manager. MenuRow.swift
+    // has no dependency on the C ABI module, so it links standalone.
+    const preview_build = b.addSystemCommand(&.{
+        "swiftc",
+        "-swift-version",
+        "5",
+        "-target",
+        "arm64-apple-macos13.0",
+        "-sdk",
+        sdk_root,
+    });
+    const preview_exe = preview_build.addPrefixedOutputFileArg("-o", "bobrwm-ui-preview");
+    preview_build.addFileArg(b.path("packages/bobrwm-ui/src/MenuRow.swift"));
+    preview_build.addFileArg(b.path("packages/bobrwm-ui/preview/main.swift"));
+
+    const preview_run = std.Build.Step.Run.create(b, "render ui preview");
+    preview_run.has_side_effects = true;
+    preview_run.addFileArg(preview_exe);
+    preview_run.addArg(b.pathFromRoot("zig-out/ui-preview"));
+
+    const preview_step = b.step("ui-preview", "Render the menu bar UI to PNGs");
+    preview_step.dependOn(&preview_run.step);
+
     const run_swipe_cmd = b.addSystemCommand(&.{
         b.getInstallPath(.prefix, bundle_macos ++ "/bobrwm-swipe"),
     });
