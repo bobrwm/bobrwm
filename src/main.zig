@@ -3293,6 +3293,7 @@ fn handleEvent(ev: *const event_mod.Event) void {
             log.info("app terminated pid={}", .{ev.pid});
             untrackAppLaunchRetry(ev.pid);
             untrackFocusRetry(ev.pid);
+            ax_mod.invalidateApp(ev.pid);
             ax_observer.unobserveApp(ev.pid);
             removeAppWindows(ev.pid);
             retile();
