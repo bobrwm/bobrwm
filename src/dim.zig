@@ -121,10 +121,7 @@ pub fn resetAll() void {
 }
 
 fn contains(set: []const u32, wid: u32) bool {
-    for (set) |w| {
-        if (w == wid) return true;
-    }
-    return false;
+    return std.mem.findScalar(u32, set, wid) != null;
 }
 
 fn isDimTarget(entries: []const Entry, focused: []const u32, wid: u32) bool {

@@ -2208,10 +2208,7 @@ fn bw_discover_windows(out: []shim.bw_window_info) usize {
 }
 
 fn pidInCache(pid: i32, cache: []const i32, count: usize) bool {
-    for (cache[0..count]) |cached| {
-        if (cached == pid) return true;
-    }
-    return false;
+    return std.mem.findScalar(i32, cache[0..count], pid) != null;
 }
 
 fn wakerPerform(info: ?*anyopaque) callconv(.c) void {
@@ -4188,13 +4185,11 @@ fn discoverWindows() void {
     for (slice) |info| {
         std.debug.assert(info.pid > 0);
 
-        var already_observed = false;
-        for (observed_pids[0..observed_pid_count]) |observed_pid| {
-            if (observed_pid == info.pid) {
-                already_observed = true;
-                break;
-            }
-        }
+        const already_observed = std.mem.findScalar(
+            i32,
+            observed_pids[0..observed_pid_count],
+            info.pid,
+        ) != null;
 
         // Observe the owning app even if this specific window is not yet
         // manageable (for example AX role/subrole is still pending).
@@ -6586,14 +6581,7 @@ fn ipcQueryApps(fd: posix.socket_t, format: ipc.IpcCommand.QueryFormat) void {
         for (ws.windows.items) |wid| {
             if (g_store.get(wid)) |win| {
                 // Deduplicate by PID
-                var already = false;
-                for (seen_pids[0..seen_count]) |p| {
-                    if (p == win.pid) {
-                        already = true;
-                        break;
-                    }
-                }
-                if (already) continue;
+                if (std.mem.findScalar(i32, seen_pids[0..seen_count], win.pid) != null) continue;
                 if (seen_count >= seen_pids.len) break;
                 seen_pids[seen_count] = win.pid;
                 seen_count += 1;
