@@ -15,6 +15,9 @@ const bundle_macos = bundle_contents ++ "/MacOS";
 const server_exe_name = "Bobrwm";
 const cli_exe_name = "bobrwm-cli";
 
+// SwiftUI menu bar, loaded from Contents/Frameworks via @rpath.
+const ui_dylib_name = "libbobrwm-ui.dylib";
+
 // launchd requires Label to match the plist's basename. src/loginitem.zig
 // registers this same name through SMAppService.
 const launchd_label = "com.bobrwm.bobrwm";
@@ -163,6 +166,41 @@ pub fn build(b: *std.Build) !void {
     // are registered at runtime by src/objc_classes.zig via zig-objc's
     // allocateClassPair. No clang-compiled translation unit is required.
 
+    // SwiftUI menu bar. `swiftc` ships with the Command Line Tools, so no
+    // Xcode project is involved, and the Swift runtime is part of the OS
+    // (/usr/lib/swift) — nothing has to ship next to the dylib.
+    const swift_ui = b.addSystemCommand(&.{
+        "swiftc",
+        // Swift 6 strict concurrency rejects the process-wide controller the
+        // C entry points share. Every call already arrives on the main thread,
+        // so the checking would buy nothing here.
+        "-swift-version",
+        "5",
+        "-target",
+        "arm64-apple-macos13.0",
+        "-emit-library",
+        "-module-name",
+        "BobrwmUI",
+        "-Xlinker",
+        "-install_name",
+        "-Xlinker",
+        "@rpath/" ++ ui_dylib_name,
+        "-sdk",
+        sdk_root,
+    });
+    if (optimize != .Debug) swift_ui.addArg("-O");
+    // Carries both bobrwm_ui.h and the modulemap that makes it importable.
+    swift_ui.addPrefixedDirectoryArg("-I", b.path("packages/bobrwm-ui/include"));
+    const ui_dylib = swift_ui.addPrefixedOutputFileArg("-o", ui_dylib_name);
+    swift_ui.addFileArg(b.path("packages/bobrwm-ui/src/MenuBar.swift"));
+    swift_ui.addFileArg(b.path("packages/bobrwm-ui/src/MenuRow.swift"));
+
+    exe_mod.addLibraryPath(ui_dylib.dirname());
+    exe_mod.linkSystemLibrary("bobrwm-ui", .{});
+    // addRPath would resolve this against the build cwd; the loader needs the
+    // @executable_path token emitted verbatim.
+    exe_mod.addRPathSpecial("@executable_path/../Frameworks");
+
     exe_mod.linkFramework("ApplicationServices", .{});
     exe_mod.linkFramework("CoreGraphics", .{});
     exe_mod.linkFramework("Carbon", .{});
@@ -235,6 +273,8 @@ pub fn build(b: *std.Build) !void {
 
     installBundleArtifact(b, swipe_exe);
 
+    installBundleFile(b, ui_dylib, "Contents/Frameworks", ui_dylib_name);
+
     installBundleFile(b, bundleInfoPlist(b, app_version), "Contents", "Info.plist");
     // Classic-era type/creator record. LaunchServices no longer needs it, but
     // some tooling still probes for it and it costs eight bytes.
@@ -255,13 +295,14 @@ pub fn build(b: *std.Build) !void {
 
         // Nested code must be sealed before the enclosing bundle, otherwise
         // the outer signature covers a helper that is about to change.
-        for ([_][2][]const u8{
-            .{ cli_exe_name, "com.bobrwm.cli" },
-            .{ "bobrwm-swipe", "com.bobrwm.swipe" },
+        for ([_][3][]const u8{
+            .{ bundle_macos, cli_exe_name, "com.bobrwm.cli" },
+            .{ bundle_macos, "bobrwm-swipe", "com.bobrwm.swipe" },
+            .{ bundle_contents ++ "/Frameworks", ui_dylib_name, "com.bobrwm.ui" },
         }) |entry| {
             const sign_helper = devCodesign(b, identity);
-            sign_helper.addArgs(&.{ "--identifier", entry[1] });
-            sign_helper.addArg(b.getInstallPath(.prefix, b.fmt("{s}/{s}", .{ bundle_macos, entry[0] })));
+            sign_helper.addArgs(&.{ "--identifier", entry[2] });
+            sign_helper.addArg(b.getInstallPath(.prefix, b.fmt("{s}/{s}", .{ entry[0], entry[1] })));
             sign_helper.step.dependOn(b.getInstallStep());
             sign_app.step.dependOn(&sign_helper.step);
         }

@@ -1,0 +1,4 @@
+module BobrwmUIABI {
+    header "bobrwm_ui.h"
+    export *
+}
