@@ -3,12 +3,13 @@
 //! The status item and its menu live in the Swift UI library under
 //! packages/bobrwm-ui. This module owns the Zig half of the C ABI declared in
 //! packages/bobrwm-ui/include/bobrwm_ui.h and the conversion from workspace
-//! state into rows. The ABI structs below mirror that header; changing one
-//! means changing both.
+//! and keybind state into rows. The ABI structs below mirror that header;
+//! changing one means changing both.
 
 const std = @import("std");
 const objc = @import("objc");
 
+const config_mod = @import("config.zig");
 const main = @import("main.zig");
 const workspace_mod = @import("workspace.zig");
 
@@ -23,28 +24,52 @@ const MenuBarCallbacks = extern struct {
     quit: *const fn () callconv(.c) void,
 };
 
-const WorkspaceRow = extern struct {
+const Workspace = extern struct {
     name: ?[*:0]const u8,
+    shortcut: ?[*:0]const u8,
+    id: u8,
+};
+
+const WorkspaceState = extern struct {
     window_count: u32,
     id: u8,
+    is_active: bool,
     is_focused: bool,
+};
+
+const ActionShortcuts = extern struct {
+    previous_workspace: ?[*:0]const u8,
+    next_workspace: ?[*:0]const u8,
 };
 
 extern fn bw_menubar_init(callbacks: MenuBarCallbacks) void;
 extern fn bw_menubar_deinit() void;
-extern fn bw_menubar_set_workspaces(rows: ?[*]const WorkspaceRow, count: usize) void;
-extern fn bw_menubar_set_active_workspaces(workspace_ids: ?[*]const u8, count: usize) void;
-extern fn bw_menubar_set_title(title: [*:0]const u8) void;
+extern fn bw_menubar_set_workspaces(
+    workspaces: ?[*]const Workspace,
+    count: usize,
+    shortcuts: ActionShortcuts,
+) void;
+extern fn bw_menubar_set_state(states: ?[*]const WorkspaceState, count: usize) void;
+extern fn bw_menubar_set_message(message: [*:0]const u8) void;
 
-/// Workspace names are borrowed by the UI only for the duration of the call,
-/// but the row array needs NUL-terminated copies to hand across, and this
-/// module has no allocator.
+/// Strings handed across the ABI are borrowed for the duration of the call,
+/// but a whole row array is passed at once, so every name and shortcut in it
+/// has to be alive simultaneously. This module has no allocator, and both are
+/// bounded, so they live in static storage.
 const max_name_bytes = 64;
+/// Four modifier glyphs at 3 bytes each, plus a key glyph, plus the sentinel.
+const max_shortcut_bytes = 24;
+
 var g_name_storage: [workspace_mod.max_workspaces][max_name_bytes]u8 = undefined;
+var g_shortcut_storage: [workspace_mod.max_workspaces][max_shortcut_bytes]u8 = undefined;
+var g_nav_shortcut_storage: [2][max_shortcut_bytes]u8 = undefined;
 
 var g_initialized = false;
 
-pub fn init(workspaces: []const workspace_mod.Workspace) void {
+pub fn init(
+    workspaces: []const workspace_mod.Workspace,
+    config: *const config_mod.Config,
+) void {
     std.debug.assert(!g_initialized);
     std.debug.assert(workspaces.len > 0 and workspaces.len <= workspace_mod.max_workspaces);
 
@@ -58,7 +83,7 @@ pub fn init(workspaces: []const workspace_mod.Workspace) void {
     });
     g_initialized = true;
 
-    updateWorkspaceMenu(workspaces);
+    updateWorkspaceMenu(workspaces, config);
     log.info("status bar created", .{});
 }
 
@@ -69,105 +94,80 @@ pub fn deinit() void {
     g_initialized = false;
 }
 
-/// Rebuild the workspace rows. Call when the workspace set changes, not when
-/// focus moves; `setTitleMulti` carries focus.
-pub fn updateWorkspaceMenu(workspaces: []const workspace_mod.Workspace) void {
+/// Rebuild the workspace rows. Call when names or keybinds change, not when
+/// focus moves; `updateState` carries everything that moves.
+pub fn updateWorkspaceMenu(
+    workspaces: []const workspace_mod.Workspace,
+    config: *const config_mod.Config,
+) void {
     if (!g_initialized) return;
     std.debug.assert(workspaces.len > 0 and workspaces.len <= workspace_mod.max_workspaces);
 
-    var rows: [workspace_mod.max_workspaces]WorkspaceRow = undefined;
+    var rows: [workspace_mod.max_workspaces]Workspace = undefined;
     for (workspaces, 0..) |workspace, index| {
         std.debug.assert(workspace.id > 0 and workspace.id <= workspace_mod.max_workspaces);
 
-        const storage = &g_name_storage[index];
-        const length = @min(workspace.name.len, storage.len - 1);
-        @memcpy(storage[0..length], workspace.name[0..length]);
-        storage[length] = 0;
+        const name_storage = &g_name_storage[index];
+        const length = @min(workspace.name.len, name_storage.len - 1);
+        @memcpy(name_storage[0..length], workspace.name[0..length]);
+        name_storage[length] = 0;
 
+        const keybind = config.findKeybind(.focus_workspace, workspace.id);
         rows[index] = .{
-            .name = @ptrCast(storage),
+            .name = @ptrCast(name_storage),
+            .shortcut = shortcutPtr(keybind, &g_shortcut_storage[index]),
+            .id = workspace.id,
+        };
+    }
+
+    bw_menubar_set_workspaces(&rows, workspaces.len, .{
+        .previous_workspace = shortcutPtr(
+            config.findKeybind(.focus_previous_workspace, 0),
+            &g_nav_shortcut_storage[0],
+        ),
+        .next_workspace = shortcutPtr(
+            config.findKeybind(.focus_next_workspace, 0),
+            &g_nav_shortcut_storage[1],
+        ),
+    });
+}
+
+/// Push window counts and which workspaces are visible where.
+pub fn updateState(
+    workspaces: []const workspace_mod.Workspace,
+    active_ids: []const u8,
+    focused_id: u8,
+) void {
+    if (!g_initialized) return;
+    std.debug.assert(workspaces.len <= workspace_mod.max_workspaces);
+    std.debug.assert(active_ids.len <= workspace_mod.max_displays);
+
+    var states: [workspace_mod.max_workspaces]WorkspaceState = undefined;
+    for (workspaces, 0..) |workspace, index| {
+        states[index] = .{
             .window_count = std.math.lossyCast(u32, workspace.windows.items.len),
             .id = workspace.id,
-            .is_focused = false,
+            .is_active = std.mem.indexOfScalar(u8, active_ids, workspace.id) != null,
+            .is_focused = workspace.id == focused_id,
         };
     }
 
-    bw_menubar_set_workspaces(&rows, workspaces.len);
+    bw_menubar_set_state(&states, workspaces.len);
 }
 
-pub const DisplayWorkspace = struct {
-    name: []const u8,
-    id: u8,
-    focused: bool,
-};
-
-/// Update the status bar title to show all active workspaces across displays.
-/// Format: "ws1 | ws2 | ..." with the focused one marked with [brackets].
-pub fn setTitleMulti(workspaces: []const DisplayWorkspace) void {
-    if (!g_initialized) return;
-    std.debug.assert(workspaces.len <= workspace_mod.max_displays);
-
-    var active_ids: [workspace_mod.max_displays]u8 = undefined;
-    for (workspaces, 0..) |workspace, index| {
-        active_ids[index] = workspace.id;
-    }
-    bw_menubar_set_active_workspaces(&active_ids, workspaces.len);
-
-    var buf: [256]u8 = undefined;
-    var pos: usize = 0;
-
-    for (workspaces, 0..) |ws, i| {
-        if (i > 0) {
-            if (pos + 3 <= buf.len) {
-                @memcpy(buf[pos..][0..3], " | ");
-                pos += 3;
-            }
-        }
-
-        // Format numeric ID into a separate buffer to avoid aliasing
-        // with `buf` when brackets are inserted for focused workspaces.
-        var id_buf: [4]u8 = undefined;
-        const label = if (ws.name.len > 0) ws.name else blk: {
-            const s = std.fmt.bufPrint(&id_buf, "{d}", .{ws.id}) catch break :blk "";
-            break :blk s;
-        };
-
-        if (ws.focused) {
-            if (pos + 1 <= buf.len) {
-                buf[pos] = '[';
-                pos += 1;
-            }
-        }
-
-        const n = @min(label.len, buf.len - pos);
-        @memcpy(buf[pos..][0..n], label[0..n]);
-        pos += n;
-
-        if (ws.focused) {
-            if (pos + 1 <= buf.len) {
-                buf[pos] = ']';
-                pos += 1;
-            }
-        }
-    }
-
-    if (pos == 0) return;
-    if (pos >= buf.len) pos = buf.len - 1;
-    buf[pos] = 0;
-
-    bw_menubar_set_title(@ptrCast(buf[0..pos :0]));
-}
-
-/// Update the status bar title to reflect the active workspace.
-pub fn setTitle(name: []const u8, id: u8) void {
-    setTitleMulti(&.{.{ .name = name, .id = id, .focused = true }});
-}
-
-/// Temporarily replace the workspace title with a caller-managed status
-/// message. The UI copies the string, so the input need not outlive the call.
+/// Temporarily replace the menu bar chips with a status message. The UI copies
+/// the string, so the input need not outlive the call.
 pub fn setMessage(message: [*:0]const u8) void {
     if (!g_initialized) return;
-    bw_menubar_set_title(message);
+    bw_menubar_set_message(message);
+}
+
+/// Adapt a keybind to the sentinel pointer the ABI expects. Null means
+/// unbound, which the UI renders as no hint at all.
+fn shortcutPtr(keybind: ?config_mod.Keybind, storage: []u8) ?[*:0]const u8 {
+    const bind = keybind orelse return null;
+    const rendered = bind.displayForm(storage) orelse return null;
+    return rendered.ptr;
 }
 
 // Menu callbacks. These run on the main thread while the menu dismisses, so
