@@ -762,40 +762,48 @@ fn maybeSetFocusedDisplayForWindow(win: window_mod.Window, source: FocusEventSou
 /// Follow focus into a hidden workspace. `focused_wid` is the window the AX
 /// event named; `win` is its group leader, which owns the workspace slot.
 ///
-/// A transition that has already been marked complete is only serving out its
-/// settle tail (synthetic move/resize suppression), so following focus through
-/// it is no different from a workspace hotkey pressed at the same moment. One
-/// still in flight must not be fought, but the intent cannot be dropped
-/// either: a fast Cmd+Tab back to the app you just left lands inside that
-/// window, and dropping it leaves the app focused with its window parked
-/// off-screen until something else happens to move focus.
+/// Hidden focus is deferred through the entire transition, including the
+/// settle tail: late AX focus from the workspace just parked can otherwise
+/// reverse an accepted switch and create a two-workspace feedback loop. The
+/// deferred replay validates the frontmost app once synthetic events settle,
+/// preserving a genuine fast Cmd+Tab without following stale AX fallout.
 fn switchToWindowWorkspaceIfHidden(win: window_mod.Window, focused_wid: u32, source: FocusEventSource) void {
     std.debug.assert(win.wid != 0);
     std.debug.assert(focused_wid != 0);
     std.debug.assert(win.workspace_id > 0 and win.workspace_id <= workspace_mod.max_workspaces);
     std.debug.assert(win.display_id != 0);
 
-    if (g_workspace_transition.isActive() and g_workspace_transition_completion_reason == .none) {
-        g_deferred_follow_focus = .{ .pid = win.pid, .wid = focused_wid, .source = source };
-        refreshRolePolling();
-        log.debug("follow focus deferred wid={d} leader={d} pid={d} workspace={d} display={d} epoch={d} target_workspace={d}", .{
-            focused_wid,
-            win.wid,
-            win.pid,
-            win.workspace_id,
-            win.display_id,
-            g_workspace_transition.epoch,
-            g_workspace_transition.target_workspace_id,
-        });
-        return;
+    const transition_active = g_workspace_transition.isActive();
+    switch (workspace_mod.followFocusAction(
+        workspaceVisibleOnDisplay(win.workspace_id, win.display_id),
+        transition_active,
+    )) {
+        .ignore => {
+            // Keep a hidden deferred event until the transition clears. A
+            // visible target notification may itself be stale; the frontmost
+            // app check at replay time is the authoritative tie-breaker.
+            if (!transition_active) g_deferred_follow_focus = null;
+            return;
+        },
+        .defer_until_settled => {
+            g_deferred_follow_focus = .{ .pid = win.pid, .wid = focused_wid, .source = source };
+            refreshRolePolling();
+            log.debug("follow focus deferred wid={d} leader={d} pid={d} workspace={d} display={d} epoch={d} target_workspace={d} completion={s}", .{
+                focused_wid,
+                win.wid,
+                win.pid,
+                win.workspace_id,
+                win.display_id,
+                g_workspace_transition.epoch,
+                g_workspace_transition.target_workspace_id,
+                @tagName(g_workspace_transition_completion_reason),
+            });
+            return;
+        },
+        .switch_workspace => {},
     }
 
-    // This focus event resolved without waiting, so anything an earlier
-    // transition deferred is stale intent the user has already moved past.
     g_deferred_follow_focus = null;
-
-    if (workspaceVisibleOnDisplay(win.workspace_id, win.display_id)) return;
-
     log.debug("follow focus switching wid={d} leader={d} pid={d} workspace={d} display={d}", .{
         focused_wid,
         win.wid,
