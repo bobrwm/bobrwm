@@ -228,6 +228,21 @@ fn resolveElement(pid: i32, wid: u32) ?c.AXUIElementRef {
     return element;
 }
 
+/// Acquire a retained AX element for a known window, reusing the geometry
+/// cache when possible. Workspace switches retile the incoming window before
+/// focusing it, so a second AXWindows enumeration here would repeat the most
+/// expensive part of resolving the focus target.
+///
+/// The caller owns the returned reference and must CFRelease it.
+pub fn retainWindow(pid: i32, wid: u32) ?c.AXUIElementRef {
+    std.debug.assert(pid > 0);
+    std.debug.assert(wid > 0);
+
+    const element = cachedElement(pid, wid) orelse resolveElement(pid, wid) orelse return null;
+    _ = c.CFRetain(@ptrCast(element));
+    return element;
+}
+
 /// Drop a window's cached element. WindowServer recycles window ids, so
 /// callers must invalidate when a window is destroyed or its id replaced
 /// rather than leave the retry path to discover it.
