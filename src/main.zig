@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const posix = std.posix;
 const filelog = @import("filelog.zig");
 const log_options = @import("log_options.zig");
@@ -2593,9 +2594,17 @@ pub fn main(init: std.process.Init.Minimal) !void {
     filelog.init();
     log.info("bobrwm starting (log_level={s})...", .{@tagName(std_options.log_level)});
 
-    var gpa: std.heap.DebugAllocator(.{}) = .init;
-    defer _ = gpa.deinit();
-    g_allocator = gpa.allocator();
+    var debug_allocator: ?std.heap.DebugAllocator(.{}) = switch (builtin.mode) {
+        .Debug => .init,
+        .ReleaseSafe, .ReleaseFast, .ReleaseSmall => null,
+    };
+    defer {
+        if (debug_allocator) |*value| _ = value.deinit();
+    }
+    g_allocator = if (debug_allocator) |*value|
+        value.allocator()
+    else
+        std.heap.c_allocator;
     defer deinitAxStrings();
     defer ax_mod.deinitElementCache();
 
