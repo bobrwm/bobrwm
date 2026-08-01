@@ -173,7 +173,11 @@ fn shortcutPtr(keybind: ?config_mod.Keybind, storage: []u8) ?[*:0]const u8 {
 fn encodeWorkspaceName(name: []const u8, storage: []u8) [:0]const u8 {
     std.debug.assert(storage.len > 0);
 
-    const length = @min(name.len, storage.len - 1);
+    var length = @min(name.len, storage.len - 1);
+    // Cutting mid-sequence hands the UI invalid UTF-8, which NSString renders
+    // as a replacement glyph, so drop the whole truncated codepoint.
+    while (length > 0 and length < name.len and name[length] & 0xC0 == 0x80) length -= 1;
+
     @memcpy(storage[0..length], name[0..length]);
     storage[length] = 0;
     return storage[0..length :0];

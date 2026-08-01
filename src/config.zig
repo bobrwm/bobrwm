@@ -77,18 +77,34 @@ pub const Config = struct {
     /// Config entries win over defaults, matching what a user reading the menu
     /// expects to see. This searches by action rather than by trigger, so when
     /// a config bind does not displace the default both stay live in the event
-    /// tap and only the config one is shown.
+    /// tap and only the config one is shown. A default whose trigger a config
+    /// entry took over is not live at all, so it is reported as unbound rather
+    /// than advertising a shortcut that now does something else.
     pub fn findKeybind(self: *const Config, action: Action, arg: u8) ?Keybind {
-        if (!isDefaultKeybindSlice(self.keybinds)) {
+        const has_overrides = !isDefaultKeybindSlice(self.keybinds);
+        if (has_overrides) {
             for (self.keybinds) |keybind| {
                 if (keybind.action == action and keybind.arg == arg) return keybind;
             }
         }
 
         for (default_keybinds) |keybind| {
-            if (keybind.action == action and keybind.arg == arg) return keybind;
+            if (keybind.action != action or keybind.arg != arg) continue;
+            if (has_overrides and self.isTriggerReassigned(keybind)) continue;
+            return keybind;
         }
         return null;
+    }
+
+    /// Whether a config entry claims this bind's trigger. `buildKeybinds`
+    /// merges by trigger, so such a default never reaches the event tap.
+    fn isTriggerReassigned(self: *const Config, keybind: Keybind) bool {
+        const target = keybindToShim(keybind) orelse return false;
+        for (self.keybinds) |override| {
+            const candidate = keybindToShim(override) orelse continue;
+            if (candidate.keycode == target.keycode and candidate.mods == target.mods) return true;
+        }
+        return false;
     }
 
     /// Push the keybind table into the hotkey shim so the CGEventTap
