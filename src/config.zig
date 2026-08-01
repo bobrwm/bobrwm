@@ -72,6 +72,41 @@ pub const Config = struct {
         return table.storage[0..count];
     }
 
+    /// Effective keybind for an action, for display in the menu bar UI.
+    ///
+    /// Config entries win over defaults, matching what a user reading the menu
+    /// expects to see. This searches by action rather than by trigger, so when
+    /// a config bind does not displace the default both stay live in the event
+    /// tap and only the config one is shown. A default whose trigger a config
+    /// entry took over is not live at all, so it is reported as unbound rather
+    /// than advertising a shortcut that now does something else.
+    pub fn findKeybind(self: *const Config, action: Action, arg: u8) ?Keybind {
+        const has_overrides = !isDefaultKeybindSlice(self.keybinds);
+        if (has_overrides) {
+            for (self.keybinds) |keybind| {
+                if (keybind.action == action and keybind.arg == arg) return keybind;
+            }
+        }
+
+        for (default_keybinds) |keybind| {
+            if (keybind.action != action or keybind.arg != arg) continue;
+            if (has_overrides and self.isTriggerReassigned(keybind)) continue;
+            return keybind;
+        }
+        return null;
+    }
+
+    /// Whether a config entry claims this bind's trigger. `buildKeybinds`
+    /// merges by trigger, so such a default never reaches the event tap.
+    fn isTriggerReassigned(self: *const Config, keybind: Keybind) bool {
+        const target = keybindToShim(keybind) orelse return false;
+        for (self.keybinds) |override| {
+            const candidate = keybindToShim(override) orelse continue;
+            if (candidate.keycode == target.keycode and candidate.mods == target.mods) return true;
+        }
+        return false;
+    }
+
     /// Push the keybind table into the hotkey shim so the CGEventTap
     /// matches against it instead of hardcoded binds. The shim keeps a
     /// reference to the table (no copy), so `table` must stay alive for as
@@ -152,7 +187,115 @@ pub const Keybind = struct {
     mods: Mods = .{},
     action: Action,
     arg: u8 = 0,
+
+    /// Render the bind the way macOS menus write it: ⌃⌥⇧⌘ in that order, then
+    /// the key. Writes into caller storage because the menu bar passes a whole
+    /// row array across the C ABI at once and has no allocator. Returns null
+    /// when the result would not fit, which the UI renders as no hint at all.
+    pub fn displayForm(self: Keybind, storage: []u8) ?[:0]const u8 {
+        var pos: usize = 0;
+        const modifiers = [_]struct { bool, []const u8 }{
+            .{ self.mods.ctrl, "⌃" },
+            .{ self.mods.alt, "⌥" },
+            .{ self.mods.shift, "⇧" },
+            .{ self.mods.cmd, "⌘" },
+        };
+        for (modifiers) |modifier| {
+            if (!modifier[0]) continue;
+            if (pos + modifier[1].len >= storage.len) return null;
+            @memcpy(storage[pos..][0..modifier[1].len], modifier[1]);
+            pos += modifier[1].len;
+        }
+
+        const key = keyGlyph(self.key);
+        if (pos + key.len >= storage.len) return null;
+        // toUpper only touches ASCII a-z, so multi-byte glyphs pass through.
+        for (key, 0..) |char, offset| storage[pos + offset] = std.ascii.toUpper(char);
+        pos += key.len;
+
+        storage[pos] = 0;
+        return storage[0..pos :0];
+    }
 };
+
+fn keyGlyph(key: []const u8) []const u8 {
+    const glyphs = [_]struct { []const u8, []const u8 }{
+        .{ "return", "↩" },
+        .{ "tab", "⇥" },
+        .{ "space", "␣" },
+        .{ "delete", "⌫" },
+        .{ "escape", "⎋" },
+        .{ "left", "←" },
+        .{ "right", "→" },
+        .{ "up", "↑" },
+        .{ "down", "↓" },
+    };
+    for (glyphs) |glyph| {
+        if (std.mem.eql(u8, key, glyph[0])) return glyph[1];
+    }
+    return key;
+}
+
+test "displayForm renders modifiers in macOS order" {
+    var storage: [24]u8 = undefined;
+
+    const alt_one: Keybind = .{ .key = "1", .mods = .{ .alt = true }, .action = .focus_workspace };
+    try std.testing.expectEqualStrings("⌥1", alt_one.displayForm(&storage).?);
+
+    const all_mods: Keybind = .{
+        .key = "r",
+        .mods = .{ .alt = true, .shift = true, .cmd = true, .ctrl = true },
+        .action = .reload_config,
+    };
+    try std.testing.expectEqualStrings("⌃⌥⇧⌘R", all_mods.displayForm(&storage).?);
+}
+
+test "displayForm maps named keys to glyphs and uppercases letters" {
+    var storage: [24]u8 = undefined;
+
+    const ctrl_left: Keybind = .{
+        .key = "left",
+        .mods = .{ .ctrl = true },
+        .action = .focus_previous_workspace,
+    };
+    try std.testing.expectEqualStrings("⌃←", ctrl_left.displayForm(&storage).?);
+
+    const alt_a: Keybind = .{ .key = "a", .mods = .{ .alt = true }, .action = .focus_workspace };
+    try std.testing.expectEqualStrings("⌥A", alt_a.displayForm(&storage).?);
+}
+
+test "displayForm returns null when the result would not fit" {
+    var tiny: [2]u8 = undefined;
+    const alt_one: Keybind = .{ .key = "1", .mods = .{ .alt = true }, .action = .focus_workspace };
+    try std.testing.expectEqual(@as(?[:0]const u8, null), alt_one.displayForm(&tiny));
+}
+
+test "findKeybind prefers config entries over defaults" {
+    var storage: [24]u8 = undefined;
+    const overrides = [_]Keybind{
+        .{ .key = "a", .mods = .{ .alt = true }, .action = .focus_workspace, .arg = 5 },
+    };
+    const config: Config = .{ .keybinds = &overrides };
+
+    const workspace_five = config.findKeybind(.focus_workspace, 5).?;
+    try std.testing.expectEqualStrings("⌥A", workspace_five.displayForm(&storage).?);
+
+    // Untouched by the override, so it still resolves from the defaults.
+    const workspace_one = config.findKeybind(.focus_workspace, 1).?;
+    try std.testing.expectEqualStrings("⌥1", workspace_one.displayForm(&storage).?);
+}
+
+test "findKeybind omits a default whose trigger was reassigned" {
+    const overrides = [_]Keybind{
+        .{ .key = "1", .mods = .{ .alt = true }, .action = .toggle_float },
+    };
+    const config: Config = .{ .keybinds = &overrides };
+
+    try std.testing.expectEqual(
+        @as(?Keybind, null),
+        config.findKeybind(.focus_workspace, 1),
+    );
+}
 
 pub const WorkspaceAssignment = struct {
     app_id: []const u8,

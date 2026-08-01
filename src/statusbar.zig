@@ -1,225 +1,231 @@
-//! macOS status bar (menu bar icon) via zig-objc.
+//! macOS status bar (menu bar icon).
 //!
-//! Displays active workspaces and provides workspace, configuration, Retile,
-//! and Quit actions through BWStatusBarDelegate in objc_classes.zig.
+//! The status item and its menu live in the Swift UI library under
+//! packages/bobrwm-ui. This module owns the Zig half of the C ABI declared in
+//! packages/bobrwm-ui/include/bobrwm_ui.h and the conversion from workspace
+//! and keybind state into rows. The ABI structs below mirror that header;
+//! changing one means changing both.
 
 const std = @import("std");
 const objc = @import("objc");
 
+const config_mod = @import("config.zig");
+const main = @import("main.zig");
 const workspace_mod = @import("workspace.zig");
 
 const log = std.log.scoped(.statusbar);
 
-var g_status_item: ?objc.Object = null;
-var g_button: ?objc.Object = null;
-var g_delegate: ?objc.Object = null;
-var g_workspace_menu: ?objc.Object = null;
+const MenuBarCallbacks = extern struct {
+    retile: *const fn () callconv(.c) void,
+    open_config: *const fn () callconv(.c) void,
+    previous_workspace: *const fn () callconv(.c) void,
+    next_workspace: *const fn () callconv(.c) void,
+    switch_to_workspace: *const fn (u8) callconv(.c) void,
+    quit: *const fn () callconv(.c) void,
+};
 
-pub fn init(workspaces: []const workspace_mod.Workspace) void {
-    std.debug.assert(g_status_item == null);
+const Workspace = extern struct {
+    name: ?[*:0]const u8,
+    shortcut: ?[*:0]const u8,
+    id: u8,
+};
+
+const WorkspaceState = extern struct {
+    window_count: u32,
+    id: u8,
+    is_active: bool,
+    is_focused: bool,
+};
+
+const ActionShortcuts = extern struct {
+    previous_workspace: ?[*:0]const u8,
+    next_workspace: ?[*:0]const u8,
+};
+
+extern fn bw_menubar_init(callbacks: MenuBarCallbacks) void;
+extern fn bw_menubar_deinit() void;
+extern fn bw_menubar_set_workspaces(
+    workspaces: ?[*]const Workspace,
+    count: usize,
+    shortcuts: ActionShortcuts,
+) void;
+extern fn bw_menubar_set_state(states: ?[*]const WorkspaceState, count: usize) void;
+extern fn bw_menubar_set_message(message: [*:0]const u8) void;
+
+/// Strings handed across the ABI are borrowed for the duration of the call,
+/// but a whole row array is passed at once, so every name and shortcut in it
+/// has to be alive simultaneously. This module has no allocator, and both are
+/// bounded, so they live in static storage.
+const max_name_bytes = 64;
+/// Four modifier glyphs at 3 bytes each, plus a key glyph, plus the sentinel.
+const max_shortcut_bytes = 24;
+
+var g_name_storage: [workspace_mod.max_workspaces][max_name_bytes]u8 = undefined;
+var g_shortcut_storage: [workspace_mod.max_workspaces][max_shortcut_bytes]u8 = undefined;
+var g_nav_shortcut_storage: [2][max_shortcut_bytes]u8 = undefined;
+
+var g_initialized = false;
+
+pub fn init(
+    workspaces: []const workspace_mod.Workspace,
+    config: *const config_mod.Config,
+) void {
+    std.debug.assert(!g_initialized);
     std.debug.assert(workspaces.len > 0 and workspaces.len <= workspace_mod.max_workspaces);
 
-    const NSStatusBar = objc.getClass("NSStatusBar") orelse return;
-    const NSMenu = objc.getClass("NSMenu") orelse return;
-    const NSMenuItem = objc.getClass("NSMenuItem") orelse return;
-    const BWDelegate = objc.getClass("BWStatusBarDelegate") orelse return;
-
-    const bar = NSStatusBar.msgSend(objc.Object, "systemStatusBar", .{});
-    // NSVariableStatusItemLength = -1
-    const item = bar.msgSend(objc.Object, "statusItemWithLength:", .{@as(f64, -1.0)});
-    // NSStatusBar does not retain status items; this module owns it until deinit.
-    g_status_item = item.retain();
-    g_button = item.msgSend(objc.Object, "button", .{});
-
-    const delegate = BWDelegate.msgSend(objc.Object, "alloc", .{})
-        .msgSend(objc.Object, "init", .{});
-    g_delegate = delegate;
-
-    const menu = NSMenu.msgSend(objc.Object, "alloc", .{})
-        .msgSend(objc.Object, "init", .{});
-    defer menu.msgSend(void, "release", .{});
-
-    addActionItem(menu, NSMenuItem, delegate, "Retile", "retile:");
-    addActionItem(menu, NSMenuItem, delegate, "Open Config File", "openConfigFile:");
-    addSeparator(menu, NSMenuItem);
-    addActionItem(menu, NSMenuItem, delegate, "Previous Workspace", "previousWorkspace:");
-    addActionItem(menu, NSMenuItem, delegate, "Next Workspace", "nextWorkspace:");
-
-    const workspaces_item = NSMenuItem.msgSend(objc.Object, "alloc", .{})
-        .msgSend(objc.Object, "initWithTitle:action:keyEquivalent:", .{
-        nsString("Workspaces"), @as(?*anyopaque, null), nsString(""),
+    bw_menubar_init(.{
+        .retile = onRetile,
+        .open_config = onOpenConfig,
+        .previous_workspace = onPreviousWorkspace,
+        .next_workspace = onNextWorkspace,
+        .switch_to_workspace = onSwitchToWorkspace,
+        .quit = onQuit,
     });
-    defer workspaces_item.msgSend(void, "release", .{});
+    g_initialized = true;
 
-    const workspace_menu = NSMenu.msgSend(objc.Object, "alloc", .{})
-        .msgSend(objc.Object, "initWithTitle:", .{nsString("Workspaces")});
-    defer workspace_menu.msgSend(void, "release", .{});
-    populateWorkspaceMenu(workspace_menu, NSMenuItem, delegate, workspaces);
-
-    workspaces_item.msgSend(void, "setSubmenu:", .{workspace_menu});
-    menu.msgSend(void, "addItem:", .{workspaces_item});
-    g_workspace_menu = workspace_menu;
-
-    addSeparator(menu, NSMenuItem);
-    addActionItem(menu, NSMenuItem, delegate, "Quit bobrwm", "quit:");
-
-    item.msgSend(void, "setMenu:", .{menu});
-
+    updateWorkspaceMenu(workspaces, config);
     log.info("status bar created", .{});
 }
 
 pub fn deinit() void {
-    g_workspace_menu = null;
-    g_button = null;
+    if (!g_initialized) return;
 
-    if (g_status_item) |item| {
-        if (objc.getClass("NSStatusBar")) |NSStatusBar| {
-            const bar = NSStatusBar.msgSend(objc.Object, "systemStatusBar", .{});
-            bar.msgSend(void, "removeStatusItem:", .{item});
-        }
-        item.release();
-        g_status_item = null;
-    }
-
-    if (g_delegate) |delegate| {
-        delegate.msgSend(void, "release", .{});
-        g_delegate = null;
-    }
+    bw_menubar_deinit();
+    g_initialized = false;
 }
 
-/// Refresh workspace labels after a configuration reload.
-pub fn updateWorkspaceMenu(workspaces: []const workspace_mod.Workspace) void {
-    std.debug.assert(workspaces.len > 0 and workspaces.len <= workspace_mod.max_workspaces);
-    const menu = g_workspace_menu orelse return;
-    const NSMenuItem = objc.getClass("NSMenuItem") orelse return;
-    const delegate = g_delegate orelse return;
-
-    menu.msgSend(void, "removeAllItems", .{});
-    populateWorkspaceMenu(menu, NSMenuItem, delegate, workspaces);
-}
-
-fn addActionItem(
-    menu: objc.Object,
-    NSMenuItem: objc.Class,
-    delegate: objc.Object,
-    title: [*:0]const u8,
-    action: [:0]const u8,
-) void {
-    const item = NSMenuItem.msgSend(objc.Object, "alloc", .{})
-        .msgSend(objc.Object, "initWithTitle:action:keyEquivalent:", .{
-        nsString(title), objc.sel(action), nsString(""),
-    });
-    defer item.msgSend(void, "release", .{});
-
-    item.msgSend(void, "setTarget:", .{delegate});
-    menu.msgSend(void, "addItem:", .{item});
-}
-
-fn addSeparator(menu: objc.Object, NSMenuItem: objc.Class) void {
-    menu.msgSend(void, "addItem:", .{
-        NSMenuItem.msgSend(objc.Object, "separatorItem", .{}),
-    });
-}
-
-fn populateWorkspaceMenu(
-    menu: objc.Object,
-    NSMenuItem: objc.Class,
-    delegate: objc.Object,
+/// Rebuild the workspace rows. Call when names or keybinds change, not when
+/// focus moves; `updateState` carries everything that moves.
+pub fn updateWorkspaceMenu(
     workspaces: []const workspace_mod.Workspace,
+    config: *const config_mod.Config,
 ) void {
-    for (workspaces) |workspace| {
+    if (!g_initialized) return;
+    std.debug.assert(workspaces.len > 0 and workspaces.len <= workspace_mod.max_workspaces);
+
+    var rows: [workspace_mod.max_workspaces]Workspace = undefined;
+    for (workspaces, 0..) |workspace, index| {
         std.debug.assert(workspace.id > 0 and workspace.id <= workspace_mod.max_workspaces);
 
-        var label_buffer: [128]u8 = undefined;
-        const label = if (workspace.name.len > 0)
-            std.fmt.bufPrintZ(&label_buffer, "Workspace {d}: {s}", .{ workspace.id, workspace.name }) catch
-                std.fmt.bufPrintZ(&label_buffer, "Workspace {d}", .{workspace.id}) catch unreachable
-        else
-            std.fmt.bufPrintZ(&label_buffer, "Workspace {d}", .{workspace.id}) catch unreachable;
+        const name_storage = &g_name_storage[index];
+        _ = encodeWorkspaceName(workspace.name, name_storage);
 
-        const item = NSMenuItem.msgSend(objc.Object, "alloc", .{})
-            .msgSend(objc.Object, "initWithTitle:action:keyEquivalent:", .{
-            nsString(label.ptr), objc.sel("switchToWorkspace:"), nsString(""),
-        });
-        defer item.msgSend(void, "release", .{});
-
-        item.msgSend(void, "setTarget:", .{delegate});
-        item.msgSend(void, "setTag:", .{@as(i64, workspace.id)});
-        menu.msgSend(void, "addItem:", .{item});
-    }
-}
-
-pub const DisplayWorkspace = struct {
-    name: []const u8,
-    id: u8,
-    focused: bool,
-};
-
-/// Update the status bar title to show all active workspaces across displays.
-/// Format: "ws1 | ws2 | ..." with the focused one marked with [brackets].
-pub fn setTitleMulti(workspaces: []const DisplayWorkspace) void {
-    const button = g_button orelse return;
-    var buf: [256]u8 = undefined;
-    var pos: usize = 0;
-
-    for (workspaces, 0..) |ws, i| {
-        if (i > 0) {
-            if (pos + 3 <= buf.len) {
-                @memcpy(buf[pos..][0..3], " | ");
-                pos += 3;
-            }
-        }
-
-        // Format numeric ID into a separate buffer to avoid aliasing
-        // with `buf` when brackets are inserted for focused workspaces.
-        var id_buf: [4]u8 = undefined;
-        const label = if (ws.name.len > 0) ws.name else blk: {
-            const s = std.fmt.bufPrint(&id_buf, "{d}", .{ws.id}) catch break :blk "";
-            break :blk s;
+        const keybind = config.findKeybind(.focus_workspace, workspace.id);
+        rows[index] = .{
+            .name = @ptrCast(name_storage),
+            .shortcut = shortcutPtr(keybind, &g_shortcut_storage[index]),
+            .id = workspace.id,
         };
-
-        if (ws.focused) {
-            if (pos + 1 <= buf.len) {
-                buf[pos] = '[';
-                pos += 1;
-            }
-        }
-
-        const n = @min(label.len, buf.len - pos);
-        @memcpy(buf[pos..][0..n], label[0..n]);
-        pos += n;
-
-        if (ws.focused) {
-            if (pos + 1 <= buf.len) {
-                buf[pos] = ']';
-                pos += 1;
-            }
-        }
     }
 
-    if (pos == 0) return;
-    if (pos >= buf.len) pos = buf.len - 1;
-    buf[pos] = 0;
-
-    button.msgSend(void, "setTitle:", .{
-        nsString(@ptrCast(buf[0..pos :0])),
+    bw_menubar_set_workspaces(&rows, workspaces.len, .{
+        .previous_workspace = shortcutPtr(
+            config.findKeybind(.focus_previous_workspace, 0),
+            &g_nav_shortcut_storage[0],
+        ),
+        .next_workspace = shortcutPtr(
+            config.findKeybind(.focus_next_workspace, 0),
+            &g_nav_shortcut_storage[1],
+        ),
     });
 }
 
-/// Update the status bar title to reflect the active workspace.
-pub fn setTitle(name: []const u8, id: u8) void {
-    setTitleMulti(&.{.{ .name = name, .id = id, .focused = true }});
+/// Push window counts and which workspaces are visible where.
+pub fn updateState(
+    workspaces: []const workspace_mod.Workspace,
+    active_ids: []const u8,
+    focused_id: u8,
+) void {
+    if (!g_initialized) return;
+    std.debug.assert(workspaces.len <= workspace_mod.max_workspaces);
+    std.debug.assert(active_ids.len <= workspace_mod.max_displays);
+
+    var states: [workspace_mod.max_workspaces]WorkspaceState = undefined;
+    for (workspaces, 0..) |workspace, index| {
+        states[index] = .{
+            .window_count = std.math.lossyCast(u32, workspace.windows.items.len),
+            .id = workspace.id,
+            .is_active = std.mem.indexOfScalar(u8, active_ids, workspace.id) != null,
+            .is_focused = workspace.id == focused_id,
+        };
+    }
+
+    bw_menubar_set_state(&states, workspaces.len);
 }
 
-/// Temporarily replace the workspace title with a caller-managed status
-/// message. AppKit copies the NSString, so the input need not outlive the call.
+/// Temporarily replace the menu bar chips with a status message. The UI copies
+/// the string, so the input need not outlive the call.
 pub fn setMessage(message: [*:0]const u8) void {
-    const button = g_button orelse return;
-    button.msgSend(void, "setTitle:", .{nsString(message)});
+    if (!g_initialized) return;
+    bw_menubar_set_message(message);
 }
 
-fn nsString(str: [*:0]const u8) objc.Object {
-    const NSString = objc.getClass("NSString") orelse
-        @panic("NSString class not found");
-    return NSString.msgSend(objc.Object, "stringWithUTF8String:", .{str});
+/// Adapt a keybind to the sentinel pointer the ABI expects. Null means
+/// unbound, which the UI renders as no hint at all.
+fn shortcutPtr(keybind: ?config_mod.Keybind, storage: []u8) ?[*:0]const u8 {
+    const bind = keybind orelse return null;
+    const rendered = bind.displayForm(storage) orelse return null;
+    return rendered.ptr;
+}
+
+/// Copy a workspace name into the sentinel-terminated representation consumed
+/// by the menu bar library.
+fn encodeWorkspaceName(name: []const u8, storage: []u8) [:0]const u8 {
+    std.debug.assert(storage.len > 0);
+
+    var length = @min(name.len, storage.len - 1);
+    // Cutting mid-sequence hands the UI invalid UTF-8, which NSString renders
+    // as a replacement glyph, so drop the whole truncated codepoint.
+    while (length > 0 and length < name.len and name[length] & 0xC0 == 0x80) length -= 1;
+
+    @memcpy(storage[0..length], name[0..length]);
+    storage[length] = 0;
+    return storage[0..length :0];
+}
+
+test "workspace ABI name truncation preserves valid UTF-8" {
+    var name: [66]u8 = undefined;
+    @memset(name[0..62], 'a');
+    @memcpy(name[62..], "😀");
+
+    var storage: [max_name_bytes]u8 = undefined;
+    const encoded = encodeWorkspaceName(&name, &storage);
+
+    try std.testing.expect(std.unicode.utf8ValidateSlice(encoded));
+    try std.testing.expectEqual(@as(usize, 62), encoded.len);
+    try std.testing.expectEqualSlices(u8, name[0..62], encoded);
+}
+
+// Menu callbacks. These run on the main thread while the menu dismisses, so
+// they can mutate Bobrwm state directly.
+
+fn onRetile() callconv(.c) void {
+    main.bw_retile();
+}
+
+fn onOpenConfig() callconv(.c) void {
+    main.bw_status_bar_action(.open_config);
+}
+
+fn onPreviousWorkspace() callconv(.c) void {
+    main.bw_status_bar_action(.previous_workspace);
+}
+
+fn onNextWorkspace() callconv(.c) void {
+    main.bw_status_bar_action(.next_workspace);
+}
+
+fn onSwitchToWorkspace(workspace_id: u8) callconv(.c) void {
+    if (workspace_id == 0 or workspace_id > workspace_mod.max_workspaces) return;
+    main.bw_status_bar_action(.{ .workspace = workspace_id });
+}
+
+/// Shutdown stays on the Zig side so window restoration keeps running before
+/// AppKit tears the process down; the UI library is presentation only.
+fn onQuit() callconv(.c) void {
+    main.bw_will_quit();
+
+    const NSApplication = objc.getClass("NSApplication").?;
+    const app = NSApplication.msgSend(objc.Object, "sharedApplication", .{});
+    app.msgSend(void, "terminate:", .{@as(objc.Object, .{ .value = null })});
 }
