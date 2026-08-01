@@ -6,6 +6,7 @@
 
 const std = @import("std");
 const c = @import("c");
+const osutil = @import("osutil.zig");
 
 extern fn _AXUIElementGetWindow(element: c.AXUIElementRef, wid: *u32) c.AXError;
 
@@ -227,6 +228,21 @@ fn resolveElement(pid: i32, wid: u32) ?c.AXUIElementRef {
     return element;
 }
 
+/// Acquire a retained AX element for a known window, reusing the geometry
+/// cache when possible. Workspace switches retile the incoming window before
+/// focusing it, so a second AXWindows enumeration here would repeat the most
+/// expensive part of resolving the focus target.
+///
+/// The caller owns the returned reference and must CFRelease it.
+pub fn retainWindow(pid: i32, wid: u32) ?c.AXUIElementRef {
+    std.debug.assert(pid > 0);
+    std.debug.assert(wid > 0);
+
+    const element = cachedElement(pid, wid) orelse resolveElement(pid, wid) orelse return null;
+    _ = c.CFRetain(@ptrCast(element));
+    return element;
+}
+
 /// Drop a window's cached element. WindowServer recycles window ids, so
 /// callers must invalidate when a window is destroyed or its id replaced
 /// rather than leave the retry path to discover it.
@@ -283,12 +299,81 @@ pub fn focusedWindowIfMatches(pid: i32, target_wid: u32) ?c.AXUIElementRef {
 }
 
 /// Query whether AXEnhancedUserInterface is currently enabled on an app element.
-pub fn enhancedUserInterface(app: c.AXUIElementRef, ax: *const AxStrings) bool {
+fn readEnhancedUserInterface(app: c.AXUIElementRef, ax: *const AxStrings) ?bool {
     var value: c.CFTypeRef = null;
     const err = c.AXUIElementCopyAttributeValue(app, ax.enhanced_ui_attr, &value);
-    if (err != c.kAXErrorSuccess or value == null) return false;
+    if (err != c.kAXErrorSuccess or value == null) return null;
     defer c.CFRelease(value.?);
     return c.CFEqual(value.?, @ptrCast(c.kCFBooleanTrue)) != 0;
+}
+
+/// Return whether AXEnhancedUserInterface is enabled, treating an unreadable
+/// attribute as disabled to preserve the existing best-effort behavior.
+pub fn enhancedUserInterface(app: c.AXUIElementRef, ax: *const AxStrings) bool {
+    return readEnhancedUserInterface(app, ax) orelse false;
+}
+
+// A workspace switch revisits the same apps several times in a short burst.
+// Cache only successful false reads: a stale entry can delay geometry repair,
+// but it can never make us restore a value that an assistive client changed.
+// Half a second covers adjacent switch/retile batches while tightly bounding
+// how long an external false -> true change can go unnoticed.
+const enhanced_ui_false_cache_slots = 64;
+const enhanced_ui_false_ttl_ns: i128 = 500 * std.time.ns_per_ms;
+
+const EnhancedUiFalseEntry = struct {
+    pid: i32,
+    checked_at_ns: i128,
+};
+
+var g_enhanced_ui_false_cache: [enhanced_ui_false_cache_slots]?EnhancedUiFalseEntry = @splat(null);
+
+fn enhancedUiFalseCacheSlot(pid: i32) usize {
+    std.debug.assert(pid > 0);
+    return @as(usize, @intCast(pid)) % enhanced_ui_false_cache_slots;
+}
+
+fn enhancedUiKnownFalse(pid: i32, now_ns: i128) bool {
+    const entry = g_enhanced_ui_false_cache[enhancedUiFalseCacheSlot(pid)] orelse return false;
+    if (entry.pid != pid) return false;
+    if (now_ns < entry.checked_at_ns) return false;
+    return now_ns - entry.checked_at_ns < enhanced_ui_false_ttl_ns;
+}
+
+fn rememberEnhancedUiFalse(pid: i32, now_ns: i128) void {
+    g_enhanced_ui_false_cache[enhancedUiFalseCacheSlot(pid)] = .{
+        .pid = pid,
+        .checked_at_ns = now_ns,
+    };
+}
+
+fn forgetEnhancedUiState(pid: i32) void {
+    const slot = enhancedUiFalseCacheSlot(pid);
+    const entry = g_enhanced_ui_false_cache[slot] orelse return;
+    if (entry.pid == pid) g_enhanced_ui_false_cache[slot] = null;
+}
+
+/// Read the attribute unless a recent successful false result proves that no
+/// suspend/restore pair is needed for this geometry burst.
+fn shouldSuspendEnhancedUi(app: c.AXUIElementRef, pid: i32, ax: *const AxStrings) bool {
+    const now_ns = osutil.nanoTimestamp();
+    if (enhancedUiKnownFalse(pid, now_ns)) return false;
+
+    const enabled = readEnhancedUserInterface(app, ax) orelse return false;
+    if (!enabled) {
+        rememberEnhancedUiFalse(pid, now_ns);
+        return false;
+    }
+
+    forgetEnhancedUiState(pid);
+    return true;
+}
+
+/// Drop per-process AX state when an application terminates. PIDs can be
+/// recycled, so a later process must never inherit the old process's result.
+pub fn invalidateApp(pid: i32) void {
+    std.debug.assert(pid > 0);
+    forgetEnhancedUiState(pid);
 }
 
 /// The app whose AXEnhancedUserInterface is suspended for the open batch, if
@@ -326,7 +411,7 @@ pub fn endGeometryBatch() void {
 /// whether the caller owns the restore.
 fn suspendEnhancedUi(app: c.AXUIElementRef, pid: i32, ax: *const AxStrings) bool {
     if (g_geometry_batch_depth == 0) {
-        const was_enabled = enhancedUserInterface(app, ax);
+        const was_enabled = shouldSuspendEnhancedUi(app, pid, ax);
         if (was_enabled) {
             _ = c.AXUIElementSetAttributeValue(app, ax.enhanced_ui_attr, c.kCFBooleanFalse);
         }
@@ -338,7 +423,7 @@ fn suspendEnhancedUi(app: c.AXUIElementRef, pid: i32, ax: *const AxStrings) bool
         restoreEnhancedUiBatch();
     }
 
-    const was_enabled = enhancedUserInterface(app, ax);
+    const was_enabled = shouldSuspendEnhancedUi(app, pid, ax);
     if (was_enabled) {
         _ = c.AXUIElementSetAttributeValue(app, ax.enhanced_ui_attr, c.kCFBooleanFalse);
     }
@@ -490,7 +575,7 @@ pub fn animationBegin(pid: i32, wid: u32) ?AnimationHandle {
     if (strings()) |ax| {
         if (c.AXUIElementCreateApplication(pid)) |app| {
             defer c.CFRelease(@ptrCast(app));
-            if (enhancedUserInterface(app, ax)) {
+            if (shouldSuspendEnhancedUi(app, pid, ax)) {
                 _ = c.AXUIElementSetAttributeValue(app, ax.enhanced_ui_attr, c.kCFBooleanFalse);
                 restore_enhanced_ui = true;
             }
@@ -532,4 +617,29 @@ pub fn animationEnd(handle: AnimationHandle) void {
         defer c.CFRelease(@ptrCast(app));
         _ = c.AXUIElementSetAttributeValue(app, ax.enhanced_ui_attr, c.kCFBooleanTrue);
     }
+}
+
+test "enhanced UI false cache expires and invalidates by pid" {
+    const pid: i32 = 42;
+    const collision_pid: i32 = pid + enhanced_ui_false_cache_slots;
+    const checked_at_ns: i128 = 1_000;
+
+    forgetEnhancedUiState(pid);
+    forgetEnhancedUiState(collision_pid);
+    defer {
+        forgetEnhancedUiState(pid);
+        forgetEnhancedUiState(collision_pid);
+    }
+
+    rememberEnhancedUiFalse(pid, checked_at_ns);
+    try std.testing.expect(enhancedUiKnownFalse(pid, checked_at_ns));
+    try std.testing.expect(enhancedUiKnownFalse(pid, checked_at_ns + enhanced_ui_false_ttl_ns - 1));
+    try std.testing.expect(!enhancedUiKnownFalse(pid, checked_at_ns + enhanced_ui_false_ttl_ns));
+
+    rememberEnhancedUiFalse(collision_pid, checked_at_ns);
+    try std.testing.expect(!enhancedUiKnownFalse(pid, checked_at_ns));
+    try std.testing.expect(enhancedUiKnownFalse(collision_pid, checked_at_ns));
+
+    invalidateApp(collision_pid);
+    try std.testing.expect(!enhancedUiKnownFalse(collision_pid, checked_at_ns));
 }

@@ -1897,7 +1897,7 @@ fn bw_ax_focus_window(pid: i32, wid: u32) bool {
     std.debug.assert(pid > 0);
     std.debug.assert(wid > 0);
 
-    const win = findAxWindow(pid, wid) orelse return false;
+    const win = ax_mod.retainWindow(pid, wid) orelse return false;
     defer c.CFRelease(@ptrCast(win));
 
     const ax = ensureAxStrings() orelse return false;
@@ -3292,6 +3292,7 @@ fn handleEvent(ev: *const event_mod.Event) void {
             log.info("app terminated pid={}", .{ev.pid});
             untrackAppLaunchRetry(ev.pid);
             untrackFocusRetry(ev.pid);
+            ax_mod.invalidateApp(ev.pid);
             ax_observer.unobserveApp(ev.pid);
             removeAppWindows(ev.pid);
             retile();
