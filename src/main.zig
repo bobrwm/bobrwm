@@ -996,17 +996,16 @@ fn assertDisplayCoverage() void {
 
 fn updateStatusBar() void {
     const focused_slot = g_workspaces.focused_display_slot;
-    var entries: [workspace_mod.max_displays]statusbar.DisplayWorkspace = undefined;
+    var active_ids: [workspace_mod.max_displays]u8 = undefined;
     for (0..g_display_count) |slot| {
-        const ws_id = g_workspaces.activeIdForDisplaySlot(slot);
-        const ws = g_workspaces.get(ws_id) orelse continue;
-        entries[slot] = .{
-            .name = ws.name,
-            .id = ws.id,
-            .focused = slot == focused_slot,
-        };
+        active_ids[slot] = g_workspaces.activeIdForDisplaySlot(slot);
     }
-    statusbar.setTitleMulti(entries[0..g_display_count]);
+
+    statusbar.updateState(
+        g_workspaces.workspaces[0..g_workspaces.workspace_count],
+        active_ids[0..g_display_count],
+        g_workspaces.activeIdForDisplaySlot(focused_slot),
+    );
 }
 
 fn clearTilingStates() void {
@@ -2319,7 +2318,7 @@ fn applyReloadedConfig(next: ConfigRuntime) void {
     // Preserve BSP topology and runtime split edits for ordinary config saves.
     // Only changing the layout algorithm requires reconstructing state.
     if (layout_changed) rebuildTilingStatesForConfig();
-    statusbar.updateWorkspaceMenu(g_workspaces.workspaces[0..g_workspaces.workspace_count]);
+    statusbar.updateWorkspaceMenu(g_workspaces.workspaces[0..g_workspaces.workspace_count], &g_config);
     updateStatusBar();
     retile();
     if (dim.enabled) pushDimSnapshot();
@@ -2725,8 +2724,8 @@ pub fn main(init: std.process.Init.Minimal) !void {
     ipc.g_dispatch = ipcDispatch;
 
     // -- NSApp (zig-objc) --
-    // Register runtime ObjC classes (BWStatusBarDelegate / BWObserver /
-    // BWLaunchGate) before any code does objc.getClass on them.
+    // Register runtime ObjC classes (BWObserver / BWLaunchGate) before
+    // any code does objc.getClass on them.
     objc_classes.register(g_allocator);
     const NSApp = initApp();
     initWorkspaceObservers();
@@ -2741,7 +2740,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     observeDiscoveredApps();
 
     // Status bar (zig-objc) --
-    statusbar.init(g_workspaces.workspaces[0..g_workspaces.workspace_count]);
+    statusbar.init(g_workspaces.workspaces[0..g_workspaces.workspace_count], &g_config);
     defer statusbar.deinit();
     updateStatusBar();
 
@@ -2852,17 +2851,17 @@ fn bw_handle_ipc_client(server_fd: c_int) void {
     }
 }
 
-/// Clean shutdown — called from BWStatusBarDelegate.quit:.
+/// Clean shutdown — called from the menu bar UI's quit action.
 pub fn bw_will_quit() void {
     restoreAllWindows();
 }
 
-/// Retile — called from BWStatusBarDelegate.retile:.
+/// Retile — called from the menu bar UI's retile action.
 pub fn bw_retile() void {
     retile();
 }
 
-/// Dispatch a BWStatusBarDelegate action on the main thread.
+/// Dispatch a menu bar action on the main thread.
 pub fn bw_status_bar_action(action: StatusBarAction) void {
     switch (action) {
         .open_config => openConfigFile(),

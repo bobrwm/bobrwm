@@ -15,6 +15,9 @@ const bundle_macos = bundle_contents ++ "/MacOS";
 const server_exe_name = "Bobrwm";
 const cli_exe_name = "bobrwm-cli";
 
+// SwiftUI menu bar, loaded from Contents/Frameworks via @rpath.
+const ui_dylib_name = "libbobrwm-ui.dylib";
+
 // launchd requires Label to match the plist's basename. src/loginitem.zig
 // registers this same name through SMAppService.
 const launchd_label = "com.bobrwm.bobrwm";
@@ -102,10 +105,10 @@ pub fn build(b: *std.Build) !void {
     const log_level_int: ?u3 = if (log_level) |l| @intFromEnum(l) else null;
     build_options.addOption(?u3, "log_level_int", log_level_int);
     build_options.addOption([]const u8, "version", version_string);
-    exe_mod.addImport("build_options", build_options.createModule());
+    const build_options_mod = build_options.createModule();
 
     const objc_dep = b.dependency("zig_objc", .{ .target = target, .optimize = optimize });
-    exe_mod.addImport("objc", objc_dep.module("objc"));
+    const objc_mod = objc_dep.module("objc");
 
     // Translate the aggregated C header surface (ApplicationServices,
     // dispatch, pthread, os/lock) once via the build system, replacing
@@ -147,7 +150,6 @@ pub fn build(b: *std.Build) !void {
         translate_c.defineCMacroRaw(flag[2..]);
     }
     const c_mod = translate_c.createModule();
-    exe_mod.addImport("c", c_mod);
 
     // Hand-written extern decls for CGEvent/CGWindow symbols Aro can't
     // translate. Needs `c` itself in scope to reference shared types.
@@ -157,23 +159,57 @@ pub fn build(b: *std.Build) !void {
         .optimize = optimize,
     });
     cg_extra_mod.addImport("c", c_mod);
-    exe_mod.addImport("cg_extra", cg_extra_mod);
+
+    const app_module_dependencies: AppModuleDependencies = .{
+        .build_options = build_options_mod,
+        .objc = objc_mod,
+        .c_mod = c_mod,
+        .cg_extra = cg_extra_mod,
+        .sdk_include = sdk_include,
+        .sdk_lib = sdk_lib,
+        .sdk_frameworks = sdk_frameworks,
+        .sdk_private_frameworks = sdk_private_frameworks,
+    };
+    configureAppModule(exe_mod, app_module_dependencies);
 
     // BW* Objective-C classes (BWStatusBarDelegate, BWObserver, BWLaunchGate)
     // are registered at runtime by src/objc_classes.zig via zig-objc's
     // allocateClassPair. No clang-compiled translation unit is required.
 
-    exe_mod.linkFramework("ApplicationServices", .{});
-    exe_mod.linkFramework("CoreGraphics", .{});
-    exe_mod.linkFramework("Carbon", .{});
-    exe_mod.linkFramework("AppKit", .{});
-    exe_mod.linkFramework("CoreFoundation", .{});
-    exe_mod.linkFramework("ServiceManagement", .{});
+    // SwiftUI menu bar. `swiftc` ships with the Command Line Tools, so no
+    // Xcode project is involved, and the Swift runtime is part of the OS
+    // (/usr/lib/swift) — nothing has to ship next to the dylib.
+    const swift_ui = b.addSystemCommand(&.{
+        "swiftc",
+        // Swift 6 strict concurrency rejects the process-wide controller the
+        // C entry points share. Every call already arrives on the main thread,
+        // so the checking would buy nothing here.
+        "-swift-version",
+        "5",
+        "-target",
+        "arm64-apple-macos13.0",
+        "-emit-library",
+        "-module-name",
+        "BobrwmUI",
+        "-Xlinker",
+        "-install_name",
+        "-Xlinker",
+        "@rpath/" ++ ui_dylib_name,
+        "-sdk",
+        sdk_root,
+    });
+    if (optimize != .Debug) swift_ui.addArg("-O");
+    // Carries both bobrwm_ui.h and the modulemap that makes it importable.
+    swift_ui.addPrefixedDirectoryArg("-I", b.path("packages/bobrwm-ui/include"));
+    const ui_dylib = swift_ui.addPrefixedOutputFileArg("-o", ui_dylib_name);
+    swift_ui.addFileArg(b.path("packages/bobrwm-ui/src/MenuBar.swift"));
+    swift_ui.addFileArg(b.path("packages/bobrwm-ui/src/MenuRow.swift"));
 
-    exe_mod.addSystemFrameworkPath(.{ .cwd_relative = sdk_frameworks });
-    exe_mod.addSystemFrameworkPath(.{ .cwd_relative = sdk_private_frameworks });
-    exe_mod.addSystemIncludePath(.{ .cwd_relative = sdk_include });
-    exe_mod.addLibraryPath(.{ .cwd_relative = sdk_lib });
+    exe_mod.addLibraryPath(ui_dylib.dirname());
+    exe_mod.linkSystemLibrary("bobrwm-ui", .{});
+    // addRPath would resolve this against the build cwd; the loader needs the
+    // @executable_path token emitted verbatim.
+    exe_mod.addRPathSpecial("@executable_path/../Frameworks");
 
     const exe = b.addExecutable(.{
         .name = server_exe_name,
@@ -191,7 +227,7 @@ pub fn build(b: *std.Build) !void {
         .optimize = optimize,
         .link_libc = true,
     });
-    cli_mod.addImport("build_options", build_options.createModule());
+    cli_mod.addImport("build_options", build_options_mod);
 
     const cli_exe = b.addExecutable(.{
         .name = cli_exe_name,
@@ -207,7 +243,7 @@ pub fn build(b: *std.Build) !void {
         .link_libc = true,
     });
     // config.zig reaches osutil.appBundleId, which uses the objc module.
-    swipe_config_mod.addImport("objc", objc_dep.module("objc"));
+    swipe_config_mod.addImport("objc", objc_mod);
 
     const swipe_mod = b.createModule(.{
         .root_source_file = b.path("packages/bobrwm-swipe/src/main.zig"),
@@ -215,7 +251,7 @@ pub fn build(b: *std.Build) !void {
         .optimize = optimize,
         .link_libc = true,
     });
-    swipe_mod.addImport("objc", objc_dep.module("objc"));
+    swipe_mod.addImport("objc", objc_mod);
     swipe_mod.addImport("c", c_mod);
     swipe_mod.addImport("cg_extra", cg_extra_mod);
     swipe_mod.addImport("bobrwm_config", swipe_config_mod);
@@ -234,6 +270,8 @@ pub fn build(b: *std.Build) !void {
     });
 
     installBundleArtifact(b, swipe_exe);
+
+    installBundleFile(b, ui_dylib, "Contents/Frameworks", ui_dylib_name);
 
     installBundleFile(b, bundleInfoPlist(b, app_version), "Contents", "Info.plist");
     // Classic-era type/creator record. LaunchServices no longer needs it, but
@@ -255,13 +293,14 @@ pub fn build(b: *std.Build) !void {
 
         // Nested code must be sealed before the enclosing bundle, otherwise
         // the outer signature covers a helper that is about to change.
-        for ([_][2][]const u8{
-            .{ cli_exe_name, "com.bobrwm.cli" },
-            .{ "bobrwm-swipe", "com.bobrwm.swipe" },
+        for ([_][3][]const u8{
+            .{ bundle_macos, cli_exe_name, "com.bobrwm.cli" },
+            .{ bundle_macos, "bobrwm-swipe", "com.bobrwm.swipe" },
+            .{ bundle_contents ++ "/Frameworks", ui_dylib_name, "com.bobrwm.ui" },
         }) |entry| {
             const sign_helper = devCodesign(b, identity);
-            sign_helper.addArgs(&.{ "--identifier", entry[1] });
-            sign_helper.addArg(b.getInstallPath(.prefix, b.fmt("{s}/{s}", .{ bundle_macos, entry[0] })));
+            sign_helper.addArgs(&.{ "--identifier", entry[2] });
+            sign_helper.addArg(b.getInstallPath(.prefix, b.fmt("{s}/{s}", .{ entry[0], entry[1] })));
             sign_helper.step.dependOn(b.getInstallStep());
             sign_app.step.dependOn(&sign_helper.step);
         }
@@ -287,6 +326,30 @@ pub fn build(b: *std.Build) !void {
 
     const run_step = b.step("run", "Run bobrwm");
     run_step.dependOn(&run_cmd.step);
+
+    // Renders the menu bar views to PNGs so the UI can be iterated on without
+    // rebuilding bobrwm and interrupting a running window manager. MenuRow.swift
+    // has no dependency on the C ABI module, so it links standalone.
+    const preview_build = b.addSystemCommand(&.{
+        "swiftc",
+        "-swift-version",
+        "5",
+        "-target",
+        "arm64-apple-macos13.0",
+        "-sdk",
+        sdk_root,
+    });
+    const preview_exe = preview_build.addPrefixedOutputFileArg("-o", "bobrwm-ui-preview");
+    preview_build.addFileArg(b.path("packages/bobrwm-ui/src/MenuRow.swift"));
+    preview_build.addFileArg(b.path("packages/bobrwm-ui/preview/main.swift"));
+
+    const preview_run = std.Build.Step.Run.create(b, "render ui preview");
+    preview_run.has_side_effects = true;
+    preview_run.addFileArg(preview_exe);
+    preview_run.addArg(b.pathFromRoot("zig-out/ui-preview"));
+
+    const preview_step = b.step("ui-preview", "Render the menu bar UI to PNGs");
+    preview_step.dependOn(&preview_run.step);
 
     const run_swipe_cmd = b.addSystemCommand(&.{
         b.getInstallPath(.prefix, bundle_macos ++ "/bobrwm-swipe"),
@@ -372,6 +435,21 @@ pub fn build(b: *std.Build) !void {
 
     const run_workspace_tests = b.addRunArtifact(workspace_tests);
 
+    const statusbar_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/statusbar.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    configureAppModule(statusbar_test_mod, app_module_dependencies);
+
+    const statusbar_tests = b.addTest(.{
+        .name = "statusbar-tests",
+        .root_module = statusbar_test_mod,
+    });
+
+    const run_statusbar_tests = b.addRunArtifact(statusbar_tests);
+
     // dim.zig draws overlay panels via zig-objc and imports config.zig (needs
     // libc via osutil), so its test module needs the objc import plus AppKit /
     // CoreGraphics linkage and SDK paths, like the swipe test module.
@@ -381,7 +459,7 @@ pub fn build(b: *std.Build) !void {
         .optimize = optimize,
         .link_libc = true,
     });
-    dim_test_mod.addImport("objc", objc_dep.module("objc"));
+    dim_test_mod.addImport("objc", objc_mod);
     dim_test_mod.linkFramework("AppKit", .{});
     dim_test_mod.linkFramework("CoreGraphics", .{});
     dim_test_mod.linkFramework("CoreFoundation", .{});
@@ -402,7 +480,7 @@ pub fn build(b: *std.Build) !void {
         .optimize = optimize,
         .link_libc = true,
     });
-    swipe_test_mod.addImport("objc", objc_dep.module("objc"));
+    swipe_test_mod.addImport("objc", objc_mod);
     swipe_test_mod.addImport("c", c_mod);
     swipe_test_mod.addImport("cg_extra", cg_extra_mod);
     swipe_test_mod.addImport("bobrwm_config", swipe_config_mod);
@@ -427,8 +505,42 @@ pub fn build(b: *std.Build) !void {
     test_step.dependOn(&run_tabgroup_tests.step);
     test_step.dependOn(&run_tiling_tests.step);
     test_step.dependOn(&run_workspace_tests.step);
+    test_step.dependOn(&run_statusbar_tests.step);
     test_step.dependOn(&run_dim_tests.step);
     test_step.dependOn(&run_swipe_tests.step);
+}
+
+const AppModuleDependencies = struct {
+    build_options: *std.Build.Module,
+    objc: *std.Build.Module,
+    c_mod: *std.Build.Module,
+    cg_extra: *std.Build.Module,
+    sdk_include: []const u8,
+    sdk_lib: []const u8,
+    sdk_frameworks: []const u8,
+    sdk_private_frameworks: []const u8,
+};
+
+/// Wire modules that compile the main application graph to the same platform
+/// imports and frameworks. Swift remains executable-only so Zig tests do not
+/// need to build or link the menu bar dylib.
+fn configureAppModule(module: *std.Build.Module, dependencies: AppModuleDependencies) void {
+    module.addImport("build_options", dependencies.build_options);
+    module.addImport("objc", dependencies.objc);
+    module.addImport("c", dependencies.c_mod);
+    module.addImport("cg_extra", dependencies.cg_extra);
+
+    module.linkFramework("ApplicationServices", .{});
+    module.linkFramework("CoreGraphics", .{});
+    module.linkFramework("Carbon", .{});
+    module.linkFramework("AppKit", .{});
+    module.linkFramework("CoreFoundation", .{});
+    module.linkFramework("ServiceManagement", .{});
+
+    module.addSystemFrameworkPath(.{ .cwd_relative = dependencies.sdk_frameworks });
+    module.addSystemFrameworkPath(.{ .cwd_relative = dependencies.sdk_private_frameworks });
+    module.addSystemIncludePath(.{ .cwd_relative = dependencies.sdk_include });
+    module.addLibraryPath(.{ .cwd_relative = dependencies.sdk_lib });
 }
 
 fn installBundleArtifact(b: *std.Build, artifact: *std.Build.Step.Compile) void {
