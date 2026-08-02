@@ -86,14 +86,17 @@ jobs:
           # the enclosing signature. --deep would sign them for us but applies
           # the app's options to every nested binary, which is why Apple
           # deprecated it.
-          for helper in bobrwm-cli:com.bobrwm.cli bobrwm-swipe:com.bobrwm.swipe; do
+          for helper in \
+            MacOS/bobrwm-cli:com.bobrwm.cli \
+            MacOS/bobrwm-swipe:com.bobrwm.swipe \
+            Frameworks/libbobrwm-ui.dylib:com.bobrwm.ui; do
             codesign \
               --force \
               --sign "$MACOS_CERTIFICATE_NAME" \
               --identifier "${helper#*:}" \
               --options runtime \
               --timestamp \
-              "$APP_PATH/Contents/MacOS/${helper%%:*}"
+              "$APP_PATH/Contents/${helper%%:*}"
           done
 
           # The app takes its identifier from CFBundleIdentifier.
@@ -114,6 +117,19 @@ jobs:
             "com.bobrwm.cli"
           test "$(codesign -dvv "$APP_PATH/Contents/MacOS/bobrwm-swipe" 2>&1 | sed -n 's/^Identifier=//p')" = \
             "com.bobrwm.swipe"
+          test "$(codesign -dvv "$APP_PATH/Contents/Frameworks/libbobrwm-ui.dylib" 2>&1 | sed -n 's/^Identifier=//p')" = \
+            "com.bobrwm.ui"
+
+          # --deep --strict accepts the ad-hoc signature the linker leaves on
+          # arm64 binaries, so nested code can pass verification and still come
+          # back Invalid from notarization. Check the authority instead.
+          while IFS= read -r nested; do
+            codesign --verify --strict "$nested"
+            codesign -dvv "$nested" 2>&1 | grep -q '^Authority=Developer ID Application' || {
+              echo "not signed with Developer ID: $nested" >&2
+              exit 1
+            }
+          done < <(find "$APP_PATH/Contents/MacOS" "$APP_PATH/Contents/Frameworks" -type f)
 
       - name: Notarize and staple
         env:
@@ -126,12 +142,25 @@ jobs:
 
           ditto -c -k --keepParent "$APP_PATH" "$ARTIFACT_PATH"
 
-          xcrun notarytool submit "$ARTIFACT_PATH" \
+          # `submit --wait` exits 0 on a rejected submission, so the status has
+          # to be read back. Without the notary log a rejection surfaces as an
+          # opaque stapler error several lines later.
+          submission="$(xcrun notarytool submit "$ARTIFACT_PATH" \
             --key "$notarization_key_path" \
             --key-id "$APPLE_NOTARIZATION_KEY_ID" \
             --issuer "$APPLE_NOTARIZATION_ISSUER" \
             --wait \
-            --timeout 30m
+            --timeout 30m \
+            --output-format json)"
+          echo "$submission"
+
+          if [[ "$(jq -r .status <<<"$submission")" != "Accepted" ]]; then
+            xcrun notarytool log "$(jq -r .id <<<"$submission")" \
+              --key "$notarization_key_path" \
+              --key-id "$APPLE_NOTARIZATION_KEY_ID" \
+              --issuer "$APPLE_NOTARIZATION_ISSUER"
+            exit 1
+          fi
 
           # The ticket staples to the .app, never to the zip that carried it
           # to Apple, so the bundle has to be repackaged afterwards. A release
