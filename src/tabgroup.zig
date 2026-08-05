@@ -1,8 +1,24 @@
+//! Tab groups: the window manager's model of a native-tabbed window.
+//!
+//! Two systems live under this name and are deliberately kept apart:
+//!
+//!   detect.zig  decides which window ids form one tabbed window and which is
+//!               on screen. Pure functions over a snapshot of OS facts.
+//!   this file    holds the resulting groups and the vocabulary the rest of the
+//!               window manager speaks: who owns the workspace slot (leader),
+//!               what is on screen (active), what must be hidden from tiling
+//!               and dimming (suppressed), and what a caller has to repair when
+//!               a member goes away.
+//!
+//! Nothing here infers anything. Nothing in detect.zig holds state.
+
 const std = @import("std");
 const WindowId = @import("window.zig").WindowId;
 const Frame = @import("window.zig").Window.Frame;
 
 const log = std.log.scoped(.tabgroup);
+
+pub const detect = @import("tabgroup/detect.zig");
 
 pub const GroupId = u32;
 
@@ -209,14 +225,9 @@ pub const TabGroupManager = struct {
         return g.leader_wid;
     }
 
-    /// Check if two frames match within ±2px tolerance.
-    pub fn framesMatch(a: Frame, b: Frame) bool {
-        const tol: f64 = 2.0;
-        return @abs(a.x - b.x) <= tol and
-            @abs(a.y - b.y) <= tol and
-            @abs(a.width - b.width) <= tol and
-            @abs(a.height - b.height) <= tol;
-    }
+    /// Frame comparison is a detection concern; kept here as the name the
+    /// window manager already calls.
+    pub const framesMatch = detect.framesMatch;
 };
 
 // Tests
@@ -284,4 +295,10 @@ test "removeMember returns none for an untracked window" {
         .none => {},
         else => return error.TestUnexpectedResult,
     }
+}
+
+// Pull in the detection module so its tests run under this test root
+// (`zig build test` compiles tabgroup.zig as the tabgroup-tests module).
+test {
+    _ = detect;
 }
