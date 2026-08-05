@@ -72,12 +72,17 @@ pub fn appHasTabGroup(app_windows: []const AppWindow) bool {
 ///
 /// Reading this beats remembering it. macOS emits no notification of any kind
 /// when the user switches native tabs, so a recorded active tab is stale from
-/// that moment, while the bar moves to whichever window is selected. Declines
-/// when two groups sit at the same frame, since nothing then says which is which.
+/// that moment, while the bar moves to whichever window is selected.
+///
+/// Only an on-screen window qualifies: the window showing a tab is on screen by
+/// definition, and without that a minimized window of another group at the same
+/// frame makes the answer look ambiguous when it is not. Still declines when two
+/// on-screen groups share a frame, since nothing then says which is which.
 pub fn selectedTabWindow(app_windows: []const AppWindow, group_frame: Frame) ?WindowId {
     var found: ?WindowId = null;
     for (app_windows) |app_window| {
         if (app_window.tab_count <= 1) continue;
+        if (!app_window.is_on_screen) continue;
 
         const live = app_window.live_frame orelse continue;
         if (!framesMatch(live, group_frame)) continue;
@@ -293,9 +298,18 @@ test "selectedTabWindow: the window carrying the bar at that frame" {
     try testing.expectEqual(@as(?WindowId, 3), selectedTabWindow(&app_windows, tiled_right));
 }
 
-test "selectedTabWindow: declines when two groups share a frame" {
+test "selectedTabWindow: declines when two on-screen groups share a frame" {
     const app_windows = [_]AppWindow{ appWin(2, tiled_left, 3), appWin(4, tiled_left, 2) };
     try testing.expectEqual(@as(?WindowId, null), selectedTabWindow(&app_windows, tiled_left));
+}
+
+test "selectedTabWindow: an off-screen group at the same frame is not a rival" {
+    // A minimized window of another group reports the same frame; it cannot be
+    // the window showing a tab, so it must not make the answer ambiguous.
+    var minimized = appWin(4, tiled_left, 2);
+    minimized.is_on_screen = false;
+    const app_windows = [_]AppWindow{ appWin(2, tiled_left, 3), minimized };
+    try testing.expectEqual(@as(?WindowId, 2), selectedTabWindow(&app_windows, tiled_left));
 }
 
 test "classifyNewWindow: a window replacing an off-screen sibling is its tab" {
