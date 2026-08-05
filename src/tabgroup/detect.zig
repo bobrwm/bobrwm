@@ -47,7 +47,46 @@ pub const AppWindow = struct {
     /// Raw CG on-screen state, without the workspace-visibility adjustment.
     is_on_screen: bool,
     is_managed: bool,
+    /// Tabs in this window's own tab bar, from AXTabGroup. Zero when it has
+    /// none: a standalone window, or a background tab, since only the selected
+    /// tab of a group carries the bar.
+    tab_count: usize,
 };
+
+/// Whether the app has any native tab group at all — some window of it carries a
+/// tab bar with more than one tab.
+///
+/// This is the gate every tab decision hangs off. Without a bar somewhere in the
+/// app, no window of it can be a background tab, so inference must not run: two
+/// same-app windows at one frame are then just two windows, which is exactly
+/// what a floating app whose windows stack looks like.
+pub fn appHasTabGroup(app_windows: []const AppWindow) bool {
+    for (app_windows) |app_window| {
+        if (app_window.tab_count > 1) return true;
+    }
+    return false;
+}
+
+/// The window showing a tab group's selected tab: the one carrying the bar at
+/// `group_frame`.
+///
+/// Reading this beats remembering it. macOS emits no notification of any kind
+/// when the user switches native tabs, so a recorded active tab is stale from
+/// that moment, while the bar moves to whichever window is selected. Declines
+/// when two groups sit at the same frame, since nothing then says which is which.
+pub fn selectedTabWindow(app_windows: []const AppWindow, group_frame: Frame) ?WindowId {
+    var found: ?WindowId = null;
+    for (app_windows) |app_window| {
+        if (app_window.tab_count <= 1) continue;
+
+        const live = app_window.live_frame orelse continue;
+        if (!framesMatch(live, group_frame)) continue;
+
+        if (found != null) return null;
+        found = app_window.wid;
+    }
+    return found;
+}
 
 // ── New or newly-focused window ──────────────────────────────────────────────
 
@@ -66,19 +105,19 @@ pub const NewWindowOutcome = union(enum) {
 /// owns a workspace slot, and WindowServer still puts it at the new window's
 /// frame, since native tabs of one group share their window's frame.
 ///
-/// An *on-screen* sibling at the same frame vetoes the whole decision: that is
-/// what two standalone windows racing through creation look like. It is also
-/// what a floating app whose windows stack looks like, which is why this
-/// returns `standalone` for a real tab in that configuration — see the tests.
+/// `app_has_tab_group` gates the whole decision: with no tab bar anywhere in the
+/// app there is nothing for the window to be a tab of, however well the frames
+/// line up. That is what keeps a floating app whose windows stack at identical
+/// frames from reading as a tab transition.
 pub fn classifyNewWindow(
     pid: i32,
     new_wid: WindowId,
     new_frame: Frame,
     candidates: []const Candidate,
+    app_has_tab_group: bool,
 ) NewWindowOutcome {
+    if (!app_has_tab_group) return .standalone;
     if (new_frame.width <= 1 or new_frame.height <= 1) return .standalone;
-
-    if (findVisibleSiblingAtFrame(pid, new_wid, new_frame, candidates) != null) return .standalone;
 
     for (candidates) |candidate| {
         if (candidate.wid == new_wid) continue;
@@ -134,38 +173,17 @@ pub fn staleCandidates(pid: i32, candidates: []const Candidate, out: []WindowId)
     return count;
 }
 
-// ── Additional members of a known group ──────────────────────────────────────
-
-/// Unmanaged windows of an app that sit off-screen at a group's frame, i.e.
-/// further background tabs of that group. Returns the number written to `out`.
-///
-/// The guards matter: an unmanaged window that is on screen, or at different
-/// bounds, is a standalone window racing through the creation pipeline rather
-/// than a tab. Swallowing one as a member would leave it permanently untiled.
-pub fn additionalMembers(
-    group_frame: Frame,
-    app_windows: []const AppWindow,
-    out: []WindowId,
-) usize {
-    var count: usize = 0;
-    for (app_windows) |app_window| {
-        if (count == out.len) break;
-        if (app_window.is_managed) continue;
-        if (app_window.is_on_screen) continue;
-
-        const live = app_window.live_frame orelse continue;
-        if (!framesMatch(live, group_frame)) continue;
-
-        out[count] = app_window.wid;
-        count += 1;
-    }
-    return count;
-}
-
 // ── Off-screen managed window found by cleanup ───────────────────────────────
 
+/// The action an off-screen managed window needs, without the payload — what a
+/// caller reports back once it has applied the decision.
+pub const OffscreenOutcomeKind = enum { keep, reap, adopt };
+
 pub const OffscreenOutcome = union(enum) {
-    /// No sibling claims it; the caller should remove it.
+    /// Leave it alone: the app still exposes it, so it is a live window that is
+    /// merely not on screen, not a ghost and not a tab.
+    keep,
+    /// Nothing claims it; the caller should remove it.
     reap,
     /// It is a background tab of the named window's group.
     adopt_into: WindowId,
@@ -175,19 +193,27 @@ pub const OffscreenOutcome = union(enum) {
 /// visible workspace.
 ///
 /// Tab inference happens at creation and focus time; when that is missed — event
-/// races, mid-animation bounds, events dropped during a workspace transition —
-/// a background tab remains managed as a standalone window that is now
-/// off-screen, and reaping it would lose the tab. `listed_in_app` is whether the
-/// app still exposes the window in its AX window list.
+/// races, mid-animation bounds, events dropped during a workspace transition — a
+/// background tab remains managed as a standalone window that is now off-screen,
+/// and reaping it would lose the tab.
+///
+/// `listed_in_app` is whether the app still exposes the window in `AXWindows`.
+/// Being listed rules a window *out* as a background tab: macOS drops background
+/// tabs from that list, which is measurable by arithmetic — a five-tab group
+/// contributes exactly one listed window, and the other four tabs' titles appear
+/// nowhere in it.
 pub fn classifyOffscreenManaged(
     wid: WindowId,
     pid: i32,
     live_frame: ?Frame,
     listed_in_app: bool,
+    app_has_tab_group: bool,
     candidates: []const Candidate,
 ) OffscreenOutcome {
+    if (listed_in_app) return .keep;
+
     const frame = live_frame orelse return .reap;
-    if (!listed_in_app) return .reap;
+    if (!app_has_tab_group) return .reap;
 
     const sibling = findVisibleSiblingAtFrame(pid, wid, frame, candidates) orelse return .reap;
     return .{ .adopt_into = sibling };
@@ -250,9 +276,63 @@ fn managed(wid: WindowId, frame: Frame, visible: bool) Candidate {
     };
 }
 
+/// An app window carrying a tab bar of `tabs` tabs.
+fn appWin(wid: WindowId, frame: ?Frame, tabs: usize) AppWindow {
+    return .{ .wid = wid, .live_frame = frame, .is_on_screen = true, .is_managed = true, .tab_count = tabs };
+}
+
+test "appHasTabGroup: only a bar with more than one tab counts" {
+    try testing.expect(!appHasTabGroup(&[_]AppWindow{}));
+    try testing.expect(!appHasTabGroup(&[_]AppWindow{ appWin(1, tiled_left, 0), appWin(2, tiled_left, 1) }));
+    try testing.expect(appHasTabGroup(&[_]AppWindow{ appWin(1, tiled_left, 0), appWin(2, tiled_left, 2) }));
+}
+
+test "selectedTabWindow: the window carrying the bar at that frame" {
+    const app_windows = [_]AppWindow{ appWin(1, tiled_left, 0), appWin(2, tiled_left, 3), appWin(3, tiled_right, 2) };
+    try testing.expectEqual(@as(?WindowId, 2), selectedTabWindow(&app_windows, tiled_left));
+    try testing.expectEqual(@as(?WindowId, 3), selectedTabWindow(&app_windows, tiled_right));
+}
+
+test "selectedTabWindow: declines when two groups share a frame" {
+    const app_windows = [_]AppWindow{ appWin(2, tiled_left, 3), appWin(4, tiled_left, 2) };
+    try testing.expectEqual(@as(?WindowId, null), selectedTabWindow(&app_windows, tiled_left));
+}
+
 test "classifyNewWindow: a window replacing an off-screen sibling is its tab" {
     const candidates = [_]Candidate{managed(1, tiled_left, false)};
-    const outcome = classifyNewWindow(100, 2, tiled_left, &candidates);
+    const outcome = classifyNewWindow(100, 2, tiled_left, &candidates, true);
+    try testing.expectEqual(@as(WindowId, 1), outcome.tab_of);
+}
+
+test "classifyNewWindow: no tab bar in the app means no tab, however the frames line up" {
+    // The fix: this is the stacked floating case. Window 1 sits off-screen at
+    // exactly the new window's frame, which used to be enough to group them.
+    const candidates = [_]Candidate{managed(1, tiled_left, false)};
+    try testing.expectEqual(NewWindowOutcome.standalone, classifyNewWindow(100, 2, tiled_left, &candidates, false));
+}
+
+test "classifyNewWindow: a stacked floating app is never grouped" {
+    // Several same-pid windows at pixel-identical frames, no tab bar anywhere:
+    // a Ghostty-style sessionizer. Previously the on-screen sibling veto had to
+    // catch this, and it also blocked real tabs; now the gate decides.
+    const candidates = [_]Candidate{
+        managed(1, tiled_left, false),
+        managed(3, tiled_left, true),
+        managed(4, tiled_left, true),
+    };
+    try testing.expectEqual(NewWindowOutcome.standalone, classifyNewWindow(100, 2, tiled_left, &candidates, false));
+}
+
+test "classifyNewWindow: a real tab is found even with siblings stacked at its frame" {
+    // The case the old veto got wrong: the app does have a tab bar, window 1
+    // really did drop out of view at this frame, and unrelated on-screen windows
+    // 3 and 4 share it. The tab must still be recognised.
+    const candidates = [_]Candidate{
+        managed(1, tiled_left, false),
+        managed(3, tiled_left, true),
+        managed(4, tiled_left, true),
+    };
+    const outcome = classifyNewWindow(100, 2, tiled_left, &candidates, true);
     try testing.expectEqual(@as(WindowId, 1), outcome.tab_of);
 }
 
@@ -260,46 +340,25 @@ test "classifyNewWindow: a different app at the same frame is not a tab" {
     var other = managed(1, tiled_left, false);
     other.pid = 999;
     const candidates = [_]Candidate{other};
-    try testing.expectEqual(NewWindowOutcome.standalone, classifyNewWindow(100, 2, tiled_left, &candidates));
+    try testing.expectEqual(NewWindowOutcome.standalone, classifyNewWindow(100, 2, tiled_left, &candidates, true));
 }
 
 test "classifyNewWindow: a sibling at another frame is not a tab" {
     const candidates = [_]Candidate{managed(1, tiled_right, false)};
-    try testing.expectEqual(NewWindowOutcome.standalone, classifyNewWindow(100, 2, tiled_left, &candidates));
+    try testing.expectEqual(NewWindowOutcome.standalone, classifyNewWindow(100, 2, tiled_left, &candidates, true));
 }
 
 test "classifyNewWindow: unsettled bounds never match" {
-    const candidates = [_]Candidate{managed(1, .{ .x = 0, .y = 0, .width = 0, .height = 0 }, false)};
     const degenerate: Frame = .{ .x = 0, .y = 0, .width = 0, .height = 0 };
-    try testing.expectEqual(NewWindowOutcome.standalone, classifyNewWindow(100, 2, degenerate, &candidates));
+    const candidates = [_]Candidate{managed(1, degenerate, false)};
+    try testing.expectEqual(NewWindowOutcome.standalone, classifyNewWindow(100, 2, degenerate, &candidates, true));
 }
 
 test "classifyNewWindow: a suppressed member does not own a slot to join" {
     var member = managed(1, tiled_left, false);
     member.owns_workspace_slot = false;
     const candidates = [_]Candidate{member};
-    try testing.expectEqual(NewWindowOutcome.standalone, classifyNewWindow(100, 2, tiled_left, &candidates));
-}
-
-test "classifyNewWindow: an on-screen sibling at the same frame vetoes inference" {
-    // Two standalone windows racing through creation at one tiled frame.
-    const candidates = [_]Candidate{ managed(1, tiled_left, false), managed(3, tiled_left, true) };
-    try testing.expectEqual(NewWindowOutcome.standalone, classifyNewWindow(100, 2, tiled_left, &candidates));
-}
-
-test "classifyNewWindow: KNOWN BAD - a stacked floating app defeats inference" {
-    // A floating app whose windows stack (a Ghostty-style sessionizer) has
-    // several same-pid windows at pixel-identical frames. Window 1 really did
-    // become a background tab of the new window, but unrelated window 3 sits
-    // on screen at the same frame, so the veto fires and the tab is managed as
-    // a standalone window. Pinned so a future fix has to change this on
-    // purpose.
-    const candidates = [_]Candidate{
-        managed(1, tiled_left, false),
-        managed(3, tiled_left, true),
-        managed(4, tiled_left, true),
-    };
-    try testing.expectEqual(NewWindowOutcome.standalone, classifyNewWindow(100, 2, tiled_left, &candidates));
+    try testing.expectEqual(NewWindowOutcome.standalone, classifyNewWindow(100, 2, tiled_left, &candidates, true));
 }
 
 test "staleCandidates: collects same-app slots WindowServer forgot" {
@@ -316,39 +375,33 @@ test "staleCandidates: collects same-app slots WindowServer forgot" {
     try testing.expectEqual(@as(WindowId, 1), out[0]);
 }
 
-test "additionalMembers: only unmanaged off-screen windows at the group frame" {
-    const app_windows = [_]AppWindow{
-        .{ .wid = 1, .live_frame = tiled_left, .is_on_screen = false, .is_managed = true }, // managed
-        .{ .wid = 2, .live_frame = tiled_left, .is_on_screen = true, .is_managed = false }, // on screen
-        .{ .wid = 3, .live_frame = tiled_right, .is_on_screen = false, .is_managed = false }, // other frame
-        .{ .wid = 4, .live_frame = null, .is_on_screen = false, .is_managed = false }, // gone
-        .{ .wid = 5, .live_frame = tiled_left, .is_on_screen = false, .is_managed = false }, // tab
-    };
-    var out: [8]WindowId = undefined;
-    const count = additionalMembers(tiled_left, &app_windows, &out);
-    try testing.expectEqual(@as(usize, 1), count);
-    try testing.expectEqual(@as(WindowId, 5), out[0]);
-}
-
-test "classifyOffscreenManaged: adopts when the app still lists it and a sibling matches" {
+test "classifyOffscreenManaged: adopts a window the app has dropped from AXWindows" {
     const candidates = [_]Candidate{managed(3, tiled_left, true)};
-    const outcome = classifyOffscreenManaged(1, 100, tiled_left, true, &candidates);
+    const outcome = classifyOffscreenManaged(1, 100, tiled_left, false, true, &candidates);
     try testing.expectEqual(@as(WindowId, 3), outcome.adopt_into);
 }
 
-test "classifyOffscreenManaged: reaps a window the app no longer lists" {
+test "classifyOffscreenManaged: a still-listed window is left alone" {
+    // Being listed rules it out as a background tab, and reaping a live window
+    // the app still exposes would lose it.
     const candidates = [_]Candidate{managed(3, tiled_left, true)};
-    try testing.expectEqual(OffscreenOutcome.reap, classifyOffscreenManaged(1, 100, tiled_left, false, &candidates));
+    try testing.expectEqual(OffscreenOutcome.keep, classifyOffscreenManaged(1, 100, tiled_left, true, true, &candidates));
+}
+
+test "classifyOffscreenManaged: reaps when the app has no tab group" {
+    // An Electron window that closed to background: nothing for it to be a tab of.
+    const candidates = [_]Candidate{managed(3, tiled_left, true)};
+    try testing.expectEqual(OffscreenOutcome.reap, classifyOffscreenManaged(1, 100, tiled_left, false, false, &candidates));
 }
 
 test "classifyOffscreenManaged: reaps when no sibling occupies the frame" {
     const candidates = [_]Candidate{managed(3, tiled_right, true)};
-    try testing.expectEqual(OffscreenOutcome.reap, classifyOffscreenManaged(1, 100, tiled_left, true, &candidates));
+    try testing.expectEqual(OffscreenOutcome.reap, classifyOffscreenManaged(1, 100, tiled_left, false, true, &candidates));
 }
 
 test "classifyOffscreenManaged: reaps a window WindowServer forgot" {
     const candidates = [_]Candidate{managed(3, tiled_left, true)};
-    try testing.expectEqual(OffscreenOutcome.reap, classifyOffscreenManaged(1, 100, null, true, &candidates));
+    try testing.expectEqual(OffscreenOutcome.reap, classifyOffscreenManaged(1, 100, null, false, true, &candidates));
 }
 
 test "classifyMember: diverged bounds while on screen is a drag-out" {

@@ -32,6 +32,9 @@ pub const AxStrings = struct {
     zoom_button_attr: c.CFStringRef,
     fullscreen_button_attr: c.CFStringRef,
     focused_attr: c.CFStringRef,
+    children_attr: c.CFStringRef,
+    tabs_attr: c.CFStringRef,
+    tab_group_role: c.CFStringRef,
 };
 
 var g_strings: ?AxStrings = null;
@@ -70,6 +73,9 @@ pub fn strings() ?*const AxStrings {
         "AXZoomButton",
         "AXFullScreenButton",
         "AXFocused",
+        "AXChildren",
+        "AXTabs",
+        "AXTabGroup",
     };
     var refs: [names.len]c.CFStringRef = undefined;
 
@@ -105,6 +111,9 @@ pub fn strings() ?*const AxStrings {
         .zoom_button_attr = refs[18],
         .fullscreen_button_attr = refs[19],
         .focused_attr = refs[20],
+        .children_attr = refs[21],
+        .tabs_attr = refs[22],
+        .tab_group_role = refs[23],
     };
     return &g_strings.?;
 }
@@ -112,6 +121,9 @@ pub fn strings() ?*const AxStrings {
 pub fn deinitStrings() void {
     if (g_strings) |s| {
         const refs = [_]c.CFStringRef{
+            s.tab_group_role,
+            s.tabs_attr,
+            s.children_attr,
             s.focused_attr,
             s.fullscreen_button_attr,
             s.zoom_button_attr,
@@ -296,6 +308,56 @@ pub fn focusedWindowIfMatches(pid: i32, target_wid: u32) ?c.AXUIElementRef {
         return null;
     }
     return focused_ref;
+}
+
+/// Number of tabs in a window's native tab bar, or 0 when it has none.
+///
+/// AppKit puts an `AXTabGroup` titled "tab bar" among a window's AX children,
+/// with one tab element per tab, and only the *selected* tab's window carries
+/// it. This is the one authoritative signal that a window belongs to a native
+/// tab group. Nothing else exposes the relationship: WindowServer models none
+/// (`SLSWindowIteratorGetParentID` is zero for every window and
+/// `SLSCopyAssociatedWindows` returns only the window itself), CG's window
+/// dictionary has no tab key, and `AXWindows` omits background tabs entirely,
+/// so their ids are not reachable at all.
+///
+/// Costs an AXChildren copy plus a role read per child, so callers should ask
+/// once per detection pass rather than per decision.
+pub fn tabCount(pid: i32, wid: u32) usize {
+    std.debug.assert(pid > 0);
+    std.debug.assert(wid > 0);
+
+    const ax = strings() orelse return 0;
+    const win = retainWindow(pid, wid) orelse return 0;
+    defer c.CFRelease(@ptrCast(win));
+
+    var children: c.CFArrayRef = null;
+    if (c.AXUIElementCopyAttributeValue(win, ax.children_attr, @ptrCast(&children)) != c.kAXErrorSuccess) return 0;
+    const children_ref = children orelse return 0;
+    defer c.CFRelease(@ptrCast(children_ref));
+
+    const count = c.CFArrayGetCount(children_ref);
+    var i: c.CFIndex = 0;
+    while (i < count) : (i += 1) {
+        const child_any = c.CFArrayGetValueAtIndex(children_ref, i) orelse continue;
+        const child: c.AXUIElementRef = @ptrCast(child_any);
+
+        var role: c.CFTypeRef = null;
+        if (c.AXUIElementCopyAttributeValue(child, ax.role_attr, &role) != c.kAXErrorSuccess) continue;
+        const role_ref = role orelse continue;
+        defer c.CFRelease(role_ref);
+        if (c.CFEqual(role_ref, @ptrCast(ax.tab_group_role)) == 0) continue;
+
+        var tabs: c.CFArrayRef = null;
+        if (c.AXUIElementCopyAttributeValue(child, ax.tabs_attr, @ptrCast(&tabs)) != c.kAXErrorSuccess) return 0;
+        const tabs_ref = tabs orelse return 0;
+        defer c.CFRelease(@ptrCast(tabs_ref));
+
+        const tab_total = c.CFArrayGetCount(tabs_ref);
+        return if (tab_total > 0) @intCast(tab_total) else 0;
+    }
+
+    return 0;
 }
 
 /// Query whether AXEnhancedUserInterface is currently enabled on an app element.
