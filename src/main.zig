@@ -2760,6 +2760,8 @@ fn bw_drain_events() void {
     g_event_drain_active = true;
     defer g_event_drain_active = false;
 
+    refreshTabGroupActiveTabs();
+
     while (g_ring.pop()) |ev| {
         handleEvent(&ev);
     }
@@ -4362,7 +4364,15 @@ fn appWindowSnapshot(
             .live_frame = liveWindowFrame(ax_wid),
             .is_on_screen = on_screen.contains(ax_wid),
             .is_managed = g_store.get(ax_wid) != null,
+            .tab_count = ax_mod.tabCount(pid, ax_wid),
         };
+        log.debug("tab facts pid={d} wid={d} tabs={d} on_screen={} managed={}", .{
+            pid,
+            ax_wid,
+            out[count].tab_count,
+            out[count].is_on_screen,
+            out[count].is_managed,
+        });
         count += 1;
     }
     return count;
@@ -4514,46 +4524,75 @@ fn addNewWindow(pid: i32, wid: u32) void {
     }
 }
 
-/// Add the app's other background tabs at the group's frame as members.
+/// Correct each tab group's recorded active tab against the window carrying its
+/// app's tab bar.
 ///
-/// Members hold no workspace or layout slot, so they are stored and nothing
-/// else. Which windows qualify is tabgroup.detect's call.
-fn discoverBackgroundTabs(
-    pid: i32,
-    group_id: tabgroup.GroupId,
-    group_frame: window_mod.Window.Frame,
-    workspace_id: u8,
-    display_id: u32,
-    mode: window_mod.WindowMode,
-) void {
-    std.debug.assert(pid > 0);
-    std.debug.assert(group_id != 0);
-    std.debug.assert(workspace_id > 0 and workspace_id <= workspace_mod.max_workspaces);
+/// macOS emits no notification of any kind when the user switches native tabs,
+/// so the recorded active tab is stale from that moment, and everything keyed
+/// off it — parking, restoring, retiling, focusing — would act on a window that
+/// is not on screen. The bar moves with the selection, so read it rather than
+/// track it.
+///
+/// The cheap gate is the point: a group whose recorded active tab is still on
+/// screen cannot have changed selection, so the AX work only happens on an actual
+/// switch. Only the active tab moves here; membership is decided elsewhere.
+fn refreshTabGroupActiveTabs() void {
+    if (g_tab_groups.groups.count() == 0) return;
 
     const on_screen = OnScreenWindows.snapshot();
-    var app_windows: [128]tabgroup.detect.AppWindow = undefined;
-    const app_count = appWindowSnapshot(pid, &on_screen, &app_windows);
 
-    var members: [128]u32 = undefined;
-    const member_count = tabgroup.detect.additionalMembers(group_frame, app_windows[0..app_count], &members);
+    const Move = struct { group_id: tabgroup.GroupId, selected: u32 };
+    var moves: [16]Move = undefined;
+    var move_count: usize = 0;
 
-    for (members[0..member_count]) |member_wid| {
-        g_tab_groups.addMember(group_id, member_wid) catch continue;
-        // The wid may still sit in the role-pending or deferred pipelines; it is
-        // accounted for as a member now, so promotion must not race the group.
-        untrackPendingRoleWindow(member_wid);
-        untrackDeferredWindowCandidate(member_wid);
-        g_store.put(.{
-            .wid = member_wid,
-            .pid = pid,
-            .title = null,
-            .frame = group_frame,
-            .is_minimized = false,
-            .mode = mode,
-            .workspace_id = workspace_id,
-            .display_id = display_id,
-        }) catch continue;
-        log.debug("tab member adopted wid={d} into group {d}", .{ member_wid, group_id });
+    var it = g_tab_groups.groups.valueIterator();
+    while (it.next()) |group| {
+        if (move_count == moves.len) break;
+
+        const leader = g_store.get(group.leader_wid) orelse continue;
+        // A parked group is off-screen on purpose and nothing acts on it until
+        // its workspace is shown again.
+        if (!workspaceVisibleOnDisplay(leader.workspace_id, leader.display_id)) continue;
+        if (on_screen.contains(group.active_wid)) continue;
+
+        var app_windows: [128]tabgroup.detect.AppWindow = undefined;
+        const app_count = appWindowSnapshot(group.pid, &on_screen, &app_windows);
+        const selected = tabgroup.detect.selectedTabWindow(
+            app_windows[0..app_count],
+            group.canonical_frame,
+        ) orelse continue;
+        if (selected == group.active_wid) continue;
+
+        moves[move_count] = .{ .group_id = group.id, .selected = selected };
+        move_count += 1;
+    }
+
+    // Applied after the walk: adopting a tab writes to the store and to the
+    // group's member list.
+    for (moves[0..move_count]) |move| {
+        const group = g_tab_groups.groups.getPtr(move.group_id) orelse continue;
+        const leader = g_store.get(group.leader_wid) orelse continue;
+
+        // The user can select a tab Bobrwm has never seen: background tabs are
+        // absent from AXWindows, so they are only discovered as they surface.
+        if (g_store.get(move.selected) == null) {
+            g_tab_groups.addMember(move.group_id, move.selected) catch continue;
+            g_store.put(.{
+                .wid = move.selected,
+                .pid = group.pid,
+                .title = null,
+                .frame = group.canonical_frame,
+                .is_minimized = false,
+                .mode = leader.mode,
+                .workspace_id = leader.workspace_id,
+                .display_id = leader.display_id,
+            }) catch continue;
+        }
+
+        log.debug("tab group {d} active tab {d} → {d} (tab bar)", .{
+            move.group_id, group.active_wid, move.selected,
+        });
+        g_tab_groups.setActive(move.selected);
     }
 }
 
@@ -4573,12 +4612,16 @@ fn tryFormTabGroupOnCreate(pid: i32, new_wid: u32) bool {
     var candidates: [128]tabgroup.detect.Candidate = undefined;
     const count = tabCandidates(pid, &on_screen, &candidates);
 
+    var app_windows: [128]tabgroup.detect.AppWindow = undefined;
+    const app_count = appWindowSnapshot(pid, &on_screen, &app_windows);
+    const has_tab_group = tabgroup.detect.appHasTabGroup(app_windows[0..app_count]);
+
     // Collected before any removal: removeWindow mutates the workspace window
     // lists that the snapshot describes.
     var stale_wids: [64]u32 = undefined;
     const stale_count = tabgroup.detect.staleCandidates(pid, candidates[0..count], &stale_wids);
 
-    const formed = switch (tabgroup.detect.classifyNewWindow(pid, new_wid, new_frame, candidates[0..count])) {
+    const formed = switch (tabgroup.detect.classifyNewWindow(pid, new_wid, new_frame, candidates[0..count], has_tab_group)) {
         .standalone => blk: {
             log.debug("tab detect: wid={d} is standalone", .{new_wid});
             break :blk false;
@@ -4622,8 +4665,6 @@ fn joinTabGroup(pid: i32, sibling_wid: u32, new_wid: u32, new_frame: window_mod.
         .workspace_id = sibling.workspace_id,
         .display_id = sibling.display_id,
     }) catch return false;
-
-    discoverBackgroundTabs(pid, group_id, new_frame, sibling.workspace_id, sibling.display_id, sibling.mode);
 
     const leader = g_tab_groups.resolveLeader(sibling_wid);
     ws.recordFocus(leader);
@@ -4855,9 +4896,9 @@ fn cleanupWorkspaceWindowsForPid(pid: i32) bool {
 /// Some Electron apps (Discord) close-to-background without emitting AX
 /// destroy/minimize notifications. This catches those ghost entries.
 ///
-/// Native background tabs are also off-screen, so windows that look like a
-/// missed tab-group inference are adopted into their sibling's group instead
-/// of being reaped (see adoptOffscreenWindowAsTab).
+/// Native background tabs are off-screen too, so each candidate goes through
+/// adoptOffscreenWindowAsTab, which keeps a window the app still lists, adopts a
+/// genuine background tab into its group, and reaps the rest.
 fn cleanupOffscreenManagedWindows() bool {
     var candidate_wids: [128]u32 = undefined;
     var candidate_count: usize = 0;
@@ -4895,14 +4936,15 @@ fn cleanupOffscreenManagedWindows() bool {
     for (candidate_wids[0..candidate_count]) |wid| {
         const win = g_store.get(wid) orelse continue;
 
-        if (adoptOffscreenWindowAsTab(win)) {
-            mutated = true;
-            continue;
+        switch (adoptOffscreenWindowAsTab(win)) {
+            .adopt => mutated = true,
+            .keep => {},
+            .reap => {
+                log.info("cleanup: removing wid={d} pid={d} reason=offscreen", .{ wid, win.pid });
+                removeWindow(wid);
+                mutated = true;
+            },
         }
-
-        log.info("cleanup: removing wid={d} pid={d} reason=offscreen", .{ wid, win.pid });
-        removeWindow(wid);
-        mutated = true;
     }
 
     return mutated;
@@ -4920,7 +4962,7 @@ fn cleanupOffscreenManagedWindows() bool {
 /// and destroyed ghosts drop out of AXWindows, native background tabs stay
 /// listed) and an on-screen managed sibling occupies the same frame (the
 /// active tab).
-fn adoptOffscreenWindowAsTab(win: window_mod.Window) bool {
+fn adoptOffscreenWindowAsTab(win: window_mod.Window) tabgroup.detect.OffscreenOutcomeKind {
     const frame = liveWindowFrame(win.wid);
 
     const on_screen = OnScreenWindows.snapshot();
@@ -4936,24 +4978,30 @@ fn adoptOffscreenWindowAsTab(win: window_mod.Window) bool {
     var candidates: [128]tabgroup.detect.Candidate = undefined;
     const count = tabCandidates(win.pid, &on_screen, &candidates);
 
+    const has_tab_group = tabgroup.detect.appHasTabGroup(app_windows[0..app_count]);
     const sibling_wid = switch (tabgroup.detect.classifyOffscreenManaged(
         win.wid,
         win.pid,
         frame,
         listed_in_app,
+        has_tab_group,
         candidates[0..count],
     )) {
-        .reap => return false,
+        .keep => {
+            log.debug("cleanup: keeping wid={d} pid={d}, the app still lists it", .{ win.wid, win.pid });
+            return .keep;
+        },
+        .reap => return .reap,
         .adopt_into => |sibling_wid| sibling_wid,
     };
 
-    const sibling = g_store.get(sibling_wid) orelse return false;
+    const sibling = g_store.get(sibling_wid) orelse return .reap;
 
     const group_id = if (g_tab_groups.groupOf(sibling_wid)) |g|
         g.id
     else
-        g_tab_groups.createGroup(win.pid, sibling_wid, sibling.frame) catch return false;
-    g_tab_groups.addMember(group_id, win.wid) catch return false;
+        g_tab_groups.createGroup(win.pid, sibling_wid, sibling.frame) catch return .reap;
+    g_tab_groups.addMember(group_id, win.wid) catch return .reap;
     g_tab_groups.setActive(sibling_wid);
 
     // Members live only in the store; drop the standalone workspace/layout slot.
@@ -4971,7 +5019,7 @@ fn adoptOffscreenWindowAsTab(win: window_mod.Window) bool {
     log.info("cleanup: adopted wid={d} as background tab, leader={d} pid={d}", .{
         win.wid, g_tab_groups.resolveLeader(sibling_wid), win.pid,
     });
-    return true;
+    return .adopt;
 }
 
 /// Updates `display_id` when a user-dragged window crosses monitors.
@@ -6196,6 +6244,10 @@ fn ipcDispatch(cmd: []const u8, client_fd: posix.socket_t) void {
         ipc.writeResponse(client_fd, "err: unknown or invalid command\n");
         return;
     };
+
+    // IPC does not pass through the event drain, but commands that move or focus
+    // windows need the same fresh view of which tab each group is showing.
+    refreshTabGroupActiveTabs();
 
     switch (command) {
         .retile => {
