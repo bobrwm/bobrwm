@@ -375,12 +375,19 @@ fn pushDimSnapshot() void {
     // the invariant is documented and compiles out in release builds.
     std.debug.assert(dim.enabled);
 
+    // An overlay is placed over the window's *stored* frame, so a store entry
+    // that is not on screen — a stale native-tab id, a window an app closed to
+    // background — darkens whatever sits underneath it instead. One entry
+    // holding a display-sized frame blacks out the display.
+    const on_screen = OnScreenWindows.snapshot();
+
     var entries: [256]dim.Entry = undefined;
     var n: usize = 0;
     var it = g_store.windows.valueIterator();
     while (it.next()) |win| {
         if (n >= entries.len) break;
         if (!isVisibleManaged(win)) continue;
+        if (!on_screen.contains(win.wid)) continue;
         entries[n] = .{
             .wid = win.wid,
             .x = win.frame.x,
@@ -4891,17 +4898,19 @@ fn cleanupWorkspaceWindowsForPid(pid: i32) bool {
     return stale_count > 0;
 }
 
-/// Remove managed windows that are no longer physically on-screen.
+/// Remove managed windows that are no longer physically on-screen, and hand a
+/// slot held by a background tab back to the tab group it belongs to.
 ///
 /// Some Electron apps (Discord) close-to-background without emitting AX
 /// destroy/minimize notifications. This catches those ghost entries.
 ///
-/// Native background tabs are off-screen too, so each candidate goes through
-/// adoptOffscreenWindowAsTab, which keeps a window the app still lists, adopts a
-/// genuine background tab into its group, and reaps the rest.
+/// A background tab looks the same to WindowServer, so every suspect goes
+/// through adoptWindowAsBackgroundTab, which keeps a window the app still lists,
+/// adopts a genuine background tab into its group, and reaps the rest.
 fn cleanupOffscreenManagedWindows() bool {
-    var candidate_wids: [128]u32 = undefined;
-    var candidate_count: usize = 0;
+    const Suspect = struct { wid: u32, is_on_screen: bool };
+    var suspects: [128]Suspect = undefined;
+    var suspect_count: usize = 0;
     var truncated = false;
 
     for (&g_workspaces.workspaces) |*ws| {
@@ -4909,17 +4918,24 @@ fn cleanupOffscreenManagedWindows() bool {
         if (!workspaceVisibleAnywhere(ws.id)) continue;
 
         for (ws.windows.items) |wid| {
-            if (g_store.get(wid) == null) continue;
+            const win = g_store.get(wid) orelse continue;
 
             // Tab-group members can be intentionally off-screen when a sibling
             // tab is active; treating them as ghosts causes layout churn.
             if (g_tab_groups.groupOf(wid) != null) continue;
 
-            if (bw_is_window_on_screen(wid)) continue;
+            // An on-screen window is healthy unless its app has stopped listing
+            // it. A window whose native tab bar moved on still reports the
+            // group's on-screen state for a while, and a slot left in its name
+            // is never placed again: every geometry write for it is addressed to
+            // a window that no longer exists, so the slot silently stops
+            // responding to tiling, fullscreen and parking.
+            const is_on_screen = bw_is_window_on_screen(wid);
+            if (is_on_screen and appListsWindow(win.pid, wid)) continue;
 
-            if (candidate_count < candidate_wids.len) {
-                candidate_wids[candidate_count] = wid;
-                candidate_count += 1;
+            if (suspect_count < suspects.len) {
+                suspects[suspect_count] = .{ .wid = wid, .is_on_screen = is_on_screen };
+                suspect_count += 1;
             } else {
                 truncated = true;
             }
@@ -4927,21 +4943,30 @@ fn cleanupOffscreenManagedWindows() bool {
     }
 
     if (truncated) {
-        log.warn("cleanup: offscreen batch truncated queued={d}", .{candidate_count});
+        log.warn("cleanup: offscreen batch truncated queued={d}", .{suspect_count});
     }
 
     // Mutations deferred to here — removeWindow/adoption modify workspace
     // window lists, which must not happen while iterating them above.
     var mutated = false;
-    for (candidate_wids[0..candidate_count]) |wid| {
-        const win = g_store.get(wid) orelse continue;
+    for (suspects[0..suspect_count]) |suspect| {
+        const win = g_store.get(suspect.wid) orelse continue;
 
-        switch (adoptOffscreenWindowAsTab(win)) {
+        switch (adoptWindowAsBackgroundTab(win)) {
             .adopt => mutated = true,
             .keep => {},
             .reap => {
-                log.info("cleanup: removing wid={d} pid={d} reason=offscreen", .{ wid, win.pid });
-                removeWindow(wid);
+                // Only the off-screen scan reaps. An on-screen window is not a
+                // ghost however little its app admits to it, and dropping one
+                // would unmanage a window the user is looking at.
+                if (suspect.is_on_screen) {
+                    log.debug("cleanup: keeping on-screen wid={d} pid={d} the app no longer lists", .{
+                        win.wid, win.pid,
+                    });
+                    continue;
+                }
+                log.info("cleanup: removing wid={d} pid={d} reason=offscreen", .{ win.wid, win.pid });
+                removeWindow(suspect.wid);
                 mutated = true;
             },
         }
@@ -4950,19 +4975,36 @@ fn cleanupOffscreenManagedWindows() bool {
     return mutated;
 }
 
-/// Adopt an off-screen managed window as a member of an on-screen sibling's
-/// tab group. Returns true when adoption happened.
+/// Whether an app still exposes `wid` in its AX window list. A window it has
+/// dropped is either destroyed or a native background tab, which macOS omits
+/// from that list entirely. An unreadable list counts as listing the window, so
+/// an AX timeout on a busy app cannot make every one of its windows look
+/// dropped at once.
+fn appListsWindow(pid: i32, wid: u32) bool {
+    std.debug.assert(pid > 0);
+    std.debug.assert(wid != 0);
+
+    var ax_wids: [128]u32 = undefined;
+    const count = bw_get_app_window_ids(pid, &ax_wids);
+    if (count == 0) return true;
+
+    return std.mem.findScalar(u32, ax_wids[0..count], wid) != null;
+}
+
+/// Adopt a managed window as a member of an on-screen sibling's tab group.
+/// Returns true when adoption happened.
 ///
 /// Tab groups are inferred heuristically at window-creation / focus time;
 /// when that inference is missed (event races, mid-animation bounds, events
 /// dropped during workspace transitions) a background tab remains managed as
-/// a standalone window that is now off-screen. Reaping it would lose the tab.
+/// a standalone window holding a slot of its own. Reaping it would lose the tab,
+/// and leaving it there gives one physical window two slots that fight over its
+/// geometry.
 ///
-/// A window qualifies when the app's AXWindows list still exposes it (hidden
-/// and destroyed ghosts drop out of AXWindows, native background tabs stay
-/// listed) and an on-screen managed sibling occupies the same frame (the
-/// active tab).
-fn adoptOffscreenWindowAsTab(win: window_mod.Window) tabgroup.detect.OffscreenOutcomeKind {
+/// A window qualifies when its app's AXWindows list has dropped it (which is
+/// what a background tab looks like, and also what a destroyed ghost looks like)
+/// and an on-screen managed sibling occupies the same frame — the active tab.
+fn adoptWindowAsBackgroundTab(win: window_mod.Window) tabgroup.detect.OffscreenOutcomeKind {
     const frame = liveWindowFrame(win.wid);
 
     const on_screen = OnScreenWindows.snapshot();
@@ -5418,31 +5460,40 @@ fn retileDisplay(display_id: u32) void {
             continue;
         }
 
+        // The leaf is the tab-group leader, which owns the slot and carries the
+        // mode and fullscreen intent, but the pixels belong to the group's
+        // active tab — and a leader whose group made another tab active is a
+        // background tab, which macOS drops from AXWindows entirely, so a write
+        // addressed to it reaches nothing. Place the tab that is showing, as
+        // restoreFloatingWindows does; applyFrameToTabGroup carries the frame
+        // to the rest of the group afterwards.
+        const visible_wid = g_tab_groups.resolveActive(entry.wid);
+        var visible = g_store.get(visible_wid) orelse continue;
+
         // Fullscreen windows fill the outer-gap-inset frame, skipping BSP splits and inner gaps
         const target_frame = if (win.is_fullscreen) frame else entry.frame;
 
-        if (!framesEqual(win.frame, target_frame)) {
+        if (!framesEqual(visible.frame, target_frame)) {
             // Fullscreen windows are never animated: macOS clamps their size
             // mid-flight and they need the two-pass set below to land on the
             // exact display frame.
             var applied = true;
             if (g_config.animation.enabled and !win.is_fullscreen) {
-                applied = g_animator.animate(win.pid, entry.wid, win.frame, target_frame);
+                applied = g_animator.animate(visible.pid, visible_wid, visible.frame, target_frame);
                 ensureAnimatorTimer();
             } else {
                 // The window may have entered fullscreen mid-animation; stop
                 // the in-flight animation so it doesn't fight the placement.
-                g_animator.cancel(entry.wid);
-                applied = applyWindowFrame(win.pid, entry.wid, win.frame, target_frame, win.is_fullscreen);
+                g_animator.cancel(visible_wid);
+                applied = applyWindowFrame(visible.pid, visible_wid, visible.frame, target_frame, win.is_fullscreen);
             }
 
             // Record the target only when the write was accepted (animation
             // converges on the target on its own). Recording a rejected frame
             // would make the next retile's framesEqual check skip the repair.
             if (applied) {
-                var updated = win;
-                updated.frame = target_frame;
-                g_store.put(updated) catch {};
+                visible.frame = target_frame;
+                g_store.put(visible) catch {};
             }
         }
 
