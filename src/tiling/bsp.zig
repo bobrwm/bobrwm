@@ -611,6 +611,22 @@ test "replaceWid swaps a wid in place and preserves the leaf slot" {
     try std.testing.expect(!s.replaceWid(1, 10));
 }
 
+test "replaceWid preserves unique window IDs" {
+    const allocator = std.testing.allocator;
+    const options: InsertOptions = .{ .split_mode = .horizontal, .child = .second };
+
+    var s = State.init();
+    defer s.deinit(allocator);
+
+    try s.insert(1, options, allocator);
+    try s.insert(2, options, allocator);
+    _ = s.replaceWid(1, 2);
+
+    if (s.windowCount() == 2 and s.firstWid() == s.lastWid()) {
+        return error.DuplicateWindowId;
+    }
+}
+
 test "insert honors child placement and falls back to the shallowest leaf" {
     const allocator = std.testing.allocator;
     const insert_second: InsertOptions = .{
