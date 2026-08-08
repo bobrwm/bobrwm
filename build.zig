@@ -385,10 +385,13 @@ pub fn build(b: *std.Build) !void {
         .target = target,
         .optimize = optimize,
     });
+    // Zig 0.16.0's fuzz runner mixes builtin and std.debug stack-trace types.
+    // Disable tracing only for fuzz binaries until the compiler is upgraded.
     const bsp_fuzz_mod = b.createModule(.{
         .root_source_file = b.path("tests/fuzz/bsp.zig"),
         .target = target,
         .optimize = optimize,
+        .error_tracing = false,
     });
     bsp_fuzz_mod.addImport("tiling", tiling_fuzz_subject_mod);
 
@@ -405,6 +408,7 @@ pub fn build(b: *std.Build) !void {
         .root_source_file = b.path("tests/fuzz/monocle.zig"),
         .target = target,
         .optimize = optimize,
+        .error_tracing = false,
     });
     monocle_fuzz_mod.addImport("tiling", tiling_fuzz_subject_mod);
 
