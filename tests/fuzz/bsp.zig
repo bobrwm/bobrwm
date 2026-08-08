@@ -49,6 +49,31 @@ test "fuzz mutation sequences preserve BSP invariants" {
     try std.testing.fuzz({}, fuzzMutationSequence, .{});
 }
 
+test "fuzz replacement preserves unique BSP window IDs" {
+    try std.testing.fuzz({}, fuzzReplacementUniqueness, .{});
+}
+
+fn fuzzReplacementUniqueness(_: void, smith: *std.testing.Smith) !void {
+    const allocator = std.testing.allocator;
+    const first_wid = fuzzWindowId(smith);
+    var second_wid = fuzzWindowId(smith);
+    if (second_wid == first_wid) {
+        second_wid = if (second_wid == fuzz_window_slots) 1 else second_wid + 1;
+    }
+
+    var state = State.init();
+    defer state.deinit(allocator);
+    const options: bsp.InsertOptions = .{ .split_mode = .horizontal, .child = .second };
+    try state.insert(first_wid, options, allocator);
+    try state.insert(second_wid, options, allocator);
+
+    _ = state.replaceWid(first_wid, second_wid);
+    if (state.windowCount() == 2 and state.firstWid() == state.lastWid()) {
+        std.debug.print("replacement collision duplicated managed window {d}\n", .{second_wid});
+        return error.DuplicateWindowId;
+    }
+}
+
 fn fuzzMutationSequence(_: void, smith: *std.testing.Smith) !void {
     const allocator = std.testing.allocator;
     const root_frame: Frame = .{ .x = 100, .y = 50, .width = 4096, .height = 2160 };
