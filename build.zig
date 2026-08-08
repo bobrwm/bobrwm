@@ -380,7 +380,7 @@ pub fn build(b: *std.Build) !void {
 
     const run_app_tests = b.addRunArtifact(app_tests);
 
-    const bsp_fuzz_subject_mod = b.createModule(.{
+    const tiling_fuzz_subject_mod = b.createModule(.{
         .root_source_file = b.path("src/tiling.zig"),
         .target = target,
         .optimize = optimize,
@@ -390,7 +390,7 @@ pub fn build(b: *std.Build) !void {
         .target = target,
         .optimize = optimize,
     });
-    bsp_fuzz_mod.addImport("tiling", bsp_fuzz_subject_mod);
+    bsp_fuzz_mod.addImport("tiling", tiling_fuzz_subject_mod);
 
     const bsp_fuzz_tests = b.addTest(.{
         .name = "bsp-fuzz-tests",
@@ -400,6 +400,26 @@ pub fn build(b: *std.Build) !void {
 
     const fuzz_bsp_step = b.step("fuzz-bsp", "Fuzz BSP tiling invariants");
     fuzz_bsp_step.dependOn(&run_bsp_fuzz_tests.step);
+
+    const monocle_fuzz_mod = b.createModule(.{
+        .root_source_file = b.path("tests/fuzz/monocle.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    monocle_fuzz_mod.addImport("tiling", tiling_fuzz_subject_mod);
+
+    const monocle_fuzz_tests = b.addTest(.{
+        .name = "monocle-fuzz-tests",
+        .root_module = monocle_fuzz_mod,
+    });
+    const run_monocle_fuzz_tests = b.addRunArtifact(monocle_fuzz_tests);
+
+    const fuzz_monocle_step = b.step("fuzz-monocle", "Fuzz monocle tiling invariants");
+    fuzz_monocle_step.dependOn(&run_monocle_fuzz_tests.step);
+
+    const fuzz_smoke_step = b.step("fuzz-smoke", "Run each fuzz target once");
+    fuzz_smoke_step.dependOn(&run_bsp_fuzz_tests.step);
+    fuzz_smoke_step.dependOn(&run_monocle_fuzz_tests.step);
 
     const swipe_test_mod = b.createModule(.{
         .root_source_file = b.path("packages/bobrwm-swipe/src/main.zig"),
