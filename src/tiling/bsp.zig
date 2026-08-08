@@ -723,6 +723,42 @@ test "computeLayout applies horizontal ratios and inner gaps" {
     );
 }
 
+test "computeLayout keeps nested positive-gap frames non-negative" {
+    const allocator = std.testing.allocator;
+    const root_frame: Frame = .{ .x = 0, .y = 0, .width = 100, .height = 80 };
+
+    var s = State.init();
+    defer s.deinit(allocator);
+    try s.insert(1, .{ .split_mode = .horizontal, .child = .second }, allocator);
+    try s.insert(2, .{
+        .split_mode = .horizontal,
+        .child = .second,
+        .anchor_wid = 1,
+        .split_ratio = min_split_ratio,
+    }, allocator);
+    try s.insert(3, .{
+        .split_mode = .horizontal,
+        .child = .second,
+        .anchor_wid = 1,
+        .split_ratio = min_split_ratio,
+    }, allocator);
+
+    var layout: std.ArrayList(LayoutEntry) = .empty;
+    defer layout.deinit(allocator);
+    try layout.ensureTotalCapacity(allocator, s.windowCount());
+    s.computeLayout(root_frame, 10, &layout);
+
+    for (layout.items) |entry| {
+        if (entry.frame.width < 0 or entry.frame.height < 0) {
+            std.debug.print(
+                "window {d} has negative layout size {d}x{d}\n",
+                .{ entry.wid, entry.frame.width, entry.frame.height },
+            );
+            return error.NegativeLayoutSize;
+        }
+    }
+}
+
 test "computeLayout applies vertical ratios and inner gaps" {
     const allocator = std.testing.allocator;
     const root_frame: Frame = .{ .x = 10, .y = 20, .width = 100, .height = 80 };
