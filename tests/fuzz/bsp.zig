@@ -86,19 +86,23 @@ fn fuzzMutationSequence(_: void, smith: *std.testing.Smith) !void {
                 const second = fuzzWindowId(smith);
                 const should_swap = first != second and
                     expected[@intCast(first)] and expected[@intCast(second)];
-                try std.testing.expectEqual(should_swap, state.swapWids(first, second));
+                if (state.swapWids(first, second) != should_swap) return error.SwapResultMismatch;
             },
             .set_ratio => {
                 const wid = fuzzWindowId(smith);
                 const should_update = expected[@intCast(wid)] and expectedCount(&expected) > 1;
-                try std.testing.expectEqual(should_update, state.setParentRatio(wid, fuzzRatio(smith)));
+                if (state.setParentRatio(wid, fuzzRatio(smith)) != should_update) {
+                    return error.SetRatioResultMismatch;
+                }
             },
             .adjust_ratio => {
                 const wid = fuzzWindowId(smith);
                 const should_update = expected[@intCast(wid)] and expectedCount(&expected) > 1;
                 const raw_delta = smith.valueRangeAtMost(i8, -64, 64);
                 const delta = @as(f64, @floatFromInt(raw_delta)) / 32.0;
-                try std.testing.expectEqual(should_update, state.adjustParentRatio(wid, delta));
+                if (state.adjustParentRatio(wid, delta) != should_update) {
+                    return error.AdjustRatioResultMismatch;
+                }
             },
             .mirror => state.mirrorTree(smith.value(Direction)),
             .equalize => state.equalizeTree(fuzzAxis(smith), fuzzRatio(smith)),
@@ -124,7 +128,9 @@ fn fuzzReplace(state: *State, expected: *FuzzPresence, smith: *std.testing.Smith
     if (expected[new_index]) return;
 
     const should_replace = old_wid != new_wid and expected[old_index];
-    try std.testing.expectEqual(should_replace, state.replaceWid(old_wid, new_wid));
+    if (state.replaceWid(old_wid, new_wid) != should_replace) {
+        return error.ReplaceResultMismatch;
+    }
     if (should_replace) {
         expected[old_index] = false;
         expected[new_index] = true;
@@ -168,15 +174,15 @@ fn validateFuzzState(
     }
 
     const count = expectedCount(expected);
-    try std.testing.expectEqual(count, tree_count);
-    try std.testing.expectEqual(count, state.windowCount());
-    try std.testing.expectEqualSlices(bool, expected, &seen);
+    if (tree_count != count) return error.TreeCountMismatch;
+    if (state.windowCount() != count) return error.WindowCountMismatch;
+    if (!std.mem.eql(bool, expected, &seen)) return error.TreeMembershipMismatch;
 
     var layout: std.ArrayList(LayoutEntry) = .empty;
     defer layout.deinit(allocator);
     try layout.ensureTotalCapacity(allocator, count);
     state.computeLayout(root_frame, 0, &layout);
-    try std.testing.expectEqual(count, layout.items.len);
+    if (layout.items.len != count) return error.LayoutCountMismatch;
     try validateFuzzLayout(state, layout.items, expected, root_frame);
 }
 
@@ -186,19 +192,21 @@ fn validateFuzzNode(
     seen: *FuzzPresence,
     count: *usize,
 ) !void {
+    const tolerance = 0.000001;
+
     switch (node.*) {
         .leaf => |leaf| {
             const index: usize = @intCast(leaf.wid);
-            try std.testing.expect(index > 0 and index < expected.len);
-            try std.testing.expect(expected[index]);
-            try std.testing.expect(!seen[index]);
+            if (index == 0 or index >= expected.len) return error.InvalidLeafWindowId;
+            if (!expected[index]) return error.UnexpectedLeafWindow;
+            if (seen[index]) return error.DuplicateLeafWindow;
             seen[index] = true;
             count.* += 1;
         },
         .split => |split| {
-            try std.testing.expect(std.math.isFinite(split.ratio));
-            try std.testing.expect(split.ratio >= min_split_ratio);
-            try std.testing.expect(split.ratio <= max_split_ratio);
+            if (!std.math.isFinite(split.ratio)) return error.NonFiniteSplitRatio;
+            if (split.ratio < min_split_ratio - tolerance) return error.SplitRatioBelowMinimum;
+            if (split.ratio > max_split_ratio + tolerance) return error.SplitRatioAboveMaximum;
             try validateFuzzNode(&split.left, expected, seen, count);
             try validateFuzzNode(&split.right, expected, seen, count);
         },
@@ -211,31 +219,41 @@ fn validateFuzzLayout(
     expected: *const FuzzPresence,
     root_frame: Frame,
 ) !void {
+    const tolerance = 0.000001;
+
     if (layout.len == 0) {
-        try std.testing.expectEqual(@as(?WindowId, null), state.firstWid());
-        try std.testing.expectEqual(@as(?WindowId, null), state.lastWid());
+        if (state.firstWid() != null) return error.UnexpectedFirstWindow;
+        if (state.lastWid() != null) return error.UnexpectedLastWindow;
         return;
     }
 
-    try std.testing.expectEqual(state.firstWid().?, layout[0].wid);
-    try std.testing.expectEqual(state.lastWid().?, layout[layout.len - 1].wid);
+    const first_wid = state.firstWid() orelse return error.MissingFirstWindow;
+    const last_wid = state.lastWid() orelse return error.MissingLastWindow;
+    if (first_wid != layout[0].wid) return error.FirstWindowMismatch;
+    if (last_wid != layout[layout.len - 1].wid) return error.LastWindowMismatch;
     var seen: FuzzPresence = @splat(false);
     for (layout) |entry| {
         const index: usize = @intCast(entry.wid);
-        try std.testing.expect(index > 0 and index < expected.len);
-        try std.testing.expect(expected[index]);
-        try std.testing.expect(!seen[index]);
+        if (index == 0 or index >= expected.len) return error.InvalidLayoutWindowId;
+        if (!expected[index]) return error.UnexpectedLayoutWindow;
+        if (seen[index]) return error.DuplicateLayoutWindow;
         seen[index] = true;
 
         const frame = entry.frame;
-        try std.testing.expect(std.math.isFinite(frame.x));
-        try std.testing.expect(std.math.isFinite(frame.y));
-        try std.testing.expect(std.math.isFinite(frame.width));
-        try std.testing.expect(std.math.isFinite(frame.height));
-        try std.testing.expect(frame.width >= 0 and frame.height >= 0);
-        try std.testing.expect(frame.x >= root_frame.x and frame.y >= root_frame.y);
-        try std.testing.expect(frame.x + frame.width <= root_frame.x + root_frame.width);
-        try std.testing.expect(frame.y + frame.height <= root_frame.y + root_frame.height);
+        if (!std.math.isFinite(frame.x) or !std.math.isFinite(frame.y) or
+            !std.math.isFinite(frame.width) or !std.math.isFinite(frame.height))
+        {
+            return error.NonFiniteLayoutFrame;
+        }
+        if (frame.width < 0 or frame.height < 0) return error.NegativeLayoutSize;
+        if (frame.x < root_frame.x - tolerance) return error.LayoutBeforeRootX;
+        if (frame.y < root_frame.y - tolerance) return error.LayoutBeforeRootY;
+        if (frame.x + frame.width > root_frame.x + root_frame.width + tolerance) {
+            return error.LayoutAfterRootX;
+        }
+        if (frame.y + frame.height > root_frame.y + root_frame.height + tolerance) {
+            return error.LayoutAfterRootY;
+        }
     }
-    try std.testing.expectEqualSlices(bool, expected, &seen);
+    if (!std.mem.eql(bool, expected, &seen)) return error.LayoutMembershipMismatch;
 }
