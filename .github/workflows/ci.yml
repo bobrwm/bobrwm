@@ -26,13 +26,16 @@ jobs:
           version: 0.16.0
 
       - name: Check formatting
-        run: zig fmt --check build.zig src packages/bobrwm-swipe/src
+        run: zig fmt --check build.zig src tests packages/bobrwm-swipe/src
 
       - name: Build
         run: zig build
 
       - name: Test
         run: zig build test --summary all
+
+      - name: Fuzz smoke tests
+        run: zig build fuzz-smoke --summary all
 
       - name: Build release
         run: zig build -Doptimize=ReleaseFast
