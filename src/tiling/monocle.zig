@@ -107,3 +107,110 @@ pub const State = struct {
         }
     }
 };
+
+test "insert deduplicates windows and focus cycles in ring order" {
+    const allocator = std.testing.allocator;
+    const options: InsertOptions = .{ .split_mode = .auto, .child = .second };
+
+    var s = State.init();
+    defer s.deinit(allocator);
+
+    try std.testing.expectEqual(@as(usize, 0), s.windowCount());
+    try std.testing.expectEqual(@as(?WindowId, null), s.firstWid());
+    try std.testing.expectEqual(@as(?WindowId, null), s.lastWid());
+
+    try s.insert(1, options, allocator);
+    try s.insert(2, options, allocator);
+    try s.insert(3, options, allocator);
+    try s.insert(2, options, allocator);
+
+    try std.testing.expectEqualSlices(WindowId, &.{ 1, 2, 3 }, s.windows.items);
+    try std.testing.expectEqual(@as(?WindowId, 2), s.cycleFocus(1, true));
+    try std.testing.expectEqual(@as(?WindowId, 1), s.cycleFocus(3, true));
+    try std.testing.expectEqual(@as(?WindowId, 3), s.cycleFocus(1, false));
+    try std.testing.expectEqual(@as(?WindowId, null), s.cycleFocus(99, true));
+
+    s.setActive(3);
+    try std.testing.expectEqualSlices(WindowId, &.{ 3, 1, 2 }, s.windows.items);
+    try std.testing.expectEqual(@as(?WindowId, 3), s.firstWid());
+    try std.testing.expectEqual(@as(?WindowId, 2), s.lastWid());
+
+    s.setActive(99);
+    try std.testing.expectEqualSlices(WindowId, &.{ 3, 1, 2 }, s.windows.items);
+}
+
+test "remove keeps remaining windows valid across active and inactive removals" {
+    const allocator = std.testing.allocator;
+    const options: InsertOptions = .{ .split_mode = .auto, .child = .second };
+
+    var s = State.init();
+    defer s.deinit(allocator);
+    try s.insert(1, options, allocator);
+    try s.insert(2, options, allocator);
+    try s.insert(3, options, allocator);
+    s.setActive(3);
+
+    s.remove(1, allocator);
+    try std.testing.expectEqualSlices(WindowId, &.{ 3, 2 }, s.windows.items);
+
+    s.remove(3, allocator);
+    try std.testing.expectEqualSlices(WindowId, &.{2}, s.windows.items);
+    try std.testing.expectEqual(@as(?WindowId, null), s.cycleFocus(2, true));
+
+    s.remove(99, allocator);
+    try std.testing.expectEqualSlices(WindowId, &.{2}, s.windows.items);
+
+    s.remove(2, allocator);
+    try std.testing.expectEqual(@as(usize, 0), s.windowCount());
+    try std.testing.expectEqual(@as(?WindowId, null), s.firstWid());
+    try std.testing.expectEqual(@as(?WindowId, null), s.lastWid());
+}
+
+test "computeLayout assigns every window the full frame in focus-ring order" {
+    const allocator = std.testing.allocator;
+    const options: InsertOptions = .{ .split_mode = .auto, .child = .second };
+    const root_frame: Frame = .{ .x = 10, .y = 20, .width = 1200, .height = 800 };
+
+    var s = State.init();
+    defer s.deinit(allocator);
+    try s.insert(1, options, allocator);
+    try s.insert(2, options, allocator);
+    try s.insert(3, options, allocator);
+    s.setActive(2);
+
+    var layout: std.ArrayList(LayoutEntry) = .empty;
+    defer layout.deinit(allocator);
+    try layout.ensureTotalCapacity(allocator, s.windowCount());
+    s.computeLayout(root_frame, 32, &layout);
+
+    try std.testing.expectEqual(@as(usize, 3), layout.items.len);
+    try std.testing.expectEqualSlices(WindowId, &.{ 2, 1, 3 }, &.{
+        layout.items[0].wid,
+        layout.items[1].wid,
+        layout.items[2].wid,
+    });
+    for (layout.items) |entry| {
+        try std.testing.expectEqualDeep(root_frame, entry.frame);
+    }
+}
+
+test "replaceWid and swapWids preserve focus-ring slots" {
+    const allocator = std.testing.allocator;
+    const options: InsertOptions = .{ .split_mode = .auto, .child = .second };
+
+    var s = State.init();
+    defer s.deinit(allocator);
+    try s.insert(1, options, allocator);
+    try s.insert(2, options, allocator);
+    try s.insert(3, options, allocator);
+
+    try std.testing.expect(s.replaceWid(2, 9));
+    try std.testing.expectEqualSlices(WindowId, &.{ 1, 9, 3 }, s.windows.items);
+    try std.testing.expect(!s.replaceWid(2, 10));
+
+    try std.testing.expect(s.swapWids(1, 3));
+    try std.testing.expectEqualSlices(WindowId, &.{ 3, 9, 1 }, s.windows.items);
+    try std.testing.expect(!s.swapWids(3, 3));
+    try std.testing.expect(!s.swapWids(3, 99));
+    try std.testing.expectEqualSlices(WindowId, &.{ 3, 9, 1 }, s.windows.items);
+}
