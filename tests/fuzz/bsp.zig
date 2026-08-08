@@ -63,17 +63,15 @@ fn fuzzMutationSequence(_: void, smith: *std.testing.Smith) !void {
             .insert => {
                 const wid = fuzzWindowId(smith);
                 const index: usize = @intCast(wid);
-                if (!expected[index]) {
-                    try state.insert(wid, .{
-                        .split_mode = smith.value(SplitMode),
-                        .child = smith.value(InsertChild),
-                        .anchor_wid = if (smith.value(bool)) fuzzWindowId(smith) else null,
-                        .root_frame = root_frame,
-                        .inner_gap = 0,
-                        .split_ratio = fuzzRatio(smith),
-                    }, allocator);
-                    expected[index] = true;
-                }
+                try state.insert(wid, .{
+                    .split_mode = smith.value(SplitMode),
+                    .child = smith.value(InsertChild),
+                    .anchor_wid = if (smith.value(bool)) fuzzWindowId(smith) else null,
+                    .root_frame = root_frame,
+                    .inner_gap = 0,
+                    .split_ratio = fuzzRatio(smith),
+                }, allocator);
+                expected[index] = true;
             },
             .remove => {
                 const wid = fuzzWindowId(smith);
