@@ -111,8 +111,8 @@ pub fn newState(kind: LayoutKind) State {
     };
 }
 
-// Pull in the algorithm modules so their tests run under this test root
-// (`zig build test` compiles tiling.zig as the tiling-tests module).
+// Pull in the algorithm modules so their inline tests are registered by the
+// consolidated application test root.
 test {
     _ = bsp_mod;
     _ = monocle_mod;

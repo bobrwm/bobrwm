@@ -83,7 +83,9 @@ const foo = Type{ .field = value };     // Avoid
 
 **Documentation:** Use `///` for public API, `//` for implementation notes. Always explain *why*, not just *what*.
 
-**Tests:** Inline in the same file, register in src/main.zig test block
+**Tests:** Keep deterministic unit tests inline and register them through
+`src/tests.zig`. Large stateful fuzz harnesses live under `tests/fuzz/`, use a
+dedicated build step per subject, and are included in `zig build fuzz-smoke`.
 
 ## ObjC Interop
 

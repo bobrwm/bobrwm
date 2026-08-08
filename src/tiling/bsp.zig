@@ -534,6 +534,67 @@ fn destroyTree(node: *const Node, allocator: std.mem.Allocator) void {
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
+fn expectFrameApproxEqual(expected: Frame, actual: Frame) !void {
+    const tolerance = 0.000001;
+    try std.testing.expectApproxEqAbs(expected.x, actual.x, tolerance);
+    try std.testing.expectApproxEqAbs(expected.y, actual.y, tolerance);
+    try std.testing.expectApproxEqAbs(expected.width, actual.width, tolerance);
+    try std.testing.expectApproxEqAbs(expected.height, actual.height, tolerance);
+}
+
+fn expectLeafOrder(state: *const State, expected: []const WindowId) !void {
+    var index: usize = 0;
+    if (state.root) |*root| {
+        try expectNodeLeafOrder(root, expected, &index);
+    }
+    try std.testing.expectEqual(expected.len, index);
+}
+
+fn expectNodeLeafOrder(node: *const Node, expected: []const WindowId, index: *usize) !void {
+    switch (node.*) {
+        .leaf => |leaf| {
+            try std.testing.expect(index.* < expected.len);
+            try std.testing.expectEqual(expected[index.*], leaf.wid);
+            index.* += 1;
+        },
+        .split => |split| {
+            try expectNodeLeafOrder(&split.left, expected, index);
+            try expectNodeLeafOrder(&split.right, expected, index);
+        },
+    }
+}
+
+fn insertTransformFixture(state: *State, allocator: std.mem.Allocator) !void {
+    try state.insert(1, .{ .split_mode = .horizontal, .child = .second }, allocator);
+    try state.insert(2, .{
+        .split_mode = .horizontal,
+        .child = .second,
+        .anchor_wid = 1,
+        .split_ratio = 0.3,
+    }, allocator);
+    try state.insert(3, .{
+        .split_mode = .vertical,
+        .child = .second,
+        .anchor_wid = 2,
+        .split_ratio = 0.6,
+    }, allocator);
+}
+
+test "inserting a managed window is idempotent" {
+    const allocator = std.testing.allocator;
+    const options: InsertOptions = .{ .split_mode = .horizontal, .child = .second };
+
+    var s = State.init();
+    defer s.deinit(allocator);
+
+    try s.insert(1, options, allocator);
+    try s.insert(1, options, allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), s.windowCount());
+    try std.testing.expectEqual(@as(?WindowId, 1), s.firstWid());
+    try std.testing.expectEqual(@as(?WindowId, 1), s.lastWid());
+}
+
 test "replaceWid swaps a wid in place and preserves the leaf slot" {
     const allocator = std.testing.allocator;
     const options: InsertOptions = .{ .split_mode = .auto, .child = .second };
@@ -548,4 +609,378 @@ test "replaceWid swaps a wid in place and preserves the leaf slot" {
     try std.testing.expectEqual(@as(WindowId, 2), s.lastWid().?);
 
     try std.testing.expect(!s.replaceWid(1, 10));
+}
+
+test "replaceWid preserves unique window IDs" {
+    const allocator = std.testing.allocator;
+    const options: InsertOptions = .{ .split_mode = .horizontal, .child = .second };
+
+    var s = State.init();
+    defer s.deinit(allocator);
+
+    try s.insert(1, options, allocator);
+    try s.insert(2, options, allocator);
+    _ = s.replaceWid(1, 2);
+
+    if (s.windowCount() == 2 and s.firstWid() == s.lastWid()) {
+        return error.DuplicateWindowId;
+    }
+}
+
+test "insert honors child placement and falls back to the shallowest leaf" {
+    const allocator = std.testing.allocator;
+    const insert_second: InsertOptions = .{
+        .split_mode = .horizontal,
+        .child = .second,
+    };
+
+    var s = State.init();
+    defer s.deinit(allocator);
+
+    try s.insert(1, insert_second, allocator);
+    try s.insert(2, .{
+        .split_mode = .horizontal,
+        .child = .first,
+        .anchor_wid = 1,
+    }, allocator);
+
+    try std.testing.expectEqual(@as(usize, 2), s.windowCount());
+    try std.testing.expectEqual(@as(?WindowId, 2), s.firstWid());
+    try std.testing.expectEqual(@as(?WindowId, 1), s.lastWid());
+
+    try s.insert(3, .{
+        .split_mode = .horizontal,
+        .child = .second,
+        .anchor_wid = 99,
+    }, allocator);
+
+    try std.testing.expectEqual(@as(usize, 3), s.windowCount());
+    try std.testing.expectEqual(@as(?WindowId, 2), s.firstWid());
+    try std.testing.expectEqual(@as(?WindowId, 1), s.lastWid());
+}
+
+test "remove collapses empty branches and ignores unknown windows" {
+    const allocator = std.testing.allocator;
+    const options: InsertOptions = .{
+        .split_mode = .horizontal,
+        .child = .second,
+    };
+
+    var s = State.init();
+    defer s.deinit(allocator);
+
+    try s.insert(1, options, allocator);
+    try s.insert(2, options, allocator);
+    try s.insert(3, options, allocator);
+
+    s.remove(99, allocator);
+    try std.testing.expectEqual(@as(usize, 3), s.windowCount());
+
+    s.remove(1, allocator);
+    try std.testing.expectEqual(@as(usize, 2), s.windowCount());
+    try std.testing.expectEqual(@as(?WindowId, 3), s.firstWid());
+    try std.testing.expectEqual(@as(?WindowId, 2), s.lastWid());
+
+    s.remove(3, allocator);
+    try std.testing.expectEqual(@as(?WindowId, 2), s.firstWid());
+    try std.testing.expectEqual(@as(?WindowId, 2), s.lastWid());
+
+    s.remove(2, allocator);
+    try std.testing.expectEqual(@as(usize, 0), s.windowCount());
+    try std.testing.expectEqual(@as(?WindowId, null), s.firstWid());
+    try std.testing.expectEqual(@as(?WindowId, null), s.lastWid());
+}
+
+test "computeLayout applies horizontal ratios and inner gaps" {
+    const allocator = std.testing.allocator;
+    const root_frame: Frame = .{ .x = 10, .y = 20, .width = 100, .height = 80 };
+
+    var s = State.init();
+    defer s.deinit(allocator);
+    try s.insert(1, .{ .split_mode = .horizontal, .child = .second }, allocator);
+    try s.insert(2, .{
+        .split_mode = .horizontal,
+        .child = .second,
+        .anchor_wid = 1,
+        .split_ratio = 0.5,
+    }, allocator);
+
+    var layout: std.ArrayList(LayoutEntry) = .empty;
+    defer layout.deinit(allocator);
+    try layout.ensureTotalCapacity(allocator, s.windowCount());
+    s.computeLayout(root_frame, 4, &layout);
+
+    try std.testing.expectEqual(@as(usize, 2), layout.items.len);
+    try std.testing.expectEqual(@as(WindowId, 1), layout.items[0].wid);
+    try expectFrameApproxEqual(
+        .{ .x = 10, .y = 20, .width = 48, .height = 80 },
+        layout.items[0].frame,
+    );
+    try std.testing.expectEqual(@as(WindowId, 2), layout.items[1].wid);
+    try expectFrameApproxEqual(
+        .{ .x = 62, .y = 20, .width = 48, .height = 80 },
+        layout.items[1].frame,
+    );
+}
+
+test "computeLayout keeps nested positive-gap frames non-negative" {
+    const allocator = std.testing.allocator;
+    const root_frame: Frame = .{ .x = 0, .y = 0, .width = 100, .height = 80 };
+
+    var s = State.init();
+    defer s.deinit(allocator);
+    try s.insert(1, .{ .split_mode = .horizontal, .child = .second }, allocator);
+    try s.insert(2, .{
+        .split_mode = .horizontal,
+        .child = .second,
+        .anchor_wid = 1,
+        .split_ratio = min_split_ratio,
+    }, allocator);
+    try s.insert(3, .{
+        .split_mode = .horizontal,
+        .child = .second,
+        .anchor_wid = 1,
+        .split_ratio = min_split_ratio,
+    }, allocator);
+
+    var layout: std.ArrayList(LayoutEntry) = .empty;
+    defer layout.deinit(allocator);
+    try layout.ensureTotalCapacity(allocator, s.windowCount());
+    s.computeLayout(root_frame, 10, &layout);
+
+    for (layout.items) |entry| {
+        if (entry.frame.width < 0 or entry.frame.height < 0) {
+            std.debug.print(
+                "window {d} has negative layout size {d}x{d}\n",
+                .{ entry.wid, entry.frame.width, entry.frame.height },
+            );
+            return error.NegativeLayoutSize;
+        }
+    }
+}
+
+test "computeLayout applies vertical ratios and inner gaps" {
+    const allocator = std.testing.allocator;
+    const root_frame: Frame = .{ .x = 10, .y = 20, .width = 100, .height = 80 };
+
+    var s = State.init();
+    defer s.deinit(allocator);
+    try s.insert(1, .{ .split_mode = .vertical, .child = .second }, allocator);
+    try s.insert(2, .{
+        .split_mode = .vertical,
+        .child = .second,
+        .anchor_wid = 1,
+        .split_ratio = 0.25,
+    }, allocator);
+
+    var layout: std.ArrayList(LayoutEntry) = .empty;
+    defer layout.deinit(allocator);
+    try layout.ensureTotalCapacity(allocator, s.windowCount());
+    s.computeLayout(root_frame, 4, &layout);
+
+    try expectFrameApproxEqual(
+        .{ .x = 10, .y = 20, .width = 100, .height = 18 },
+        layout.items[0].frame,
+    );
+    try expectFrameApproxEqual(
+        .{ .x = 10, .y = 42, .width = 100, .height = 58 },
+        layout.items[1].frame,
+    );
+}
+
+test "auto split follows the anchored leaf aspect ratio" {
+    const allocator = std.testing.allocator;
+    const root_frame: Frame = .{ .x = 0, .y = 0, .width = 120, .height = 80 };
+
+    var s = State.init();
+    defer s.deinit(allocator);
+    try s.insert(1, .{ .split_mode = .auto, .child = .second }, allocator);
+    try s.insert(2, .{
+        .split_mode = .auto,
+        .child = .second,
+        .anchor_wid = 1,
+        .root_frame = root_frame,
+        .inner_gap = 4,
+    }, allocator);
+    try s.insert(3, .{
+        .split_mode = .auto,
+        .child = .second,
+        .anchor_wid = 1,
+        .root_frame = root_frame,
+        .inner_gap = 4,
+    }, allocator);
+
+    const root_split = switch (s.root.?) {
+        .leaf => unreachable,
+        .split => |split| split,
+    };
+    try std.testing.expectEqual(Direction.horizontal, root_split.direction);
+    const nested_split = switch (root_split.left) {
+        .leaf => unreachable,
+        .split => |split| split,
+    };
+    try std.testing.expectEqual(Direction.vertical, nested_split.direction);
+}
+
+test "swapWids exchanges leaf slots only when both windows exist" {
+    const allocator = std.testing.allocator;
+
+    var s = State.init();
+    defer s.deinit(allocator);
+    try s.insert(1, .{ .split_mode = .horizontal, .child = .second }, allocator);
+    try s.insert(2, .{
+        .split_mode = .horizontal,
+        .child = .second,
+        .anchor_wid = 1,
+    }, allocator);
+    try s.insert(3, .{
+        .split_mode = .horizontal,
+        .child = .second,
+        .anchor_wid = 2,
+    }, allocator);
+
+    try std.testing.expect(s.swapWids(1, 3));
+    try std.testing.expectEqual(@as(?WindowId, 3), s.firstWid());
+    try std.testing.expectEqual(@as(?WindowId, 1), s.lastWid());
+
+    try std.testing.expect(!s.swapWids(3, 3));
+    try std.testing.expect(!s.swapWids(3, 99));
+    try std.testing.expectEqual(@as(?WindowId, 3), s.firstWid());
+    try std.testing.expectEqual(@as(?WindowId, 1), s.lastWid());
+}
+
+test "parent ratio operations clamp values and reject unknown windows" {
+    const allocator = std.testing.allocator;
+
+    var s = State.init();
+    defer s.deinit(allocator);
+    try s.insert(1, .{ .split_mode = .horizontal, .child = .second }, allocator);
+    try s.insert(2, .{
+        .split_mode = .horizontal,
+        .child = .second,
+        .anchor_wid = 1,
+    }, allocator);
+    try s.insert(3, .{
+        .split_mode = .vertical,
+        .child = .second,
+        .anchor_wid = 2,
+    }, allocator);
+
+    const root_split = switch (s.root.?) {
+        .leaf => unreachable,
+        .split => |split| split,
+    };
+    const nested_split = switch (root_split.right) {
+        .leaf => unreachable,
+        .split => |split| split,
+    };
+
+    try std.testing.expect(s.setParentRatio(1, -4));
+    try std.testing.expectApproxEqAbs(min_split_ratio, root_split.ratio, 0.000001);
+    try std.testing.expect(s.setParentRatio(3, 4));
+    try std.testing.expectApproxEqAbs(max_split_ratio, nested_split.ratio, 0.000001);
+    try std.testing.expect(s.adjustParentRatio(2, -4));
+    try std.testing.expectApproxEqAbs(min_split_ratio, nested_split.ratio, 0.000001);
+
+    try std.testing.expect(!s.setParentRatio(99, 0.5));
+    try std.testing.expect(!s.adjustParentRatio(99, 0.1));
+}
+
+test "mirrorTree reverses only splits on the selected axis" {
+    const allocator = std.testing.allocator;
+
+    var s = State.init();
+    defer s.deinit(allocator);
+    try insertTransformFixture(&s, allocator);
+
+    try expectLeafOrder(&s, &.{ 1, 2, 3 });
+    s.mirrorTree(.horizontal);
+    try expectLeafOrder(&s, &.{ 2, 3, 1 });
+    s.mirrorTree(.horizontal);
+    try expectLeafOrder(&s, &.{ 1, 2, 3 });
+
+    s.mirrorTree(.vertical);
+    try expectLeafOrder(&s, &.{ 1, 3, 2 });
+    s.mirrorTree(.vertical);
+    try expectLeafOrder(&s, &.{ 1, 2, 3 });
+}
+
+test "rotateTree composes inverse rotations without losing ratios" {
+    const allocator = std.testing.allocator;
+
+    var s = State.init();
+    defer s.deinit(allocator);
+    try insertTransformFixture(&s, allocator);
+
+    s.rotateTree(90);
+    try expectLeafOrder(&s, &.{ 1, 3, 2 });
+    var root_split = switch (s.root.?) {
+        .leaf => unreachable,
+        .split => |split| split,
+    };
+    try std.testing.expectEqual(Direction.vertical, root_split.direction);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.3), root_split.ratio, 0.000001);
+    var nested_split = switch (root_split.right) {
+        .leaf => unreachable,
+        .split => |split| split,
+    };
+    try std.testing.expectEqual(Direction.horizontal, nested_split.direction);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.4), nested_split.ratio, 0.000001);
+
+    s.rotateTree(270);
+    try expectLeafOrder(&s, &.{ 1, 2, 3 });
+    root_split = switch (s.root.?) {
+        .leaf => unreachable,
+        .split => |split| split,
+    };
+    try std.testing.expectEqual(Direction.horizontal, root_split.direction);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.3), root_split.ratio, 0.000001);
+    nested_split = switch (root_split.right) {
+        .leaf => unreachable,
+        .split => |split| split,
+    };
+    try std.testing.expectEqual(Direction.vertical, nested_split.direction);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.6), nested_split.ratio, 0.000001);
+
+    s.rotateTree(180);
+    try expectLeafOrder(&s, &.{ 3, 2, 1 });
+    s.rotateTree(180);
+    try expectLeafOrder(&s, &.{ 1, 2, 3 });
+}
+
+test "equalizeTree and balanceTree honor axis filters" {
+    const allocator = std.testing.allocator;
+
+    var s = State.init();
+    defer s.deinit(allocator);
+    try insertTransformFixture(&s, allocator);
+
+    const root_split = switch (s.root.?) {
+        .leaf => unreachable,
+        .split => |split| split,
+    };
+    const nested_split = switch (root_split.right) {
+        .leaf => unreachable,
+        .split => |split| split,
+    };
+
+    s.equalizeTree(.horizontal, 2);
+    try std.testing.expectApproxEqAbs(max_split_ratio, root_split.ratio, 0.000001);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.6), nested_split.ratio, 0.000001);
+
+    s.equalizeTree(.vertical, -1);
+    try std.testing.expectApproxEqAbs(max_split_ratio, root_split.ratio, 0.000001);
+    try std.testing.expectApproxEqAbs(min_split_ratio, nested_split.ratio, 0.000001);
+
+    s.equalizeTree(null, 0.4);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.4), root_split.ratio, 0.000001);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.4), nested_split.ratio, 0.000001);
+
+    s.balanceTree(.vertical);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.4), root_split.ratio, 0.000001);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.5), nested_split.ratio, 0.000001);
+
+    s.balanceTree(null);
+    try std.testing.expectApproxEqAbs(@as(f64, 1.0 / 3.0), root_split.ratio, 0.000001);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.5), nested_split.ratio, 0.000001);
 }
