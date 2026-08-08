@@ -380,6 +380,27 @@ pub fn build(b: *std.Build) !void {
 
     const run_app_tests = b.addRunArtifact(app_tests);
 
+    const bsp_fuzz_subject_mod = b.createModule(.{
+        .root_source_file = b.path("src/tiling.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const bsp_fuzz_mod = b.createModule(.{
+        .root_source_file = b.path("tests/fuzz/bsp.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    bsp_fuzz_mod.addImport("tiling", bsp_fuzz_subject_mod);
+
+    const bsp_fuzz_tests = b.addTest(.{
+        .name = "bsp-fuzz-tests",
+        .root_module = bsp_fuzz_mod,
+    });
+    const run_bsp_fuzz_tests = b.addRunArtifact(bsp_fuzz_tests);
+
+    const fuzz_bsp_step = b.step("fuzz-bsp", "Fuzz BSP tiling invariants");
+    fuzz_bsp_step.dependOn(&run_bsp_fuzz_tests.step);
+
     const swipe_test_mod = b.createModule(.{
         .root_source_file = b.path("packages/bobrwm-swipe/src/main.zig"),
         .target = target,
