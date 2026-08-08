@@ -53,6 +53,51 @@ test "fuzz replacement preserves unique BSP window IDs" {
     try std.testing.fuzz({}, fuzzReplacementUniqueness, .{});
 }
 
+test "fuzz positive inner gaps preserve non-negative BSP frames" {
+    try std.testing.fuzz({}, fuzzPositiveInnerGaps, .{});
+}
+
+fn fuzzPositiveInnerGaps(_: void, smith: *std.testing.Smith) !void {
+    const allocator = std.testing.allocator;
+    const root_frame: Frame = .{
+        .x = 100,
+        .y = 50,
+        .width = @floatFromInt(smith.valueRangeAtMost(u16, 32, 4096)),
+        .height = 2160,
+    };
+    const inner_gap: f64 = @floatFromInt(smith.valueRangeAtMost(u8, 1, 64));
+    const split_count = smith.valueRangeAtMost(u8, 2, 8);
+
+    var state = State.init();
+    defer state.deinit(allocator);
+    try state.insert(1, .{ .split_mode = .horizontal, .child = .second }, allocator);
+
+    var split_index: u8 = 0;
+    while (split_index < split_count) : (split_index += 1) {
+        try state.insert(@as(WindowId, split_index) + 2, .{
+            .split_mode = .horizontal,
+            .child = .second,
+            .anchor_wid = 1,
+            .split_ratio = fuzzRatio(smith),
+        }, allocator);
+    }
+
+    var layout: std.ArrayList(LayoutEntry) = .empty;
+    defer layout.deinit(allocator);
+    try layout.ensureTotalCapacity(allocator, state.windowCount());
+    state.computeLayout(root_frame, inner_gap, &layout);
+
+    for (layout.items) |entry| {
+        if (entry.frame.width < 0 or entry.frame.height < 0) {
+            std.debug.print(
+                "positive gap {d} produced negative frame {d}x{d} for window {d}\n",
+                .{ inner_gap, entry.frame.width, entry.frame.height, entry.wid },
+            );
+            return error.NegativeLayoutSize;
+        }
+    }
+}
+
 fn fuzzReplacementUniqueness(_: void, smith: *std.testing.Smith) !void {
     const allocator = std.testing.allocator;
     const first_wid = fuzzWindowId(smith);
