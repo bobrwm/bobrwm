@@ -580,6 +580,21 @@ fn insertTransformFixture(state: *State, allocator: std.mem.Allocator) !void {
     }, allocator);
 }
 
+test "inserting a managed window is idempotent" {
+    const allocator = std.testing.allocator;
+    const options: InsertOptions = .{ .split_mode = .horizontal, .child = .second };
+
+    var s = State.init();
+    defer s.deinit(allocator);
+
+    try s.insert(1, options, allocator);
+    try s.insert(1, options, allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), s.windowCount());
+    try std.testing.expectEqual(@as(?WindowId, 1), s.firstWid());
+    try std.testing.expectEqual(@as(?WindowId, 1), s.lastWid());
+}
+
 test "replaceWid swaps a wid in place and preserves the leaf slot" {
     const allocator = std.testing.allocator;
     const options: InsertOptions = .{ .split_mode = .auto, .child = .second };
