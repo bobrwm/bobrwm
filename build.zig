@@ -363,116 +363,22 @@ pub fn build(b: *std.Build) !void {
     const run_swipe_step = b.step("run-swipe", "Run bobrwm-swipe");
     run_swipe_step.dependOn(&run_swipe_cmd.step);
 
-    // config.zig imports only Zig declarations, so the test module needs
-    // no SDK or include wiring.
-    const test_mod = b.createModule(.{
-        .root_source_file = b.path("src/config.zig"),
+    // A single application test graph keeps imported declarations from being
+    // executed once per subsystem root and makes every inline test reachable.
+    const app_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/tests.zig"),
         .target = target,
         .optimize = optimize,
         .link_libc = true,
     });
+    configureAppModule(app_test_mod, app_module_dependencies);
 
-    const tests = b.addTest(.{
-        .name = "config-tests",
-        .root_module = test_mod,
+    const app_tests = b.addTest(.{
+        .name = "app-tests",
+        .root_module = app_test_mod,
     });
 
-    const run_tests = b.addRunArtifact(tests);
-
-    const ipc_test_mod = b.createModule(.{
-        .root_source_file = b.path("src/ipc.zig"),
-        .target = target,
-        .optimize = optimize,
-        .link_libc = true,
-    });
-
-    const ipc_tests = b.addTest(.{
-        .name = "ipc-tests",
-        .root_module = ipc_test_mod,
-    });
-
-    const run_ipc_tests = b.addRunArtifact(ipc_tests);
-
-    // tabgroup.zig and tiling.zig are pure Zig (window.zig types only),
-    // so their test modules need no SDK or include wiring either.
-    const tabgroup_test_mod = b.createModule(.{
-        .root_source_file = b.path("src/tabgroup.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-
-    const tabgroup_tests = b.addTest(.{
-        .name = "tabgroup-tests",
-        .root_module = tabgroup_test_mod,
-    });
-
-    const run_tabgroup_tests = b.addRunArtifact(tabgroup_tests);
-
-    const tiling_test_mod = b.createModule(.{
-        .root_source_file = b.path("src/tiling.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-
-    const tiling_tests = b.addTest(.{
-        .name = "tiling-tests",
-        .root_module = tiling_test_mod,
-    });
-
-    const run_tiling_tests = b.addRunArtifact(tiling_tests);
-
-    // workspace.zig is pure Zig (window.zig types only) as well.
-    const workspace_test_mod = b.createModule(.{
-        .root_source_file = b.path("src/workspace.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-
-    const workspace_tests = b.addTest(.{
-        .name = "workspace-tests",
-        .root_module = workspace_test_mod,
-    });
-
-    const run_workspace_tests = b.addRunArtifact(workspace_tests);
-
-    const statusbar_test_mod = b.createModule(.{
-        .root_source_file = b.path("src/statusbar.zig"),
-        .target = target,
-        .optimize = optimize,
-        .link_libc = true,
-    });
-    configureAppModule(statusbar_test_mod, app_module_dependencies);
-
-    const statusbar_tests = b.addTest(.{
-        .name = "statusbar-tests",
-        .root_module = statusbar_test_mod,
-    });
-
-    const run_statusbar_tests = b.addRunArtifact(statusbar_tests);
-
-    // dim.zig draws overlay panels via zig-objc and imports config.zig (needs
-    // libc via osutil), so its test module needs the objc import plus AppKit /
-    // CoreGraphics linkage and SDK paths, like the swipe test module.
-    const dim_test_mod = b.createModule(.{
-        .root_source_file = b.path("src/dim.zig"),
-        .target = target,
-        .optimize = optimize,
-        .link_libc = true,
-    });
-    dim_test_mod.addImport("objc", objc_mod);
-    dim_test_mod.linkFramework("AppKit", .{});
-    dim_test_mod.linkFramework("CoreGraphics", .{});
-    dim_test_mod.linkFramework("CoreFoundation", .{});
-    dim_test_mod.addSystemFrameworkPath(.{ .cwd_relative = sdk_frameworks });
-    dim_test_mod.addSystemIncludePath(.{ .cwd_relative = sdk_include });
-    dim_test_mod.addLibraryPath(.{ .cwd_relative = sdk_lib });
-
-    const dim_tests = b.addTest(.{
-        .name = "dim-tests",
-        .root_module = dim_test_mod,
-    });
-
-    const run_dim_tests = b.addRunArtifact(dim_tests);
+    const run_app_tests = b.addRunArtifact(app_tests);
 
     const swipe_test_mod = b.createModule(.{
         .root_source_file = b.path("packages/bobrwm-swipe/src/main.zig"),
@@ -500,13 +406,7 @@ pub fn build(b: *std.Build) !void {
     const run_swipe_tests = b.addRunArtifact(swipe_tests);
 
     const test_step = b.step("test", "Run unit tests");
-    test_step.dependOn(&run_tests.step);
-    test_step.dependOn(&run_ipc_tests.step);
-    test_step.dependOn(&run_tabgroup_tests.step);
-    test_step.dependOn(&run_tiling_tests.step);
-    test_step.dependOn(&run_workspace_tests.step);
-    test_step.dependOn(&run_statusbar_tests.step);
-    test_step.dependOn(&run_dim_tests.step);
+    test_step.dependOn(&run_app_tests.step);
     test_step.dependOn(&run_swipe_tests.step);
 }
 
