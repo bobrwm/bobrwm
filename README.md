@@ -167,7 +167,7 @@ built-in defaults; use the same key + modifiers to override a default binding.
 | `focus_previous_workspace` | Switch to the previous workspace; if already at the first workspace, pass the key through | — |
 | `focus_next_workspace` | Switch to the next workspace; if already at the last workspace, pass the key through | — |
 | `move_to_workspace` | Move focused window to workspace N | workspace number |
-| `move_workspace_to_display` | Move the active workspace to display N | display number |
+| `move_workspace_to_display` | Move the active workspace to display N, next, or previous | display number; `0` = next, `255` = previous |
 | `focus_left` | Focus window to the left | — |
 | `focus_right` | Focus window to the right | — |
 | `focus_up` | Focus window above | — |
