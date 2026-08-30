@@ -444,7 +444,10 @@ fn scheduleObserveRetry(pid: i32) void {
     if (observeRetryIndex(pid)) |existing| {
         g_observe_retry_entries[existing].attempts_remaining = observe_retry_attempts_max;
     } else {
-        if (g_observe_retry_count >= max_observed_apps) return;
+        if (g_observe_retry_count >= max_observed_apps) {
+            log.warn("AX observe retry queue exhausted pid={d} limit={d}", .{ pid, max_observed_apps });
+            return;
+        }
         g_observe_retry_entries[g_observe_retry_count] = .{
             .pid = pid,
             .attempts_remaining = observe_retry_attempts_max,
@@ -687,7 +690,10 @@ fn retryResolveWid(context: ?*anyopaque) callconv(.c) void {
 }
 
 fn scheduleWidResolutionRetry(observer: c.AXObserverRef, element: c.AXUIElementRef, pid: i32) void {
-    const ctx = acquireWidRetryCtx() orelse return;
+    const ctx = acquireWidRetryCtx() orelse {
+        log.warn("AX window-id retry pool exhausted pid={d} limit={d}", .{ pid, max_wid_retry_contexts });
+        return;
+    };
 
     const retained_observer = c.CFRetain(@ptrCast(observer)) orelse {
         releaseWidRetryCtx(ctx);

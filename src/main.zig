@@ -54,11 +54,9 @@ pub const std_options = std.Options{
 
 const log = std.log.scoped(.bobrwm);
 
-// Lock-free SPSC ring buffer
-//
-// Single-producer (main thread) only. All emitters must run on the
-// main thread / main queue. The consumer is bw_drain_events, also on
-// the main run-loop.
+// Fixed-capacity event ring. Producers are serialized by g_ring_lock because
+// AX callbacks run on the observer thread while AppKit and hotkey callbacks run
+// on the main thread. The main-runloop consumer remains lock-free.
 
 const EventRing = struct {
     const capacity = 1024;
@@ -66,6 +64,7 @@ const EventRing = struct {
     buf: [capacity]event_mod.Event = undefined,
     head: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
     tail: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
+    overflowed: std.atomic.Value(bool) = .init(false),
     dropped: usize = 0,
 
     fn push(self: *EventRing, ev: event_mod.Event) void {
@@ -73,6 +72,7 @@ const EventRing = struct {
         const next = (t + 1) % capacity;
         if (next == self.head.load(.acquire)) {
             self.dropped += 1;
+            self.overflowed.store(true, .release);
             log.err("event ring full, dropped event kind={s} pid={d} wid={d} total_dropped={d}", .{
                 @tagName(ev.kind), ev.pid, ev.wid, self.dropped,
             });
@@ -88,6 +88,10 @@ const EventRing = struct {
         const ev = self.buf[h];
         self.head.store((h + 1) % capacity, .release);
         return ev;
+    }
+
+    fn takeOverflowed(self: *EventRing) bool {
+        return self.overflowed.swap(false, .acq_rel);
     }
 };
 
@@ -1570,6 +1574,8 @@ var g_retile_requested_all_displays = false;
 var g_retile_dirty_display_ids: [workspace_mod.max_displays]u32 = [_]u32{0} ** workspace_mod.max_displays;
 var g_retile_dirty_display_count: usize = 0;
 var g_event_drain_active = false;
+var g_event_overflow_recovery_pending = false;
+var g_on_screen_truncation_logged = false;
 var g_cleanup_pending_offscreen = false;
 var g_cleanup_pending_pids: [cleanup_pid_capacity_per_drain]i32 = undefined;
 var g_cleanup_pending_pid_count: usize = 0;
@@ -1634,7 +1640,10 @@ fn requestCleanupForPid(pid: i32) void {
     }
 
     if (g_cleanup_pending_pid_count >= g_cleanup_pending_pids.len) {
-        log.warn("cleanup: pid queue saturated, skipping pid={d}", .{pid});
+        log.warn("cleanup: pid queue saturated, scheduling broad reconciliation pid={d}", .{pid});
+        g_event_overflow_recovery_pending = true;
+        g_cleanup_pending_offscreen = true;
+        refreshRolePolling();
         return;
     }
 
@@ -1865,16 +1874,21 @@ fn cgWindowInfoVisible(info: c.CFDictionaryRef) bool {
 
 /// Get all AX-backed window IDs for an application PID.
 /// Includes windows that may not currently be visible on screen.
-fn bw_get_app_window_ids(pid: i32, out: []u32) usize {
-    if (out.len == 0) return 0;
+const BoundedSnapshotResult = struct {
+    count: usize,
+    truncated: bool,
+};
+
+fn bw_get_app_window_ids(pid: i32, out: []u32) BoundedSnapshotResult {
+    if (out.len == 0) return .{ .count = 0, .truncated = true };
 
     std.debug.assert(pid > 0);
 
     const out_buf = out;
-    const app = c.AXUIElementCreateApplication(pid) orelse return 0;
+    const app = c.AXUIElementCreateApplication(pid) orelse return .{ .count = 0, .truncated = false };
     defer c.CFRelease(@ptrCast(app));
 
-    const ax = ensureAxStrings() orelse return 0;
+    const ax = ensureAxStrings() orelse return .{ .count = 0, .truncated = false };
     const windows_attr = ax.windows_attr;
 
     var windows: c.CFArrayRef = null;
@@ -1883,8 +1897,8 @@ fn bw_get_app_window_ids(pid: i32, out: []u32) usize {
         windows_attr,
         @ptrCast(&windows),
     );
-    if (err != c.kAXErrorSuccess or windows == null) return 0;
-    const windows_ref = windows orelse return 0;
+    if (err != c.kAXErrorSuccess or windows == null) return .{ .count = 0, .truncated = false };
+    const windows_ref = windows orelse return .{ .count = 0, .truncated = false };
     defer c.CFRelease(@ptrCast(windows_ref));
 
     var written: usize = 0;
@@ -1892,19 +1906,24 @@ fn bw_get_app_window_ids(pid: i32, out: []u32) usize {
     std.debug.assert(total >= 0);
 
     var i: c.CFIndex = 0;
-    while (i < total and written < out_buf.len) : (i += 1) {
+    var truncated = false;
+    while (i < total) : (i += 1) {
         const win_any = c.CFArrayGetValueAtIndex(windows_ref, i) orelse continue;
         const win: c.AXUIElementRef = @ptrCast(win_any);
 
         var wid: u32 = 0;
         if (_AXUIElementGetWindow(win, &wid) == c.kAXErrorSuccess and wid != 0) {
+            if (written == out_buf.len) {
+                truncated = true;
+                break;
+            }
             out_buf[written] = wid;
             written += 1;
         }
     }
 
     std.debug.assert(written <= out_buf.len);
-    return @intCast(written);
+    return .{ .count = written, .truncated = truncated };
 }
 
 fn isRegularActivationApp(pid: i32) bool {
@@ -2167,13 +2186,14 @@ fn bw_window_manage_state(pid: i32, wid: u32) u8 {
 /// share the CGWindowList but have Prohibited activation policy. Caching the
 /// accept/reject decision per PID avoids an ObjC message send for every window
 /// belonging to the same rejected process.
-fn bw_discover_windows(out: []shim.bw_window_info) usize {
-    if (out.len == 0) return 0;
+fn bw_discover_windows(out: []shim.bw_window_info) BoundedSnapshotResult {
+    if (out.len == 0) return .{ .count = 0, .truncated = true };
     const out_buf = out;
 
     const options: cg_extra.CGWindowListOption =
         cg_extra.kCGWindowListOptionOnScreenOnly | cg_extra.kCGWindowListExcludeDesktopElements;
-    const window_list = cg_extra.CGWindowListCopyWindowInfo(options, cg_extra.kCGNullWindowID) orelse return 0;
+    const window_list = cg_extra.CGWindowListCopyWindowInfo(options, cg_extra.kCGNullWindowID) orelse
+        return .{ .count = 0, .truncated = false };
     defer c.CFRelease(@ptrCast(window_list));
 
     const total = c.CFArrayGetCount(window_list);
@@ -2187,8 +2207,9 @@ fn bw_discover_windows(out: []shim.bw_window_info) usize {
     var rejected_pid_count: usize = 0;
 
     var count: usize = 0;
+    var truncated = false;
     var i: c.CFIndex = 0;
-    while (i < total and count < out_buf.len) : (i += 1) {
+    while (i < total) : (i += 1) {
         const info_any = c.CFArrayGetValueAtIndex(window_list, i) orelse continue;
         const info: c.CFDictionaryRef = @ptrCast(info_any);
 
@@ -2234,6 +2255,11 @@ fn bw_discover_windows(out: []shim.bw_window_info) usize {
         }
         if (bounds.size.width < 1 or bounds.size.height < 1) continue;
 
+        if (count == out_buf.len) {
+            truncated = true;
+            break;
+        }
+
         out_buf[count] = .{
             .wid = wid,
             .pid = pid,
@@ -2246,7 +2272,7 @@ fn bw_discover_windows(out: []shim.bw_window_info) usize {
     }
 
     std.debug.assert(count <= out_buf.len);
-    return @intCast(count);
+    return .{ .count = count, .truncated = truncated };
 }
 
 fn pidInCache(pid: i32, cache: []const i32, count: usize) bool {
@@ -2777,6 +2803,12 @@ fn bw_drain_events() void {
     }
     drainIpcRequests();
 
+    if (g_ring.takeOverflowed()) {
+        g_event_overflow_recovery_pending = true;
+        refreshRolePolling();
+    }
+    recoverFromEventOverflow();
+
     // Flush retile BEFORE cleanup so windows are at their layout positions
     // when cleanup checks on-screen status. Without this, cleanup sees
     // corner-parked windows and incorrectly removes them as ghosts.
@@ -2801,6 +2833,39 @@ fn bw_drain_events() void {
     if (g_shutdown_requested.load(.acquire)) {
         gracefulStopNSApp();
     }
+}
+
+/// A dropped event has unknown semantics, so recover from authoritative OS
+/// state instead of guessing which individual mutation was lost. Cleanup is
+/// deferred through workspace transitions because parked windows are expected
+/// to be off-screen during that interval.
+fn recoverFromEventOverflow() void {
+    if (!g_event_overflow_recovery_pending) return;
+    if (g_workspace_transition.isActive()) return;
+
+    g_event_overflow_recovery_pending = false;
+    log.warn("event overflow: reconciling window, app, focus, and frame state", .{});
+
+    // Mouse-up may be the lost event. Abandon transient drag state rather than
+    // leaving every later AX move classified as a user drag indefinitely.
+    g_mouse_left_down = false;
+    g_drag_reconcile_on_drop = false;
+    clearDragPreview();
+
+    _ = removeStoppedAppWindows();
+    discoverWindows();
+    refreshTabGroupActiveTabs();
+    reconcileVisibleFramesFromWindowServer();
+
+    if (frontmostApplicationPid()) |pid| {
+        if (focusedWindowIdForPid(pid)) |wid| {
+            reconcileFocusedWindow(pid, wid);
+        }
+        requestCleanupForPid(pid);
+    }
+    requestOffscreenCleanup();
+    requestRetileAllDisplays();
+    refreshRolePolling();
 }
 
 /// Exit `[NSApp run]` cleanly by setting NSApplication's stop flag and posting
@@ -3746,7 +3811,8 @@ fn refreshRolePolling() void {
         g_app_launch_retries.count() > 0 or
         g_focus_retries.count() > 0 or
         g_deferred_follow_focus != null or
-        g_display_resettle_at_s != 0;
+        g_display_resettle_at_s != 0 or
+        g_event_overflow_recovery_pending;
     setRolePolling(has_pending);
 }
 
@@ -4293,14 +4359,17 @@ fn processDeferredWindowCandidates() bool {
 
 fn discoverWindows() void {
     var buf: [256]shim.bw_window_info = undefined;
-    const count = bw_discover_windows(&buf);
+    const discovery = bw_discover_windows(&buf);
+    if (discovery.truncated) {
+        log.warn("window discovery truncated limit={d}; excess windows remain unmanaged", .{buf.len});
+    }
     var observed_pids: [128]i32 = undefined;
     var observed_pid_count: usize = 0;
 
     // Sort windows by current x-position so the BSP tree order matches
     // their on-screen placement. Without this, windows discovered in
     // arbitrary order get swapped to the opposite side on the first retile.
-    const slice = buf[0..count];
+    const slice = buf[0..discovery.count];
     std.mem.sortUnstable(shim.bw_window_info, slice, {}, struct {
         fn lessThan(_: void, a: shim.bw_window_info, b: shim.bw_window_info) bool {
             return a.x < b.x;
@@ -4395,6 +4464,7 @@ fn discoverWindows() void {
 const OnScreenWindows = struct {
     wids: [512]u32 = undefined,
     count: usize = 0,
+    truncated: bool = false,
 
     fn snapshot() OnScreenWindows {
         var self: OnScreenWindows = .{};
@@ -4407,7 +4477,7 @@ const OnScreenWindows = struct {
         const total = c.CFArrayGetCount(list);
         std.debug.assert(total >= 0);
         var i: c.CFIndex = 0;
-        while (i < total and self.count < self.wids.len) : (i += 1) {
+        while (i < total) : (i += 1) {
             const info_any = c.CFArrayGetValueAtIndex(list, i) orelse continue;
             const info: c.CFDictionaryRef = @ptrCast(info_any);
             const wid_ref_any = c.CFDictionaryGetValue(info, cg_extra.kCGWindowNumber) orelse continue;
@@ -4416,6 +4486,15 @@ const OnScreenWindows = struct {
             var wid: u32 = 0;
             if (c.CFNumberGetValue(wid_ref, c.kCFNumberSInt32Type, &wid) == 0) continue;
             if (!cgWindowInfoVisible(info)) continue;
+
+            if (self.count == self.wids.len) {
+                self.truncated = true;
+                if (!g_on_screen_truncation_logged) {
+                    log.warn("on-screen window snapshot truncated limit={d}", .{self.wids.len});
+                    g_on_screen_truncation_logged = true;
+                }
+                break;
+            }
 
             self.wids[self.count] = wid;
             self.count += 1;
@@ -4438,14 +4517,18 @@ fn tabCandidates(
     pid: i32,
     on_screen: *const OnScreenWindows,
     out: []tabgroup.detect.Candidate,
-) usize {
+) BoundedSnapshotResult {
     std.debug.assert(pid > 0);
 
     var count: usize = 0;
+    var truncated = false;
     var it = g_store.windows.valueIterator();
     while (it.next()) |win| {
-        if (count == out.len) break;
         if (win.pid != pid) continue;
+        if (count == out.len) {
+            truncated = true;
+            break;
+        }
 
         const on_visible_workspace = workspaceVisibleOnDisplay(win.workspace_id, win.display_id);
         out[count] = .{
@@ -4457,7 +4540,7 @@ fn tabCandidates(
         };
         count += 1;
     }
-    return count;
+    return .{ .count = count, .truncated = truncated };
 }
 
 /// Snapshot the windows an application exposes in its AX window list.
@@ -4465,15 +4548,19 @@ fn appWindowSnapshot(
     pid: i32,
     on_screen: *const OnScreenWindows,
     out: []tabgroup.detect.AppWindow,
-) usize {
+) BoundedSnapshotResult {
     std.debug.assert(pid > 0);
 
     var ax_wids: [128]u32 = undefined;
-    const ax_count = bw_get_app_window_ids(pid, &ax_wids);
+    const ax_snapshot = bw_get_app_window_ids(pid, &ax_wids);
 
     var count: usize = 0;
-    for (ax_wids[0..ax_count]) |ax_wid| {
-        if (count == out.len) break;
+    var truncated = ax_snapshot.truncated;
+    for (ax_wids[0..ax_snapshot.count]) |ax_wid| {
+        if (count == out.len) {
+            truncated = true;
+            break;
+        }
         out[count] = .{
             .wid = ax_wid,
             .live_frame = liveWindowFrame(ax_wid),
@@ -4490,7 +4577,7 @@ fn appWindowSnapshot(
         });
         count += 1;
     }
-    return count;
+    return .{ .count = count, .truncated = truncated };
 }
 
 fn addNewWindowManagedWithAssignment(pid: i32, wid: u32, workspace_id: u8, assigned_display_id: u32) bool {
@@ -4654,15 +4741,18 @@ fn refreshTabGroupActiveTabs() void {
     if (g_tab_groups.groups.count() == 0) return;
 
     const on_screen = OnScreenWindows.snapshot();
+    if (on_screen.truncated) return;
 
     const Move = struct { group_id: tabgroup.GroupId, selected: u32 };
-    var moves: [16]Move = undefined;
-    var move_count: usize = 0;
+    var moves: std.ArrayList(Move) = .empty;
+    defer moves.deinit(g_allocator);
+    moves.ensureTotalCapacity(g_allocator, g_tab_groups.groups.count()) catch |err| {
+        log.err("tab refresh skipped: failed to allocate move snapshot: {}", .{err});
+        return;
+    };
 
     var it = g_tab_groups.groups.valueIterator();
     while (it.next()) |group| {
-        if (move_count == moves.len) break;
-
         const leader = g_store.get(group.leader_wid) orelse continue;
         // A parked group is off-screen on purpose and nothing acts on it until
         // its workspace is shown again.
@@ -4670,20 +4760,23 @@ fn refreshTabGroupActiveTabs() void {
         if (on_screen.contains(group.active_wid)) continue;
 
         var app_windows: [128]tabgroup.detect.AppWindow = undefined;
-        const app_count = appWindowSnapshot(group.pid, &on_screen, &app_windows);
+        const app_snapshot = appWindowSnapshot(group.pid, &on_screen, &app_windows);
+        if (app_snapshot.truncated) {
+            log.warn("tab refresh skipped: AX window snapshot truncated pid={d} limit={d}", .{ group.pid, app_windows.len });
+            continue;
+        }
         const selected = tabgroup.detect.selectedTabWindow(
-            app_windows[0..app_count],
+            app_windows[0..app_snapshot.count],
             group.canonical_frame,
         ) orelse continue;
         if (selected == group.active_wid) continue;
 
-        moves[move_count] = .{ .group_id = group.id, .selected = selected };
-        move_count += 1;
+        moves.appendAssumeCapacity(.{ .group_id = group.id, .selected = selected });
     }
 
     // Applied after the walk: adopting a tab writes to the store and to the
     // group's member list.
-    for (moves[0..move_count]) |move| {
+    for (moves.items) |move| {
         const group = g_tab_groups.groups.getPtr(move.group_id) orelse continue;
         const leader = g_store.get(group.leader_wid) orelse continue;
 
@@ -4724,19 +4817,28 @@ fn tryFormTabGroupOnCreate(pid: i32, new_wid: u32) bool {
     });
 
     const on_screen = OnScreenWindows.snapshot();
+    if (on_screen.truncated) return false;
     var candidates: [128]tabgroup.detect.Candidate = undefined;
-    const count = tabCandidates(pid, &on_screen, &candidates);
+    const candidate_snapshot = tabCandidates(pid, &on_screen, &candidates);
+    if (candidate_snapshot.truncated) {
+        log.warn("tab detect skipped: managed candidate snapshot truncated pid={d} limit={d}", .{ pid, candidates.len });
+        return false;
+    }
 
     var app_windows: [128]tabgroup.detect.AppWindow = undefined;
-    const app_count = appWindowSnapshot(pid, &on_screen, &app_windows);
-    const has_tab_group = tabgroup.detect.appHasTabGroup(app_windows[0..app_count]);
+    const app_snapshot = appWindowSnapshot(pid, &on_screen, &app_windows);
+    if (app_snapshot.truncated) {
+        log.warn("tab detect skipped: AX window snapshot truncated pid={d} limit={d}", .{ pid, app_windows.len });
+        return false;
+    }
+    const has_tab_group = tabgroup.detect.appHasTabGroup(app_windows[0..app_snapshot.count]);
 
     // Collected before any removal: removeWindow mutates the workspace window
     // lists that the snapshot describes.
-    var stale_wids: [64]u32 = undefined;
-    const stale_count = tabgroup.detect.staleCandidates(pid, candidates[0..count], &stale_wids);
+    var stale_wids: [128]u32 = undefined;
+    const stale_count = tabgroup.detect.staleCandidates(pid, candidates[0..candidate_snapshot.count], &stale_wids);
 
-    const formed = switch (tabgroup.detect.classifyNewWindow(pid, new_wid, new_frame, candidates[0..count], has_tab_group)) {
+    const formed = switch (tabgroup.detect.classifyNewWindow(pid, new_wid, new_frame, candidates[0..candidate_snapshot.count], has_tab_group)) {
         .standalone => blk: {
             log.debug("tab detect: wid={d} is standalone", .{new_wid});
             break :blk false;
@@ -4917,43 +5019,62 @@ fn removeAppWindows(pid: i32) void {
     untrackPendingRoleWindowsForPid(pid);
     untrackDeferredWindowCandidatesForPid(pid);
     clearDragPreview();
-    var wids: [128]u32 = undefined;
-    var ws_ids: [128]u8 = undefined;
-    var n: usize = 0;
+    var total_removed: usize = 0;
 
-    // Collect managed windows across all workspaces
-    for (&g_workspaces.workspaces) |*ws| {
-        for (ws.windows.items) |wid| {
-            if (g_store.get(wid)) |win| {
-                if (win.pid == pid and n < wids.len) {
-                    wids[n] = wid;
-                    ws_ids[n] = ws.id;
-                    n += 1;
-                }
+    // Iterate in batches because removeWindow mutates the store. Rescan until
+    // no matching entries remain; the old single 128-entry batch silently
+    // leaked every window above the cap after an app termination.
+    while (true) {
+        var wids: [128]u32 = undefined;
+        var count: usize = 0;
+
+        var store_it = g_store.windows.iterator();
+        while (store_it.next()) |entry| {
+            if (entry.value_ptr.pid != pid) continue;
+            if (count == wids.len) break;
+            wids[count] = entry.key_ptr.*;
+            count += 1;
+        }
+
+        if (count == 0) break;
+        for (wids[0..count]) |wid| removeWindow(wid);
+        total_removed += count;
+    }
+
+    if (total_removed > 128) {
+        log.warn("app termination cleanup exceeded one batch pid={d} removed={d}", .{ pid, total_removed });
+    }
+}
+
+fn isAppRunning(pid: i32) ?bool {
+    std.debug.assert(pid > 0);
+    const NSRunningApplication = objc.getClass("NSRunningApplication") orelse return null;
+    const app = NSRunningApplication.msgSend(objc.Object, "runningApplicationWithProcessIdentifier:", .{pid});
+    return app.value != null;
+}
+
+/// Recover app-termination notifications lost to event-ring overflow. Find one
+/// stopped process at a time so store mutation never overlaps map iteration.
+fn removeStoppedAppWindows() bool {
+    var removed_any = false;
+    while (true) {
+        const stopped_pid: ?i32 = blk: {
+            var it = g_store.windows.valueIterator();
+            while (it.next()) |win| {
+                const running = isAppRunning(win.pid) orelse {
+                    log.warn("event overflow: cannot query running applications; skipping termination recovery", .{});
+                    return removed_any;
+                };
+                if (!running) break :blk win.pid;
             }
-        }
-    }
+            break :blk null;
+        };
+        const pid = stopped_pid orelse return removed_any;
 
-    // Also collect suppressed tab members from the store
-    var store_it = g_store.windows.iterator();
-    while (store_it.next()) |entry| {
-        const wid = entry.key_ptr.*;
-        if (entry.value_ptr.pid != pid) continue;
-        if (!g_tab_groups.isSuppressed(wid)) continue;
-        if (n >= wids.len) continue;
-
-        wids[n] = wid;
-        ws_ids[n] = entry.value_ptr.workspace_id;
-        n += 1;
-    }
-
-    for (wids[0..n], ws_ids[0..n]) |wid, ws_id| {
-        _ = g_tab_groups.removeMember(wid);
-        g_store.remove(wid);
-        if (g_workspaces.get(ws_id)) |ws| {
-            ws.removeWindow(wid);
-        }
-        removeFromTiling(ws_id, wid);
+        ax_mod.invalidateApp(pid);
+        ax_observer.unobserveApp(pid);
+        removeAppWindows(pid);
+        removed_any = true;
     }
 }
 
@@ -5098,10 +5219,15 @@ fn appListsWindow(pid: i32, wid: u32) bool {
     std.debug.assert(wid != 0);
 
     var ax_wids: [128]u32 = undefined;
-    const count = bw_get_app_window_ids(pid, &ax_wids);
-    if (count == 0) return true;
+    const snapshot = bw_get_app_window_ids(pid, &ax_wids);
+    if (snapshot.count == 0) return true;
 
-    return std.mem.findScalar(u32, ax_wids[0..count], wid) != null;
+    if (std.mem.findScalar(u32, ax_wids[0..snapshot.count], wid) != null) return true;
+    if (snapshot.truncated) {
+        log.warn("AX window membership inconclusive: snapshot truncated pid={d} wid={d} limit={d}", .{ pid, wid, ax_wids.len });
+        return true;
+    }
+    return false;
 }
 
 /// Adopt a managed window as a member of an on-screen sibling's tab group.
@@ -5121,26 +5247,35 @@ fn adoptWindowAsBackgroundTab(win: window_mod.Window) tabgroup.detect.OffscreenO
     const frame = liveWindowFrame(win.wid);
 
     const on_screen = OnScreenWindows.snapshot();
+    if (on_screen.truncated) return .keep;
     var app_windows: [128]tabgroup.detect.AppWindow = undefined;
-    const app_count = appWindowSnapshot(win.pid, &on_screen, &app_windows);
+    const app_snapshot = appWindowSnapshot(win.pid, &on_screen, &app_windows);
+    if (app_snapshot.truncated) {
+        log.warn("background-tab adoption skipped: AX window snapshot truncated pid={d} limit={d}", .{ win.pid, app_windows.len });
+        return .keep;
+    }
     const listed_in_app = blk: {
-        for (app_windows[0..app_count]) |app_window| {
+        for (app_windows[0..app_snapshot.count]) |app_window| {
             if (app_window.wid == win.wid) break :blk true;
         }
         break :blk false;
     };
 
     var candidates: [128]tabgroup.detect.Candidate = undefined;
-    const count = tabCandidates(win.pid, &on_screen, &candidates);
+    const candidate_snapshot = tabCandidates(win.pid, &on_screen, &candidates);
+    if (candidate_snapshot.truncated) {
+        log.warn("background-tab adoption skipped: candidate snapshot truncated pid={d} limit={d}", .{ win.pid, candidates.len });
+        return .keep;
+    }
 
-    const has_tab_group = tabgroup.detect.appHasTabGroup(app_windows[0..app_count]);
+    const has_tab_group = tabgroup.detect.appHasTabGroup(app_windows[0..app_snapshot.count]);
     const sibling_wid = switch (tabgroup.detect.classifyOffscreenManaged(
         win.wid,
         win.pid,
         frame,
         listed_in_app,
         has_tab_group,
-        candidates[0..count],
+        candidates[0..candidate_snapshot.count],
     )) {
         .keep => {
             log.debug("cleanup: keeping wid={d} pid={d}, the app still lists it", .{ win.wid, win.pid });
