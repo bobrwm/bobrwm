@@ -3007,10 +3007,16 @@ fn windowIsTiled(wid: u32) bool {
     return win.mode == .tiled;
 }
 
-fn insertIntoTiling(workspace_id: u8, wid: u32) void {
+fn tryInsertIntoTiling(workspace_id: u8, wid: u32) !void {
     const sp = tilingStatePtr(workspace_id);
-    if (sp.* == null) sp.* = tiling.newState(g_config.layout);
-    const ws = g_workspaces.get(workspace_id) orelse return;
+    const created_state = sp.* == null;
+    if (created_state) sp.* = tiling.newState(g_config.layout);
+    errdefer if (created_state) {
+        sp.*.?.deinit(g_allocator);
+        sp.* = null;
+    };
+
+    const ws = g_workspaces.get(workspace_id) orelse return error.InvalidWorkspace;
     const anchor_wid = blk: {
         const st = sp.* orelse break :blk null;
         switch (g_config.bsp_insert_point) {
@@ -3032,7 +3038,26 @@ fn insertIntoTiling(workspace_id: u8, wid: u32) void {
         .inner_gap = @floatFromInt(g_config.gaps.inner),
         .split_ratio = g_config.bsp_split_ratio,
     };
-    sp.*.?.insert(wid, options, g_allocator) catch return;
+    try sp.*.?.insert(wid, options, g_allocator);
+}
+
+fn insertIntoTiling(workspace_id: u8, wid: u32) void {
+    tryInsertIntoTiling(workspace_id, wid) catch |err| {
+        log.err("failed to insert wid={d} into workspace {d} layout: {}", .{ wid, workspace_id, err });
+    };
+}
+
+/// Reserve every allocating container before committing a managed window.
+/// Layout insertion happens before the no-fail store/workspace append, so an
+/// allocation failure cannot leave a window present in only part of the model.
+fn adoptWindow(ws: *workspace_mod.Workspace, win: window_mod.Window) !void {
+    std.debug.assert(g_store.get(win.wid) == null);
+    try g_store.ensureUnusedCapacity(1);
+    try ws.ensureUnusedWindowCapacity(1);
+    if (win.mode == .tiled) try tryInsertIntoTiling(ws.id, win.wid);
+
+    g_store.putAssumeCapacity(win);
+    ws.addWindowAssumeCapacity(win.wid);
 }
 
 fn setTilingActive(workspace_id: u8, wid: u32) void {
@@ -3618,18 +3643,22 @@ fn setWindowMode(wid: u32, target: window_mod.WindowMode) void {
     const old = win.mode;
     if (old == target) return;
 
+    // Allocate the new layout slot before changing the stored mode. On
+    // failure the window remains consistently floating.
+    if (target == .tiled) {
+        tryInsertIntoTiling(win.workspace_id, wid) catch |err| {
+            log.err("failed to tile wid={d}: {}", .{ wid, err });
+            return;
+        };
+    }
+
     // Leaving tiled → remove from BSP so remaining windows fill the space
     if (old == .tiled) {
         removeFromTiling(win.workspace_id, wid);
     }
 
-    // Entering tiled → re-insert into BSP
-    if (target == .tiled) {
-        insertIntoTiling(win.workspace_id, wid);
-    }
-
     win.mode = target;
-    g_store.put(win) catch {};
+    g_store.putAssumeCapacity(win);
     log.info("window {d} mode: {s} → {s}", .{ wid, @tagName(old), @tagName(target) });
     retile();
 }
@@ -4340,9 +4369,10 @@ fn discoverWindows() void {
             .display_id = managed_display,
         };
 
-        g_store.put(win) catch continue;
-        target_ws.addWindow(info.wid) catch continue;
-        insertIntoTiling(target_ws.id, info.wid);
+        adoptWindow(target_ws, win) catch |err| {
+            log.err("discover: failed to adopt pid={d} wid={d}: {}", .{ info.pid, info.wid, err });
+            continue;
+        };
 
         // If assigned to a non-visible workspace, hide immediately
         if (!workspaceVisibleOnDisplay(target_ws.id, managed_display)) {
@@ -4550,11 +4580,10 @@ fn addNewWindowManagedWithAssignment(pid: i32, wid: u32, workspace_id: u8, assig
         .display_id = display_id,
     };
 
-    g_store.put(win) catch return false;
-    ws.addWindow(wid) catch return false;
-    if (mode == .tiled) {
-        insertIntoTiling(ws.id, wid);
-    }
+    adoptWindow(ws, win) catch |err| {
+        log.err("addNewWindow: failed to adopt pid={d} wid={d}: {}", .{ pid, wid, err });
+        return false;
+    };
     ws.recordFocus(wid);
 
     // If assigned to a non-visible workspace, hide immediately
@@ -4661,8 +4690,9 @@ fn refreshTabGroupActiveTabs() void {
         // The user can select a tab Bobrwm has never seen: background tabs are
         // absent from AXWindows, so they are only discovered as they surface.
         if (g_store.get(move.selected) == null) {
+            g_store.ensureUnusedCapacity(1) catch continue;
             g_tab_groups.addMember(move.group_id, move.selected) catch continue;
-            g_store.put(.{
+            g_store.putAssumeCapacity(.{
                 .wid = move.selected,
                 .pid = group.pid,
                 .title = null,
@@ -4671,7 +4701,7 @@ fn refreshTabGroupActiveTabs() void {
                 .mode = leader.mode,
                 .workspace_id = leader.workspace_id,
                 .display_id = leader.display_id,
-            }) catch continue;
+            });
         }
 
         log.debug("tab group {d} active tab {d} → {d} (tab bar)", .{
@@ -4731,16 +4761,21 @@ fn tryFormTabGroupOnCreate(pid: i32, new_wid: u32) bool {
 fn joinTabGroup(pid: i32, sibling_wid: u32, new_wid: u32, new_frame: window_mod.Window.Frame) bool {
     const sibling = g_store.get(sibling_wid) orelse return false;
     const ws = g_workspaces.get(sibling.workspace_id) orelse return false;
+    std.debug.assert(g_store.get(new_wid) == null);
 
-    const group_id = if (g_tab_groups.groupOf(sibling_wid)) |g|
-        g.id
-    else
-        g_tab_groups.createGroup(pid, sibling_wid, sibling.frame) catch return false;
+    // Reserve the store first. Once the group mutation succeeds, publishing
+    // the new member's Window record cannot fail.
+    g_store.ensureUnusedCapacity(1) catch return false;
 
-    g_tab_groups.addMember(group_id, new_wid) catch return false;
+    if (g_tab_groups.groupOf(sibling_wid)) |g| {
+        g_tab_groups.addMember(g.id, new_wid) catch return false;
+    } else {
+        _ = g_tab_groups.createGroupWithMember(pid, sibling_wid, new_wid, sibling.frame) catch return false;
+    }
+
     g_tab_groups.setActive(new_wid);
 
-    g_store.put(.{
+    g_store.putAssumeCapacity(.{
         .wid = new_wid,
         .pid = pid,
         .title = null,
@@ -4749,7 +4784,7 @@ fn joinTabGroup(pid: i32, sibling_wid: u32, new_wid: u32, new_frame: window_mod.
         .mode = sibling.mode,
         .workspace_id = sibling.workspace_id,
         .display_id = sibling.display_id,
-    }) catch return false;
+    });
 
     const leader = g_tab_groups.resolveLeader(sibling_wid);
     ws.recordFocus(leader);
@@ -5117,11 +5152,11 @@ fn adoptWindowAsBackgroundTab(win: window_mod.Window) tabgroup.detect.OffscreenO
 
     const sibling = g_store.get(sibling_wid) orelse return .reap;
 
-    const group_id = if (g_tab_groups.groupOf(sibling_wid)) |g|
-        g.id
-    else
-        g_tab_groups.createGroup(win.pid, sibling_wid, sibling.frame) catch return .reap;
-    g_tab_groups.addMember(group_id, win.wid) catch return .reap;
+    if (g_tab_groups.groupOf(sibling_wid)) |group| {
+        g_tab_groups.addMember(group.id, win.wid) catch return .reap;
+    } else {
+        _ = g_tab_groups.createGroupWithMember(win.pid, sibling_wid, win.wid, sibling.frame) catch return .reap;
+    }
     g_tab_groups.setActive(sibling_wid);
 
     // Members live only in the store; drop the standalone workspace/layout slot.
@@ -6044,18 +6079,21 @@ fn moveWindowToWorkspace(target_id: u8) void {
     const wid = wid_opt orelse return;
     if (target_id == ws.id) return;
     const target_ws = g_workspaces.get(target_id) orelse return;
-
-    // Remove from current workspace BSP + list
-    ws.removeWindow(wid);
-    removeFromTiling(ws.id, wid);
-
     var updated = g_store.get(wid) orelse return;
 
-    // Add to target workspace BSP + list
-    target_ws.addWindow(wid) catch return;
+    // Prepare the destination completely before removing the source slot.
+    // After these fallible steps, the move commits without allocation.
+    target_ws.ensureUnusedWindowCapacity(1) catch return;
     if (updated.mode == .tiled) {
-        insertIntoTiling(target_id, wid);
+        tryInsertIntoTiling(target_id, wid) catch |err| {
+            log.err("failed to move wid={d} to workspace {d}: {}", .{ wid, target_id, err });
+            return;
+        };
     }
+    target_ws.addWindowAssumeCapacity(wid);
+
+    ws.removeWindow(wid);
+    removeFromTiling(ws.id, wid);
     if (target_ws.focused_wid == null) {
         target_ws.recordFocus(wid);
     }
@@ -6067,7 +6105,7 @@ fn moveWindowToWorkspace(target_id: u8) void {
     // switchWorkspace will correct it when the workspace is activated.
     updated.workspace_id = target_id;
     updated.display_id = target_ws.display_id orelse display_id;
-    g_store.put(updated) catch {};
+    g_store.putAssumeCapacity(updated);
     updateTabGroupAssignment(wid, target_id, updated.display_id);
 
     // If target is not visible on the window's new display, hide it.
@@ -6098,43 +6136,37 @@ fn moveManagedWindowToDisplay(wid: u32, target_display_id: u32) bool {
         const source_ws = g_workspaces.get(source_workspace_id) orelse return false;
         const target_ws = g_workspaces.get(target_workspace_id) orelse return false;
 
-        var target_had_window = false;
         for (target_ws.windows.items) |existing_wid| {
             if (existing_wid == wid) {
-                target_had_window = true;
-                break;
+                log.warn("refusing display move for wid={d}: already in target workspace {d}", .{ wid, target_workspace_id });
+                return false;
             }
         }
 
-        target_ws.addWindow(wid) catch return false;
+        target_ws.ensureUnusedWindowCapacity(1) catch return false;
+        if (win.mode == .tiled) {
+            tryInsertIntoTiling(target_workspace_id, wid) catch |err| {
+                log.err("failed to move wid={d} to display {d}: {}", .{ wid, target_display_id, err });
+                return false;
+            };
+        }
+        target_ws.addWindowAssumeCapacity(wid);
 
         var updated = win;
         updated.workspace_id = target_workspace_id;
         updated.display_id = target_display_id;
-        g_store.put(updated) catch {
-            if (!target_had_window) {
-                target_ws.removeWindow(wid);
-            }
-            return false;
-        };
+        g_store.putAssumeCapacity(updated);
         updateTabGroupAssignment(wid, target_workspace_id, target_display_id);
 
         removeFromTiling(source_workspace_id, wid);
         source_ws.removeWindow(wid);
         target_ws.recordFocus(wid);
-        if (updated.mode == .tiled) {
-            insertIntoTiling(target_workspace_id, wid);
-        }
 
         win = updated;
     } else {
-        removeFromTiling(source_workspace_id, wid);
         win.display_id = target_display_id;
-        g_store.put(win) catch return false;
+        g_store.putAssumeCapacity(win);
         updateTabGroupAssignment(wid, source_workspace_id, target_display_id);
-        if (win.mode == .tiled) {
-            insertIntoTiling(source_workspace_id, wid);
-        }
     }
 
     _ = maybeSetFocusedDisplayForWindow(win, .keyboard);

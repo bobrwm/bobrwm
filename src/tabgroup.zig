@@ -69,42 +69,77 @@ pub const TabGroupManager = struct {
 
     /// Create a new group. First member becomes leader + active.
     pub fn createGroup(self: *TabGroupManager, pid: i32, wid: WindowId, frame: Frame) !GroupId {
+        return self.createGroupFromMembers(pid, &.{wid}, frame);
+    }
+
+    /// Create a new group with a leader and one additional member.
+    pub fn createGroupWithMember(
+        self: *TabGroupManager,
+        pid: i32,
+        leader_wid: WindowId,
+        member_wid: WindowId,
+        frame: Frame,
+    ) !GroupId {
+        if (leader_wid == member_wid) return error.DuplicateWindow;
+        return self.createGroupFromMembers(pid, &.{ leader_wid, member_wid }, frame);
+    }
+
+    fn createGroupFromMembers(
+        self: *TabGroupManager,
+        pid: i32,
+        initial_members: []const WindowId,
+        frame: Frame,
+    ) !GroupId {
+        std.debug.assert(pid > 0);
+        std.debug.assert(initial_members.len > 0);
+
+        for (initial_members) |wid| {
+            if (wid == 0) return error.InvalidWindow;
+            if (self.wid_to_group.contains(wid)) return error.WindowAlreadyGrouped;
+        }
+
         const id = self.next_id;
-        self.next_id += 1;
+        if (id == std.math.maxInt(GroupId)) return error.GroupIdExhausted;
 
         var members: std.ArrayListUnmanaged(WindowId) = .empty;
-        try members.ensureTotalCapacity(self.allocator, 4);
-        try members.append(self.allocator, wid);
+        errdefer members.deinit(self.allocator);
+        try members.ensureTotalCapacity(self.allocator, @max(4, initial_members.len));
+        try self.groups.ensureUnusedCapacity(self.allocator, 1);
+        try self.wid_to_group.ensureUnusedCapacity(self.allocator, @intCast(initial_members.len));
 
-        try self.groups.put(self.allocator, id, .{
+        for (initial_members) |wid| members.appendAssumeCapacity(wid);
+        self.groups.putAssumeCapacityNoClobber(id, .{
             .id = id,
             .pid = pid,
-            .leader_wid = wid,
-            .active_wid = wid,
+            .leader_wid = initial_members[0],
+            .active_wid = initial_members[initial_members.len - 1],
             .members = members,
             .canonical_frame = frame,
         });
-        try self.wid_to_group.put(self.allocator, wid, id);
+        for (initial_members) |wid| self.wid_to_group.putAssumeCapacityNoClobber(wid, id);
+        self.next_id += 1;
 
-        log.info("created group {d} leader={d} pid={d}", .{ id, wid, pid });
+        log.info("created group {d} leader={d} pid={d}", .{ id, initial_members[0], pid });
         return id;
     }
 
     /// Add a window to an existing group.
     pub fn addMember(self: *TabGroupManager, group_id: GroupId, wid: WindowId) !void {
-        const g = self.groups.getPtr(group_id) orelse return;
+        if (wid == 0) return error.InvalidWindow;
+        if (self.wid_to_group.get(wid)) |existing_group_id| {
+            if (existing_group_id == group_id) return;
+            return error.WindowAlreadyGrouped;
+        }
+
+        const g = self.groups.getPtr(group_id) orelse return error.GroupNotFound;
         for (g.members.items) |m| {
             if (m == wid) return;
         }
 
-        if (g.members.items.len == g.members.capacity) {
-            const current_capacity = g.members.capacity;
-            const next_capacity: usize = if (current_capacity < 4) 4 else current_capacity * 2;
-            try g.members.ensureTotalCapacity(self.allocator, next_capacity);
-        }
-
-        try g.members.append(self.allocator, wid);
-        try self.wid_to_group.put(self.allocator, wid, group_id);
+        try g.members.ensureUnusedCapacity(self.allocator, 1);
+        try self.wid_to_group.ensureUnusedCapacity(self.allocator, 1);
+        g.members.appendAssumeCapacity(wid);
+        self.wid_to_group.putAssumeCapacityNoClobber(wid, group_id);
 
         log.debug("added wid={d} to group {d} (now {d} members)", .{
             wid, group_id, g.members.items.len,
@@ -235,6 +270,46 @@ pub const TabGroupManager = struct {
 const testing = std.testing;
 
 const test_frame: Frame = .{ .x = 0, .y = 0, .width = 800, .height = 600 };
+
+fn exerciseAllocationFailures(allocator: std.mem.Allocator) !void {
+    var mgr = TabGroupManager.init(allocator);
+    defer mgr.deinit();
+
+    const gid = mgr.createGroupWithMember(100, 1, 2, test_frame) catch |err| {
+        try testing.expectEqual(@as(u32, 0), mgr.groups.count());
+        try testing.expectEqual(@as(u32, 0), mgr.wid_to_group.count());
+        try testing.expectEqual(@as(GroupId, 1), mgr.next_id);
+        return err;
+    };
+
+    mgr.addMember(gid, 3) catch |err| {
+        const group = mgr.groupOf(1) orelse return error.TestUnexpectedResult;
+        try testing.expectEqualSlices(WindowId, &.{ 1, 2 }, group.members.items);
+        try testing.expect(mgr.groupOf(3) == null);
+        try testing.expectEqual(@as(u32, 2), mgr.wid_to_group.count());
+        return err;
+    };
+
+    const group = mgr.groupOf(1) orelse return error.TestUnexpectedResult;
+    try testing.expectEqualSlices(WindowId, &.{ 1, 2, 3 }, group.members.items);
+    try testing.expectEqual(gid, mgr.wid_to_group.get(3).?);
+}
+
+test "group mutations remain consistent across allocation failures" {
+    try testing.checkAllAllocationFailures(testing.allocator, exerciseAllocationFailures, .{});
+}
+
+test "a window cannot belong to two groups" {
+    var mgr = TabGroupManager.init(testing.allocator);
+    defer mgr.deinit();
+
+    const first = try mgr.createGroup(100, 1, test_frame);
+    const second = try mgr.createGroup(200, 2, test_frame);
+
+    try testing.expectError(error.WindowAlreadyGrouped, mgr.addMember(second, 1));
+    try testing.expectEqual(first, mgr.wid_to_group.get(1).?);
+    try testing.expectEqualSlices(WindowId, &.{2}, mgr.groups.getPtr(second).?.members.items);
+}
 
 test "removeMember hands leadership to a surviving member" {
     var mgr = TabGroupManager.init(testing.allocator);
