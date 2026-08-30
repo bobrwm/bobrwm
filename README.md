@@ -200,7 +200,9 @@ Choose the tiling algorithm:
 
 ```zon
 .layout = .bsp, // .bsp | .monocle
-.bsp_split_ratio = 0.5, // finite value from 0.1 through 0.9
+.layout_config = .{
+    .bsp = .{ .split_ratio = 0.5 },
+},
 ```
 
 ### Workspaces

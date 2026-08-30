@@ -14,12 +14,98 @@ pub const SplitMode = bsp_mod.SplitMode;
 pub const InsertChild = bsp_mod.InsertChild;
 pub const Direction = bsp_mod.Direction;
 
+/// Configuration for every available layout. Selection remains independent in
+/// the top-level config so users can configure inactive layouts in advance.
+pub const Config = struct {
+    bsp: bsp_mod.Config = .{},
+    monocle: monocle_mod.Config = .{},
+};
+
+// Merge error unions from each available layout so that error message strings
+// can be defined in the layout module.
+pub const HandleCommandError = bsp_mod.HandleCommandError || monocle_mod.HandleCommandError;
+
+pub fn handleCommandErrorString(err: HandleCommandError) []const u8 {
+    if (bsp_mod.handleCommandErrorString(err)) |str| return str;
+    if (monocle_mod.handleCommandErrorString(err)) |str| return str;
+    return "err: layout command failed\n";
+}
+
 // ── Layout algorithm selection ────────────────────────────────────────────────
 
 pub const LayoutKind = enum {
     bsp,
     monocle,
 };
+
+/// A layout module owns the command grammar below its namespace and the state
+/// mutation that follows parsing. IPC only knows that it is a layout command.
+pub const Command = union(LayoutKind) {
+    bsp: bsp_mod.Command,
+    monocle: monocle_mod.Command,
+
+    // TODO: Simplify into something more like the functions in `state`
+    pub fn handleCommand(
+        self: *const Command,
+        state: *State,
+        focused_wid: WindowId,
+        settings: *Settings,
+    ) HandleCommandError!void {
+        switch (self.*) {
+            .bsp => |command| {
+                const bsp_state = switch (state.*) {
+                    .bsp => |*s| s,
+                    else => unreachable,
+                };
+                const bsp_settings = switch (settings.*) {
+                    .bsp => |*value| value,
+                    else => unreachable,
+                };
+                return bsp_mod.handleCommand(command, bsp_state, focused_wid, bsp_settings);
+            },
+            .monocle => |command| {
+                const monocle_state = switch (state.*) {
+                    .monocle => |*s| s,
+                    else => unreachable,
+                };
+                const monocle_settings = switch (settings.*) {
+                    .monocle => |*value| value,
+                    else => unreachable,
+                };
+                return monocle_mod.handleCommand(command, monocle_state, focused_wid, monocle_settings);
+            },
+        }
+    }
+
+    pub fn needsRetile(self: *const Command) bool {
+        return switch (self.*) {
+            .bsp => |command| switch (command) {
+                .toggle_split, .insert_point => false,
+                else => true,
+            },
+            .monocle => false,
+        };
+    }
+};
+
+/// Runtime configuration selected with the active layout, so command handling
+/// never exposes one algorithm's settings through the generic tiling API.
+pub const Settings = union(LayoutKind) {
+    bsp: bsp_mod.RuntimeSettings,
+    monocle: monocle_mod.RuntimeSettings,
+};
+
+pub fn parseCommand(cmd: []const u8) ?Command {
+    if (bsp_mod.parseCommand(cmd)) |command| return .{ .bsp = command };
+    if (monocle_mod.parseCommand(cmd)) |command| return .{ .monocle = command };
+    return null;
+}
+
+pub fn commandKind(command: Command) LayoutKind {
+    return std.meta.activeTag(command);
+}
+
+pub const layout_help = bsp_mod.help_text ++ monocle_mod.help_text;
 
 // ── Dispatch state ────────────────────────────────────────────────────────────
 //

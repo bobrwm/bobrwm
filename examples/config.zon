@@ -10,21 +10,27 @@
     // Or fullscreen-per-window tiling:
     // .layout = .monocle,
 
-    // BSP split axis policy.
-    // .auto picks axis from target tile geometry (yabai-style).
-    // .horizontal always splits left/right, .vertical always splits top/bottom.
-    // .bsp_split = .auto,
-
-    // BSP insertion point policy.
-    // .focused, .first, .last, .min_depth
-    // .bsp_insert_point = .focused,
-
-    // Default ratio for newly-created BSP splits (must be 0.1..0.9).
-    // .bsp_split_ratio = 0.5,
-
-    // Placement for newly tiled windows when splitting.
-    // .second = right/bottom, .first = left/top
-    // .new_window_split = .second,
+    // Layout specific configuration
+    // .layout_config = .{
+    //     .bsp = .{
+    //         // BSP split axis policy.
+    //         // .auto picks axis from target tile geometry (yabai-style).
+    //         // .horizontal always splits left/right, .vertical always splits top/bottom.
+    //         .split_mode = .auto,
+    //
+    //         // BSP insertion point policy.
+    //         // .focused, .first, .last, .min_depth
+    //         .insert_point = .focused,
+    //
+    //         // Default ratio for newly-created BSP splits (must be 0.1..0.9).
+    //         .split_ratio = 0.5,
+    //
+    //         // Placement for newly tiled windows when splitting.
+    //         // .second = right/bottom, .first = left/top
+    //         .new_window_split = .second,
+    //     },
+    //     .monocle = .{},
+    // },
 
     // Optional bobrwm-swipe companion configuration. Core bobrwm only
     // parses this field; the companion package owns gesture handling.

@@ -1512,7 +1512,26 @@ var g_workspaces: workspace_mod.WorkspaceManager = undefined;
 var g_tiling_states: [workspace_mod.max_workspaces]?tiling.State = undefined;
 var g_displays: [workspace_mod.max_displays]DisplayInfo = undefined;
 var g_display_count: usize = 0;
-var g_bsp_split_mode: tiling.SplitMode = .auto;
+var g_layout_settings: tiling.Settings = .{ .bsp = .{} };
+
+fn bspSettings() *bsp_mod.RuntimeSettings {
+    return switch (g_layout_settings) {
+        .bsp => |*settings| settings,
+        .monocle => unreachable,
+    };
+}
+
+fn resetLayoutSettings() void {
+    g_layout_settings = switch (g_config.layout) {
+        .bsp => .{ .bsp = .{
+            .split_mode = g_config.layout_config.bsp.split_mode,
+            .insert_point = g_config.layout_config.bsp.insert_point,
+            .split_ratio = g_config.layout_config.bsp.split_ratio,
+            .new_window_split = g_config.layout_config.bsp.new_window_split,
+        } },
+        .monocle => .{ .monocle = .{} },
+    };
+}
 var g_tab_groups: tabgroup.TabGroupManager = undefined;
 var g_geometry: geometry_mod = undefined;
 var g_pending_role_windows: PendingRoleWindowMap = undefined;
@@ -2395,7 +2414,7 @@ fn applyReloadedConfig(next: ConfigRuntime) void {
     const layout_changed = previous.config.layout != replacement.config.layout;
     g_config_runtime = replacement;
     g_config = replacement.config;
-    g_bsp_split_mode = g_config.bsp_split;
+    resetLayoutSettings();
     g_animator.finishAll();
     g_animator.init(g_config.animation);
     dim.configure(g_config.dimmed_inactive);
@@ -2717,7 +2736,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     defer g_config_runtime.?.deinit();
     g_config = g_config_runtime.?.config;
 
-    g_bsp_split_mode = g_config.bsp_split;
+    resetLayoutSettings();
     g_config.applyKeybinds(&g_config_runtime.?.keybind_table);
     g_animator.init(g_config.animation);
 
@@ -3160,9 +3179,22 @@ fn tryInsertIntoTiling(workspace_id: u8, wid: u32) !void {
     };
 
     const ws = g_workspaces.get(workspace_id) orelse return error.InvalidWorkspace;
+    const bsp_defaults: bsp_mod.RuntimeSettings = switch (g_config.layout) {
+        .bsp => .{
+            .split_mode = g_config.layout_config.bsp.split_mode,
+            .insert_point = g_config.layout_config.bsp.insert_point,
+            .split_ratio = g_config.layout_config.bsp.split_ratio,
+            .new_window_split = g_config.layout_config.bsp.new_window_split,
+        },
+        .monocle => .{},
+    };
+    const settings = switch (g_layout_settings) {
+        .bsp => |value| value,
+        .monocle => bsp_defaults,
+    };
     const anchor_wid = blk: {
         const st = sp.* orelse break :blk null;
-        switch (g_config.bsp_insert_point) {
+        switch (settings.insert_point) {
             .focused => {
                 const focused_wid = ws.focused_wid orelse break :blk null;
                 if (focused_wid == wid) break :blk null;
@@ -3174,12 +3206,12 @@ fn tryInsertIntoTiling(workspace_id: u8, wid: u32) !void {
         }
     };
     const options: tiling.InsertOptions = .{
-        .split_mode = g_bsp_split_mode,
-        .child = g_config.new_window_split,
+        .split_mode = settings.split_mode,
+        .child = settings.new_window_split,
         .anchor_wid = anchor_wid,
         .root_frame = if (ws.display_id) |did| displayContentFrame(did) else null,
         .inner_gap = @floatFromInt(g_config.gaps.inner),
-        .split_ratio = g_config.bsp_split_ratio,
+        .split_ratio = settings.split_ratio,
     };
     try sp.*.?.insert(wid, options, g_allocator);
 }
@@ -3782,12 +3814,13 @@ fn handleEvent(ev: *const event_mod.Event) void {
         .hk_swap_up => swapDirection(.up),
         .hk_swap_down => swapDirection(.down),
         .hk_toggle_split => {
-            g_bsp_split_mode = switch (g_bsp_split_mode) {
+            if (g_config.layout != .bsp) return;
+            bspSettings().split_mode = switch (bspSettings().split_mode) {
                 .auto => .horizontal,
                 .horizontal => .vertical,
                 .vertical => .auto,
             };
-            log.info("split mode: {s}", .{@tagName(g_bsp_split_mode)});
+            log.info("split mode: {s}", .{@tagName(bspSettings().split_mode)});
         },
         .hk_toggle_fullscreen => {
             const focused = hotkeyTargetWindowId() orelse return;
@@ -6926,12 +6959,29 @@ fn ipcDispatch(cmd: []const u8, client_fd: posix.socket_t) void {
                 ipc.writeResponse(client_fd, "err: config reload failed; current config kept\n");
             }
         },
-        .toggle_split => {
-            g_bsp_split_mode = switch (g_bsp_split_mode) {
-                .auto => .horizontal,
-                .horizontal => .vertical,
-                .vertical => .auto,
+        .layout => |layout_command| {
+            if (tiling.commandKind(layout_command) != g_config.layout) {
+                ipc.writeResponse(client_fd, "err: not in bsp mode\n"); // TODO: not in <required layout> mode
+                return;
+            }
+            const ctx = focusedLayoutContext();
+            const needs_retile = layout_command.needsRetile();
+            const focused = ctx orelse {
+                ipc.writeResponse(client_fd, "err: no focused managed window\n");
+                return;
             };
+            layout_command.handleCommand(
+                focused.state,
+                focused.focused_wid,
+                &g_layout_settings,
+            ) catch |err| {
+                const err_string = tiling.handleCommandErrorString(err);
+                ipc.writeResponse(client_fd, err_string);
+                return;
+            };
+            if (needs_retile) {
+                retileDisplay(focused.focused_win.display_id);
+            }
             ipc.writeResponse(client_fd, "ok\n");
         },
         .focus => |dir| {
@@ -6981,116 +7031,6 @@ fn ipcDispatch(cmd: []const u8, client_fd: posix.socket_t) void {
                 moveWorkspaceToDisplay(@as(usize, n) - 1);
                 ipc.writeResponse(client_fd, "ok\n");
             },
-        },
-        .bsp_ratio_rel => |delta| {
-            const ctx = focusedLayoutContext() orelse {
-                ipc.writeResponse(client_fd, "err: no focused managed window\n");
-                return;
-            };
-            const bsp_state: *bsp_mod.State = switch (ctx.state.*) {
-                .bsp => |*s| s,
-                else => {
-                    ipc.writeResponse(client_fd, "err: not in bsp mode\n");
-                    return;
-                },
-            };
-            if (!bsp_state.adjustParentRatio(ctx.focused_wid, delta)) {
-                ipc.writeResponse(client_fd, "err: no parent split\n");
-                return;
-            }
-            retileDisplay(ctx.focused_win.display_id);
-            ipc.writeResponse(client_fd, "ok\n");
-        },
-        .bsp_ratio_abs => |ratio| {
-            const ctx = focusedLayoutContext() orelse {
-                ipc.writeResponse(client_fd, "err: no focused managed window\n");
-                return;
-            };
-            const bsp_state: *bsp_mod.State = switch (ctx.state.*) {
-                .bsp => |*s| s,
-                else => {
-                    ipc.writeResponse(client_fd, "err: not in bsp mode\n");
-                    return;
-                },
-            };
-            if (!bsp_state.setParentRatio(ctx.focused_wid, ratio)) {
-                ipc.writeResponse(client_fd, "err: no parent split\n");
-                return;
-            }
-            retileDisplay(ctx.focused_win.display_id);
-            ipc.writeResponse(client_fd, "ok\n");
-        },
-        .bsp_insert_point => |point| {
-            g_config.bsp_insert_point = point;
-            ipc.writeResponse(client_fd, "ok\n");
-        },
-        .bsp_mirror => |axis| {
-            const ctx = focusedLayoutContext() orelse {
-                ipc.writeResponse(client_fd, "err: no focused managed window\n");
-                return;
-            };
-            const bsp_state: *bsp_mod.State = switch (ctx.state.*) {
-                .bsp => |*s| s,
-                else => {
-                    ipc.writeResponse(client_fd, "err: not in bsp mode\n");
-                    return;
-                },
-            };
-            bsp_state.mirrorTree(axis);
-            retileDisplay(ctx.focused_win.display_id);
-            ipc.writeResponse(client_fd, "ok\n");
-        },
-        .bsp_equalize => {
-            const ctx = focusedLayoutContext() orelse {
-                ipc.writeResponse(client_fd, "err: no focused managed window\n");
-                return;
-            };
-            const bsp_state: *bsp_mod.State = switch (ctx.state.*) {
-                .bsp => |*s| s,
-                else => {
-                    ipc.writeResponse(client_fd, "err: not in bsp mode\n");
-                    return;
-                },
-            };
-            bsp_state.equalizeTree(null, g_config.bsp_split_ratio);
-            retileDisplay(ctx.focused_win.display_id);
-            ipc.writeResponse(client_fd, "ok\n");
-        },
-        .bsp_balance => {
-            const ctx = focusedLayoutContext() orelse {
-                ipc.writeResponse(client_fd, "err: no focused managed window\n");
-                return;
-            };
-            const bsp_state: *bsp_mod.State = switch (ctx.state.*) {
-                .bsp => |*s| s,
-                else => {
-                    ipc.writeResponse(client_fd, "err: not in bsp mode\n");
-                    return;
-                },
-            };
-            bsp_state.balanceTree(null);
-            retileDisplay(ctx.focused_win.display_id);
-            ipc.writeResponse(client_fd, "ok\n");
-        },
-        .bsp_rotate => |degrees| {
-            if (!(degrees == 90 or degrees == 180 or degrees == 270)) {
-                ipc.writeResponse(client_fd, "err: expected 90|180|270\n");
-                return;
-            }
-            const ctx = focusedLayoutContext() orelse {
-                ipc.writeResponse(client_fd, "err: no focused managed window\n");
-                return;
-            };
-            const bsp_state: *bsp_mod.State = switch (ctx.state.*) {
-                .bsp => |*s| s,
-                else => {
-                    ipc.writeResponse(client_fd, "err: not in bsp mode\n");
-                    return;
-                },
-            };
-            bsp_state.rotateTree(degrees);
-            retileDisplay(ctx.focused_win.display_id);
-            ipc.writeResponse(client_fd, "ok\n");
         },
         .query_windows => |format| ipcQueryWindows(client_fd, format),
         .query_workspaces => |format| ipcQueryWorkspaces(client_fd, format),

@@ -25,10 +25,7 @@ pub const Config = struct {
     dimmed_inactive: DimConfig = .{},
     gaps: Gaps = .{},
     layout: tiling.LayoutKind = .bsp,
-    bsp_split: tiling.SplitMode = .auto,
-    bsp_insert_point: tiling.InsertionPointPolicy = .focused,
-    bsp_split_ratio: f64 = 0.5,
-    new_window_split: tiling.InsertChild = .second,
+    layout_config: tiling.Config = .{},
     animation: animation.AnimationConfig = .{},
     /// Register Bobrwm.app as a login item. Reconciled against
     /// ServiceManagement on startup and on every reload.
@@ -503,9 +500,9 @@ pub fn validate(config: *const Config) !void {
         }
     }
 
-    if (!std.math.isFinite(config.bsp_split_ratio) or
-        config.bsp_split_ratio < 0.1 or
-        config.bsp_split_ratio > 0.9)
+    if (!std.math.isFinite(config.layout_config.bsp.split_ratio) or
+        config.layout_config.bsp.split_ratio < 0.1 or
+        config.layout_config.bsp.split_ratio > 0.9)
     {
         return error.InvalidBspSplitRatio;
     }
@@ -760,10 +757,10 @@ test "default config" {
     try t.expectEqual(@as(u16, 0), cfg.gaps.inner);
     try t.expectEqual(@as(u16, 0), cfg.gaps.outer.left);
     try t.expectEqual(tiling.LayoutKind.bsp, cfg.layout);
-    try t.expectEqual(tiling.SplitMode.auto, cfg.bsp_split);
-    try t.expectEqual(tiling.InsertionPointPolicy.focused, cfg.bsp_insert_point);
-    try t.expectApproxEqAbs(@as(f64, 0.5), cfg.bsp_split_ratio, 0.0001);
-    try t.expectEqual(tiling.InsertChild.second, cfg.new_window_split);
+    try t.expectEqual(tiling.SplitMode.auto, cfg.layout_config.bsp.split_mode);
+    try t.expectEqual(tiling.InsertionPointPolicy.focused, cfg.layout_config.bsp.insert_point);
+    try t.expectApproxEqAbs(@as(f64, 0.5), cfg.layout_config.bsp.split_ratio, 0.0001);
+    try t.expectEqual(tiling.InsertChild.second, cfg.layout_config.bsp.new_window_split);
     try t.expect(!cfg.animation.enabled);
     try t.expectEqual(@as(u64, 200), cfg.animation.duration_ms);
     try t.expectEqual(animation.Easing.ease_out, cfg.animation.easing);
@@ -782,7 +779,7 @@ test "validate accepts defaults and a reduced workspace set" {
 test "validate rejects geometry and gesture values that are not finite or bounded" {
     var cfg: Config = .{};
 
-    cfg.bsp_split_ratio = std.math.inf(f64);
+    cfg.layout_config.bsp.split_ratio = std.math.inf(f64);
     try t.expectError(error.InvalidBspSplitRatio, validate(&cfg));
 
     cfg = .{};
@@ -1010,10 +1007,6 @@ test "loadFromPath: examples/config.zon" {
     try t.expectEqual(@as(usize, 0), cfg.workspace_assignments.len);
     try t.expectEqual(@as(u16, 0), cfg.gaps.inner);
     try t.expectEqual(tiling.LayoutKind.bsp, cfg.layout);
-    try t.expectEqual(tiling.SplitMode.auto, cfg.bsp_split);
-    try t.expectEqual(tiling.InsertionPointPolicy.focused, cfg.bsp_insert_point);
-    try t.expectApproxEqAbs(@as(f64, 0.5), cfg.bsp_split_ratio, 0.0001);
-    try t.expectEqual(tiling.InsertChild.second, cfg.new_window_split);
 }
 
 test "loadFromPath: custom zon" {
@@ -1032,11 +1025,8 @@ test "loadFromPath: custom zon" {
         \\    },
         \\    .swipe = .{ .enabled = true, .fingers = 4, .distance_pct = 0.1 },
         \\    .gaps = .{ .inner = 8, .outer = .{ .left = 4, .right = 4, .top = 4, .bottom = 4 } },
-        \\    .layout = .monocle,
-        \\    .bsp_split = .vertical,
-        \\    .bsp_insert_point = .last,
-        \\    .bsp_split_ratio = 0.6,
-        \\    .new_window_split = .first,
+        \\    .layout = .bsp,
+        \\    .layout_config = .{ .bsp = .{ .split_mode = .vertical, .insert_point = .last, .split_ratio = 0.6, .new_window_split = .first }, .monocle = .{} },
         \\}
     ;
 
@@ -1066,9 +1056,9 @@ test "loadFromPath: custom zon" {
     try t.expectEqual(@as(u16, 4), cfg.gaps.outer.right);
     try t.expectEqual(@as(u16, 4), cfg.gaps.outer.top);
     try t.expectEqual(@as(u16, 4), cfg.gaps.outer.bottom);
-    try t.expectEqual(tiling.LayoutKind.monocle, cfg.layout);
-    try t.expectEqual(tiling.SplitMode.vertical, cfg.bsp_split);
-    try t.expectEqual(tiling.InsertionPointPolicy.last, cfg.bsp_insert_point);
-    try t.expectApproxEqAbs(@as(f64, 0.6), cfg.bsp_split_ratio, 0.0001);
-    try t.expectEqual(tiling.InsertChild.first, cfg.new_window_split);
+    try t.expectEqual(tiling.LayoutKind.bsp, cfg.layout);
+    try t.expectEqual(tiling.SplitMode.vertical, cfg.layout_config.bsp.split_mode);
+    try t.expectEqual(tiling.InsertionPointPolicy.last, cfg.layout_config.bsp.insert_point);
+    try t.expectApproxEqAbs(@as(f64, 0.6), cfg.layout_config.bsp.split_ratio, 0.0001);
+    try t.expectEqual(tiling.InsertChild.first, cfg.layout_config.bsp.new_window_split);
 }
