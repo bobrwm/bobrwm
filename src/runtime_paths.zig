@@ -1,27 +1,24 @@
-//! User-private runtime paths shared by the daemon and companion clients.
+//! Runtime paths shared by the daemon and companion clients.
 
 const std = @import("std");
 
 const runtime_dir_suffix = "Library/Caches/bobrwm";
-const socket_name = "bobrwm.sock";
 const log_name = "bobrwm.log";
 
 pub fn socketPathAlloc(allocator: std.mem.Allocator) ![:0]u8 {
-    const home = getenv("HOME") orelse return error.MissingHome;
     return std.fmt.allocPrintSentinel(
         allocator,
-        "{s}/{s}/{s}",
-        .{ home, runtime_dir_suffix, socket_name },
+        "/tmp/bobrwm_{d}.sock",
+        .{std.c.getuid()},
         0,
     );
 }
 
 pub fn socketPathBuf(buf: []u8) ![:0]u8 {
-    const home = getenv("HOME") orelse return error.MissingHome;
     return std.fmt.bufPrintSentinel(
         buf,
-        "{s}/{s}/{s}",
-        .{ home, runtime_dir_suffix, socket_name },
+        "/tmp/bobrwm_{d}.sock",
+        .{std.c.getuid()},
         0,
     );
 }
@@ -36,9 +33,7 @@ pub fn logPathBuf(buf: []u8) ![:0]u8 {
     );
 }
 
-/// Create and lock down the directory that contains runtime files.
-/// Keeping it below the user's home directory prevents other local users from
-/// pre-creating predictable socket or log paths in a world-writable directory.
+/// Create and lock down the directory that contains the daemon log.
 pub fn ensureRuntimeDir(allocator: std.mem.Allocator) !void {
     const home = getenv("HOME") orelse return error.MissingHome;
     const path = try std.fmt.allocPrintSentinel(

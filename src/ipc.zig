@@ -156,7 +156,6 @@ pub const Server = struct {
     path: [:0]const u8,
 
     pub fn init(allocator: std.mem.Allocator) !Server {
-        try runtime_paths.ensureRuntimeDir(allocator);
         const path = try runtime_paths.socketPathAlloc(allocator);
         errdefer allocator.free(path);
 

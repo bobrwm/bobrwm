@@ -480,15 +480,22 @@ fn isDefaultKeybindSlice(keybinds: []const Keybind) bool {
 
 // Loading
 
+/// Number of workspaces this configuration creates at startup. An omitted
+/// name list selects the full default set rather than zero workspaces.
+pub fn workspaceCount(config: *const Config) u8 {
+    std.debug.assert(config.workspace_names.len <= workspace.max_workspaces);
+    return if (config.workspace_names.len == 0)
+        workspace.max_workspaces
+    else
+        @intCast(config.workspace_names.len);
+}
+
 /// Reject values that parse as valid ZON but violate runtime invariants.
 /// Validation happens before a config becomes visible to the main loop, so a
 /// bad reload leaves the last known-good config intact.
 pub fn validate(config: *const Config) !void {
     if (config.workspace_names.len > workspace.max_workspaces) return error.TooManyWorkspaces;
-    const workspace_count: usize = if (config.workspace_names.len == 0)
-        workspace.max_workspaces
-    else
-        config.workspace_names.len;
+    const workspace_count = workspaceCount(config);
 
     for (config.workspace_names) |name| {
         if (!std.unicode.utf8ValidateSlice(name) or std.mem.indexOfScalar(u8, name, 0) != null) {
@@ -765,9 +772,11 @@ test "default config" {
 test "validate accepts defaults and a reduced workspace set" {
     const defaults: Config = .{};
     try validate(&defaults);
+    try t.expectEqual(workspace.max_workspaces, workspaceCount(&defaults));
 
     const reduced: Config = .{ .workspace_names = &.{ "term", "web", "code", "chat" } };
     try validate(&reduced);
+    try t.expectEqual(@as(u8, 4), workspaceCount(&reduced));
 }
 
 test "validate rejects geometry and gesture values that are not finite or bounded" {

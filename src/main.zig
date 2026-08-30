@@ -2386,6 +2386,8 @@ fn rebuildTilingStatesForConfig() void {
 }
 
 fn applyReloadedConfig(next: ConfigRuntime) void {
+    std.debug.assert(config_mod.workspaceCount(&next.config) == g_workspaces.workspace_count);
+
     var replacement = next;
     replacement.config.applyKeybinds(&replacement.keybind_table);
 
@@ -2402,13 +2404,6 @@ fn applyReloadedConfig(next: ConfigRuntime) void {
     for (g_workspaces.workspaces[0..g_workspaces.workspace_count], 0..) |*ws, i| {
         ws.name = if (i < g_config.workspace_names.len) g_config.workspace_names[i] else "";
     }
-    if (g_config.workspace_names.len > 0 and g_config.workspace_names.len != g_workspaces.workspace_count) {
-        log.warn("config reload cannot change workspace count ({d} running, {d} configured); restart to apply the new count", .{
-            g_workspaces.workspace_count,
-            g_config.workspace_names.len,
-        });
-    }
-
     // Preserve BSP topology and runtime split edits for ordinary config saves.
     // Only changing the layout algorithm requires reconstructing state.
     if (layout_changed) rebuildTilingStatesForConfig();
@@ -2442,11 +2437,21 @@ fn notifyConfigReloadFailed() void {
 
 fn reloadConfig() bool {
     const path = g_config_path orelse return false;
-    const next = ConfigRuntime.init(g_allocator, path, false) catch |err| {
+    var next = ConfigRuntime.init(g_allocator, path, false) catch |err| {
         log.err("config reload failed, keeping current config: {}", .{err});
         notifyConfigReloadFailed();
         return false;
     };
+    const configured_count = config_mod.workspaceCount(&next.config);
+    if (configured_count != g_workspaces.workspace_count) {
+        log.err("config reload cannot change workspace count ({d} running, {d} configured); restart to apply it", .{
+            g_workspaces.workspace_count,
+            configured_count,
+        });
+        next.deinit();
+        notifyConfigReloadFailed();
+        return false;
+    }
     applyReloadedConfig(next);
     return true;
 }
@@ -2694,6 +2699,16 @@ pub fn main(init: std.process.Init.Minimal) !void {
     defer deinitAxStrings();
     defer ax_mod.deinitElementCache();
 
+    // Claim the single-instance endpoint before config reconciliation,
+    // accessibility prompts, SkyLight, or window discovery can mutate any
+    // external state. A losing second launch must be completely inert.
+    g_ipc = ipc.Server.init(g_allocator) catch |err| {
+        log.err("IPC init failed: {}", .{err});
+        return err;
+    };
+    defer g_ipc.deinit(g_allocator);
+    ipc.g_dispatch = ipcDispatch;
+
     // -- Config --
     const config_path = config_mod.resolvePath(g_allocator, parseConfigPath(init.args)) catch null;
     defer if (config_path) |path| g_allocator.free(path);
@@ -2723,10 +2738,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     // -- Core state --
     g_store = window_mod.WindowStore.init(g_allocator);
     defer g_store.deinit();
-    const ws_count: u8 = if (g_config.workspace_names.len > 0)
-        @intCast(g_config.workspace_names.len)
-    else
-        workspace_mod.max_workspaces;
+    const ws_count = config_mod.workspaceCount(&g_config);
     g_workspaces = workspace_mod.WorkspaceManager.init(g_allocator, ws_count);
     defer g_workspaces.deinit();
     clearTilingStates();
@@ -2807,14 +2819,6 @@ pub fn main(init: std.process.Init.Minimal) !void {
     discoverWindows();
     log.info("discovered {} windows", .{g_store.count()});
     retileAllDisplays();
-
-    // -- IPC server --
-    g_ipc = ipc.Server.init(g_allocator) catch |err| {
-        log.err("IPC init failed: {}", .{err});
-        return err;
-    };
-    defer g_ipc.deinit(g_allocator);
-    ipc.g_dispatch = ipcDispatch;
 
     // -- NSApp (zig-objc) --
     // Register runtime ObjC classes (BWObserver / BWLaunchGate) before
@@ -3718,27 +3722,39 @@ fn handleEvent(ev: *const event_mod.Event) void {
                 return;
             }
 
+            // A suppressed tab can become a standalone window during the
+            // drag. Resolve layout ownership only after that reconciliation:
+            // native-tab AX notifications carry the physical member wid,
+            // while workspace and BSP state carry the group leader.
+            const tab_dragged_out = checkTabDragOut(ev.pid, ev.wid);
+            const layout_wid = g_tab_groups.resolveLeader(ev.wid);
+
             if (updateDraggedWindowGeometry(ev.wid, observed)) {
                 retile();
                 return;
             }
+            if (tab_dragged_out) {
+                if (g_store.get(layout_wid)) |win| {
+                    _ = maybeSetFocusedDisplayForWindow(win, .drag);
+                }
+                retile();
+            }
             // Snap fullscreen windows back to display frame
-            if (g_store.get(ev.wid)) |win| {
+            if (g_store.get(layout_wid)) |win| {
                 if (win.is_fullscreen) {
                     retile();
                     return;
                 }
             }
-            checkTabDragOut(ev.pid, ev.wid);
             if (g_pointer_drag_wid == ev.wid) {
-                if (g_store.get(ev.wid)) |win| {
+                if (g_store.get(layout_wid)) |win| {
                     if (win.mode == .tiled and !win.is_fullscreen and workspaceVisibleOnDisplay(win.workspace_id, win.display_id)) {
                         g_drag_reconcile_on_drop = true;
                     }
                 }
             }
             if (ev.kind == .window_moved) {
-                updateWindowMovePreview(ev.wid);
+                updateWindowMovePreview(layout_wid);
             } else {
                 clearDragPreview();
             }
@@ -5444,42 +5460,63 @@ fn adoptWindowAsBackgroundTab(win: window_mod.Window) tabgroup.detect.OffscreenO
     return .adopt;
 }
 
-/// Adopt geometry from the exact window claimed by a real pointer drag.
+/// Adopt geometry from the exact window claimed by a real pointer drag while
+/// mutating workspace/layout ownership through its native-tab group leader.
 /// Returns true when display ownership changed and callers should retile.
-fn updateDraggedWindowGeometry(wid: u32, frame: window_mod.Window.Frame) bool {
-    if (g_pointer_drag_wid != wid) return false;
-    var win = g_store.get(wid) orelse return false;
+fn updateDraggedWindowGeometry(dragged_wid: u32, frame: window_mod.Window.Frame) bool {
+    if (g_pointer_drag_wid != dragged_wid) return false;
+    const leader_wid = g_tab_groups.resolveLeader(dragged_wid);
+    const leader = g_store.get(leader_wid) orelse return false;
     const next_display_id = displayIdForFrame(frame);
-    if (next_display_id == win.display_id) {
-        win.frame = frame;
-        if (win.mode == .floating and !win.is_fullscreen) win.float_frame = frame;
-        g_store.put(win) catch {};
+    if (next_display_id == leader.display_id) {
+        adoptDraggedFrame(dragged_wid, leader_wid, frame);
         return false;
     }
 
     // Only reassign display while its workspace is visible. A notification
     // from a hidden window must not transfer ownership to the visible display.
-    if (!workspaceVisibleOnDisplay(win.workspace_id, win.display_id)) {
-        win.frame = frame;
-        g_store.put(win) catch {};
+    if (!workspaceVisibleOnDisplay(leader.workspace_id, leader.display_id)) {
+        adoptDraggedFrame(dragged_wid, leader_wid, frame);
         return false;
     }
 
-    removeFromTiling(win.workspace_id, wid);
-    win.frame = frame;
-    if (win.mode == .floating and !win.is_fullscreen) win.float_frame = frame;
-    win.display_id = next_display_id;
-    g_store.put(win) catch return false;
-    if (win.mode == .tiled) {
-        insertIntoTiling(win.workspace_id, wid);
-    }
+    if (!reassignManagedWindowToDisplay(leader_wid, next_display_id)) return false;
+    adoptDraggedFrame(dragged_wid, leader_wid, frame);
 
-    if (!workspaceVisibleOnDisplay(win.workspace_id, win.display_id)) {
-        hideWindow(win.pid, wid);
+    if (g_store.get(leader_wid)) |updated| {
+        _ = maybeSetFocusedDisplayForWindow(updated, .drag);
     }
-    _ = maybeSetFocusedDisplayForWindow(win, .drag);
-    log.info("window moved to display wid={d} display={d}", .{ wid, win.display_id });
+    log.info("window moved to display dragged_wid={d} leader={d} display={d}", .{
+        dragged_wid,
+        leader_wid,
+        next_display_id,
+    });
     return true;
+}
+
+/// Keep the physical tab and its layout owner in sync after accepting a real
+/// pointer sample. Other members are placed from the canonical frame by the
+/// next retile; writing them during the drag would fight AppKit's tab motion.
+fn adoptDraggedFrame(
+    dragged_wid: u32,
+    leader_wid: u32,
+    frame: window_mod.Window.Frame,
+) void {
+    if (g_store.get(dragged_wid)) |dragged| {
+        var updated = dragged;
+        updated.frame = frame;
+        if (updated.mode == .floating and !updated.is_fullscreen) updated.float_frame = frame;
+        g_store.putAssumeCapacity(updated);
+    }
+    if (leader_wid != dragged_wid) {
+        if (g_store.get(leader_wid)) |leader| {
+            var updated = leader;
+            updated.frame = frame;
+            if (updated.mode == .floating and !updated.is_fullscreen) updated.float_frame = frame;
+            g_store.putAssumeCapacity(updated);
+        }
+    }
+    g_tab_groups.updateFrame(leader_wid, frame);
 }
 
 /// Apply ownership policy to geometry changed without an active pointer drag.
@@ -6072,13 +6109,13 @@ fn reconcileFocusedWindow(pid: i32, focused_wid: u32) void {
 /// Called on window_moved / window_resized — detects tab drag-out.
 /// When a suppressed tab's bounds diverge from its group's canonical frame,
 /// promote it to a standalone tiled window.
-fn checkTabDragOut(_: i32, wid: u32) void {
-    const g = g_tab_groups.groupOfMut(wid) orelse return;
-    if (g.active_wid == wid) return; // only check suppressed members
+fn checkTabDragOut(_: i32, wid: u32) bool {
+    const g = g_tab_groups.groupOfMut(wid) orelse return false;
+    if (g.active_wid == wid) return false; // only check suppressed members
 
-    const frame = liveWindowFrame(wid) orelse return;
+    const frame = liveWindowFrame(wid) orelse return false;
     switch (tabgroup.detect.classifyMember(frame, g.canonical_frame, isVisibleOnScreen(wid))) {
-        .keep => return,
+        .keep => return false,
         .promote_to_standalone => {},
     }
 
@@ -6089,12 +6126,11 @@ fn checkTabDragOut(_: i32, wid: u32) void {
     if (g_store.get(wid)) |win| {
         var updated = win;
         updated.frame = frame;
-        updated.display_id = displayIdForFrame(frame);
-        g_store.put(updated) catch return;
+        g_store.put(updated) catch return false;
     }
 
-    const win = g_store.get(wid) orelse return;
-    const ws = g_workspaces.get(win.workspace_id) orelse return;
+    const win = g_store.get(wid) orelse return false;
+    const ws = g_workspaces.get(win.workspace_id) orelse return false;
 
     // If the dragged-out tab led the group, its existing workspace/layout
     // slot belongs to the surviving group — hand it to the new leader before
@@ -6114,11 +6150,10 @@ fn checkTabDragOut(_: i32, wid: u32) void {
         }
     }
     if (!wid_in_ws) {
-        ws.addWindow(wid) catch return;
+        ws.addWindow(wid) catch return false;
         insertIntoTiling(win.workspace_id, wid);
     }
     ws.recordFocus(wid);
-    _ = maybeSetFocusedDisplayForWindow(win, .drag);
 
     // If the group dissolved, verify the survivor is still managed
     switch (removal) {
@@ -6139,7 +6174,7 @@ fn checkTabDragOut(_: i32, wid: u32) void {
         .none, .leader_changed => {},
     }
 
-    retile();
+    return true;
 }
 
 // Workspace resolution (config-based app → workspace mapping)
@@ -6178,6 +6213,8 @@ fn frameCenterOnDisplay(frame: window_mod.Window.Frame, display: shim.bw_frame) 
 fn workspaceRevealSettled(ws: *const workspace_mod.Workspace, display_id: u32) bool {
     const display_slot = displayIndexById(display_id) orelse return false;
     const display = g_displays[display_slot].visible;
+    const on_screen = OnScreenWindows.snapshot();
+    if (on_screen.truncated) return false;
 
     for (ws.windows.items) |leader_wid| {
         const visible_wid = g_tab_groups.resolveActive(leader_wid);
@@ -6186,6 +6223,9 @@ fn workspaceRevealSettled(ws: *const workspace_mod.Workspace, display_id: u32) b
         if (win.workspace_id != ws.id or win.display_id != display_id) return false;
         if (!frameCenterOnDisplay(win.frame, display)) return false;
 
+        // CG can retain layer-0 Electron windows (and stale native-tab IDs)
+        // with plausible bounds after they stop contributing pixels.
+        if (!on_screen.contains(visible_wid)) return false;
         const actual = liveWindowFrame(visible_wid) orelse return false;
         if (!workspace_mod.frameCoversTarget(actual, win.frame)) return false;
     }
@@ -6575,9 +6615,10 @@ fn moveWindowToWorkspace(target_id: u8) void {
     retile();
 }
 
-/// Move a managed window to a target display and map it onto the target
-/// display's active workspace so it stays visible after the move.
-fn moveManagedWindowToDisplay(wid: u32, target_display_id: u32) bool {
+/// Update every ownership structure for a cross-display move. The caller owns
+/// focus policy and the final retile so pointer drags can first adopt the
+/// physical tab's latest frame.
+fn reassignManagedWindowToDisplay(wid: u32, target_display_id: u32) bool {
     std.debug.assert(wid != 0);
     std.debug.assert(target_display_id != 0);
 
@@ -6625,7 +6666,16 @@ fn moveManagedWindowToDisplay(wid: u32, target_display_id: u32) bool {
         updateTabGroupAssignment(wid, source_workspace_id, target_display_id);
     }
 
-    _ = maybeSetFocusedDisplayForWindow(win, .keyboard);
+    return true;
+}
+
+/// Move a managed window to a target display and map it onto the target
+/// display's active workspace so it stays visible after the move.
+fn moveManagedWindowToDisplay(wid: u32, target_display_id: u32) bool {
+    if (!reassignManagedWindowToDisplay(wid, target_display_id)) return false;
+    if (g_store.get(wid)) |win| {
+        _ = maybeSetFocusedDisplayForWindow(win, .keyboard);
+    }
     retile();
     return true;
 }
