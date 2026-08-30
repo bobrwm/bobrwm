@@ -1585,6 +1585,9 @@ var g_animator_source: c.dispatch_source_t = null;
 var g_ipc_requests: IpcRequestRing = .{};
 var g_ipc_thread: ?std.Thread = null;
 var g_ipc_transport_stop: std.atomic.Value(bool) = .init(false);
+var g_signal_source: c.dispatch_source_t = null;
+var g_signal_read_fd: c_int = -1;
+var g_signal_write_fd: c_int = -1;
 
 const ConfigRuntime = struct {
     arena: std.heap.ArenaAllocator,
@@ -2741,8 +2744,11 @@ pub fn main(init: std.process.Init.Minimal) !void {
         g_workspaces.workspaces[i].name = name;
     }
 
-    // -- Crash handlers (restore hidden windows on abnormal exit) --
-    installCrashHandlers();
+    // -- Signal transport (handler writes only; cleanup runs on main) --
+    try initSignalTransport();
+    defer deinitSignalTransport();
+    installSignalHandlers();
+    defer uninstallSignalHandlers();
     errdefer restoreAllWindows();
 
     // -- Discover existing windows and tile --
@@ -2825,14 +2831,6 @@ fn bw_drain_events() void {
     // here and never enters the snapshot path — no call, no loop, no reliance
     // on the optimizer eliding a no-op body.
     if (dim.enabled) pushDimSnapshot();
-
-    // Honour pending Ctrl-C / SIGTERM by exiting NSApp.run cleanly so the
-    // deferred cleanup (IPC socket unlink, layout free, restoreAllWindows)
-    // actually runs. Without this, NSApp keeps spinning and the next launch
-    // sees a live socket and bails out with AddressInUse.
-    if (g_shutdown_requested.load(.acquire)) {
-        gracefulStopNSApp();
-    }
 }
 
 /// A dropped event has unknown semantics, so recover from authoritative OS
@@ -5765,7 +5763,7 @@ fn observeDiscoveredApps() void {
     }
 }
 
-// Crash / exit recovery — restore all hidden windows to screen center
+// Exit recovery — restore all hidden windows to screen center
 
 fn restoreAllWindows() void {
     // Undo any inactive-window dimming so windows are left undimmed.
@@ -5788,67 +5786,96 @@ fn restoreAllWindows() void {
     }
 }
 
-var g_shutdown_requested: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
-
-/// Graceful signal handler for INT/TERM/HUP/QUIT. Sets a flag and wakes the
-/// run loop so restoreAllWindows() runs on the main thread where AX calls and
-/// hash table access are safe. Only uses async-signal-safe operations.
-///
-/// CFRunLoopStop alone does NOT exit `[NSApp run]` reliably: NSApplication
-/// re-enters the CFRunLoop internally, so a stop is a no-op for its outer
-/// loop. Instead we set a flag and wake the existing waker source; the main
-/// thread (in bw_drain_events) sees the flag and performs `[NSApp stop:]` +
-/// posts a dummy event, which is the documented way to exit NSApp.run.
-///
-/// Zig 0.16 made `posix.SIG` an enum; the kernel-facing handler signature now
-/// takes that enum directly rather than `c_int`.
+/// Graceful signal handler for INT/TERM/HUP/QUIT. `write(2)` is
+/// async-signal-safe; the dispatch read source performs all AppKit and cleanup
+/// work later on the main queue. The pipe is nonblocking, so repeated signals
+/// cannot deadlock a full process in the handler.
 fn gracefulSignalHandler(sig: posix.SIG) callconv(.c) void {
-    _ = sig;
-    g_shutdown_requested.store(true, .release);
-    signalWaker();
+    const byte: u8 = @intCast(@intFromEnum(sig));
+    _ = c.write(g_signal_write_fd, &byte, 1);
 }
 
-/// Crash signal handler for SEGV/BUS/TRAP/ABRT. Best-effort restore using
-/// async-signal-unsafe functions. May deadlock if the crash occurs mid-
-/// allocation or mid-hash-table-mutation, but leaving windows hidden is worse.
-fn crashSignalHandler(sig: posix.SIG) callconv(.c) void {
-    restoreAllWindows();
+fn signalSourceReady(context: ?*anyopaque) callconv(.c) void {
+    _ = context;
+    if (g_signal_read_fd < 0) return;
 
-    // Re-raise with default handler so the OS produces a core dump / correct exit code.
-    var default_sa: posix.Sigaction = .{
-        .handler = .{ .handler = posix.SIG.DFL },
-        .mask = posix.sigemptyset(),
-        .flags = 0,
-    };
-    posix.sigaction(sig, &default_sa, null);
-    posix.raise(sig) catch {};
+    var buf: [64]u8 = undefined;
+    while (c.read(g_signal_read_fd, &buf, buf.len) > 0) {}
+    gracefulStopNSApp();
 }
 
-fn installCrashHandlers() void {
-    // Graceful signals: handled safely via run loop stop + main-thread cleanup
-    const graceful_signals = [_]posix.SIG{
-        posix.SIG.INT, posix.SIG.TERM,
-        posix.SIG.HUP, posix.SIG.QUIT,
-    };
+fn configureSignalPipeFd(fd: c_int) !void {
+    if (c.fcntl(fd, c.F_SETFL, c.O_NONBLOCK) < 0) return error.SignalPipeConfigureFailed;
+    if (c.fcntl(fd, c.F_SETFD, c.FD_CLOEXEC) < 0) return error.SignalPipeConfigureFailed;
+}
+
+fn initSignalTransport() !void {
+    std.debug.assert(g_signal_source == null);
+    std.debug.assert(g_signal_read_fd < 0 and g_signal_write_fd < 0);
+
+    var fds: [2]c_int = undefined;
+    if (c.pipe(&fds) != 0) return error.SignalPipeCreateFailed;
+    errdefer {
+        _ = std.c.close(fds[0]);
+        _ = std.c.close(fds[1]);
+    }
+    try configureSignalPipeFd(fds[0]);
+    try configureSignalPipeFd(fds[1]);
+
+    const source = c.dispatch_source_create(
+        cg_extra.DISPATCH_SOURCE_TYPE_READ(),
+        @intCast(fds[0]),
+        0,
+        cg_extra.dispatch_get_main_queue(),
+    ) orelse return error.SignalSourceCreateFailed;
+
+    g_signal_read_fd = fds[0];
+    g_signal_write_fd = fds[1];
+    g_signal_source = source;
+    c.dispatch_source_set_event_handler_f(source, signalSourceReady);
+    c.dispatch_resume(.{ ._ds = source });
+}
+
+fn deinitSignalTransport() void {
+    if (g_signal_source) |source| {
+        c.dispatch_source_cancel(source);
+        c.dispatch_release(.{ ._ds = source });
+        g_signal_source = null;
+    }
+    if (g_signal_read_fd >= 0) {
+        const fd = g_signal_read_fd;
+        g_signal_read_fd = -1;
+        _ = std.c.close(fd);
+    }
+    if (g_signal_write_fd >= 0) {
+        const fd = g_signal_write_fd;
+        g_signal_write_fd = -1;
+        _ = std.c.close(fd);
+    }
+}
+
+const graceful_signals = [_]posix.SIG{
+    posix.SIG.INT, posix.SIG.TERM,
+    posix.SIG.HUP, posix.SIG.QUIT,
+};
+
+fn installSignalHandlers() void {
     for (graceful_signals) |sig| {
         var sa: posix.Sigaction = .{
             .handler = .{ .handler = gracefulSignalHandler },
             .mask = posix.sigemptyset(),
-            .flags = 0,
+            .flags = posix.SA.RESTART,
         };
         posix.sigaction(sig, &sa, null);
     }
+}
 
-    // Crash signals: best-effort restore, then re-raise for core dump
-    const crash_signals = [_]posix.SIG{
-        posix.SIG.ABRT, posix.SIG.SEGV,
-        posix.SIG.BUS,  posix.SIG.TRAP,
-    };
-    for (crash_signals) |sig| {
+fn uninstallSignalHandlers() void {
+    for (graceful_signals) |sig| {
         var sa: posix.Sigaction = .{
-            .handler = .{ .handler = crashSignalHandler },
+            .handler = .{ .handler = posix.SIG.DFL },
             .mask = posix.sigemptyset(),
-            .flags = posix.SA.RESETHAND, // one-shot: avoid infinite re-entry
+            .flags = 0,
         };
         posix.sigaction(sig, &sa, null);
     }
