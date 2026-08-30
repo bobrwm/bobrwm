@@ -412,6 +412,19 @@ pub fn build(b: *std.Build) !void {
 
     const run_queue_tests = b.addRunArtifact(queue_tests);
 
+    const geometry_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/geometry.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    const geometry_tests = b.addTest(.{
+        .name = "geometry-tests",
+        .root_module = geometry_test_mod,
+    });
+
+    const run_geometry_tests = b.addRunArtifact(geometry_tests);
+
     // tabgroup.zig and tiling.zig are pure Zig (window.zig types only),
     // so their test modules need no SDK or include wiring either.
     const tabgroup_test_mod = b.createModule(.{
@@ -528,6 +541,7 @@ pub fn build(b: *std.Build) !void {
     test_step.dependOn(&run_tests.step);
     test_step.dependOn(&run_ipc_tests.step);
     test_step.dependOn(&run_queue_tests.step);
+    test_step.dependOn(&run_geometry_tests.step);
     test_step.dependOn(&run_tabgroup_tests.step);
     test_step.dependOn(&run_tiling_tests.step);
     test_step.dependOn(&run_workspace_tests.step);
