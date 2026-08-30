@@ -71,6 +71,21 @@ pub const Workspace = struct {
         try self.windows.append(self.allocator, wid);
     }
 
+    /// Reserve entries before a mutation that must commit across multiple
+    /// containers. Capacity changes are harmless if a later reservation fails.
+    pub fn ensureUnusedWindowCapacity(self: *Workspace, additional_count: usize) !void {
+        try self.windows.ensureUnusedCapacity(self.allocator, additional_count);
+    }
+
+    /// Append after a matching `ensureUnusedWindowCapacity` call.
+    pub fn addWindowAssumeCapacity(self: *Workspace, wid: Window.WindowId) void {
+        std.debug.assert(wid != 0);
+        for (self.windows.items) |existing| {
+            std.debug.assert(existing != wid);
+        }
+        self.windows.appendAssumeCapacity(wid);
+    }
+
     /// Replace a window ID in-place, preserving its position in the window
     /// list. Used for tab-group leader succession. Returns true when old_wid
     /// was present and replaced.
