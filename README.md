@@ -101,13 +101,13 @@ without `start_at_login` runs unsupervised.
 
 ### Logging
 
-The window manager writes to `/tmp/bobrwm_$(id -u).log` as well as stderr, so
+The window manager writes to `~/Library/Caches/bobrwm/bobrwm.log` as well as stderr, so
 logs are there however it was started — from Finder there is no terminal to
 read. The file is appended across restarts, which keeps the tail that explains
 a crash, and is truncated at startup once it passes 8 MiB.
 
 ```bash
-tail -f "/tmp/bobrwm_$(id -u).log"
+tail -f ~/Library/Caches/bobrwm/bobrwm.log
 ```
 
 Log level is compile-time configurable and applies to both binaries. Default

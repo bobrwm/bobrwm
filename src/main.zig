@@ -2630,6 +2630,7 @@ fn parseConfigPath(process_args: std.process.Args) ?[]const u8 {
 pub fn main(init: std.process.Init.Minimal) !void {
     // Before any thread starts, so logFn never races on the descriptor.
     filelog.init();
+    defer filelog.deinit();
     log.info("bobrwm starting (log_level={s})...", .{@tagName(std_options.log_level)});
 
     var debug_allocator: ?std.heap.DebugAllocator(.{}) = switch (builtin.mode) {
