@@ -19,6 +19,8 @@ const c = @import("c");
 
 pub extern fn CGEventGetFlags(event: c.CGEventRef) c.CGEventFlags;
 
+pub extern fn CGEventGetLocation(event: c.CGEventRef) c.CGPoint;
+
 pub extern fn CGEventGetIntegerValueField(
     event: c.CGEventRef,
     field: c.CGEventField,

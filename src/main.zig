@@ -27,6 +27,7 @@ const loginitem = @import("loginitem.zig");
 const objc_classes = @import("objc_classes.zig");
 const animation_mod = @import("animation.zig");
 const ax_mod = @import("ax.zig");
+const geometry_mod = @import("geometry.zig");
 const spsc_queue = @import("spsc_queue.zig");
 
 extern fn _AXUIElementGetWindow(element: c.AXUIElementRef, wid: *u32) c.AXError;
@@ -73,6 +74,9 @@ const app_launch_retry_attempts_max: u8 = 10;
 /// Capacity reserved for wid-keyed role/deferred maps to avoid growth churn.
 const pending_role_window_capacity: usize = 256;
 const deferred_window_candidate_capacity: usize = 256;
+/// Geometry entries are wid-keyed and include suppressed native-tab members.
+/// Match the bounded WindowServer snapshots used by discovery and cleanup.
+const geometry_window_capacity: u32 = 512;
 /// Capacity reserved for app launch retries (pid-keyed, bounded by observers).
 const app_launch_retry_capacity: usize = 64;
 /// Focus query retry budget. Electron apps (Discord) can report no AX
@@ -919,6 +923,7 @@ fn reconcileVisibleFramesFromWindowServer() void {
             .width = rect.size.width,
             .height = rect.size.height,
         };
+        seedObservedFrame(win.wid, frame);
         if (framesEqual(win.frame, frame)) continue;
 
         log.debug("frame reconcile wid={d} stored x={d:.0} y={d:.0} w={d:.0} h={d:.0} actual x={d:.0} y={d:.0} w={d:.0} h={d:.0}", .{
@@ -1264,9 +1269,9 @@ fn inferDisplayIdForWindow(wid: u32) ?u32 {
     return displayIdForFrame(frame);
 }
 
-/// Live WindowServer bounds for a window. Floating geometry is not kept in the
-/// store on user drags, so callers that need where a window actually *is* must
-/// ask WindowServer rather than trust `Window.frame`.
+/// Live WindowServer bounds for a window. `Window.frame` records bobrwm's last
+/// accepted target or adopted user/external geometry; callers that need what
+/// is physically visible now must still ask WindowServer.
 fn liveWindowFrame(wid: u32) ?window_mod.Window.Frame {
     const sky = g_sky orelse return null;
     var rect: skylight.CGRect = undefined;
@@ -1276,6 +1281,12 @@ fn liveWindowFrame(wid: u32) ?window_mod.Window.Frame {
         .y = rect.origin.y,
         .width = rect.size.width,
         .height = rect.size.height,
+    };
+}
+
+fn seedObservedFrame(wid: u32, frame: window_mod.Window.Frame) void {
+    g_geometry.seedObserved(wid, frame) catch |err| {
+        log.warn("geometry: failed to seed observed frame wid={d}: {}", .{ wid, err });
     };
 }
 
@@ -1353,7 +1364,7 @@ const HideCtx = struct {
         const pos_x = park.x;
         const pos_y = park.y;
 
-        const ok = ax_mod.setWindowPosition(pid, wid, pos_x, pos_y);
+        const ok = setWindowPositionTracked(pid, wid, pos_x, pos_y, .workspace_park);
         log.debug("hide window wid={d} pid={d} ok={} x={d:.0} y={d:.0}", .{ wid, pid, ok, pos_x, pos_y });
         if (!ok and !self.hideFocusedFallback(pid, wid, pos_x, pos_y)) {
             log.warn("hide failed wid={d} pid={d}", .{ wid, pid });
@@ -1421,7 +1432,7 @@ const HideCtx = struct {
         const focused_wid = focusedWindowIdForPid(pid) orelse return false;
         if (focused_wid == failed_wid) return false;
 
-        const ok = ax_mod.setWindowPosition(pid, focused_wid, x, y);
+        const ok = setWindowPositionTracked(pid, focused_wid, x, y, .workspace_park);
         log.debug("hide fallback focused window failed_wid={d} focused_wid={d} pid={d} ok={} x={d:.0} y={d:.0}", .{
             failed_wid,
             focused_wid,
@@ -1490,6 +1501,7 @@ var g_displays: [workspace_mod.max_displays]DisplayInfo = undefined;
 var g_display_count: usize = 0;
 var g_bsp_split_mode: tiling.SplitMode = .auto;
 var g_tab_groups: tabgroup.TabGroupManager = undefined;
+var g_geometry: geometry_mod = undefined;
 var g_pending_role_windows: PendingRoleWindowMap = undefined;
 var g_deferred_window_candidates: DeferredWindowCandidateMap = undefined;
 var g_app_launch_retries: AppLaunchRetryMap = undefined;
@@ -1501,6 +1513,10 @@ var g_config_runtime: ?ConfigRuntime = null;
 var g_config_path: ?[:0]const u8 = null;
 var g_drag_preview: DragPreviewState = .{};
 var g_mouse_left_down = false;
+var g_mouse_down_location: c.CGPoint = .{ .x = 0, .y = 0 };
+var g_pointer_drag_candidate_wid: ?u32 = null;
+var g_pointer_drag_wid: ?u32 = null;
+var g_mouse_drag_event_emitted = false;
 var g_drag_reconcile_on_drop = false;
 /// PID of the last window we focused via bw_ax_focus_window. Used to detect
 /// same-process focus switches that need a delay for Electron compatibility.
@@ -1823,6 +1839,49 @@ fn cgWindowInfoVisible(info: c.CFDictionaryRef) bool {
     const ok = c.CFNumberGetValue(alpha_ref, c.kCFNumberCGFloatType, &alpha);
     if (ok == 0) return true;
     return alpha > 0.01;
+}
+
+/// Resolve the topmost managed layer-0 window under a pointer-down location.
+/// CG's list is front-to-back, so skipping unmanaged overlays still reaches
+/// the actual window below them. Binding the drag candidate here lets the
+/// first real leftMouseDragged event establish exact per-window ownership;
+/// a mouse button merely held elsewhere never authorizes geometry adoption.
+fn managedWindowAtPoint(point: c.CGPoint) ?u32 {
+    const options: cg_extra.CGWindowListOption =
+        cg_extra.kCGWindowListOptionOnScreenOnly | cg_extra.kCGWindowListExcludeDesktopElements;
+    const list = cg_extra.CGWindowListCopyWindowInfo(options, cg_extra.kCGNullWindowID) orelse return null;
+    defer c.CFRelease(@ptrCast(list));
+
+    const count = c.CFArrayGetCount(list);
+    std.debug.assert(count >= 0);
+    var i: c.CFIndex = 0;
+    while (i < count) : (i += 1) {
+        const info_any = c.CFArrayGetValueAtIndex(list, i) orelse continue;
+        const info: c.CFDictionaryRef = @ptrCast(info_any);
+        if (!cgWindowInfoVisible(info)) continue;
+
+        const layer_ref_any = c.CFDictionaryGetValue(info, cg_extra.kCGWindowLayer) orelse continue;
+        const layer_ref: c.CFNumberRef = @ptrCast(layer_ref_any);
+        var layer: i32 = 0;
+        if (c.CFNumberGetValue(layer_ref, c.kCFNumberSInt32Type, &layer) == 0 or layer != 0) continue;
+
+        const wid_ref_any = c.CFDictionaryGetValue(info, cg_extra.kCGWindowNumber) orelse continue;
+        const wid_ref: c.CFNumberRef = @ptrCast(wid_ref_any);
+        var wid: u32 = 0;
+        if (c.CFNumberGetValue(wid_ref, c.kCFNumberSInt32Type, &wid) == 0) continue;
+        if (g_store.get(wid) == null) continue;
+
+        const bounds_ref_any = c.CFDictionaryGetValue(info, cg_extra.kCGWindowBounds) orelse continue;
+        const bounds_ref: c.CFDictionaryRef = @ptrCast(bounds_ref_any);
+        var bounds: c.CGRect = std.mem.zeroes(c.CGRect);
+        if (!c.CGRectMakeWithDictionaryRepresentation(bounds_ref, &bounds)) continue;
+
+        const inside_x = point.x >= bounds.origin.x and point.x <= bounds.origin.x + bounds.size.width;
+        const inside_y = point.y >= bounds.origin.y and point.y <= bounds.origin.y + bounds.size.height;
+        if (inside_x and inside_y) return wid;
+    }
+
+    return null;
 }
 
 /// Get all AX-backed window IDs for an application PID.
@@ -2433,10 +2492,20 @@ fn hotkeyTapCallback(
     }
 
     if (event_type == c.kCGEventLeftMouseDown) {
+        g_mouse_down_location = cg_extra.CGEventGetLocation(event);
+        g_mouse_drag_event_emitted = false;
         bw_hotkey_mouse_down();
         return event;
     }
+    if (event_type == c.kCGEventLeftMouseDragged) {
+        if (!g_mouse_drag_event_emitted) {
+            g_mouse_drag_event_emitted = true;
+            bw_hotkey_mouse_dragged();
+        }
+        return event;
+    }
     if (event_type == c.kCGEventLeftMouseUp) {
+        g_mouse_drag_event_emitted = false;
         bw_hotkey_mouse_up();
         return event;
     }
@@ -2456,6 +2525,7 @@ fn setupHotkeyEventTap() void {
     const mask: c.CGEventMask =
         (@as(c.CGEventMask, 1) << @intCast(c.kCGEventKeyDown)) |
         (@as(c.CGEventMask, 1) << @intCast(c.kCGEventLeftMouseDown)) |
+        (@as(c.CGEventMask, 1) << @intCast(c.kCGEventLeftMouseDragged)) |
         (@as(c.CGEventMask, 1) << @intCast(c.kCGEventLeftMouseUp));
 
     g_tap_port = cg_extra.CGEventTapCreate(
@@ -2535,6 +2605,12 @@ fn bw_hotkey_mouse_down() void {
 /// Callback target for shim hotkey mouse up events.
 fn bw_hotkey_mouse_up() void {
     bw_emit_event(shim.BW_EVENT_MOUSE_UP, 0, 0);
+}
+
+/// Mark the first actual pointer-drag event separately from mouse-down. A
+/// click held while bobrwm retiles is not a user geometry change.
+fn bw_hotkey_mouse_dragged() void {
+    bw_emit_event(shim.BW_EVENT_MOUSE_DRAGGED, 0, 0);
 }
 
 /// Accept the keybind table from config. Stores a reference to caller-owned
@@ -2645,6 +2721,12 @@ pub fn main(init: std.process.Init.Minimal) !void {
     defer destroyAllTilingStates();
     g_tab_groups = tabgroup.TabGroupManager.init(g_allocator);
     defer g_tab_groups.deinit();
+    g_geometry = geometry_mod.init(g_allocator);
+    defer g_geometry.deinit();
+    g_geometry.ensureTotalCapacity(geometry_window_capacity) catch |err| {
+        log.err("geometry coordinator reserve failed: {}", .{err});
+        return err;
+    };
     g_pending_role_windows = PendingRoleWindowMap.init(g_allocator);
     defer g_pending_role_windows.deinit();
     g_pending_role_windows.ensureTotalCapacity(pending_role_window_capacity) catch |err| {
@@ -2820,6 +2902,9 @@ fn recoverFromEventOverflow() void {
     // Mouse-up may be the lost event. Abandon transient drag state rather than
     // leaving every later AX move classified as a user drag indefinitely.
     g_mouse_left_down = false;
+    g_pointer_drag_candidate_wid = null;
+    g_pointer_drag_wid = null;
+    g_geometry.clearIntents();
     g_drag_reconcile_on_drop = false;
     clearDragPreview();
 
@@ -2837,6 +2922,81 @@ fn recoverFromEventOverflow() void {
     requestOffscreenCleanup();
     requestRetileAllDisplays();
     refreshRolePolling();
+}
+
+/// Re-read WindowServer after AX notification delivery has settled. The
+/// immediate event handler can still see the prior frame, and some apps emit
+/// no follow-up notification after the physical geometry finally changes.
+fn reconcileDueGeometryObservations() void {
+    const now_ns = nanoTimestamp();
+    var due_wids: [geometry_window_capacity]u32 = undefined;
+    const due_count = g_geometry.collectDueResamples(now_ns, &due_wids);
+
+    for (due_wids[0..due_count]) |wid| {
+        if (g_pointer_drag_wid == wid) {
+            g_geometry.deferResample(wid, now_ns);
+            continue;
+        }
+
+        const observed = liveWindowFrame(wid) orelse {
+            if (g_geometry.get(wid)) |entry| {
+                if (entry.intent) |intent| {
+                    if (now_ns <= intent.settle_deadline_ns) {
+                        g_geometry.deferResample(wid, now_ns);
+                        continue;
+                    }
+                    if (reconcileDivergedGeometryIntent(wid, intent)) {
+                        g_geometry.forget(wid);
+                        continue;
+                    }
+                }
+            }
+            // No physical window exists after the ownership interval. Drop
+            // the sample state; cleanup/tab reconciliation owns any remaining
+            // store entry and a later write will create fresh provenance.
+            g_geometry.forget(wid);
+            continue;
+        };
+        const pending_intent = if (g_geometry.get(wid)) |entry| entry.intent else null;
+        switch (g_geometry.settle(wid, observed, now_ns)) {
+            .manager => log.debug("geometry: trailing sample manager-owned wid={d}", .{wid}),
+            .external => {
+                log.debug("geometry: trailing sample external wid={d}", .{wid});
+                if (pending_intent) |intent| {
+                    if (reconcileDivergedGeometryIntent(wid, intent)) continue;
+                }
+                handleExternalWindowGeometry(wid, observed);
+            },
+        }
+    }
+}
+
+/// An accepted AX write can target a native-tab ID that disappeared from the
+/// visible AX window set while the application simultaneously surfaced a new
+/// focused ID. Reconcile through the existing tab-aware focus path before
+/// retrying geometry; blindly reissuing the stale ID would loop forever.
+fn reconcileDivergedGeometryIntent(wid: u32, intent: geometry_mod.Intent) bool {
+    switch (intent.source) {
+        .tab_sync, .workspace_park, .exit_restore => return false,
+        .layout, .floating_restore, .user_command, .animation => {},
+    }
+
+    const win = g_store.get(wid) orelse return false;
+    if (!workspaceVisibleOnDisplay(win.workspace_id, win.display_id)) return false;
+    if (bw_is_window_on_screen(wid)) return false;
+
+    const focused_wid = focusedWindowIdForPid(win.pid) orelse return false;
+    if (focused_wid == wid) return false;
+
+    log.debug("geometry: divergent intent reconciling stale wid={d} focused_wid={d} pid={d} source={s}", .{
+        wid,
+        focused_wid,
+        win.pid,
+        @tagName(intent.source),
+    });
+    reconcileFocusedWindow(win.pid, focused_wid);
+    requestRetileDisplay(win.display_id);
+    return true;
 }
 
 /// Exit `[NSApp run]` cleanly by setting NSApplication's stop flag and posting
@@ -3023,6 +3183,7 @@ fn adoptWindow(ws: *workspace_mod.Workspace, win: window_mod.Window) !void {
 
     g_store.putAssumeCapacity(win);
     ws.addWindowAssumeCapacity(win.wid);
+    seedObservedFrame(win.wid, win.frame);
 }
 
 fn setTilingActive(workspace_id: u8, wid: u32) void {
@@ -3076,6 +3237,8 @@ fn replaceManagedWindowId(old_wid: u32, new_wid: u32, frame: window_mod.Window.F
         return false;
     };
     g_store.remove(old_wid);
+    g_geometry.forget(old_wid);
+    seedObservedFrame(new_wid, frame);
     ax_mod.invalidateWindow(old_wid);
     log.info("window id replaced old={d} new={d} pid={d} workspace={d} display={d}", .{
         old_wid,
@@ -3454,6 +3617,7 @@ fn handleEvent(ev: *const event_mod.Event) void {
             log.info("space changed", .{});
         },
         .role_poll_tick => {
+            reconcileDueGeometryObservations();
             if (processDueDisplayResettle()) return;
             const promoted_pending = processPendingRoleWindows();
             const promoted_deferred = processDeferredWindowCandidates();
@@ -3466,10 +3630,22 @@ fn handleEvent(ev: *const event_mod.Event) void {
         },
         .mouse_down => {
             g_mouse_left_down = true;
+            g_pointer_drag_candidate_wid = managedWindowAtPoint(g_mouse_down_location);
+            g_pointer_drag_wid = null;
             g_drag_reconcile_on_drop = false;
+        },
+        .mouse_dragged => {
+            if (g_mouse_left_down and g_pointer_drag_wid == null) {
+                g_pointer_drag_wid = g_pointer_drag_candidate_wid;
+                if (g_pointer_drag_wid) |wid| {
+                    log.debug("geometry: pointer drag claimed wid={d}", .{wid});
+                }
+            }
         },
         .mouse_up => {
             g_mouse_left_down = false;
+            g_pointer_drag_candidate_wid = null;
+            g_pointer_drag_wid = null;
             const drag_needs_reconcile_on_drop = g_drag_reconcile_on_drop;
             defer g_drag_reconcile_on_drop = false;
             if (g_drag_preview.source_wid) |source_wid| {
@@ -3494,7 +3670,7 @@ fn handleEvent(ev: *const event_mod.Event) void {
             // retile per tick.
             if (g_animator.isAnimatingWindow(ev.wid)) return;
 
-            if (inWorkspaceTransition() and !g_mouse_left_down) {
+            if (inWorkspaceTransition() and g_pointer_drag_wid != ev.wid) {
                 if (ev.kind == .window_resized) {
                     clearDragPreview();
                 }
@@ -3505,7 +3681,29 @@ fn handleEvent(ev: *const event_mod.Event) void {
                 if (ev.kind == .window_moved) "moved" else "resized",
                 ev.wid,
             });
-            if (updateWindowDisplayAssignment(ev.wid)) {
+
+            const observed = liveWindowFrame(ev.wid) orelse return;
+            const owner = g_geometry.observe(
+                ev.wid,
+                observed,
+                nanoTimestamp(),
+                g_pointer_drag_wid,
+            ) catch |err| {
+                log.warn("geometry: failed to record observation wid={d}: {}", .{ ev.wid, err });
+                return;
+            };
+            refreshRolePolling();
+
+            if (owner == .manager) {
+                log.debug("geometry: ignored manager echo wid={d}", .{ev.wid});
+                return;
+            }
+            if (owner == .external) {
+                handleExternalWindowGeometry(ev.wid, observed);
+                return;
+            }
+
+            if (updateDraggedWindowGeometry(ev.wid, observed)) {
                 retile();
                 return;
             }
@@ -3517,7 +3715,7 @@ fn handleEvent(ev: *const event_mod.Event) void {
                 }
             }
             checkTabDragOut(ev.pid, ev.wid);
-            if (g_mouse_left_down) {
+            if (g_pointer_drag_wid == ev.wid) {
                 if (g_store.get(ev.wid)) |win| {
                     if (win.mode == .tiled and !win.is_fullscreen and workspaceVisibleOnDisplay(win.workspace_id, win.display_id)) {
                         g_drag_reconcile_on_drop = true;
@@ -3525,10 +3723,7 @@ fn handleEvent(ev: *const event_mod.Event) void {
                 }
             }
             if (ev.kind == .window_moved) {
-                // Ignore synthetic move events generated by our own retile calls.
-                if (g_mouse_left_down) {
-                    updateWindowMovePreview(ev.wid);
-                }
+                updateWindowMovePreview(ev.wid);
             } else {
                 clearDragPreview();
             }
@@ -3653,7 +3848,7 @@ fn toggleWindowFullscreen(wid: u32) void {
 
     if (restore_to) |target| {
         if (g_store.get(visible_wid)) |visible| {
-            if (applyWindowFrame(visible.pid, visible_wid, visible.frame, target, false)) {
+            if (applyWindowFrame(visible.pid, visible_wid, visible.frame, target, false, .floating_restore)) {
                 var updated = visible;
                 updated.frame = target;
                 g_store.put(updated) catch {};
@@ -3682,7 +3877,10 @@ fn centerFloatingWindow(wid: u32) void {
 
     const size = liveWindowFrame(wid) orelse win.frame;
     const target = centeredFrame(size.width, size.height, display);
-    _ = ax_mod.setWindowFrame(win.pid, wid, target.x, target.y, target.width, target.height);
+    if (!setWindowFrameTracked(win.pid, wid, target, .user_command)) {
+        log.warn("center floating: frame write rejected wid={d}", .{wid});
+        return;
+    }
     win.frame = target;
     win.float_frame = target;
     g_store.put(win) catch {};
@@ -3712,7 +3910,8 @@ fn refreshRolePolling() void {
         g_focus_retries.count() > 0 or
         g_deferred_follow_focus != null or
         g_display_resettle_at_s != 0 or
-        g_event_overflow_recovery_pending;
+        g_event_overflow_recovery_pending or
+        g_geometry.hasPendingResamples();
     setRolePolling(has_pending);
 }
 
@@ -3918,8 +4117,16 @@ fn trackPendingRoleWindow(pid: i32, wid: u32, workspace_id: u8, display_id: u32)
 fn untrackPendingRoleWindow(wid: u32) void {
     std.debug.assert(wid != 0);
     if (g_pending_role_windows.remove(wid)) {
+        forgetGeometryIfUnmanaged(wid);
         refreshRolePolling();
     }
+}
+
+fn forgetGeometryIfUnmanaged(wid: u32) void {
+    if (g_store.get(wid) != null) return;
+    if (g_pending_role_windows.contains(wid)) return;
+    if (g_deferred_window_candidates.contains(wid)) return;
+    g_geometry.forget(wid);
 }
 
 /// Remove all entries matching `pid` from a wid-keyed map whose values
@@ -3944,6 +4151,7 @@ fn removeEntriesForPid(comptime V: type, map: *std.AutoHashMap(u32, V), pid: i32
         for (remove_batch[0..remove_count]) |wid| {
             if (map.remove(wid)) {
                 removed_any = true;
+                forgetGeometryIfUnmanaged(wid);
             }
         }
 
@@ -3997,6 +4205,7 @@ fn trackDeferredWindowCandidate(pid: i32, wid: u32, workspace_id: u8, display_id
 fn untrackDeferredWindowCandidate(wid: u32) void {
     std.debug.assert(wid != 0);
     if (g_deferred_window_candidates.remove(wid)) {
+        forgetGeometryIfUnmanaged(wid);
         refreshRolePolling();
     }
 }
@@ -4083,6 +4292,7 @@ fn processPendingRoleWindows() bool {
 
     for (remove_wids[0..remove_count]) |wid| {
         _ = g_pending_role_windows.remove(wid);
+        forgetGeometryIfUnmanaged(wid);
     }
     refreshRolePolling();
 
@@ -4215,6 +4425,7 @@ fn processDeferredWindowCandidates() bool {
 
     for (remove_wids[0..remove_count]) |wid| {
         _ = g_deferred_window_candidates.remove(wid);
+        forgetGeometryIfUnmanaged(wid);
     }
 
     if (truncated) {
@@ -4234,6 +4445,7 @@ fn processDeferredWindowCandidates() bool {
             // Managed (or resolved another way, e.g. adopted into a tab
             // group, which stores the window without returning true).
             _ = g_deferred_window_candidates.remove(candidate.wid);
+            forgetGeometryIfUnmanaged(candidate.wid);
             added_any = true;
         } else if (g_deferred_window_candidates.getPtr(candidate.wid)) |entry| {
             // Promotion failed and re-deferred (e.g. bounds still unsettled).
@@ -4241,6 +4453,7 @@ fn processDeferredWindowCandidates() bool {
             // never settle expires instead of cycling forever.
             if (entry.attempts_remaining == 0) {
                 _ = g_deferred_window_candidates.remove(candidate.wid);
+                forgetGeometryIfUnmanaged(candidate.wid);
                 log.info("deferred-window: giving up pid={d} wid={d} after {d}ms with unsettled bounds", .{
                     candidate.pid,
                     candidate.wid,
@@ -4695,6 +4908,7 @@ fn refreshTabGroupActiveTabs() void {
                 .workspace_id = leader.workspace_id,
                 .display_id = leader.display_id,
             });
+            seedObservedFrame(move.selected, group.canonical_frame);
         }
 
         log.debug("tab group {d} active tab {d} → {d} (tab bar)", .{
@@ -4787,6 +5001,7 @@ fn joinTabGroup(pid: i32, sibling_wid: u32, new_wid: u32, new_frame: window_mod.
         .workspace_id = sibling.workspace_id,
         .display_id = sibling.display_id,
     });
+    seedObservedFrame(new_wid, new_frame);
 
     const leader = g_tab_groups.resolveLeader(sibling_wid);
     ws.recordFocus(leader);
@@ -4801,6 +5016,7 @@ fn joinTabGroup(pid: i32, sibling_wid: u32, new_wid: u32, new_frame: window_mod.
 
 fn removeWindow(wid: u32) void {
     g_animator.cancel(wid);
+    g_geometry.forget(wid);
     ax_mod.invalidateWindow(wid);
     untrackPendingRoleWindow(wid);
     untrackDeferredWindowCandidate(wid);
@@ -5212,31 +5428,15 @@ fn adoptWindowAsBackgroundTab(win: window_mod.Window) tabgroup.detect.OffscreenO
     return .adopt;
 }
 
-/// Updates `display_id` when a user-dragged window crosses monitors.
+/// Adopt geometry from the exact window claimed by a real pointer drag.
 /// Returns true when display ownership changed and callers should retile.
-fn updateWindowDisplayAssignment(wid: u32) bool {
-    // AX move/resize notifications also echo every frame bobrwm writes. The
-    // corresponding SkyLight bounds can still describe the previous frame,
-    // so accepting them here corrupts the stored layout target and makes the
-    // next placement look like a no-op. Only a live pointer drag transfers
-    // geometry ownership from the layout back to the user.
-    if (!g_mouse_left_down) return false;
-
+fn updateDraggedWindowGeometry(wid: u32, frame: window_mod.Window.Frame) bool {
+    if (g_pointer_drag_wid != wid) return false;
     var win = g_store.get(wid) orelse return false;
-    const sky = g_sky orelse return false;
-
-    var rect: skylight.CGRect = undefined;
-    if (sky.getWindowBounds(sky.mainConnectionID(), wid, &rect) != 0) return false;
-
-    const frame: window_mod.Window.Frame = .{
-        .x = rect.origin.x,
-        .y = rect.origin.y,
-        .width = rect.size.width,
-        .height = rect.size.height,
-    };
     const next_display_id = displayIdForFrame(frame);
     if (next_display_id == win.display_id) {
         win.frame = frame;
+        if (win.mode == .floating and !win.is_fullscreen) win.float_frame = frame;
         g_store.put(win) catch {};
         return false;
     }
@@ -5251,6 +5451,7 @@ fn updateWindowDisplayAssignment(wid: u32) bool {
 
     removeFromTiling(win.workspace_id, wid);
     win.frame = frame;
+    if (win.mode == .floating and !win.is_fullscreen) win.float_frame = frame;
     win.display_id = next_display_id;
     g_store.put(win) catch return false;
     if (win.mode == .tiled) {
@@ -5263,6 +5464,44 @@ fn updateWindowDisplayAssignment(wid: u32) bool {
     _ = maybeSetFocusedDisplayForWindow(win, .drag);
     log.info("window moved to display wid={d} display={d}", .{ wid, win.display_id });
     return true;
+}
+
+/// Apply ownership policy to geometry changed without an active pointer drag.
+/// Layout-owned windows are repaired from their desired frame; floating
+/// windows accept same-display application changes as their new restore frame.
+fn handleExternalWindowGeometry(wid: u32, frame: window_mod.Window.Frame) void {
+    var win = g_store.get(wid) orelse return;
+
+    if (!workspaceVisibleOnDisplay(win.workspace_id, win.display_id)) {
+        // Parked windows intentionally differ from their layout frame while
+        // hidden. Never let their trailing AX echoes retile the visible
+        // workspace or adopt the parked position as floating restore state.
+        log.debug("geometry: ignored external sample for hidden wid={d}", .{wid});
+        return;
+    }
+
+    if (win.mode == .tiled or win.is_fullscreen) {
+        log.debug("geometry: external layout drift wid={d}; scheduling retile", .{wid});
+        requestRetileDisplay(win.display_id);
+        return;
+    }
+
+    const next_display_id = displayIdForFrame(frame);
+    if (next_display_id != win.display_id) {
+        // Workspace/display ownership changes only through the pointer-drag or
+        // explicit move paths, which update every correlated data structure.
+        // Accepting just the frame here would strand the floating window on a
+        // display where its workspace is not visible.
+        log.debug("geometry: external floating cross-display drift wid={d}; scheduling restore", .{wid});
+        requestRetileDisplay(win.display_id);
+        return;
+    }
+
+    win.frame = frame;
+    win.float_frame = frame;
+    g_store.put(win) catch |err| {
+        log.warn("geometry: failed to store external floating frame wid={d}: {}", .{ wid, err });
+    };
 }
 
 /// Lowest workspace id (1-based) not yet claimed as active on a display.
@@ -5427,9 +5666,21 @@ fn parkHiddenWorkspaceWindows() void {
 /// and clamped fullscreen sizes must be re-asserted even when the store
 /// believes they already match. Returns whether the final AX write was
 /// accepted so callers can avoid recording frames that were never applied.
-fn applyWindowFrame(pid: i32, wid: u32, current: window_mod.Window.Frame, target: window_mod.Window.Frame, two_pass: bool) bool {
-    if (!two_pass and current.sizeApproxEqual(target, window_mod.Window.Frame.tolerance)) {
-        return ax_mod.setWindowPosition(pid, wid, target.x, target.y);
+fn applyWindowFrame(
+    pid: i32,
+    wid: u32,
+    current: window_mod.Window.Frame,
+    target: window_mod.Window.Frame,
+    two_pass: bool,
+    source: geometry_mod.IntentSource,
+) bool {
+    // Choose position-only from observed physical geometry, not the stored
+    // target. External resize drift can leave the store already equal to the
+    // desired layout while WindowServer has a different size; consulting the
+    // store there would issue a move and permanently leave the bad size.
+    const physical = if (g_geometry.get(wid)) |entry| entry.observed orelse current else current;
+    if (!two_pass and physical.sizeApproxEqual(target, window_mod.Window.Frame.tolerance)) {
+        return setWindowPositionTracked(pid, wid, target.x, target.y, source);
     }
 
     var ok = false;
@@ -5437,7 +5688,61 @@ fn applyWindowFrame(pid: i32, wid: u32, current: window_mod.Window.Frame, target
     for (0..passes) |_| {
         ok = ax_mod.setWindowFrame(pid, wid, target.x, target.y, target.width, target.height);
     }
+    if (ok) recordFrameIntent(wid, target, source);
     return ok;
+}
+
+fn setWindowFrameTracked(
+    pid: i32,
+    wid: u32,
+    target: window_mod.Window.Frame,
+    source: geometry_mod.IntentSource,
+) bool {
+    const ok = ax_mod.setWindowFrame(pid, wid, target.x, target.y, target.width, target.height);
+    if (ok) recordFrameIntent(wid, target, source);
+    return ok;
+}
+
+fn setWindowPositionTracked(
+    pid: i32,
+    wid: u32,
+    x: f64,
+    y: f64,
+    source: geometry_mod.IntentSource,
+) bool {
+    const ok = ax_mod.setWindowPosition(pid, wid, x, y);
+    if (ok) {
+        _ = g_geometry.recordPositionAccepted(wid, x, y, source, nanoTimestamp()) catch |err| {
+            log.warn("geometry: failed to record position intent wid={d}: {}", .{ wid, err });
+            return ok;
+        };
+        refreshRolePolling();
+    }
+    return ok;
+}
+
+fn recordFrameIntent(wid: u32, target: window_mod.Window.Frame, source: geometry_mod.IntentSource) void {
+    _ = g_geometry.recordFrameAccepted(wid, target, source, nanoTimestamp()) catch |err| {
+        log.warn("geometry: failed to record frame intent wid={d}: {}", .{ wid, err });
+        return;
+    };
+    refreshRolePolling();
+}
+
+fn recordAnimationIntent(wid: u32, target: window_mod.Window.Frame) void {
+    const animation_ns = @as(i128, @intCast(g_config.animation.duration_ms)) * std.time.ns_per_ms;
+    const settle_ns = animation_ns + geometry_mod.default_settle_interval_ns;
+    _ = g_geometry.recordFrameAcceptedFor(
+        wid,
+        target,
+        .animation,
+        nanoTimestamp(),
+        settle_ns,
+    ) catch |err| {
+        log.warn("geometry: failed to record animation intent wid={d}: {}", .{ wid, err });
+        return;
+    };
+    refreshRolePolling();
 }
 
 fn clampFrameToDisplay(frame: window_mod.Window.Frame, display: shim.bw_frame) window_mod.Window.Frame {
@@ -5501,8 +5806,8 @@ fn restoreFloatingWindows(ws_id: u8, display_id: u32, display: shim.bw_frame, co
         // re-enter here forever, but write two-pass because macOS clamps
         // fullscreen sizes mid-flight.
         if (leader.is_fullscreen) {
-            if (!framesEqual(win.frame, content)) {
-                if (applyWindowFrame(win.pid, wid, win.frame, content, true)) {
+            if (!framesEqual(win.frame, content) or g_geometry.needsRepair(wid, content, nanoTimestamp())) {
+                if (applyWindowFrame(win.pid, wid, win.frame, content, true, .floating_restore)) {
                     win.frame = content;
                     g_store.put(win) catch {};
                 }
@@ -5528,7 +5833,10 @@ fn restoreFloatingWindows(ws_id: u8, display_id: u32, display: shim.bw_frame, co
         else
             centeredFrame(rect.size.width, rect.size.height, display);
 
-        _ = ax_mod.setWindowFrame(win.pid, wid, target.x, target.y, target.width, target.height);
+        if (!setWindowFrameTracked(win.pid, wid, target, .floating_restore)) {
+            log.warn("restore floating: frame write rejected wid={d}", .{wid});
+            continue;
+        }
         win.frame = target;
         g_store.put(win) catch {};
         applyFrameToTabGroup(leader_wid, target);
@@ -5551,9 +5859,9 @@ fn applyFrameToTabGroup(leader_wid: u32, frame: window_mod.Window.Frame) void {
     g.canonical_frame = frame;
     for (g.members.items) |member_wid| {
         const member = g_store.get(member_wid) orelse continue;
-        if (framesEqual(member.frame, frame)) continue;
+        if (framesEqual(member.frame, frame) and !g_geometry.needsRepair(member_wid, frame, nanoTimestamp())) continue;
 
-        if (applyWindowFrame(member.pid, member_wid, member.frame, frame, false)) {
+        if (applyWindowFrame(member.pid, member_wid, member.frame, frame, false, .tab_sync)) {
             var updated = member;
             updated.frame = frame;
             g_store.put(updated) catch {};
@@ -5623,19 +5931,22 @@ fn retileDisplay(display_id: u32) void {
         // Fullscreen windows fill the outer-gap-inset frame, skipping BSP splits and inner gaps
         const target_frame = if (win.is_fullscreen) frame else entry.frame;
 
-        if (!framesEqual(visible.frame, target_frame)) {
+        if (!framesEqual(visible.frame, target_frame) or
+            g_geometry.needsRepair(visible_wid, target_frame, nanoTimestamp()))
+        {
             // Fullscreen windows are never animated: macOS clamps their size
             // mid-flight and they need the two-pass set below to land on the
             // exact display frame.
             var applied = true;
             if (g_config.animation.enabled and !win.is_fullscreen) {
                 applied = g_animator.animate(visible.pid, visible_wid, visible.frame, target_frame);
+                if (applied) recordAnimationIntent(visible_wid, target_frame);
                 ensureAnimatorTimer();
             } else {
                 // The window may have entered fullscreen mid-animation; stop
                 // the in-flight animation so it doesn't fight the placement.
                 g_animator.cancel(visible_wid);
-                applied = applyWindowFrame(visible.pid, visible_wid, visible.frame, target_frame, win.is_fullscreen);
+                applied = applyWindowFrame(visible.pid, visible_wid, visible.frame, target_frame, win.is_fullscreen, .layout);
             }
 
             // Record the target only when the write was accepted (animation
@@ -5684,7 +5995,13 @@ fn restoreAllWindows() void {
                 const h = if (win.frame.height > 1) win.frame.height else display.h * 0.5;
                 const x = display.x + (display.w - w) / 2.0;
                 const y = display.y + (display.h - h) / 2.0;
-                _ = ax_mod.setWindowFrame(win.pid, wid, x, y, w, h);
+                const target: window_mod.Window.Frame = .{
+                    .x = x,
+                    .y = y,
+                    .width = w,
+                    .height = h,
+                };
+                _ = setWindowFrameTracked(win.pid, wid, target, .exit_restore);
             }
         }
     }

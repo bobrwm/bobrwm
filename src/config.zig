@@ -171,7 +171,7 @@ pub const Action = enum(u8) {
     comptime {
         // stringToEnum builds a StaticStringMap whose pdq sort blows past
         // the default branch quota when the enum has many fields.
-        @setEvalBranchQuota(20_000);
+        @setEvalBranchQuota(40_000);
         const event = @import("event.zig").EventKind;
         for (@typeInfo(Action).@"enum".fields) |f| {
             // Verify each Action.<name> has a matching EventKind.hk_<name>;

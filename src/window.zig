@@ -11,6 +11,9 @@ pub const Window = struct {
     wid: WindowId,
     pid: i32,
     title: ?[]const u8,
+    /// Last geometry bobrwm deliberately accepted: either a successful AX
+    /// target or a user/external frame admitted by the ownership coordinator.
+    /// This is not an unconditionally live WindowServer observation.
     frame: Frame,
     is_minimized: bool,
     is_fullscreen: bool = false,
