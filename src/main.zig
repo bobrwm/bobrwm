@@ -91,6 +91,39 @@ const EventRing = struct {
     }
 };
 
+const IpcRequest = struct {
+    fd: c_int,
+    len: u16,
+    buf: [512]u8,
+};
+
+/// One IPC acceptor thread produces complete requests; the main thread drains
+/// them. Socket reads never run on AppKit's queue.
+const IpcRequestRing = struct {
+    const capacity = 16;
+
+    buf: [capacity]IpcRequest = undefined,
+    head: std.atomic.Value(usize) = .init(0),
+    tail: std.atomic.Value(usize) = .init(0),
+
+    fn push(self: *IpcRequestRing, request: IpcRequest) bool {
+        const tail = self.tail.load(.monotonic);
+        const next = (tail + 1) % capacity;
+        if (next == self.head.load(.acquire)) return false;
+        self.buf[tail] = request;
+        self.tail.store(next, .release);
+        return true;
+    }
+
+    fn pop(self: *IpcRequestRing) ?IpcRequest {
+        const head = self.head.load(.monotonic);
+        if (head == self.tail.load(.acquire)) return null;
+        const request = self.buf[head];
+        self.head.store((head + 1) % capacity, .release);
+        return request;
+    }
+};
+
 // Hidden-window position (bottom-right corner, barely visible)
 
 /// Pixels visible in the corner when a window is hidden off-screen.
@@ -1525,7 +1558,6 @@ var g_display_resettle_at_s: f64 = 0;
 var g_hotkey_bindings: []const shim.bw_keybind = &.{};
 var g_waker_source: c.CFRunLoopSourceRef = null;
 var g_role_poll_source: c.dispatch_source_t = null;
-var g_ipc_source: c.dispatch_source_t = null;
 var g_tap_port: c.CFMachPortRef = null;
 var g_workspace_transition: WorkspaceTransitionState = .{};
 var g_workspace_transition_completion_reason: WorkspaceTransitionCompletionReason = .none;
@@ -1544,6 +1576,9 @@ var g_cleanup_pending_pid_count: usize = 0;
 
 var g_animator: animation_mod.Animator = undefined;
 var g_animator_source: c.dispatch_source_t = null;
+var g_ipc_requests: IpcRequestRing = .{};
+var g_ipc_thread: ?std.Thread = null;
+var g_ipc_transport_stop: std.atomic.Value(bool) = .init(false);
 
 const ConfigRuntime = struct {
     arena: std.heap.ArenaAllocator,
@@ -2460,39 +2495,6 @@ fn setupHotkeyEventTap() void {
     cg_extra.CGEventTapEnable(tap, true);
 }
 
-fn ipcSourceTick(context: ?*anyopaque) callconv(.c) void {
-    const fd_raw = @intFromPtr(context orelse return);
-    const server_fd: c_int = @intCast(fd_raw);
-    bw_handle_ipc_client(server_fd);
-}
-
-fn initIpcSource(server_fd: c_int) void {
-    if (g_ipc_source) |source| {
-        c.dispatch_source_cancel(source);
-        g_ipc_source = null;
-    }
-
-    const source = c.dispatch_source_create(
-        cg_extra.DISPATCH_SOURCE_TYPE_READ(),
-        @intCast(server_fd),
-        0,
-        cg_extra.dispatch_get_main_queue(),
-    );
-    if (source == null) return;
-
-    c.dispatch_set_context(.{ ._ds = source }, @ptrFromInt(@as(usize, @intCast(server_fd))));
-    c.dispatch_source_set_event_handler_f(source, ipcSourceTick);
-    c.dispatch_resume(.{ ._ds = source });
-    g_ipc_source = source;
-}
-
-fn cancelIpcSource() void {
-    if (g_ipc_source) |source| {
-        c.dispatch_source_cancel(source);
-        g_ipc_source = null;
-    }
-}
-
 // Event bridge (called from ObjC shim)
 
 // Thread-safe: AX observer callbacks run on per-app background threads
@@ -2726,7 +2728,6 @@ pub fn main(init: std.process.Init.Minimal) !void {
         log.err("IPC init failed: {}", .{err});
         return err;
     };
-    defer cancelIpcSource();
     defer g_ipc.deinit(g_allocator);
     ipc.g_dispatch = ipcDispatch;
 
@@ -2742,7 +2743,8 @@ pub fn main(init: std.process.Init.Minimal) !void {
     defer ax_observer.deinit();
     setupHotkeyEventTap();
     initWakerSource();
-    initIpcSource(@intCast(g_ipc.fd));
+    try startIpcTransport();
+    defer stopIpcTransport();
     refreshRolePolling();
     observeDiscoveredApps();
 
@@ -2772,6 +2774,7 @@ fn bw_drain_events() void {
     while (g_ring.pop()) |ev| {
         handleEvent(&ev);
     }
+    drainIpcRequests();
 
     // Flush retile BEFORE cleanup so windows are at their layout positions
     // when cleanup checks on-screen status. Without this, cleanup sees
@@ -2828,35 +2831,109 @@ fn gracefulStopNSApp() void {
     app.msgSend(void, "postEvent:atStart:", .{ event, true });
 }
 
-/// Accept and handle one IPC client connection — called by dispatch_source.
-fn bw_handle_ipc_client(server_fd: c_int) void {
-    // std.posix.accept was removed in Zig 0.16; call libc directly.
-    const client_fd = std.c.accept(server_fd, null, null);
-    if (client_fd < 0) {
-        log.err("accept failed: errno={d}", .{std.c._errno().*});
-        return;
-    }
-    defer _ = std.c.close(client_fd);
-    ipc.disableSigpipe(client_fd);
+fn handleIpcRequest(request: IpcRequest) void {
+    defer _ = std.c.close(request.fd);
     const started_ns = nanoTimestamp();
-
-    var buf: [512]u8 = undefined;
-    const n = posix.read(client_fd, &buf) catch |err| {
-        log.err("IPC read: {}", .{err});
-        return;
-    };
-    if (n == 0) return;
-
-    const cmd = std.mem.trimEnd(u8, buf[0..n], &.{ '\n', '\r', ' ', 0 });
-    if (cmd.len == 0) return;
-    log.debug("[trace] ipc recv fd={} bytes={} cmd={s}", .{ client_fd, n, cmd });
+    const cmd = request.buf[0..request.len];
+    log.debug("[trace] ipc recv fd={} bytes={} cmd={s}", .{ request.fd, request.len, cmd });
 
     if (ipc.g_dispatch) |dispatch| {
-        dispatch(cmd, client_fd);
+        dispatch(cmd, request.fd);
         const elapsed_ms = @divTrunc(nanoTimestamp() - started_ns, std.time.ns_per_ms);
-        log.debug("[trace] ipc handled fd={} cmd={s} elapsed_ms={}", .{ client_fd, cmd, elapsed_ms });
+        log.debug("[trace] ipc handled fd={} cmd={s} elapsed_ms={}", .{ request.fd, cmd, elapsed_ms });
     } else {
         log.warn("ipc dispatch callback missing", .{});
+    }
+}
+
+fn drainIpcRequests() void {
+    while (g_ipc_requests.pop()) |request| {
+        handleIpcRequest(request);
+    }
+}
+
+fn configureIpcClient(fd: c_int) void {
+    ipc.disableSigpipe(fd);
+    const timeout: std.c.timeval = .{ .sec = 0, .usec = 250_000 };
+    posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.SNDTIMEO, std.mem.asBytes(&timeout)) catch |err| {
+        log.warn("IPC send timeout setup failed: {}", .{err});
+    };
+}
+
+fn readIpcRequest(fd: c_int) ?IpcRequest {
+    var request: IpcRequest = .{ .fd = fd, .len = 0, .buf = undefined };
+    var written: usize = 0;
+
+    while (written < request.buf.len) {
+        var poll_fds = [_]posix.pollfd{.{
+            .fd = fd,
+            .events = posix.POLL.IN,
+            .revents = 0,
+        }};
+        const ready = posix.poll(&poll_fds, 1000) catch return null;
+        if (ready == 0) return null;
+
+        const n = posix.read(fd, request.buf[written..]) catch return null;
+        if (n == 0) break;
+        written += n;
+    }
+
+    if (written == request.buf.len) {
+        ipc.writeResponse(fd, "err: command too long\n");
+        return null;
+    }
+
+    const command = std.mem.trimEnd(u8, request.buf[0..written], &.{ '\n', '\r', ' ', 0 });
+    if (command.len == 0) return null;
+    request.len = @intCast(command.len);
+    return request;
+}
+
+fn ipcAcceptLoop() void {
+    while (!g_ipc_transport_stop.load(.acquire)) {
+        var poll_fds = [_]posix.pollfd{.{
+            .fd = g_ipc.fd,
+            .events = posix.POLL.IN,
+            .revents = 0,
+        }};
+        const ready = posix.poll(&poll_fds, 250) catch |err| {
+            if (!g_ipc_transport_stop.load(.acquire)) {
+                log.warn("IPC listener poll failed: {}", .{err});
+            }
+            continue;
+        };
+        if (ready == 0) continue;
+
+        const client_fd = std.c.accept(g_ipc.fd, null, null);
+        if (client_fd < 0) continue;
+        configureIpcClient(client_fd);
+
+        const request = readIpcRequest(client_fd) orelse {
+            _ = std.c.close(client_fd);
+            continue;
+        };
+        if (!g_ipc_requests.push(request)) {
+            ipc.writeResponse(client_fd, "err: IPC queue busy\n");
+            _ = std.c.close(client_fd);
+            continue;
+        }
+        signalWaker();
+    }
+}
+
+fn startIpcTransport() !void {
+    std.debug.assert(g_ipc_thread == null);
+    g_ipc_transport_stop.store(false, .release);
+    g_ipc_thread = try std.Thread.spawn(.{}, ipcAcceptLoop, .{});
+}
+
+fn stopIpcTransport() void {
+    g_ipc_transport_stop.store(true, .release);
+    if (g_ipc_thread) |thread| thread.join();
+    g_ipc_thread = null;
+
+    while (g_ipc_requests.pop()) |request| {
+        _ = std.c.close(request.fd);
     }
 }
 

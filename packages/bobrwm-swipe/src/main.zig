@@ -5,6 +5,7 @@ const objc = @import("objc");
 const c = @import("c");
 const cg_extra = @import("cg_extra");
 const config_mod = @import("bobrwm_config");
+const runtime_paths = @import("runtime_paths");
 
 const log = std.log.scoped(.bobrwm_swipe);
 
@@ -295,7 +296,7 @@ fn findSample(samples: []const TouchSample, id: usize) ?TouchSample {
 
 fn sendIpcCommand(cmd: []const u8) IpcResult {
     var path_buf: [128]u8 = undefined;
-    const path = std.fmt.bufPrintSentinel(&path_buf, "/tmp/bobrwm_{d}.sock", .{std.c.getuid()}, 0) catch return .failed;
+    const path = runtime_paths.socketPathBuf(&path_buf) catch return .failed;
 
     const fd = std.c.socket(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0);
     if (fd < 0) return .failed;
@@ -306,8 +307,9 @@ fn sendIpcCommand(cmd: []const u8) IpcResult {
     };
 
     var addr: std.posix.sockaddr.un = .{ .path = undefined, .family = std.posix.AF.UNIX };
+    if (path.len >= addr.path.len) return .failed;
     @memcpy(addr.path[0..path.len], path[0..path.len]);
-    if (path.len < addr.path.len) addr.path[path.len] = 0;
+    addr.path[path.len] = 0;
 
     if (std.c.connect(fd, @ptrCast(&addr), @sizeOf(std.posix.sockaddr.un)) != 0) return .failed;
     if (!writeAll(fd, cmd)) return .failed;
