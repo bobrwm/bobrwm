@@ -136,7 +136,7 @@ const help_text =
     \\  version                  Show version information
     \\
     \\Window Commands (IPC):
-    \\  retile                    Re-tile all windows on the active workspace
+    \\  retile                    Re-tile visible workspaces on all displays
     \\  reload-config             Reload config, keeping current config on failure
     \\  toggle-split              Cycle BSP split mode (auto, horizontal, vertical)
     \\  focus <direction>         Focus window in direction (left, right, up, down)
@@ -150,7 +150,6 @@ const help_text =
     \\BSP Layout Commands (IPC):
     \\  bsp ratio rel <delta>     Adjust focused split ratio relatively
     \\  bsp ratio abs <ratio>     Set focused split ratio absolutely
-    \\  bsp insert-mode <mode>    Set insert mode (split, stack)
     \\  bsp insert-point <point>  Set insertion point (focused, first, last, min_depth)
     \\  bsp mirror <axis>         Mirror layout (horizontal, vertical)
     \\  bsp equalize              Reset all split ratios to default

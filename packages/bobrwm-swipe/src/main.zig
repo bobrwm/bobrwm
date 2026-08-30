@@ -9,7 +9,7 @@ const runtime_paths = @import("runtime_paths");
 
 const log = std.log.scoped(.bobrwm_swipe);
 
-const max_touches: usize = 16;
+const max_touches: usize = config_mod.max_swipe_fingers;
 const nsevent_type_gesture: c.CGEventType = 29;
 const touch_phase_ended: u32 = 1 << 3;
 const touch_phase_cancelled: u32 = 1 << 4;
@@ -168,7 +168,7 @@ fn parseCli(process_args: std.process.Args) Cli {
 
 fn validateSwipeConfig(config: config_mod.SwipeConfig) !RuntimeConfig {
     if (config.fingers == 0 or config.fingers > max_touches) return error.InvalidFingerCount;
-    if (config.distance_pct <= 0 or config.distance_pct > 1) return error.InvalidDistancePct;
+    if (!std.math.isFinite(config.distance_pct) or config.distance_pct <= 0 or config.distance_pct > 1) return error.InvalidDistancePct;
     return .{
         .fingers = config.fingers,
         .distance_pct = config.distance_pct,

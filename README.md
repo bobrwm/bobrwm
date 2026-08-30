@@ -68,7 +68,6 @@ bobrwm query apps --json  # IPC: list observed apps as JSON
 bobrwm focus-workspace next # IPC: switch to next workspace without wrapping
 bobrwm focus-workspace prev # IPC: switch to previous workspace without wrapping
 bobrwm move-to-display 2  # IPC: move focused window to display slot 2
-bobrwm bsp insert-mode stack          # IPC: split | stack
 bobrwm bsp insert-point min_depth     # IPC: focused | first | last | min_depth
 bobrwm bsp ratio rel 0.05             # IPC: adjust focused parent split ratio
 bobrwm bsp ratio abs 0.6              # IPC: set focused parent split ratio
@@ -130,9 +129,9 @@ Config is loaded from (in order):
 If no config file is found, built-in defaults are used. See [`examples/config.zon`](examples/config.zon) for a full example.
 
 Press `Alt+Shift+R` (the default `reload_config` binding) to apply changes
-without restarting. If the file contains invalid ZON, bobrwm keeps the last
-valid configuration and shows a temporary error in its menu-bar item; parser
-details remain in the error log.
+without restarting. If the file contains invalid ZON or values outside the
+documented bounds, bobrwm keeps the last valid configuration and shows a
+temporary error in its menu-bar item; details remain in the error log.
 
 The same reload is available from the command line:
 
@@ -168,6 +167,7 @@ built-in defaults; use the same key + modifiers to override a default binding.
 | `focus_previous_workspace` | Switch to the previous workspace; if already at the first workspace, pass the key through | — |
 | `focus_next_workspace` | Switch to the next workspace; if already at the last workspace, pass the key through | — |
 | `move_to_workspace` | Move focused window to workspace N | workspace number |
+| `move_workspace_to_display` | Move the active workspace to display N | display number |
 | `focus_left` | Focus window to the left | — |
 | `focus_right` | Focus window to the right | — |
 | `focus_up` | Focus window above | — |
@@ -175,6 +175,12 @@ built-in defaults; use the same key + modifiers to override a default binding.
 | `toggle_split` | Toggle next split direction | — |
 | `toggle_fullscreen` | Toggle focused window fullscreen | — |
 | `toggle_float` | Toggle focused window floating | — |
+| `swap_left` | Swap the focused tiled window left | — |
+| `swap_right` | Swap the focused tiled window right | — |
+| `swap_up` | Swap the focused tiled window up | — |
+| `swap_down` | Swap the focused tiled window down | — |
+| `center_float` | Center the focused floating window | — |
+| `toggle_dimming` | Toggle inactive-window dimming | — |
 | `reload_config` | Reload the config file, keeping the current config if parsing fails | — |
 
 ### Gaps
@@ -194,6 +200,7 @@ Choose the tiling algorithm:
 
 ```zon
 .layout = .bsp, // .bsp | .monocle
+.bsp_split_ratio = 0.5, // finite value from 0.1 through 0.9
 ```
 
 ### Workspaces
@@ -211,7 +218,7 @@ By default, bobrwm creates 10 workspaces. To configure a smaller count, provide 
 },
 ```
 
-Workspace IDs are still 1-based, so the example above creates workspaces 1 through 4. Keybinds and app assignments should only reference workspaces in that range. The current maximum is 10 workspaces.
+Workspace IDs are still 1-based, so the example above creates workspaces 1 through 4. Keybinds and app assignments must reference workspaces in that range. The current maximum is 10 workspaces; invalid references reject the entire config.
 
 ### Workspace Assignments
 

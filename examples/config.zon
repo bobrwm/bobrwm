@@ -19,7 +19,7 @@
     // .focused, .first, .last, .min_depth
     // .bsp_insert_point = .focused,
 
-    // Default ratio for newly-created BSP splits (clamped to 0.1..0.9).
+    // Default ratio for newly-created BSP splits (must be 0.1..0.9).
     // .bsp_split_ratio = 0.5,
 
     // Placement for newly tiled windows when splitting.

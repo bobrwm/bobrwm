@@ -7,6 +7,7 @@ const shim = @import("shim_api.zig");
 const tiling = @import("tiling.zig");
 const osutil = @import("osutil.zig");
 const animation = @import("animation.zig");
+const workspace = @import("workspace.zig");
 
 const log = std.log.scoped(.config);
 
@@ -317,6 +318,8 @@ pub const SwipeConfig = struct {
     reverse: bool = false,
 };
 
+pub const max_swipe_fingers: u8 = 16;
+
 /// Inactive-window dimming via owned black overlay panels. When enabled, every
 /// visible managed window except the focused one gets a click-through black
 /// overlay at `level` opacity, giving a clean multiplicative darken with no
@@ -473,6 +476,98 @@ fn isDefaultKeybindSlice(keybinds: []const Keybind) bool {
 
 // Loading
 
+/// Reject values that parse as valid ZON but violate runtime invariants.
+/// Validation happens before a config becomes visible to the main loop, so a
+/// bad reload leaves the last known-good config intact.
+pub fn validate(config: *const Config) !void {
+    if (config.workspace_names.len > workspace.max_workspaces) return error.TooManyWorkspaces;
+    const workspace_count: usize = if (config.workspace_names.len == 0)
+        workspace.max_workspaces
+    else
+        config.workspace_names.len;
+
+    for (config.workspace_names) |name| {
+        if (!std.unicode.utf8ValidateSlice(name) or std.mem.indexOfScalar(u8, name, 0) != null) {
+            return error.InvalidWorkspaceName;
+        }
+    }
+
+    if (!std.math.isFinite(config.bsp_split_ratio) or
+        config.bsp_split_ratio < 0.1 or
+        config.bsp_split_ratio > 0.9)
+    {
+        return error.InvalidBspSplitRatio;
+    }
+    if (!std.math.isFinite(config.dimmed_inactive.level) or
+        config.dimmed_inactive.level < 0 or
+        config.dimmed_inactive.level > 1)
+    {
+        return error.InvalidDimLevel;
+    }
+    if (config.swipe.fingers == 0 or config.swipe.fingers > max_swipe_fingers) {
+        return error.InvalidSwipeFingerCount;
+    }
+    if (!std.math.isFinite(config.swipe.distance_pct) or
+        config.swipe.distance_pct <= 0 or
+        config.swipe.distance_pct > 1)
+    {
+        return error.InvalidSwipeDistance;
+    }
+
+    try validateKeybinds(config.keybinds, workspace_count);
+    try validateAppRules(config.app_rules, workspace_count);
+    try validateWorkspaceAssignments(config.workspace_assignments, workspace_count);
+}
+
+fn validateKeybinds(keybinds: []const Keybind, workspace_count: usize) !void {
+    const validate_targets = !isDefaultKeybindSlice(keybinds);
+    for (keybinds) |keybind| {
+        if (keyNameToCode(keybind.key) == null) return error.UnknownKeyName;
+        if (!validate_targets) continue;
+        switch (keybind.action) {
+            .focus_workspace, .move_to_workspace => {
+                if (keybind.arg == 0 or @as(usize, keybind.arg) > workspace_count) {
+                    return error.InvalidKeybindWorkspace;
+                }
+            },
+            .move_workspace_to_display => {
+                if (keybind.arg == 0 or keybind.arg > workspace.max_displays) {
+                    return error.InvalidKeybindDisplay;
+                }
+            },
+            else => {},
+        }
+    }
+}
+
+fn validateAppRules(rules: []const AppRule, workspace_count: usize) !void {
+    for (rules, 0..) |rule, i| {
+        if (rule.app_id.len == 0) return error.EmptyAppId;
+        if (rule.workspace) |workspace_id| {
+            if (workspace_id == 0 or @as(usize, workspace_id) > workspace_count) {
+                return error.InvalidAppRuleWorkspace;
+            }
+        }
+        for (rules[0..i]) |previous| {
+            if (std.mem.eql(u8, previous.app_id, rule.app_id)) return error.DuplicateAppRule;
+        }
+    }
+}
+
+fn validateWorkspaceAssignments(assignments: []const WorkspaceAssignment, workspace_count: usize) !void {
+    for (assignments, 0..) |assignment, i| {
+        if (assignment.app_id.len == 0) return error.EmptyAppId;
+        if (assignment.workspace == 0 or @as(usize, assignment.workspace) > workspace_count) {
+            return error.InvalidWorkspaceAssignment;
+        }
+        for (assignments[0..i]) |previous| {
+            if (std.mem.eql(u8, previous.app_id, assignment.app_id)) {
+                return error.DuplicateWorkspaceAssignment;
+            }
+        }
+    }
+}
+
 pub fn load(allocator: std.mem.Allocator, explicit_path: ?[]const u8) Config {
     const path = resolvePath(allocator, explicit_path) catch return .{};
     defer allocator.free(path);
@@ -517,6 +612,10 @@ pub fn loadFromPath(allocator: std.mem.Allocator, path: []const u8) ?Config {
     // asserts at comptime that T contains no allocator-managed types.
     const parsed = std.zon.parse.fromSliceAlloc(Config, allocator, source, null, .{}) catch |err| {
         log.err("failed to parse {s}: {}", .{ path, err });
+        return null;
+    };
+    validate(&parsed) catch |err| {
+        log.err("invalid config {s}: {}", .{ path, err });
         return null;
     };
 
@@ -654,6 +753,75 @@ test "default config" {
     try t.expect(!cfg.animation.enabled);
     try t.expectEqual(@as(u64, 200), cfg.animation.duration_ms);
     try t.expectEqual(animation.Easing.ease_out, cfg.animation.easing);
+}
+
+test "validate accepts defaults and a reduced workspace set" {
+    const defaults: Config = .{};
+    try validate(&defaults);
+
+    const reduced: Config = .{ .workspace_names = &.{ "term", "web", "code", "chat" } };
+    try validate(&reduced);
+}
+
+test "validate rejects geometry and gesture values that are not finite or bounded" {
+    var cfg: Config = .{};
+
+    cfg.bsp_split_ratio = std.math.inf(f64);
+    try t.expectError(error.InvalidBspSplitRatio, validate(&cfg));
+
+    cfg = .{};
+    cfg.dimmed_inactive.level = std.math.nan(f32);
+    try t.expectError(error.InvalidDimLevel, validate(&cfg));
+
+    cfg = .{};
+    cfg.swipe.fingers = max_swipe_fingers + 1;
+    try t.expectError(error.InvalidSwipeFingerCount, validate(&cfg));
+
+    cfg = .{};
+    cfg.swipe.distance_pct = std.math.nan(f64);
+    try t.expectError(error.InvalidSwipeDistance, validate(&cfg));
+}
+
+test "validate rejects invalid workspace references and duplicate rules" {
+    const too_many_names: Config = .{
+        .workspace_names = &.{ "1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11" },
+    };
+    try t.expectError(error.TooManyWorkspaces, validate(&too_many_names));
+
+    const invalid_keybinds = [_]Keybind{
+        .{ .key = "1", .mods = .{ .alt = true }, .action = .focus_workspace, .arg = 5 },
+    };
+    const bad_keybind: Config = .{
+        .workspace_names = &.{ "1", "2", "3", "4" },
+        .keybinds = &invalid_keybinds,
+    };
+    try t.expectError(error.InvalidKeybindWorkspace, validate(&bad_keybind));
+
+    const bad_assignment: Config = .{
+        .workspace_names = &.{ "1", "2" },
+        .workspace_assignments = &.{.{ .app_id = "com.example.App", .workspace = 0 }},
+    };
+    try t.expectError(error.InvalidWorkspaceAssignment, validate(&bad_assignment));
+
+    const duplicate_rules: Config = .{
+        .app_rules = &.{
+            .{ .app_id = "com.example.App", .float = true },
+            .{ .app_id = "com.example.App", .workspace = 2 },
+        },
+    };
+    try t.expectError(error.DuplicateAppRule, validate(&duplicate_rules));
+}
+
+test "validate rejects unknown keys and invalid workspace name text" {
+    const keybinds = [_]Keybind{
+        .{ .key = "F1", .mods = .{ .alt = true }, .action = .focus_left },
+    };
+    const unknown_key: Config = .{ .keybinds = &keybinds };
+    try t.expectError(error.UnknownKeyName, validate(&unknown_key));
+
+    const invalid_utf8 = [_]u8{0xff};
+    const invalid_name: Config = .{ .workspace_names = &.{invalid_utf8[0..]} };
+    try t.expectError(error.InvalidWorkspaceName, validate(&invalid_name));
 }
 
 test "default_keybinds" {
