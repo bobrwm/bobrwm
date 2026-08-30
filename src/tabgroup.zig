@@ -329,6 +329,21 @@ test "removeMember hands leadership to a surviving member" {
     }
 }
 
+test "focused member becomes active without taking the leader slot" {
+    var mgr = TabGroupManager.init(testing.allocator);
+    defer mgr.deinit();
+
+    _ = try mgr.createGroupWithMember(100, 1, 2, test_frame);
+    try testing.expectEqual(@as(WindowId, 2), mgr.resolveActive(1));
+
+    mgr.setActive(1);
+    try testing.expectEqual(@as(WindowId, 1), mgr.resolveActive(1));
+
+    mgr.setActive(2);
+    try testing.expectEqual(@as(WindowId, 1), mgr.resolveLeader(2));
+    try testing.expectEqual(@as(WindowId, 2), mgr.resolveActive(1));
+}
+
 test "removeMember dissolves a two-member group to a solo survivor" {
     var mgr = TabGroupManager.init(testing.allocator);
     defer mgr.deinit();

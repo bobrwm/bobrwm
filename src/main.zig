@@ -418,26 +418,55 @@ fn focusedWindowIdForLoggedEvent(comptime event_name: []const u8, pid: i32) ?u32
     return focused_wid;
 }
 
-fn focusedManagedLeaderWindow() ?window_mod.Window {
-    const pid = frontmostApplicationPid() orelse return null;
-    const focused_wid = focusedWindowIdForPid(pid) orelse return null;
-
+fn managedLeaderForFocusedWindow(pid: i32, focused_wid: u32) ?window_mod.Window {
+    std.debug.assert(pid > 0);
+    std.debug.assert(focused_wid != 0);
     const leader_wid = g_tab_groups.resolveLeader(focused_wid);
     const leader = g_store.get(leader_wid) orelse return null;
     if (leader.pid != pid) return null;
     return leader;
 }
 
+fn focusedManagedLeaderWindow() ?window_mod.Window {
+    const pid = frontmostApplicationPid() orelse return null;
+    const focused_wid = focusedWindowIdForPid(pid) orelse return null;
+    return managedLeaderForFocusedWindow(pid, focused_wid);
+}
+
 /// Window a hotkey that acts on "the focused window" should target. Asks AX
-/// first: the per-workspace cache only advances on focus notifications that
-/// survive the transition filters, so with two windows of one app it lags a
-/// click and the hotkey lands on the wrong window. Falls back to the cache
-/// when the frontmost app's focused window is unmanaged or sits on a workspace
-/// that is not currently visible, where retile would never place it.
+/// first and synchronizes native-tab state before returning the group's leader:
+/// the per-workspace cache and active-tab record can both lag a user click.
+/// Falls back to the cache during transitions or when reconciliation cannot
+/// produce a visible managed window.
 fn hotkeyTargetWindowId() ?u32 {
-    if (focusedManagedLeaderWindow()) |win| {
-        if (workspaceVisibleOnDisplay(win.workspace_id, win.display_id)) return win.wid;
+    const pid = frontmostApplicationPid() orelse return g_workspaces.active().focused_wid;
+    const focused_wid = focusedWindowIdForPid(pid) orelse return g_workspaces.active().focused_wid;
+
+    if (managedLeaderForFocusedWindow(pid, focused_wid)) |win| {
+        if (workspaceVisibleOnDisplay(win.workspace_id, win.display_id)) {
+            // A known suppressed member can become AX-focused without a
+            // notification reaching the main loop first. The leader owns the
+            // fullscreen flag, but retile must address this active member.
+            if (!g_workspace_transition.isActive()) {
+                _ = syncFocusStateForWindowId(focused_wid, .keyboard);
+            }
+            return win.wid;
+        }
     }
+
+    // Native tabs can replace the focused CG window ID without emitting a
+    // creation event. Do not send the first hotkey after a tab switch to the
+    // stale workspace cache: reconcile the AX-reported ID synchronously, then
+    // resolve it back to the group's slot. Transition focus remains isolated
+    // until its settle window closes, as with asynchronous AX focus events.
+    if (!g_workspace_transition.isActive()) {
+        log.debug("hotkey target reconciling unknown focused window pid={d} wid={d}", .{ pid, focused_wid });
+        reconcileFocusedWindow(pid, focused_wid);
+        if (managedLeaderForFocusedWindow(pid, focused_wid)) |win| {
+            if (workspaceVisibleOnDisplay(win.workspace_id, win.display_id)) return win.wid;
+        }
+    }
+
     return g_workspaces.active().focused_wid;
 }
 
