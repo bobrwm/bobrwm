@@ -95,6 +95,12 @@ const workspace_event_debounce_interval_s: f64 = 0.05;
 const display_settle_delay_s: f64 = 0.25;
 /// Hard cap for workspace transition convergence before we fail closed.
 const workspace_transition_watchdog_interval_s: f64 = 0.4;
+/// A successful AX write can precede the corresponding WindowServer move.
+/// Keep the outgoing workspace covering the display while polling for the
+/// incoming physical frames; the deferred path handles slower applications.
+const workspace_reveal_poll_interval_us: u32 = 500;
+const workspace_reveal_wait_max_us: u32 = 50_000;
+const workspace_reveal_deferred_timeout_s: f64 = 1.0;
 
 const DisplayInfo = struct {
     id: u32,
@@ -170,6 +176,13 @@ const WorkspaceTransitionState = struct {
     fn isActive(self: WorkspaceTransitionState) bool {
         return self.kind != .idle;
     }
+};
+
+const PendingWorkspacePark = struct {
+    outgoing_workspace_id: u8,
+    target_workspace_id: u8,
+    display_id: u32,
+    deadline_at_s: f64,
 };
 
 const PendingFocusEntry = struct {
@@ -1536,6 +1549,7 @@ var g_role_poll_source: c.dispatch_source_t = null;
 var g_tap_port: c.CFMachPortRef = null;
 var g_workspace_transition: WorkspaceTransitionState = .{};
 var g_workspace_transition_completion_reason: WorkspaceTransitionCompletionReason = .none;
+var g_pending_workspace_parks: [workspace_mod.max_displays]?PendingWorkspacePark = @splat(null);
 var g_pending_focus_entries: [pending_focus_capacity_per_epoch]PendingFocusEntry = undefined;
 var g_pending_focus_count: usize = 0;
 var g_pending_focus_sequence: u64 = 0;
@@ -3618,6 +3632,7 @@ fn handleEvent(ev: *const event_mod.Event) void {
         },
         .role_poll_tick => {
             reconcileDueGeometryObservations();
+            processPendingWorkspaceParks();
             if (processDueDisplayResettle()) return;
             const promoted_pending = processPendingRoleWindows();
             const promoted_deferred = processDeferredWindowCandidates();
@@ -3910,6 +3925,7 @@ fn refreshRolePolling() void {
         g_focus_retries.count() > 0 or
         g_deferred_follow_focus != null or
         g_display_resettle_at_s != 0 or
+        hasPendingWorkspaceParks() or
         g_event_overflow_recovery_pending or
         g_geometry.hasPendingResamples();
     setRolePolling(has_pending);
@@ -5528,6 +5544,11 @@ fn firstUnclaimedWorkspace(claimed: []const bool) u8 {
 /// windows always follow their workspace — to the primary display when their
 /// monitor vanished, and back when it returns and reclaims the workspace.
 fn reconcileDisplayChange() void {
+    // Display slots and ids are about to be rebuilt. Any delayed park keyed
+    // by the old topology is invalid; parkHiddenWorkspaceWindows below
+    // re-establishes visibility from the new authoritative mapping.
+    g_pending_workspace_parks = @splat(null);
+
     // Snapshot present displays' active workspaces (by UUID) before the
     // topology changes, so a monitor that vanishes keeps its binding and
     // reclaims its workspace on return.
@@ -5611,6 +5632,7 @@ fn reconcileDisplayChange() void {
     parkHiddenWorkspaceWindows();
     rememberDisplayWorkspaces();
     assertDisplayCoverage();
+    refreshRolePolling();
 }
 
 /// Park every window of every hidden workspace so a topology change never
@@ -6140,6 +6162,147 @@ fn resolveWorkspace(pid: i32, display_id: u32) *workspace_mod.Workspace {
 
 // Workspace switching
 
+fn frameCenterOnDisplay(frame: window_mod.Window.Frame, display: shim.bw_frame) bool {
+    if (frame.width <= 0 or frame.height <= 0) return false;
+    const center_x = frame.x + frame.width / 2.0;
+    const center_y = frame.y + frame.height / 2.0;
+    return center_x >= display.x and center_x <= display.x + display.w and
+        center_y >= display.y and center_y <= display.y + display.h;
+}
+
+/// Confirm that every non-minimized incoming window physically covers its
+/// assigned target. AX returning success only means the app accepted the
+/// request; WindowServer can expose the parked frame for several more
+/// milliseconds. An empty workspace is immediately ready because revealing
+/// the wallpaper is the requested result.
+fn workspaceRevealSettled(ws: *const workspace_mod.Workspace, display_id: u32) bool {
+    const display_slot = displayIndexById(display_id) orelse return false;
+    const display = g_displays[display_slot].visible;
+
+    for (ws.windows.items) |leader_wid| {
+        const visible_wid = g_tab_groups.resolveActive(leader_wid);
+        const win = g_store.get(visible_wid) orelse return false;
+        if (win.is_minimized) continue;
+        if (win.workspace_id != ws.id or win.display_id != display_id) return false;
+        if (!frameCenterOnDisplay(win.frame, display)) return false;
+
+        const actual = liveWindowFrame(visible_wid) orelse return false;
+        if (!workspace_mod.frameCoversTarget(actual, win.frame)) return false;
+    }
+    return true;
+}
+
+fn waitForWorkspaceReveal(ws: *const workspace_mod.Workspace, display_id: u32) bool {
+    var waited_us: u32 = 0;
+    while (waited_us < workspace_reveal_wait_max_us) : (waited_us += workspace_reveal_poll_interval_us) {
+        if (workspaceRevealSettled(ws, display_id)) return true;
+        _ = c.usleep(workspace_reveal_poll_interval_us);
+    }
+    return workspaceRevealSettled(ws, display_id);
+}
+
+/// Park immediately once the incoming pixels are visible. Slow AX servers use
+/// the role-poll path, which leaves the old workspace covering the display
+/// instead of exposing the wallpaper while the reveal is still in flight.
+fn parkOutgoingWhenRevealed(
+    outgoing_ws: *workspace_mod.Workspace,
+    target_ws: *const workspace_mod.Workspace,
+    display_id: u32,
+) void {
+    const display_slot = displayIndexById(display_id) orelse return;
+    const prior = g_pending_workspace_parks[display_slot];
+
+    if (waitForWorkspaceReveal(target_ws, display_id)) {
+        g_pending_workspace_parks[display_slot] = null;
+        parkOutgoingWorkspace(outgoing_ws, target_ws.id, display_id);
+        if (prior) |pending| {
+            if (pending.outgoing_workspace_id != outgoing_ws.id and
+                pending.outgoing_workspace_id != target_ws.id)
+            {
+                if (g_workspaces.get(pending.outgoing_workspace_id)) |prior_outgoing| {
+                    parkOutgoingWorkspace(prior_outgoing, target_ws.id, display_id);
+                }
+            }
+        }
+        refreshRolePolling();
+        return;
+    }
+
+    // A prior deferred outgoing workspace still covers this display. Keep it
+    // as the cover and park the logical current workspace now, otherwise a
+    // rapid A → B → C sequence would leak both A and B over C.
+    const cover_workspace_id: u8 = if (prior) |pending| blk: {
+        if (pending.outgoing_workspace_id != target_ws.id and
+            pending.outgoing_workspace_id != outgoing_ws.id)
+        {
+            parkOutgoingWorkspace(outgoing_ws, target_ws.id, display_id);
+            break :blk pending.outgoing_workspace_id;
+        }
+        break :blk outgoing_ws.id;
+    } else outgoing_ws.id;
+
+    g_pending_workspace_parks[display_slot] = .{
+        .outgoing_workspace_id = cover_workspace_id,
+        .target_workspace_id = target_ws.id,
+        .display_id = display_id,
+        .deadline_at_s = c.CFAbsoluteTimeGetCurrent() + workspace_reveal_deferred_timeout_s,
+    };
+    log.debug("workspace switch deferring outgoing park current_workspace={d} target_workspace={d} display={d}", .{
+        cover_workspace_id,
+        target_ws.id,
+        display_id,
+    });
+    refreshRolePolling();
+}
+
+fn hasPendingWorkspaceParks() bool {
+    for (g_pending_workspace_parks) |pending| {
+        if (pending != null) return true;
+    }
+    return false;
+}
+
+fn processPendingWorkspaceParks() void {
+    var changed = false;
+    for (0..g_display_count) |display_slot| {
+        const pending = g_pending_workspace_parks[display_slot] orelse continue;
+        const active_workspace_id = g_workspaces.activeIdForDisplaySlot(display_slot);
+        if (active_workspace_id != pending.target_workspace_id) {
+            g_pending_workspace_parks[display_slot] = null;
+            changed = true;
+            if (pending.outgoing_workspace_id != active_workspace_id) {
+                if (g_workspaces.get(pending.outgoing_workspace_id)) |outgoing_ws| {
+                    parkOutgoingWorkspace(outgoing_ws, active_workspace_id, pending.display_id);
+                }
+            }
+            continue;
+        }
+
+        const target_ws = g_workspaces.get(pending.target_workspace_id) orelse {
+            g_pending_workspace_parks[display_slot] = null;
+            changed = true;
+            continue;
+        };
+        const reveal_settled = workspaceRevealSettled(target_ws, pending.display_id);
+        const timed_out = c.CFAbsoluteTimeGetCurrent() >= pending.deadline_at_s;
+        if (!reveal_settled and !timed_out) continue;
+
+        g_pending_workspace_parks[display_slot] = null;
+        changed = true;
+        if (!reveal_settled) {
+            log.warn("workspace switch reveal timed out current_workspace={d} target_workspace={d} display={d}; parking outgoing workspace", .{
+                pending.outgoing_workspace_id,
+                pending.target_workspace_id,
+                pending.display_id,
+            });
+        }
+        if (g_workspaces.get(pending.outgoing_workspace_id)) |outgoing_ws| {
+            parkOutgoingWorkspace(outgoing_ws, pending.target_workspace_id, pending.display_id);
+        }
+    }
+    if (changed) refreshRolePolling();
+}
+
 fn switchWorkspace(target_id: u8) void {
     const target_ws = g_workspaces.get(target_id) orelse return;
 
@@ -6201,12 +6364,17 @@ fn switchWorkspace(target_id: u8) void {
 
     startWorkspaceTransition(.switch_workspace, target_id, target_display);
     retile();
+    // `retile` normally batches work until the event drain completes. A
+    // workspace switch cannot use that latency boundary: parking the outgoing
+    // windows before the incoming AX writes land exposes the wallpaper. Flush
+    // the reveal now, while the outgoing workspace still covers the display.
+    flushRetileRequests();
     setFocusedDisplay(target_display);
     updateStatusBar();
 
     focusWorkspaceWindow(target_ws);
 
-    parkOutgoingWorkspace(old_ws, target_id, target_display);
+    parkOutgoingWhenRevealed(old_ws, target_ws, target_display);
 }
 
 /// Park every window the outgoing workspace has on `display_id`.
