@@ -2,8 +2,38 @@ const std = @import("std");
 const WindowId = @import("../window.zig").WindowId;
 const Frame = @import("../window.zig").Window.Frame;
 const bsp = @import("bsp.zig");
+const tiling = @import("../tiling.zig");
 const LayoutEntry = bsp.LayoutEntry;
 const InsertOptions = bsp.InsertOptions;
+
+pub const Command = void;
+pub const RuntimeSettings = struct {};
+pub const Config = struct {};
+
+pub fn parseCommand(_: []const u8) ?Command {
+    return null;
+}
+
+// Avoid compiler errors about already handling all cases by making this
+// non-exhaustive. This can be removed once another layout is added
+pub const HandleCommandError = error{_};
+
+pub fn handleCommandErrorString(_: tiling.HandleCommandError) ?[]const u8 {
+    return null;
+}
+
+/// Monocle currently has no layout-specific IPC commands. Keeping this
+/// handler in the module makes the layout command interface uniform.
+pub fn handleCommand(
+    _: Command,
+    _: ?*State,
+    _: ?WindowId,
+    _: *RuntimeSettings,
+) HandleCommandError!void {
+    return;
+}
+
+pub const help_text = "";
 
 pub const State = struct {
     windows: std.ArrayListUnmanaged(WindowId) = .empty,

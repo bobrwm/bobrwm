@@ -13,6 +13,7 @@ const build_options = @import("build_options");
 const log_options = @import("log_options.zig");
 const osutil = @import("osutil.zig");
 const runtime_paths = @import("runtime_paths.zig");
+const tiling = @import("tiling.zig");
 
 pub const std_options = std.Options{
     .log_level = log_options.level,
@@ -138,7 +139,6 @@ const help_text =
     \\Window Commands (IPC):
     \\  retile                    Re-tile visible workspaces on all displays
     \\  reload-config             Reload config, keeping current config on failure
-    \\  toggle-split              Cycle BSP split mode (auto, horizontal, vertical)
     \\  focus <direction>         Focus window in direction (left, right, up, down)
     \\  focus-workspace <n|prev|next>
     \\                            Focus workspace by number or adjacent direction
@@ -147,15 +147,7 @@ const help_text =
     \\  move-workspace-to-display <n|next|prev>
     \\                            Move active workspace to another display
     \\
-    \\BSP Layout Commands (IPC):
-    \\  bsp ratio rel <delta>     Adjust focused split ratio relatively
-    \\  bsp ratio abs <ratio>     Set focused split ratio absolutely
-    \\  bsp insert-point <point>  Set insertion point (focused, first, last, min_depth)
-    \\  bsp mirror <axis>         Mirror layout (horizontal, vertical)
-    \\  bsp equalize              Reset all split ratios to default
-    \\  bsp balance               Balance the BSP tree
-    \\  bsp rotate <degrees>      Rotate layout (90, 180, 270)
-    \\
+++ tiling.layout_help ++
     \\Query Commands (IPC):
     \\  query windows [--json]    List windows on the active workspace
     \\  query workspaces [--json] List all workspaces
