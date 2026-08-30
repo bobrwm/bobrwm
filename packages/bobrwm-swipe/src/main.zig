@@ -100,7 +100,8 @@ const GestureState = struct {
         if (@abs(avg_dx) <= @abs(avg_dy)) return null;
 
         self.fired = true;
-        return if (avg_dx < 0 and !runtime.reverse) .previous else .next;
+        const moves_previous = (avg_dx < 0) != runtime.reverse;
+        return if (moves_previous) .previous else .next;
     }
 };
 
@@ -414,23 +415,45 @@ test "validate swipe config" {
     try t.expectError(error.InvalidDistancePct, validateSwipeConfig(.{ .distance_pct = 1.1 }));
 }
 
-test "gesture frame fires once without wrapping policy" {
+test "gesture frame maps both directions with reverse policy" {
     const t = std.testing;
 
-    var state: GestureState = .{};
-    const runtime: RuntimeConfig = .{ .fingers = 3, .distance_pct = 0.08 };
     const start = [_]TouchSample{
         .{ .id = 1, .x = 0.5, .y = 0.5 },
         .{ .id = 2, .x = 0.6, .y = 0.5 },
         .{ .id = 3, .x = 0.7, .y = 0.5 },
     };
-    state.begin(&start);
-
-    const moved = [_]TouchSample{
+    const moved_left = [_]TouchSample{
         .{ .id = 1, .x = 0.4, .y = 0.51 },
         .{ .id = 2, .x = 0.5, .y = 0.51 },
         .{ .id = 3, .x = 0.6, .y = 0.51 },
     };
-    try t.expectEqual(Direction.previous, state.update(&moved, runtime).?);
-    try t.expectEqual(@as(?Direction, null), state.update(&moved, runtime));
+    const moved_right = [_]TouchSample{
+        .{ .id = 1, .x = 0.6, .y = 0.49 },
+        .{ .id = 2, .x = 0.7, .y = 0.49 },
+        .{ .id = 3, .x = 0.8, .y = 0.49 },
+    };
+
+    const cases = [_]struct {
+        moved: []const TouchSample,
+        reverse: bool,
+        expected: Direction,
+    }{
+        .{ .moved = &moved_left, .reverse = false, .expected = .previous },
+        .{ .moved = &moved_right, .reverse = false, .expected = .next },
+        .{ .moved = &moved_left, .reverse = true, .expected = .next },
+        .{ .moved = &moved_right, .reverse = true, .expected = .previous },
+    };
+
+    for (cases) |case| {
+        var state: GestureState = .{};
+        state.begin(&start);
+        const runtime: RuntimeConfig = .{
+            .fingers = 3,
+            .distance_pct = 0.08,
+            .reverse = case.reverse,
+        };
+        try t.expectEqual(case.expected, state.update(case.moved, runtime).?);
+        try t.expectEqual(@as(?Direction, null), state.update(case.moved, runtime));
+    }
 }
