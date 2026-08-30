@@ -202,13 +202,6 @@ const WorkspaceTraversalDirection = enum {
     next,
 };
 
-pub const StatusBarAction = union(enum) {
-    open_config,
-    previous_workspace,
-    next_workspace,
-    workspace: workspace_mod.WorkspaceId,
-};
-
 const HotkeyEvent = struct {
     kind: u8,
     arg: u32,
@@ -2541,32 +2534,31 @@ export fn bw_emit_event(kind: u8, pid: i32, wid: u32) void {
     signalWaker();
 }
 
-/// Callback target for BWObserver.appTerminated:. Called from
-/// objc_classes.zig so it no longer needs C-symbol export.
-pub fn bw_workspace_app_terminated(pid: i32) void {
+/// Callback target for BWObserver.appTerminated:.
+fn workspaceAppTerminated(pid: i32) void {
     std.debug.assert(pid > 0);
     bw_emit_event(shim.BW_EVENT_APP_TERMINATED, pid, 0);
 }
 
 /// Callback target for BWObserver.appLaunched:.
-pub fn bw_workspace_app_launched(pid: i32) void {
+fn workspaceAppLaunched(pid: i32) void {
     std.debug.assert(pid > 0);
     bw_emit_event(shim.BW_EVENT_APP_LAUNCHED, pid, 0);
 }
 
 /// Callback target for BWObserver.activeAppChanged:.
-pub fn bw_workspace_active_app_changed(pid: i32) void {
+fn workspaceActiveAppChanged(pid: i32) void {
     std.debug.assert(pid > 0);
     bw_emit_event(shim.BW_EVENT_WINDOW_FOCUSED, pid, 0);
 }
 
 /// Callback target for BWObserver.spaceChanged:.
-pub fn bw_workspace_space_changed() void {
+fn workspaceSpaceChanged() void {
     bw_emit_event(shim.BW_EVENT_SPACE_CHANGED, 0, 0);
 }
 
 /// Callback target for BWObserver.displayChanged:.
-pub fn bw_workspace_display_changed() void {
+fn workspaceDisplayChanged() void {
     bw_emit_event(shim.BW_EVENT_DISPLAY_CHANGED, 0, 0);
 }
 
@@ -2768,7 +2760,13 @@ pub fn main(init: std.process.Init.Minimal) !void {
     // -- NSApp (zig-objc) --
     // Register runtime ObjC classes (BWObserver / BWLaunchGate) before
     // any code does objc.getClass on them.
-    objc_classes.register(g_allocator);
+    objc_classes.register(g_allocator, .{
+        .app_launched = workspaceAppLaunched,
+        .app_terminated = workspaceAppTerminated,
+        .active_app_changed = workspaceActiveAppChanged,
+        .space_changed = workspaceSpaceChanged,
+        .display_changed = workspaceDisplayChanged,
+    });
     const NSApp = initApp();
     initWorkspaceObservers();
 
@@ -2783,7 +2781,18 @@ pub fn main(init: std.process.Init.Minimal) !void {
     observeDiscoveredApps();
 
     // Status bar (zig-objc) --
-    statusbar.init(g_workspaces.workspaces[0..g_workspaces.workspace_count], &g_config);
+    statusbar.init(
+        g_workspaces.workspaces[0..g_workspaces.workspace_count],
+        &g_config,
+        .{
+            .retile = statusBarRetile,
+            .open_config = statusBarOpenConfig,
+            .previous_workspace = statusBarPreviousWorkspace,
+            .next_workspace = statusBarNextWorkspace,
+            .switch_to_workspace = statusBarSwitchToWorkspace,
+            .quit = statusBarQuit,
+        },
+    );
     defer statusbar.deinit();
     updateStatusBar();
 
@@ -3002,24 +3011,38 @@ fn stopIpcTransport() void {
     }
 }
 
-/// Clean shutdown — called from the menu bar UI's quit action.
-pub fn bw_will_quit() void {
-    restoreAllWindows();
-}
-
-/// Retile — called from the menu bar UI's retile action.
-pub fn bw_retile() void {
+// Menu callbacks run on the main thread while AppKit dismisses the menu, so
+// state mutations are safe here. Keeping them in the application root makes
+// the UI adapter depend only on the callbacks it is given.
+fn statusBarRetile() callconv(.c) void {
     retile();
 }
 
-/// Dispatch a menu bar action on the main thread.
-pub fn bw_status_bar_action(action: StatusBarAction) void {
-    switch (action) {
-        .open_config => openConfigFile(),
-        .previous_workspace => switchAdjacentWorkspace(.previous),
-        .next_workspace => switchAdjacentWorkspace(.next),
-        .workspace => |workspace_id| switchWorkspace(workspace_id),
-    }
+fn statusBarOpenConfig() callconv(.c) void {
+    openConfigFile();
+}
+
+fn statusBarPreviousWorkspace() callconv(.c) void {
+    switchAdjacentWorkspace(.previous);
+}
+
+fn statusBarNextWorkspace() callconv(.c) void {
+    switchAdjacentWorkspace(.next);
+}
+
+fn statusBarSwitchToWorkspace(workspace_id: u8) callconv(.c) void {
+    if (workspace_id == 0 or workspace_id > g_workspaces.workspace_count) return;
+    switchWorkspace(workspace_id);
+}
+
+/// Restore windows before asking AppKit to terminate; the UI library must not
+/// own shutdown because restoration mutates all window-management state.
+fn statusBarQuit() callconv(.c) void {
+    restoreAllWindows();
+
+    const NSApplication = objc.getClass("NSApplication").?;
+    const app = NSApplication.msgSend(objc.Object, "sharedApplication", .{});
+    app.msgSend(void, "terminate:", .{@as(objc.Object, .{ .value = null })});
 }
 
 fn openConfigFile() void {
