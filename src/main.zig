@@ -5215,6 +5215,13 @@ fn adoptWindowAsBackgroundTab(win: window_mod.Window) tabgroup.detect.OffscreenO
 /// Updates `display_id` when a user-dragged window crosses monitors.
 /// Returns true when display ownership changed and callers should retile.
 fn updateWindowDisplayAssignment(wid: u32) bool {
+    // AX move/resize notifications also echo every frame bobrwm writes. The
+    // corresponding SkyLight bounds can still describe the previous frame,
+    // so accepting them here corrupts the stored layout target and makes the
+    // next placement look like a no-op. Only a live pointer drag transfers
+    // geometry ownership from the layout back to the user.
+    if (!g_mouse_left_down) return false;
+
     var win = g_store.get(wid) orelse return false;
     const sky = g_sky orelse return false;
 
@@ -5234,13 +5241,8 @@ fn updateWindowDisplayAssignment(wid: u32) bool {
         return false;
     }
 
-    // Only reassign display when the user is actively dragging and the
-    // workspace is visible. Stops our retile from triggering this.
-    if (!g_mouse_left_down) {
-        win.frame = frame;
-        g_store.put(win) catch {};
-        return false;
-    }
+    // Only reassign display while its workspace is visible. A notification
+    // from a hidden window must not transfer ownership to the visible display.
     if (!workspaceVisibleOnDisplay(win.workspace_id, win.display_id)) {
         win.frame = frame;
         g_store.put(win) catch {};
