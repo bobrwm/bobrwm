@@ -25,6 +25,7 @@ const loginitem = @import("loginitem.zig");
 const objc_classes = @import("objc_classes.zig");
 const animation_mod = @import("animation.zig");
 const ax_mod = @import("ax.zig");
+const spsc_queue = @import("spsc_queue.zig");
 
 extern fn _AXUIElementGetWindow(element: c.AXUIElementRef, wid: *u32) c.AXError;
 
@@ -54,46 +55,7 @@ pub const std_options = std.Options{
 
 const log = std.log.scoped(.bobrwm);
 
-// Fixed-capacity event ring. Producers are serialized by g_ring_lock because
-// AX callbacks run on the observer thread while AppKit and hotkey callbacks run
-// on the main thread. The main-runloop consumer remains lock-free.
-
-const EventRing = struct {
-    const capacity = 1024;
-
-    buf: [capacity]event_mod.Event = undefined,
-    head: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
-    tail: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
-    overflowed: std.atomic.Value(bool) = .init(false),
-    dropped: usize = 0,
-
-    fn push(self: *EventRing, ev: event_mod.Event) void {
-        const t = self.tail.load(.acquire);
-        const next = (t + 1) % capacity;
-        if (next == self.head.load(.acquire)) {
-            self.dropped += 1;
-            self.overflowed.store(true, .release);
-            log.err("event ring full, dropped event kind={s} pid={d} wid={d} total_dropped={d}", .{
-                @tagName(ev.kind), ev.pid, ev.wid, self.dropped,
-            });
-            return;
-        }
-        self.buf[t] = ev;
-        self.tail.store(next, .release);
-    }
-
-    fn pop(self: *EventRing) ?event_mod.Event {
-        const h = self.head.load(.acquire);
-        if (h == self.tail.load(.acquire)) return null; // empty
-        const ev = self.buf[h];
-        self.head.store((h + 1) % capacity, .release);
-        return ev;
-    }
-
-    fn takeOverflowed(self: *EventRing) bool {
-        return self.overflowed.swap(false, .acq_rel);
-    }
-};
+const EventQueue = spsc_queue.Queue(event_mod.Event, 1024);
 
 const IpcRequest = struct {
     fd: c_int,
@@ -103,30 +65,7 @@ const IpcRequest = struct {
 
 /// One IPC acceptor thread produces complete requests; the main thread drains
 /// them. Socket reads never run on AppKit's queue.
-const IpcRequestRing = struct {
-    const capacity = 16;
-
-    buf: [capacity]IpcRequest = undefined,
-    head: std.atomic.Value(usize) = .init(0),
-    tail: std.atomic.Value(usize) = .init(0),
-
-    fn push(self: *IpcRequestRing, request: IpcRequest) bool {
-        const tail = self.tail.load(.monotonic);
-        const next = (tail + 1) % capacity;
-        if (next == self.head.load(.acquire)) return false;
-        self.buf[tail] = request;
-        self.tail.store(next, .release);
-        return true;
-    }
-
-    fn pop(self: *IpcRequestRing) ?IpcRequest {
-        const head = self.head.load(.monotonic);
-        if (head == self.tail.load(.acquire)) return null;
-        const request = self.buf[head];
-        self.head.store((head + 1) % capacity, .release);
-        return request;
-    }
-};
+const IpcRequestQueue = spsc_queue.Queue(IpcRequest, 16);
 
 // Hidden-window position (bottom-right corner, barely visible)
 
@@ -1516,8 +1455,10 @@ fn framesEqual(lhs: window_mod.Window.Frame, rhs: window_mod.Window.Frame) bool 
 
 // Globals
 
-var g_ring: EventRing = .{};
-/// Protects g_ring.push from concurrent AX observer threads.
+var g_event_queue: EventQueue = .{};
+var g_event_overflowed: std.atomic.Value(bool) = .init(false);
+var g_event_dropped: usize = 0;
+/// Serializes producers before they enter the single-producer event queue.
 var g_ring_lock: c.os_unfair_lock_s = .{ ._os_unfair_lock_opaque = 0 };
 var g_sky: ?skylight.SkyLight = null;
 var g_allocator: std.mem.Allocator = undefined;
@@ -1575,7 +1516,7 @@ var g_cleanup_pending_pid_count: usize = 0;
 
 var g_animator: animation_mod.Animator = undefined;
 var g_animator_source: c.dispatch_source_t = null;
-var g_ipc_requests: IpcRequestRing = .{};
+var g_ipc_requests: IpcRequestQueue = .{};
 var g_ipc_thread: ?std.Thread = null;
 var g_ipc_transport_stop: std.atomic.Value(bool) = .init(false);
 var g_signal_source: c.dispatch_source_t = null;
@@ -2524,12 +2465,20 @@ fn setupHotkeyEventTap() void {
 // and push events here.  The os_unfair_lock serialises concurrent pushes
 // while the main-thread consumer (pop) is wait-free.
 export fn bw_emit_event(kind: u8, pid: i32, wid: u32) void {
-    c.os_unfair_lock_lock(&g_ring_lock);
-    g_ring.push(.{
+    const event: event_mod.Event = .{
         .kind = @enumFromInt(kind),
         .pid = pid,
         .wid = wid,
-    });
+    };
+
+    c.os_unfair_lock_lock(&g_ring_lock);
+    if (!g_event_queue.push(event)) {
+        g_event_dropped += 1;
+        g_event_overflowed.store(true, .release);
+        log.err("event queue full, dropped event kind={s} pid={d} wid={d} total_dropped={d}", .{
+            @tagName(event.kind), event.pid, event.wid, g_event_dropped,
+        });
+    }
     c.os_unfair_lock_unlock(&g_ring_lock);
     signalWaker();
 }
@@ -2814,12 +2763,12 @@ fn bw_drain_events() void {
 
     refreshTabGroupActiveTabs();
 
-    while (g_ring.pop()) |ev| {
+    while (g_event_queue.pop()) |ev| {
         handleEvent(&ev);
     }
     drainIpcRequests();
 
-    if (g_ring.takeOverflowed()) {
+    if (g_event_overflowed.swap(false, .acq_rel)) {
         g_event_overflow_recovery_pending = true;
         refreshRolePolling();
     }
