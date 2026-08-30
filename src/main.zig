@@ -15,6 +15,7 @@ const tiling = @import("tiling.zig");
 const bsp_mod = tiling.bsp_mod;
 const ipc = @import("ipc.zig");
 const ipc_transport = @import("ipc_transport.zig");
+const signal_transport = @import("signal_transport.zig");
 const tabgroup = @import("tabgroup.zig");
 const config_mod = @import("config.zig");
 const dim = @import("dim.zig");
@@ -1508,9 +1509,6 @@ var g_cleanup_pending_pid_count: usize = 0;
 var g_animator: animation_mod.Animator = undefined;
 var g_animator_source: c.dispatch_source_t = null;
 var g_ipc_transport: ipc_transport.Transport = .{};
-var g_signal_source: c.dispatch_source_t = null;
-var g_signal_read_fd: c_int = -1;
-var g_signal_write_fd: c_int = -1;
 
 const ConfigRuntime = struct {
     arena: std.heap.ArenaAllocator,
@@ -2676,10 +2674,8 @@ pub fn main(init: std.process.Init.Minimal) !void {
     }
 
     // -- Signal transport (handler writes only; cleanup runs on main) --
-    try initSignalTransport();
-    defer deinitSignalTransport();
-    installSignalHandlers();
-    defer uninstallSignalHandlers();
+    try signal_transport.init(gracefulStopNSApp);
+    defer signal_transport.deinit();
     errdefer restoreAllWindows();
 
     // -- Discover existing windows and tile --
@@ -5660,101 +5656,6 @@ fn restoreAllWindows() void {
                 _ = ax_mod.setWindowFrame(win.pid, wid, x, y, w, h);
             }
         }
-    }
-}
-
-/// Graceful signal handler for INT/TERM/HUP/QUIT. `write(2)` is
-/// async-signal-safe; the dispatch read source performs all AppKit and cleanup
-/// work later on the main queue. The pipe is nonblocking, so repeated signals
-/// cannot deadlock a full process in the handler.
-fn gracefulSignalHandler(sig: posix.SIG) callconv(.c) void {
-    const byte: u8 = @intCast(@intFromEnum(sig));
-    _ = c.write(g_signal_write_fd, &byte, 1);
-}
-
-fn signalSourceReady(context: ?*anyopaque) callconv(.c) void {
-    _ = context;
-    if (g_signal_read_fd < 0) return;
-
-    var buf: [64]u8 = undefined;
-    while (c.read(g_signal_read_fd, &buf, buf.len) > 0) {}
-    gracefulStopNSApp();
-}
-
-fn configureSignalPipeFd(fd: c_int) !void {
-    if (c.fcntl(fd, c.F_SETFL, c.O_NONBLOCK) < 0) return error.SignalPipeConfigureFailed;
-    if (c.fcntl(fd, c.F_SETFD, c.FD_CLOEXEC) < 0) return error.SignalPipeConfigureFailed;
-}
-
-fn initSignalTransport() !void {
-    std.debug.assert(g_signal_source == null);
-    std.debug.assert(g_signal_read_fd < 0 and g_signal_write_fd < 0);
-
-    var fds: [2]c_int = undefined;
-    if (c.pipe(&fds) != 0) return error.SignalPipeCreateFailed;
-    errdefer {
-        _ = std.c.close(fds[0]);
-        _ = std.c.close(fds[1]);
-    }
-    try configureSignalPipeFd(fds[0]);
-    try configureSignalPipeFd(fds[1]);
-
-    const source = c.dispatch_source_create(
-        cg_extra.DISPATCH_SOURCE_TYPE_READ(),
-        @intCast(fds[0]),
-        0,
-        cg_extra.dispatch_get_main_queue(),
-    ) orelse return error.SignalSourceCreateFailed;
-
-    g_signal_read_fd = fds[0];
-    g_signal_write_fd = fds[1];
-    g_signal_source = source;
-    c.dispatch_source_set_event_handler_f(source, signalSourceReady);
-    c.dispatch_resume(.{ ._ds = source });
-}
-
-fn deinitSignalTransport() void {
-    if (g_signal_source) |source| {
-        c.dispatch_source_cancel(source);
-        c.dispatch_release(.{ ._ds = source });
-        g_signal_source = null;
-    }
-    if (g_signal_read_fd >= 0) {
-        const fd = g_signal_read_fd;
-        g_signal_read_fd = -1;
-        _ = std.c.close(fd);
-    }
-    if (g_signal_write_fd >= 0) {
-        const fd = g_signal_write_fd;
-        g_signal_write_fd = -1;
-        _ = std.c.close(fd);
-    }
-}
-
-const graceful_signals = [_]posix.SIG{
-    posix.SIG.INT, posix.SIG.TERM,
-    posix.SIG.HUP, posix.SIG.QUIT,
-};
-
-fn installSignalHandlers() void {
-    for (graceful_signals) |sig| {
-        var sa: posix.Sigaction = .{
-            .handler = .{ .handler = gracefulSignalHandler },
-            .mask = posix.sigemptyset(),
-            .flags = posix.SA.RESTART,
-        };
-        posix.sigaction(sig, &sa, null);
-    }
-}
-
-fn uninstallSignalHandlers() void {
-    for (graceful_signals) |sig| {
-        var sa: posix.Sigaction = .{
-            .handler = .{ .handler = posix.SIG.DFL },
-            .mask = posix.sigemptyset(),
-            .flags = 0,
-        };
-        posix.sigaction(sig, &sa, null);
     }
 }
 
