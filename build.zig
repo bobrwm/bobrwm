@@ -399,6 +399,19 @@ pub fn build(b: *std.Build) !void {
 
     const run_ipc_tests = b.addRunArtifact(ipc_tests);
 
+    const queue_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/spsc_queue.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    const queue_tests = b.addTest(.{
+        .name = "spsc-queue-tests",
+        .root_module = queue_test_mod,
+    });
+
+    const run_queue_tests = b.addRunArtifact(queue_tests);
+
     // tabgroup.zig and tiling.zig are pure Zig (window.zig types only),
     // so their test modules need no SDK or include wiring either.
     const tabgroup_test_mod = b.createModule(.{
@@ -514,6 +527,7 @@ pub fn build(b: *std.Build) !void {
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_tests.step);
     test_step.dependOn(&run_ipc_tests.step);
+    test_step.dependOn(&run_queue_tests.step);
     test_step.dependOn(&run_tabgroup_tests.step);
     test_step.dependOn(&run_tiling_tests.step);
     test_step.dependOn(&run_workspace_tests.step);
