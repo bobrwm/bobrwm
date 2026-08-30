@@ -12,6 +12,7 @@ const posix = std.posix;
 const build_options = @import("build_options");
 const log_options = @import("log_options.zig");
 const osutil = @import("osutil.zig");
+const runtime_paths = @import("runtime_paths.zig");
 
 pub const std_options = std.Options{
     .log_level = log_options.level,
@@ -186,7 +187,7 @@ fn runClient(cmd: []const u8) u8 {
     var transport_failed = false;
 
     var path_buf: [128]u8 = undefined;
-    const path = std.fmt.bufPrintSentinel(&path_buf, "/tmp/bobrwm_{d}.sock", .{std.c.getuid()}, 0) catch {
+    const path = runtime_paths.socketPathBuf(&path_buf) catch {
         writeStderr("error: socket path too long\n");
         return 1;
     };
@@ -207,8 +208,12 @@ fn runClient(cmd: []const u8) u8 {
     };
 
     var addr: posix.sockaddr.un = .{ .path = undefined, .family = posix.AF.UNIX };
+    if (path.len >= addr.path.len) {
+        writeStderr("error: socket path too long\n");
+        return 1;
+    }
     @memcpy(addr.path[0..path.len], path[0..path.len]);
-    if (path.len < addr.path.len) addr.path[path.len] = 0;
+    addr.path[path.len] = 0;
 
     log.debug("[trace] ipc client connecting path={s} cmd={s}", .{ path, cmd });
 

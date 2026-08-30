@@ -255,6 +255,12 @@ pub fn build(b: *std.Build) !void {
     swipe_mod.addImport("c", c_mod);
     swipe_mod.addImport("cg_extra", cg_extra_mod);
     swipe_mod.addImport("bobrwm_config", swipe_config_mod);
+    swipe_mod.addImport("runtime_paths", b.createModule(.{
+        .root_source_file = b.path("src/runtime_paths.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    }));
     swipe_mod.addAssemblyFile(b.path("packages/bobrwm-swipe/src/info_plist.s"));
     swipe_mod.linkFramework("ApplicationServices", .{});
     swipe_mod.linkFramework("CoreGraphics", .{});
@@ -484,6 +490,12 @@ pub fn build(b: *std.Build) !void {
     swipe_test_mod.addImport("c", c_mod);
     swipe_test_mod.addImport("cg_extra", cg_extra_mod);
     swipe_test_mod.addImport("bobrwm_config", swipe_config_mod);
+    swipe_test_mod.addImport("runtime_paths", b.createModule(.{
+        .root_source_file = b.path("src/runtime_paths.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    }));
     swipe_test_mod.linkFramework("ApplicationServices", .{});
     swipe_test_mod.linkFramework("CoreGraphics", .{});
     swipe_test_mod.linkFramework("AppKit", .{});

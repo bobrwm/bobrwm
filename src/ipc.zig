@@ -3,6 +3,7 @@ const builtin = @import("builtin");
 const posix = std.posix;
 const tiling = @import("tiling.zig");
 const osutil = @import("osutil.zig");
+const runtime_paths = @import("runtime_paths.zig");
 
 const log = std.log.scoped(.ipc);
 
@@ -149,7 +150,8 @@ pub const Server = struct {
     path: [:0]const u8,
 
     pub fn init(allocator: std.mem.Allocator) !Server {
-        const path = try std.fmt.allocPrintSentinel(allocator, "/tmp/bobrwm_{d}.sock", .{std.c.getuid()}, 0);
+        try runtime_paths.ensureRuntimeDir(allocator);
+        const path = try runtime_paths.socketPathAlloc(allocator);
         errdefer allocator.free(path);
 
         // Check if another daemon is already running by probing the socket.
@@ -164,8 +166,9 @@ pub const Server = struct {
             defer _ = std.c.close(probe_fd);
 
             var addr: posix.sockaddr.un = .{ .path = undefined, .family = posix.AF.UNIX };
+            if (path.len >= addr.path.len) return error.NameTooLong;
             @memcpy(addr.path[0..path.len], path[0..path.len]);
-            if (path.len < addr.path.len) addr.path[path.len] = 0;
+            addr.path[path.len] = 0;
 
             if (std.c.connect(probe_fd, @ptrCast(&addr), @sizeOf(posix.sockaddr.un)) == 0) {
                 log.err("another bobrwm instance is already running on {s}", .{path});
@@ -183,13 +186,12 @@ pub const Server = struct {
         disableSigpipe(fd);
 
         var addr: posix.sockaddr.un = .{ .path = undefined, .family = posix.AF.UNIX };
-        if (path.len > addr.path.len) return error.NameTooLong;
+        if (path.len >= addr.path.len) return error.NameTooLong;
         @memcpy(addr.path[0..path.len], path[0..path.len]);
-        if (path.len < addr.path.len) {
-            addr.path[path.len] = 0;
-        }
+        addr.path[path.len] = 0;
 
         if (std.c.bind(fd, @ptrCast(&addr), @sizeOf(posix.sockaddr.un)) != 0) return error.BindFailed;
+        if (std.c.chmod(path, 0o600) != 0) return error.SecureSocketFailed;
         if (std.c.listen(fd, 5) != 0) return error.ListenFailed;
 
         log.info("IPC listening on {s}", .{path});
