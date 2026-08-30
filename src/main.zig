@@ -14,6 +14,7 @@ const workspace_mod = @import("workspace.zig");
 const tiling = @import("tiling.zig");
 const bsp_mod = tiling.bsp_mod;
 const ipc = @import("ipc.zig");
+const ipc_transport = @import("ipc_transport.zig");
 const tabgroup = @import("tabgroup.zig");
 const config_mod = @import("config.zig");
 const dim = @import("dim.zig");
@@ -56,16 +57,6 @@ pub const std_options = std.Options{
 const log = std.log.scoped(.bobrwm);
 
 const EventQueue = spsc_queue.Queue(event_mod.Event, 1024);
-
-const IpcRequest = struct {
-    fd: c_int,
-    len: u16,
-    buf: [512]u8,
-};
-
-/// One IPC acceptor thread produces complete requests; the main thread drains
-/// them. Socket reads never run on AppKit's queue.
-const IpcRequestQueue = spsc_queue.Queue(IpcRequest, 16);
 
 // Hidden-window position (bottom-right corner, barely visible)
 
@@ -1516,9 +1507,7 @@ var g_cleanup_pending_pid_count: usize = 0;
 
 var g_animator: animation_mod.Animator = undefined;
 var g_animator_source: c.dispatch_source_t = null;
-var g_ipc_requests: IpcRequestQueue = .{};
-var g_ipc_thread: ?std.Thread = null;
-var g_ipc_transport_stop: std.atomic.Value(bool) = .init(false);
+var g_ipc_transport: ipc_transport.Transport = .{};
 var g_signal_source: c.dispatch_source_t = null;
 var g_signal_read_fd: c_int = -1;
 var g_signal_write_fd: c_int = -1;
@@ -2724,8 +2713,8 @@ pub fn main(init: std.process.Init.Minimal) !void {
     defer ax_observer.deinit();
     setupHotkeyEventTap();
     initWakerSource();
-    try startIpcTransport();
-    defer stopIpcTransport();
+    try g_ipc_transport.start(g_ipc.fd, signalWaker);
+    defer g_ipc_transport.stop();
     refreshRolePolling();
     observeDiscoveredApps();
 
@@ -2854,10 +2843,10 @@ fn gracefulStopNSApp() void {
     app.msgSend(void, "postEvent:atStart:", .{ event, true });
 }
 
-fn handleIpcRequest(request: IpcRequest) void {
+fn handleIpcRequest(request: ipc_transport.Request) void {
     defer _ = std.c.close(request.fd);
     const started_ns = nanoTimestamp();
-    const cmd = request.buf[0..request.len];
+    const cmd = request.command();
     log.debug("[trace] ipc recv fd={} bytes={} cmd={s}", .{ request.fd, request.len, cmd });
 
     if (ipc.g_dispatch) |dispatch| {
@@ -2870,93 +2859,8 @@ fn handleIpcRequest(request: IpcRequest) void {
 }
 
 fn drainIpcRequests() void {
-    while (g_ipc_requests.pop()) |request| {
+    while (g_ipc_transport.pop()) |request| {
         handleIpcRequest(request);
-    }
-}
-
-fn configureIpcClient(fd: c_int) void {
-    ipc.disableSigpipe(fd);
-    const timeout: std.c.timeval = .{ .sec = 0, .usec = 250_000 };
-    posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.SNDTIMEO, std.mem.asBytes(&timeout)) catch |err| {
-        log.warn("IPC send timeout setup failed: {}", .{err});
-    };
-}
-
-fn readIpcRequest(fd: c_int) ?IpcRequest {
-    var request: IpcRequest = .{ .fd = fd, .len = 0, .buf = undefined };
-    var written: usize = 0;
-
-    while (written < request.buf.len) {
-        var poll_fds = [_]posix.pollfd{.{
-            .fd = fd,
-            .events = posix.POLL.IN,
-            .revents = 0,
-        }};
-        const ready = posix.poll(&poll_fds, 1000) catch return null;
-        if (ready == 0) return null;
-
-        const n = posix.read(fd, request.buf[written..]) catch return null;
-        if (n == 0) break;
-        written += n;
-    }
-
-    if (written == request.buf.len) {
-        ipc.writeResponse(fd, "err: command too long\n");
-        return null;
-    }
-
-    const command = std.mem.trimEnd(u8, request.buf[0..written], &.{ '\n', '\r', ' ', 0 });
-    if (command.len == 0) return null;
-    request.len = @intCast(command.len);
-    return request;
-}
-
-fn ipcAcceptLoop() void {
-    while (!g_ipc_transport_stop.load(.acquire)) {
-        var poll_fds = [_]posix.pollfd{.{
-            .fd = g_ipc.fd,
-            .events = posix.POLL.IN,
-            .revents = 0,
-        }};
-        const ready = posix.poll(&poll_fds, 250) catch |err| {
-            if (!g_ipc_transport_stop.load(.acquire)) {
-                log.warn("IPC listener poll failed: {}", .{err});
-            }
-            continue;
-        };
-        if (ready == 0) continue;
-
-        const client_fd = std.c.accept(g_ipc.fd, null, null);
-        if (client_fd < 0) continue;
-        configureIpcClient(client_fd);
-
-        const request = readIpcRequest(client_fd) orelse {
-            _ = std.c.close(client_fd);
-            continue;
-        };
-        if (!g_ipc_requests.push(request)) {
-            ipc.writeResponse(client_fd, "err: IPC queue busy\n");
-            _ = std.c.close(client_fd);
-            continue;
-        }
-        signalWaker();
-    }
-}
-
-fn startIpcTransport() !void {
-    std.debug.assert(g_ipc_thread == null);
-    g_ipc_transport_stop.store(false, .release);
-    g_ipc_thread = try std.Thread.spawn(.{}, ipcAcceptLoop, .{});
-}
-
-fn stopIpcTransport() void {
-    g_ipc_transport_stop.store(true, .release);
-    if (g_ipc_thread) |thread| thread.join();
-    g_ipc_thread = null;
-
-    while (g_ipc_requests.pop()) |request| {
-        _ = std.c.close(request.fd);
     }
 }
 
