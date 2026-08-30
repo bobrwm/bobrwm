@@ -3540,10 +3540,10 @@ fn handleEvent(ev: *const event_mod.Event) void {
         },
         .hk_move_workspace_to_display => {
             const arg: u8 = @intCast(ev.wid);
-            if (arg == 0) {
+            if (arg == config_mod.next_display_arg) {
                 log.info("hotkey: move workspace to display next", .{});
                 moveWorkspaceToDisplayNext();
-            } else if (arg == 255) {
+            } else if (arg == config_mod.previous_display_arg) {
                 log.info("hotkey: move workspace to display prev", .{});
                 moveWorkspaceToDisplayPrev();
             } else {

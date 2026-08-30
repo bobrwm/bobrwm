@@ -183,6 +183,10 @@ pub const Action = enum(u8) {
     }
 };
 
+/// Sentinel arguments for relative display movement in keybinds.
+pub const next_display_arg: u8 = 0;
+pub const previous_display_arg: u8 = std.math.maxInt(u8);
+
 pub const Keybind = struct {
     key: []const u8,
     mods: Mods = .{},
@@ -531,7 +535,10 @@ fn validateKeybinds(keybinds: []const Keybind, workspace_count: usize) !void {
                 }
             },
             .move_workspace_to_display => {
-                if (keybind.arg == 0 or keybind.arg > workspace.max_displays) {
+                const is_relative = keybind.arg == next_display_arg or
+                    keybind.arg == previous_display_arg;
+                const is_explicit = keybind.arg > 0 and keybind.arg <= workspace.max_displays;
+                if (!is_relative and !is_explicit) {
                     return error.InvalidKeybindDisplay;
                 }
             },
@@ -810,6 +817,22 @@ test "validate rejects invalid workspace references and duplicate rules" {
         },
     };
     try t.expectError(error.DuplicateAppRule, validate(&duplicate_rules));
+}
+
+test "validate accepts relative display keybind targets" {
+    const keybinds = [_]Keybind{
+        .{ .key = "n", .action = .move_workspace_to_display, .arg = next_display_arg },
+        .{ .key = "p", .action = .move_workspace_to_display, .arg = previous_display_arg },
+        .{ .key = "1", .action = .move_workspace_to_display, .arg = 1 },
+    };
+    const cfg: Config = .{ .keybinds = &keybinds };
+    try validate(&cfg);
+
+    const invalid_keybinds = [_]Keybind{
+        .{ .key = "9", .action = .move_workspace_to_display, .arg = workspace.max_displays + 1 },
+    };
+    const invalid: Config = .{ .keybinds = &invalid_keybinds };
+    try t.expectError(error.InvalidKeybindDisplay, validate(&invalid));
 }
 
 test "validate rejects unknown keys and invalid workspace name text" {
