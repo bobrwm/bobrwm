@@ -2403,6 +2403,7 @@ fn setRolePolling(enabled: bool) void {
     if (!enabled) {
         if (g_role_poll_source) |source| {
             c.dispatch_source_cancel(source);
+            c.dispatch_release(.{ ._ds = source });
             g_role_poll_source = null;
         }
         return;
