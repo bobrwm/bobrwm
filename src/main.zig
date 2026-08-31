@@ -483,14 +483,10 @@ fn focusedManagedLeaderWindow() ?window_mod.Window {
     return managedLeaderForFocusedWindow(pid, focused_wid);
 }
 
-/// Window a hotkey that acts on "the focused window" should target. Asks AX
-/// first and synchronizes native-tab state before returning the group's leader:
-/// the per-workspace cache and active-tab record can both lag a user click.
-/// Falls back to the cache during transitions or when reconciliation cannot
-/// produce a visible managed window.
-fn hotkeyTargetWindowId() ?u32 {
-    const pid = frontmostApplicationPid() orelse return g_workspaces.active().focused_wid;
-    const focused_wid = focusedWindowIdForPid(pid) orelse return g_workspaces.active().focused_wid;
+/// Resolve the frontmost app's AX-focused window to its visible layout owner.
+fn reconciledFocusedWindowId() ?u32 {
+    const pid = frontmostApplicationPid() orelse return null;
+    const focused_wid = focusedWindowIdForPid(pid) orelse return null;
 
     if (managedLeaderForFocusedWindow(pid, focused_wid)) |win| {
         if (workspaceVisibleOnDisplay(win.workspace_id, win.display_id)) {
@@ -517,7 +513,13 @@ fn hotkeyTargetWindowId() ?u32 {
         }
     }
 
-    return g_workspaces.active().focused_wid;
+    return null;
+}
+
+/// Window a hotkey that acts on "the focused window" should target. Falls back
+/// to workspace history for reversible actions when AX is temporarily absent.
+fn hotkeyTargetWindowId() ?u32 {
+    return reconciledFocusedWindowId() orelse g_workspaces.active().focused_wid;
 }
 
 fn clearWorkspaceTransition() void {
@@ -7163,32 +7165,17 @@ fn updateTabGroupAssignment(leader_wid: u32, workspace_id: u8, display_id: u32) 
 }
 
 fn moveWindowToWorkspace(target_id: u8) void {
-    const display_id = focusedDisplayId();
-    const current_ws_id = activeWorkspaceIdForDisplay(display_id);
-    const ws = g_workspaces.get(current_ws_id) orelse return;
-    var wid_opt = ws.focused_wid;
-    if (wid_opt) |focused_wid| {
-        if (g_store.get(focused_wid)) |focused_win| {
-            if (focused_win.display_id != display_id or focused_win.workspace_id != ws.id) {
-                wid_opt = null;
-            }
-        } else {
-            wid_opt = null;
-        }
-    }
-    if (wid_opt == null) {
-        for (ws.windows.items) |candidate_wid| {
-            const candidate = g_store.get(candidate_wid) orelse continue;
-            if (candidate.display_id == display_id and candidate.workspace_id == ws.id) {
-                wid_opt = candidate_wid;
-                break;
-            }
-        }
-    }
-    const wid = wid_opt orelse return;
-    if (target_id == ws.id) return;
-    const target_ws = g_workspaces.get(target_id) orelse return;
+    const wid = reconciledFocusedWindowId() orelse {
+        log.debug("move workspace skipped: no visible AX-focused managed window", .{});
+        return;
+    };
     var updated = g_store.get(wid) orelse return;
+    const ws = g_workspaces.get(updated.workspace_id) orelse return;
+    if (target_id == ws.id) return;
+
+    log.debug("move workspace target wid={d} pid={d} source={d} target={d}", .{ wid, updated.pid, ws.id, target_id });
+
+    const target_ws = g_workspaces.get(target_id) orelse return;
     const source_display = updated.display_id;
 
     // Prepare the destination completely before removing the source slot.
@@ -7200,7 +7187,7 @@ fn moveWindowToWorkspace(target_id: u8) void {
             return;
         };
     }
-    const target_display = target_ws.display_id orelse display_id;
+    const target_display = target_ws.display_id orelse source_display;
     if (nativeSpacesEnabled() and !moveTabGroupToNativeSpace(wid, target_display, target_id)) {
         if (updated.mode == .tiled) removeFromTiling(target_id, wid);
         log.warn("failed to move wid={d} to native workspace {d} on display {d}", .{ wid, target_id, target_display });
