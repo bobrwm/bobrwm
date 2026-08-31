@@ -93,6 +93,7 @@ const workspace_event_debounce_interval_s: f64 = 0.05;
 /// an intermediate topology, so a reconcile this long after the final event
 /// converges on the settled arrangement.
 const display_settle_delay_s: f64 = 0.25;
+const native_space_settle_delay_s: f64 = 3.2;
 /// Hard cap for workspace transition convergence before we fail closed.
 const workspace_transition_watchdog_interval_s: f64 = 0.4;
 /// A successful AX write can precede the corresponding WindowServer move.
@@ -111,6 +112,16 @@ const DisplayInfo = struct {
     visible: shim.bw_frame,
     full: shim.bw_frame,
     is_primary: bool,
+};
+
+const NativeSpaceSwitchState = struct {
+    target_workspace_id: u8 = 0,
+    display_id: u32 = 0,
+    is_confirmed: bool = false,
+
+    fn isActive(self: NativeSpaceSwitchState) bool {
+        return self.target_workspace_id != 0 and self.display_id != 0;
+    }
 };
 
 const DragPreviewState = struct {
@@ -163,6 +174,7 @@ const WorkspaceTransitionCompletionReason = enum {
     none,
     focus_accepted,
     empty_workspace,
+    native_space_changed,
 };
 
 const WorkspaceTransitionState = struct {
@@ -787,6 +799,16 @@ fn switchToWindowWorkspaceIfHidden(win: window_mod.Window, focused_wid: u32, sou
     std.debug.assert(focused_wid != 0);
     std.debug.assert(win.workspace_id > 0 and win.workspace_id <= workspace_mod.max_workspaces);
     std.debug.assert(win.display_id != 0);
+
+    if (g_native_space_switch.isActive()) {
+        log.debug("follow focus ignored during native switch wid={d} pid={d} workspace={d} target_workspace={d}", .{
+            focused_wid,
+            win.pid,
+            win.workspace_id,
+            g_native_space_switch.target_workspace_id,
+        });
+        return;
+    }
 
     const transition_active = g_workspace_transition.isActive();
     switch (workspace_mod.followFocusAction(
@@ -1531,15 +1553,35 @@ var g_pointer_drag_candidate_wid: ?u32 = null;
 var g_pointer_drag_wid: ?u32 = null;
 var g_mouse_drag_event_emitted = false;
 var g_drag_reconcile_on_drop = false;
+
+fn nativeSpacesEnabled() bool {
+    return g_config.native_spaces and g_sky != null and g_sky.?.supportsNativeSpaces();
+}
+
+fn moveTabGroupToNativeSpace(wid: u32, display_id: u32, workspace_id: u8) bool {
+    if (!nativeSpacesEnabled()) return false;
+    const sky = &g_sky.?;
+    if (g_tab_groups.groupOf(wid)) |group| {
+        for (group.members.items) |member_wid| {
+            if (!sky.moveWindowToNativeSpace(member_wid, display_id, workspace_id)) return false;
+        }
+        return true;
+    }
+    return sky.moveWindowToNativeSpace(wid, display_id, workspace_id);
+}
+
 /// PID of the last window we focused via bw_ax_focus_window. Used to detect
 /// same-process focus switches that need a delay for Electron compatibility.
 var g_last_focused_pid: i32 = 0;
 var g_last_space_changed_at_s: f64 = 0;
 var g_last_display_changed_at_s: f64 = 0;
+var g_native_space_resettle_at_s: f64 = 0;
 /// Absolute time at which a trailing display reconcile is due, or 0 when none
 /// is pending. Re-armed on every display_changed so the reconcile fires once,
 /// after the arrangement stops changing.
 var g_display_resettle_at_s: f64 = 0;
+var g_native_space_switch: NativeSpaceSwitchState = .{};
+var g_native_space_queued_workspace_id: u8 = 0;
 /// Compiled keybind table referenced (not copied) by the hotkey event tap.
 /// The caller of bw_set_keybinds owns the storage and must keep it alive for
 /// as long as the event tap can fire; main's KeybindTable guarantees this.
@@ -2452,6 +2494,12 @@ fn reloadConfig() bool {
         notifyConfigReloadFailed();
         return false;
     }
+    if (next.config.native_spaces != g_config.native_spaces) {
+        log.err("config reload cannot change native_spaces; restart to apply it", .{});
+        next.deinit();
+        notifyConfigReloadFailed();
+        return false;
+    }
     applyReloadedConfig(next);
     return true;
 }
@@ -2528,6 +2576,9 @@ fn hotkeyTapCallback(
         bw_hotkey_mouse_up();
         return event;
     }
+    if (event_type == 29 or event_type == 30) {
+        return event;
+    }
 
     const flags = cg_extra.CGEventGetFlags(event);
     const keycode_raw = cg_extra.CGEventGetIntegerValueField(event, c.kCGKeyboardEventKeycode);
@@ -2541,11 +2592,14 @@ fn hotkeyTapCallback(
 }
 
 fn setupHotkeyEventTap() void {
-    const mask: c.CGEventMask =
+    var mask: c.CGEventMask =
         (@as(c.CGEventMask, 1) << @intCast(c.kCGEventKeyDown)) |
         (@as(c.CGEventMask, 1) << @intCast(c.kCGEventLeftMouseDown)) |
         (@as(c.CGEventMask, 1) << @intCast(c.kCGEventLeftMouseDragged)) |
         (@as(c.CGEventMask, 1) << @intCast(c.kCGEventLeftMouseUp));
+    if (g_config.native_spaces) {
+        mask |= (@as(c.CGEventMask, 1) << 29) | (@as(c.CGEventMask, 1) << 30);
+    }
 
     g_tap_port = cg_extra.CGEventTapCreate(
         c.kCGSessionEventTap,
@@ -2734,6 +2788,10 @@ pub fn main(init: std.process.Init.Minimal) !void {
 
     // -- SkyLight (optional) --
     g_sky = skylight.SkyLight.init();
+    if (g_config.native_spaces and (g_sky == null or !g_sky.?.supportsNativeSpaces())) {
+        log.err("native_spaces requested but required SkyLight symbols are unavailable", .{});
+        return error.NativeSpacesUnavailable;
+    }
 
     // -- Core state --
     g_store = window_mod.WindowStore.init(g_allocator);
@@ -2801,6 +2859,20 @@ pub fn main(init: std.process.Init.Minimal) !void {
                 ws.display_id = g_displays[slot].id;
             }
             extra += 1;
+        }
+    }
+    // Start from WindowServer's truth. Assuming space 1 here would immediately
+    // tile windows from whichever native space happened to be visible into the
+    // wrong internal workspace after a relaunch.
+    if (nativeSpacesEnabled()) {
+        for (0..g_display_count) |slot| {
+            const display_id = g_displays[slot].id;
+            const active_id = g_sky.?.currentNativeWorkspace(display_id, wsc) orelse {
+                log.err("current native space is not one of the configured ordinary spaces on display {d}", .{display_id});
+                return error.NativeSpaceMappingUnavailable;
+            };
+            g_workspaces.setActiveForDisplaySlot(slot, active_id);
+            if (g_workspaces.get(active_id)) |ws| ws.display_id = display_id;
         }
     }
 
@@ -3631,12 +3703,31 @@ fn handleEvent(ev: *const event_mod.Event) void {
             reconcileDisplays();
         },
         .space_changed => {
+            if (nativeSpacesEnabled()) {
+                log.info("native space changed", .{});
+                if (g_native_space_switch.isActive()) {
+                    const confirmed_workspace_id = g_native_space_switch.target_workspace_id;
+                    g_native_space_switch.is_confirmed = true;
+                    g_pending_focus_count = 0;
+                    g_deferred_follow_focus = null;
+                    markWorkspaceTransitionComplete(.native_space_changed);
+                    if (g_native_space_queued_workspace_id != 0 and
+                        g_native_space_queued_workspace_id != confirmed_workspace_id)
+                    {
+                        g_native_space_switch = .{};
+                    }
+                }
+                armNativeSpaceResettle();
+                drainQueuedNativeSpaceSwitch();
+                return;
+            }
             if (!shouldHandleWorkspaceEvent(&g_last_space_changed_at_s)) return;
             log.info("space changed", .{});
         },
         .role_poll_tick => {
             reconcileDueGeometryObservations();
             processPendingWorkspaceParks();
+            if (processDueNativeSpaceResettle()) return;
             if (processDueDisplayResettle()) return;
             const promoted_pending = processPendingRoleWindows();
             const promoted_deferred = processDeferredWindowCandidates();
@@ -3940,6 +4031,7 @@ fn refreshRolePolling() void {
         g_app_launch_retries.count() > 0 or
         g_focus_retries.count() > 0 or
         g_deferred_follow_focus != null or
+        g_native_space_resettle_at_s != 0 or
         g_display_resettle_at_s != 0 or
         hasPendingWorkspaceParks() or
         g_event_overflow_recovery_pending or
@@ -3954,6 +4046,70 @@ fn reconcileDisplays() void {
     discoverWindows();
     retile();
     updateStatusBar();
+}
+
+fn reconcileNativeSpaces() void {
+    if (!nativeSpacesEnabled()) return;
+
+    if (g_native_space_switch.isActive()) {
+        const pending = g_native_space_switch;
+        const actual_id = g_sky.?.currentNativeWorkspace(pending.display_id, g_workspaces.workspace_count) orelse {
+            log.warn("native workspace reconcile could not read display={d}", .{pending.display_id});
+            g_native_space_switch = .{};
+            g_native_space_queued_workspace_id = 0;
+            return;
+        };
+        if (actual_id != pending.target_workspace_id) {
+            log.warn("native workspace switch did not converge display={d} actual={d} target={d}", .{
+                pending.display_id,
+                actual_id,
+                pending.target_workspace_id,
+            });
+        }
+        g_native_space_switch = .{};
+    }
+
+    for (0..g_display_count) |slot| {
+        const display_id = g_displays[slot].id;
+        const active_id = g_sky.?.currentNativeWorkspace(display_id, g_workspaces.workspace_count) orelse {
+            log.warn("native workspace reconcile could not map display={d}", .{display_id});
+            continue;
+        };
+        g_workspaces.setActiveForDisplaySlot(slot, active_id);
+        if (g_workspaces.get(active_id)) |ws| ws.display_id = display_id;
+    }
+
+    discoverWindows();
+    retile();
+    updateStatusBar();
+    drainQueuedNativeSpaceSwitch();
+}
+
+fn drainQueuedNativeSpaceSwitch() void {
+    if (g_native_space_switch.isActive()) return;
+
+    const target_workspace_id = g_native_space_queued_workspace_id;
+    g_native_space_queued_workspace_id = 0;
+    if (target_workspace_id == 0) return;
+    if (workspaceVisibleAnywhere(target_workspace_id)) return;
+
+    log.debug("native workspace switch draining queued target={d}", .{target_workspace_id});
+    switchWorkspace(target_workspace_id);
+}
+
+fn armNativeSpaceResettle() void {
+    g_native_space_resettle_at_s = c.CFAbsoluteTimeGetCurrent() + native_space_settle_delay_s;
+    refreshRolePolling();
+}
+
+fn processDueNativeSpaceResettle() bool {
+    if (g_native_space_resettle_at_s == 0) return false;
+    if (c.CFAbsoluteTimeGetCurrent() < g_native_space_resettle_at_s) return false;
+
+    g_native_space_resettle_at_s = 0;
+    reconcileNativeSpaces();
+    refreshRolePolling();
+    return true;
 }
 
 /// (Re-)arm the trailing display reconcile for `display_settle_delay_s` from
@@ -4588,9 +4744,19 @@ fn discoverWindows() void {
             continue;
         };
 
-        // If assigned to a non-visible workspace, hide immediately
         if (!workspaceVisibleOnDisplay(target_ws.id, managed_display)) {
-            hideWindow(info.pid, info.wid);
+            if (nativeSpacesEnabled()) {
+                const target_display = target_ws.display_id orelse managed_display;
+                if (!moveTabGroupToNativeSpace(info.wid, target_display, target_ws.id)) {
+                    log.warn("failed to move discovered wid={d} to native workspace {d} on display {d}", .{
+                        info.wid,
+                        target_ws.id,
+                        target_display,
+                    });
+                }
+            } else {
+                hideWindow(info.pid, info.wid);
+            }
         }
     }
 
@@ -4818,9 +4984,17 @@ fn addNewWindowManagedWithAssignment(pid: i32, wid: u32, workspace_id: u8, assig
     };
     ws.recordFocus(wid);
 
-    // If assigned to a non-visible workspace, hide immediately
+    // A native-space move must happen after the window exists in WindowServer
+    // but before it can flash on the current workspace as managed content.
     if (!workspaceVisibleOnDisplay(ws.id, display_id)) {
-        hideWindow(pid, wid);
+        if (nativeSpacesEnabled()) {
+            const target_display = ws.display_id orelse display_id;
+            if (!moveTabGroupToNativeSpace(wid, target_display, ws.id)) {
+                log.warn("failed to move new wid={d} to native workspace {d} on display {d}", .{ wid, ws.id, target_display });
+            }
+        } else {
+            hideWindow(pid, wid);
+        }
     }
 
     const float_reason = if (mode == .tiled) "tiled" else if (rule_float) "floated (app rule)" else "floated (undersized+non-resizable)";
@@ -6346,6 +6520,19 @@ fn processPendingWorkspaceParks() void {
 fn switchWorkspace(target_id: u8) void {
     const target_ws = g_workspaces.get(target_id) orelse return;
 
+    if (nativeSpacesEnabled() and g_native_space_switch.isActive()) {
+        if (g_native_space_switch.is_confirmed and target_id != g_native_space_switch.target_workspace_id) {
+            g_native_space_switch = .{};
+        } else {
+            g_native_space_queued_workspace_id = if (target_id == g_native_space_switch.target_workspace_id) 0 else target_id;
+            log.debug("native workspace switch queued active_target={d} queued_target={d}", .{
+                g_native_space_switch.target_workspace_id,
+                g_native_space_queued_workspace_id,
+            });
+            return;
+        }
+    }
+
     // If target is already visible on some display, just focus there.
     if (workspaceVisibleAnywhere(target_id)) {
         const target_display = target_ws.display_id orelse return;
@@ -6376,8 +6563,13 @@ fn switchWorkspace(target_id: u8) void {
         target_ws.windows.items.len,
     });
 
-    ax_mod.beginGeometryBatch();
-    defer ax_mod.endGeometryBatch();
+    const is_native_switch = nativeSpacesEnabled();
+    if (is_native_switch and !g_sky.?.switchNativeSpace(target_display, current_id, target_id)) {
+        log.warn("native workspace switch failed current_workspace={d} target_workspace={d} display={d}", .{
+            current_id, target_id, target_display,
+        });
+        return;
+    }
 
     // Activate target; old workspace keeps its display_id (just hidden).
     g_workspaces.setActiveForDisplaySlot(display_slot, target_id);
@@ -6403,6 +6595,21 @@ fn switchWorkspace(target_id: u8) void {
     assertDisplayCoverage();
 
     startWorkspaceTransition(.switch_workspace, target_id, target_display);
+    if (is_native_switch) {
+        g_workspace_transition.deadline_at_s = c.CFAbsoluteTimeGetCurrent() + native_space_settle_delay_s;
+        g_native_space_switch = .{
+            .target_workspace_id = target_id,
+            .display_id = target_display,
+        };
+        armNativeSpaceResettle();
+        setFocusedDisplay(target_display);
+        updateStatusBar();
+        return;
+    }
+
+    ax_mod.beginGeometryBatch();
+    defer ax_mod.endGeometryBatch();
+
     retile();
     // `retile` normally batches work until the event drain completes. A
     // workspace switch cannot use that latency boundary: parking the outgoing
@@ -6413,7 +6620,6 @@ fn switchWorkspace(target_id: u8) void {
     updateStatusBar();
 
     focusWorkspaceWindow(target_ws);
-
     parkOutgoingWhenRevealed(old_ws, target_ws, target_display);
 }
 
@@ -6586,6 +6792,12 @@ fn moveWindowToWorkspace(target_id: u8) void {
             return;
         };
     }
+    const target_display = target_ws.display_id orelse display_id;
+    if (nativeSpacesEnabled() and !moveTabGroupToNativeSpace(wid, target_display, target_id)) {
+        if (updated.mode == .tiled) removeFromTiling(target_id, wid);
+        log.warn("failed to move wid={d} to native workspace {d} on display {d}", .{ wid, target_id, target_display });
+        return;
+    }
     target_ws.addWindowAssumeCapacity(wid);
 
     ws.removeWindow(wid);
@@ -6600,12 +6812,12 @@ fn moveWindowToWorkspace(target_id: u8) void {
     // display for hidden workspaces with no assigned display yet —
     // switchWorkspace will correct it when the workspace is activated.
     updated.workspace_id = target_id;
-    updated.display_id = target_ws.display_id orelse display_id;
+    updated.display_id = target_display;
     g_store.putAssumeCapacity(updated);
     updateTabGroupAssignment(wid, target_id, updated.display_id);
 
     // If target is not visible on the window's new display, hide it.
-    if (!workspaceVisibleOnDisplay(target_id, updated.display_id)) {
+    if (!nativeSpacesEnabled() and !workspaceVisibleOnDisplay(target_id, updated.display_id)) {
         const visible_wid = g_tab_groups.resolveActive(wid);
         if (g_store.get(visible_wid)) |win| {
             hideWindow(win.pid, visible_wid);

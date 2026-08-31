@@ -205,7 +205,28 @@ Choose the tiling algorithm:
 
 ### Workspaces
 
-bobrwm uses virtual workspaces. They are not native macOS Spaces; hidden workspace windows are parked off-screen and restored when that workspace is focused.
+bobrwm uses virtual workspaces by default: hidden workspace windows are parked off-screen and restored when that workspace is focused.
+
+Native Mission Control spaces are available as an opt-in experimental backend:
+
+```zon
+.native_spaces = true,
+```
+
+This maps workspace 1 to the first ordinary native space, workspace 2 to the
+second, and so on, independently on each display. Create at least as many
+Mission Control spaces as configured bobrwm workspaces on every display where
+they will be used. Full-screen application spaces are ignored when assigning
+workspace numbers, but are crossed when switching. Switching uses the
+high-velocity synthetic Dock gesture pioneered by InstantSpaceSwitcher;
+on macOS 27 and later, Bobrwm also supplies the serialized IOHID payload now
+required by Dock. Window moves and topology queries use private, undocumented
+APIs. Either path can break on a future macOS release. Bobrwm waits for the
+native transition to settle, then reconciles the landed Space against
+WindowServer without injecting a second gesture from stale intermediate state.
+Rapid switch requests are serialized at native Space-change confirmations;
+while one is in flight, the newest requested workspace replaces older queued
+requests.
 
 By default, bobrwm creates 10 workspaces. To configure a smaller count, provide `.workspace_names`; the number of names is the workspace count:
 

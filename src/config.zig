@@ -21,6 +21,9 @@ pub const Config = struct {
     /// `app_rules` entry wins.
     workspace_assignments: []const WorkspaceAssignment = &.{},
     workspace_names: []const []const u8 = &.{},
+    /// Use real Mission Control spaces through private SkyLight APIs instead
+    /// of parking hidden workspace windows off-screen.
+    native_spaces: bool = false,
     swipe: SwipeConfig = .{},
     dimmed_inactive: DimConfig = .{},
     gaps: Gaps = .{},

@@ -77,6 +77,10 @@
     //     "code",
     //     "chat",
     // },
+    // Use the first N ordinary Mission Control spaces on each display instead
+    // of Bobrwm's off-screen virtual workspaces. Requires one native space per
+    // configured workspace on every display where those workspaces are used.
+    // .native_spaces = true,
 
     // Keybinds merge with built-in defaults. Use the same key + modifiers to
     // override a default binding, or add new entries for additional shortcuts.
