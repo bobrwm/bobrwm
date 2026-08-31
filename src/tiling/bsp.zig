@@ -1,6 +1,7 @@
 const std = @import("std");
 const WindowId = @import("../window.zig").WindowId;
 const Frame = @import("../window.zig").Window.Frame;
+const tiling = @import("../tiling.zig");
 
 // ── Shared types ─────────────────────────────────────────────────────────────
 
@@ -27,6 +28,13 @@ pub const InsertionPointPolicy = enum {
     min_depth,
 };
 
+pub const Config = struct {
+    split_mode: SplitMode = .auto,
+    insert_point: InsertionPointPolicy = .focused,
+    split_ratio: f64 = 0.5,
+    new_window_split: InsertChild = .second,
+};
+
 pub const InsertOptions = struct {
     split_mode: SplitMode,
     child: InsertChild,
@@ -35,6 +43,111 @@ pub const InsertOptions = struct {
     inner_gap: f64 = 0,
     split_ratio: f64 = 0.5,
 };
+
+/// Session-only controls configured by BSP IPC commands.
+pub const RuntimeSettings = struct {
+    split_mode: SplitMode = .auto,
+    insert_point: InsertionPointPolicy = .focused,
+    split_ratio: f64 = 0.5,
+    new_window_split: InsertChild = .second,
+};
+
+pub const Command = union(enum) {
+    toggle_split,
+    ratio_rel: f64,
+    ratio_abs: f64,
+    insert_point: InsertionPointPolicy,
+    mirror: Direction,
+    equalize,
+    balance,
+    rotate: i32,
+};
+
+pub const help_text =
+    \\BSP Layout Commands (IPC):
+    \\  bsp toggle-split          Cycle BSP split mode (auto, horizontal, vertical)
+    \\  bsp ratio rel <delta>     Adjust focused split ratio relatively
+    \\  bsp ratio abs <ratio>     Set focused split ratio absolutely
+    \\  bsp insert-point <point>  Set insertion point (focused, first, last, min_depth)
+    \\  bsp mirror <axis>         Mirror layout (horizontal, vertical)
+    \\  bsp equalize              Reset all split ratios to default
+    \\  bsp balance               Balance the BSP tree
+    \\  bsp rotate <degrees>      Rotate layout (90, 180, 270)
+    \\
+;
+
+pub fn parseCommand(cmd: []const u8) ?Command {
+    if (std.mem.eql(u8, cmd, "bsp toggle-split")) return .toggle_split;
+    if (std.mem.eql(u8, cmd, "bsp equalize")) return .equalize;
+    if (std.mem.eql(u8, cmd, "bsp balance")) return .balance;
+    if (stripPrefix(cmd, "bsp ratio rel ")) |arg| {
+        const delta = std.fmt.parseFloat(f64, arg) catch return null;
+        if (!std.math.isFinite(delta)) return null;
+        return .{ .ratio_rel = delta };
+    }
+    if (stripPrefix(cmd, "bsp ratio abs ")) |arg| {
+        const ratio = std.fmt.parseFloat(f64, arg) catch return null;
+        if (!std.math.isFinite(ratio) or ratio < min_split_ratio or ratio > max_split_ratio) return null;
+        return .{ .ratio_abs = ratio };
+    }
+    if (stripPrefix(cmd, "bsp insert-point ")) |arg|
+        return .{ .insert_point = std.meta.stringToEnum(InsertionPointPolicy, arg) orelse return null };
+    if (stripPrefix(cmd, "bsp mirror ")) |arg|
+        return .{ .mirror = std.meta.stringToEnum(Direction, arg) orelse return null };
+    if (stripPrefix(cmd, "bsp rotate ")) |arg| {
+        const degrees = std.fmt.parseInt(i32, arg, 10) catch return null;
+        return .{ .rotate = degrees };
+    }
+    return null;
+}
+
+pub const HandleCommandError = error{
+    NoParentSplit,
+    InvalidRotation,
+};
+
+pub fn handleCommandErrorString(err: tiling.HandleCommandError) ?[]const u8 {
+    return switch (err) {
+        HandleCommandError.InvalidRotation => "err: expected 90|180|270\n",
+        HandleCommandError.NoParentSplit => "err: no parent split\n",
+        else => null,
+    };
+}
+
+pub fn handleCommand(command: Command, s: *State, wid: WindowId, settings: *RuntimeSettings) HandleCommandError!void {
+    switch (command) {
+        .toggle_split => {
+            settings.split_mode = switch (settings.split_mode) {
+                .auto => .horizontal,
+                .horizontal => .vertical,
+                .vertical => .auto,
+            };
+            return;
+        },
+        .insert_point => |point| {
+            settings.insert_point = point;
+            return;
+        },
+        else => {},
+    }
+    switch (command) {
+        .ratio_rel => |delta| if (!s.adjustParentRatio(wid, delta)) return HandleCommandError.NoParentSplit,
+        .ratio_abs => |ratio| if (!s.setParentRatio(wid, ratio)) return HandleCommandError.NoParentSplit,
+        .mirror => |axis| s.mirrorTree(axis),
+        .equalize => s.equalizeTree(null, settings.split_ratio),
+        .balance => s.balanceTree(null),
+        .rotate => |degrees| {
+            if (degrees != 90 and degrees != 180 and degrees != 270)
+                return HandleCommandError.InvalidRotation;
+            s.rotateTree(degrees);
+        },
+        else => unreachable,
+    }
+}
+
+fn stripPrefix(cmd: []const u8, prefix: []const u8) ?[]const u8 {
+    return if (std.mem.startsWith(u8, cmd, prefix)) cmd[prefix.len..] else null;
+}
 
 pub const LayoutEntry = struct {
     wid: WindowId,
@@ -448,9 +561,11 @@ fn replaceWindowId(root: *Node, old_wid: WindowId, new_wid: WindowId) bool {
 
 fn findLeafPtr(node: *Node, wid: WindowId) ?*Node.Leaf {
     switch (node.*) {
-        .leaf => |*leaf| return if (leaf.wid == wid) leaf else null,
+        .leaf => |*leaf| {
+            return if (leaf.wid == wid) leaf else null;
+        },
         .split => |split| {
-            if (findLeafPtr(&split.left, wid)) |l| return l;
+            if (findLeafPtr(&split.left, wid)) |leaf| return leaf;
             return findLeafPtr(&split.right, wid);
         },
     }
@@ -548,4 +663,11 @@ test "replaceWid swaps a wid in place and preserves the leaf slot" {
     try std.testing.expectEqual(@as(WindowId, 2), s.lastWid().?);
 
     try std.testing.expect(!s.replaceWid(1, 10));
+}
+
+test "parse BSP commands" {
+    const t = std.testing;
+    try t.expectEqual(Command.toggle_split, parseCommand("toggle-split").?);
+    try t.expectEqual(Command{ .rotate = 90 }, parseCommand("bsp rotate 90").?);
+    try t.expectEqual(Command{ .rotate = 45 }, parseCommand("bsp rotate 45").?);
 }

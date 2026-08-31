@@ -15,19 +15,12 @@ pub const DispatchFn = *const fn (cmd: []const u8, client_fd: posix.socket_t) vo
 pub const IpcCommand = union(enum) {
     retile,
     reload_config,
-    toggle_split,
+    layout: tiling.Command,
     focus: FocusDir,
     focus_workspace: WorkspaceTarget,
     move_to_workspace: u8,
     move_to_display: u8,
     move_workspace_to_display: DisplayTarget,
-    bsp_ratio_rel: f64,
-    bsp_ratio_abs: f64,
-    bsp_insert_point: tiling.InsertionPointPolicy,
-    bsp_mirror: tiling.Direction,
-    bsp_equalize,
-    bsp_balance,
-    bsp_rotate: i32,
     query_windows: QueryFormat,
     query_workspaces: QueryFormat,
     query_displays: QueryFormat,
@@ -55,9 +48,6 @@ pub const IpcCommand = union(enum) {
         // Exact-match commands (no arguments)
         if (std.mem.eql(u8, cmd, "retile")) return .retile;
         if (std.mem.eql(u8, cmd, "reload-config")) return .reload_config;
-        if (std.mem.eql(u8, cmd, "toggle-split")) return .toggle_split;
-        if (std.mem.eql(u8, cmd, "bsp equalize")) return .bsp_equalize;
-        if (std.mem.eql(u8, cmd, "bsp balance")) return .bsp_balance;
         if (std.mem.eql(u8, cmd, "query windows")) return .{ .query_windows = .text };
         if (std.mem.eql(u8, cmd, "query windows --json")) return .{ .query_windows = .json };
         if (std.mem.eql(u8, cmd, "query workspaces")) return .{ .query_workspaces = .text };
@@ -78,16 +68,8 @@ pub const IpcCommand = union(enum) {
             return parseBoundedU8(arg, workspace.max_displays, .move_to_display);
         if (stripPrefix(cmd, "move-workspace-to-display ")) |arg|
             return parseDisplayTarget(arg);
-        if (stripPrefix(cmd, "bsp ratio rel ")) |arg|
-            return parseFloat(arg, .bsp_ratio_rel);
-        if (stripPrefix(cmd, "bsp ratio abs ")) |arg|
-            return parseFloat(arg, .bsp_ratio_abs);
-        if (stripPrefix(cmd, "bsp insert-point ")) |arg|
-            return parseEnum(tiling.InsertionPointPolicy, arg, .bsp_insert_point);
-        if (stripPrefix(cmd, "bsp mirror ")) |arg|
-            return parseEnum(tiling.Direction, arg, .bsp_mirror);
-        if (stripPrefix(cmd, "bsp rotate ")) |arg|
-            return parseInt(i32, arg, .bsp_rotate);
+        if (tiling.parseCommand(cmd)) |layout_command|
+            return .{ .layout = layout_command };
 
         return null;
     }
@@ -107,18 +89,6 @@ pub const IpcCommand = union(enum) {
     fn parseBoundedU8(arg: []const u8, comptime max: u8, comptime tag: anytype) ?IpcCommand {
         const val = std.fmt.parseInt(u8, arg, 10) catch return null;
         if (val == 0 or val > max) return null;
-        return @unionInit(IpcCommand, @tagName(tag), val);
-    }
-
-    fn parseInt(comptime T: type, arg: []const u8, comptime tag: anytype) ?IpcCommand {
-        const val = std.fmt.parseInt(T, arg, 10) catch return null;
-        return @unionInit(IpcCommand, @tagName(tag), val);
-    }
-
-    fn parseFloat(arg: []const u8, comptime tag: anytype) ?IpcCommand {
-        const val = std.fmt.parseFloat(f64, arg) catch return null;
-        if (!std.math.isFinite(val)) return null;
-        if (tag == .bsp_ratio_abs and (val < 0.1 or val > 0.9)) return null;
         return @unionInit(IpcCommand, @tagName(tag), val);
     }
 
@@ -282,6 +252,16 @@ test "parse reload config" {
     try t.expectEqual(@as(?IpcCommand, null), IpcCommand.parse("reload-config extra"));
 }
 
+test "parse layout commands through tiling" {
+    const t = std.testing;
+
+    try t.expectEqual(
+        IpcCommand{ .layout = .{ .bsp = .toggle_split } },
+        IpcCommand.parse("toggle-split").?,
+    );
+    try t.expectEqual(IpcCommand{ .layout = .{ .bsp = .{ .rotate = 45 } } }, IpcCommand.parse("bsp rotate 45").?);
+}
+
 test "parse focus workspace target" {
     const t = std.testing;
 
@@ -304,5 +284,8 @@ test "parse rejects invalid numeric command arguments" {
     try t.expectEqual(@as(?IpcCommand, null), IpcCommand.parse("bsp ratio rel nan"));
     try t.expectEqual(@as(?IpcCommand, null), IpcCommand.parse("bsp ratio abs 0"));
     try t.expectEqual(@as(?IpcCommand, null), IpcCommand.parse("bsp ratio abs 1"));
-    try t.expectEqual(IpcCommand{ .bsp_ratio_abs = 0.5 }, IpcCommand.parse("bsp ratio abs 0.5").?);
+    try t.expectEqual(
+        IpcCommand{ .layout = .{ .bsp = .{ .ratio_abs = 0.5 } } },
+        IpcCommand.parse("bsp ratio abs 0.5").?,
+    );
 }
