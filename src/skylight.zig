@@ -1,6 +1,7 @@
 const std = @import("std");
 const cg_extra = @import("cg_extra");
 const c = @import("c");
+const objc = @import("objc");
 const log = std.log.scoped(.skylight);
 
 const CFArrayRef = *const anyopaque;
@@ -8,7 +9,9 @@ const CFDictionaryRef = *const anyopaque;
 const CFStringRef = *const anyopaque;
 
 const CopyManagedDisplaySpacesFn = *const fn (c_int) callconv(.c) ?CFArrayRef;
+const CopySpacesForWindowsFn = *const fn (c_int, c_int, CFArrayRef) callconv(.c) ?CFArrayRef;
 const MoveWindowsToManagedSpaceFn = *const fn (c_int, CFArrayRef, u64) callconv(.c) void;
+const PerformBridgedMoveFn = *const fn (?*anyopaque) callconv(.c) void;
 
 const DockSwipeDirection = enum {
     left,
@@ -64,7 +67,10 @@ pub const SkyLight = struct {
     setFrontProcessWithOptions: ?SetFrontProcessFn,
     postEventRecordTo: ?PostEventRecordFn,
     copyManagedDisplaySpaces: ?CopyManagedDisplaySpacesFn,
+    copySpacesForWindows: ?CopySpacesForWindowsFn,
     moveWindowsToManagedSpace: ?MoveWindowsToManagedSpaceFn,
+    performBridgedMove: ?PerformBridgedMoveFn,
+    bridgedMoveClass: ?objc.Class,
 
     pub fn init() ?SkyLight {
         var lib = std.DynLib.open("/System/Library/PrivateFrameworks/SkyLight.framework/SkyLight") catch {
@@ -105,13 +111,18 @@ pub const SkyLight = struct {
             .setFrontProcessWithOptions = set_front,
             .postEventRecordTo = post_event,
             .copyManagedDisplaySpaces = lib.lookup(CopyManagedDisplaySpacesFn, "SLSCopyManagedDisplaySpaces"),
+            .copySpacesForWindows = lib.lookup(CopySpacesForWindowsFn, "SLSCopySpacesForWindows"),
             .moveWindowsToManagedSpace = lib.lookup(MoveWindowsToManagedSpaceFn, "SLSMoveWindowsToManagedSpace"),
+            .performBridgedMove = resolveBridgedMove(),
+            .bridgedMoveClass = objc.getClass("SLSBridgedMoveWindowsToManagedSpaceOperation"),
         };
     }
 
     pub fn supportsNativeSpaces(self: *const SkyLight) bool {
         return self.copyManagedDisplaySpaces != null and
-            self.moveWindowsToManagedSpace != null;
+            self.copySpacesForWindows != null and
+            ((self.performBridgedMove != null and self.bridgedMoveClass != null) or
+                self.moveWindowsToManagedSpace != null);
     }
 
     /// Return the Bobrwm index of the display's current ordinary native space.
@@ -180,15 +191,52 @@ pub const SkyLight = struct {
     }
 
     pub fn moveWindowToNativeSpace(self: *const SkyLight, wid: u32, display_id: u32, workspace_id: u8) bool {
-        const move = self.moveWindowsToManagedSpace orelse return false;
         const sid = self.nativeSpaceId(display_id, workspace_id) orelse return false;
         const number = c.CFNumberCreate(null, c.kCFNumberSInt32Type, &wid) orelse return false;
         defer c.CFRelease(number);
         var values = [_]?*const anyopaque{number};
         const windows = c.CFArrayCreate(null, &values, 1, &c.kCFTypeArrayCallBacks) orelse return false;
         defer c.CFRelease(windows);
+
+        if (self.performBridgedMove) |perform| {
+            const cls = self.bridgedMoveClass orelse return false;
+            const allocated = cls.msgSend(objc.Object, "alloc", .{});
+            if (allocated.value == null) return false;
+            const operation = allocated.msgSend(objc.Object, "initWithWindows:spaceID:", .{ windows, sid });
+            if (operation.value == null) return false;
+            defer operation.msgSend(void, "release", .{});
+            perform(operation.value);
+            return true;
+        }
+
+        const move = self.moveWindowsToManagedSpace orelse return false;
         move(self.mainConnectionID(), windows, sid);
         return true;
+    }
+
+    pub fn nativeWindowMoveConfirmed(self: *const SkyLight, wid: u32, target_sid: u64, source_sid: u64) ?bool {
+        const copy_spaces = self.copySpacesForWindows orelse return null;
+        const number = c.CFNumberCreate(null, c.kCFNumberSInt32Type, &wid) orelse return null;
+        defer c.CFRelease(number);
+        var values = [_]?*const anyopaque{number};
+        const windows = c.CFArrayCreate(null, &values, 1, &c.kCFTypeArrayCallBacks) orelse return null;
+        defer c.CFRelease(windows);
+        const spaces = copy_spaces(self.mainConnectionID(), 0x7, windows) orelse return null;
+        defer c.CFRelease(spaces);
+
+        var is_on_target = false;
+        var is_on_source = false;
+        const count = c.CFArrayGetCount(@ptrCast(spaces));
+        for (0..@intCast(count)) |index| {
+            const space = c.CFArrayGetValueAtIndex(@ptrCast(spaces), @intCast(index)) orelse continue;
+            var candidate_sid: i64 = 0;
+            if (c.CFNumberGetValue(@ptrCast(space), c.kCFNumberSInt64Type, &candidate_sid) == 0) continue;
+            if (candidate_sid <= 0) continue;
+            const candidate: u64 = @intCast(candidate_sid);
+            if (candidate == target_sid) is_on_target = true;
+            if (source_sid != 0 and candidate == source_sid) is_on_source = true;
+        }
+        return is_on_target and !is_on_source;
     }
 
     fn currentNativeSpaceId(self: *const SkyLight, display_id: u32) ?u64 {
@@ -252,6 +300,77 @@ pub const SkyLight = struct {
         return null;
     }
 };
+
+extern fn _dyld_image_count() u32;
+extern fn _dyld_get_image_name(image_index: u32) ?[*:0]const u8;
+extern fn _dyld_get_image_header(image_index: u32) ?*const std.macho.mach_header_64;
+extern fn _dyld_get_image_vmaddr_slide(image_index: u32) isize;
+
+fn resolveBridgedMove() ?PerformBridgedMoveFn {
+    const symbol = "__ZL54SLSPerformAsynchronousBridgedWindowManagementOperationP47SLSAsynchronousBridgedWindowManagementOperation";
+    const address = findSkyLightLocalSymbol(symbol) orelse return null;
+    return @ptrFromInt(address);
+}
+
+fn findSkyLightLocalSymbol(name: []const u8) ?usize {
+    const image_count = _dyld_image_count();
+    var image_index: u32 = 0;
+    while (image_index < image_count) : (image_index += 1) {
+        const image_name = _dyld_get_image_name(image_index) orelse continue;
+        if (!std.mem.endsWith(u8, std.mem.span(image_name), "/SkyLight")) continue;
+
+        const header = _dyld_get_image_header(image_index) orelse return null;
+        const slide = _dyld_get_image_vmaddr_slide(image_index);
+        var linkedit: ?*const std.macho.segment_command_64 = null;
+        var symtab: ?*const std.macho.symtab_command = null;
+
+        var command_offset: usize = 0;
+        var command_index: u32 = 0;
+        while (command_index < header.ncmds) : (command_index += 1) {
+            if (command_offset + @sizeOf(std.macho.load_command) > header.sizeofcmds) return null;
+            const command_address = @intFromPtr(header) + @sizeOf(std.macho.mach_header_64) + command_offset;
+            const command: *const std.macho.load_command = @ptrFromInt(command_address);
+            if (command.cmdsize < @sizeOf(std.macho.load_command) or
+                command_offset + command.cmdsize > header.sizeofcmds)
+            {
+                return null;
+            }
+            if (command.cmd == .SEGMENT_64) {
+                const segment: *const std.macho.segment_command_64 = @ptrFromInt(command_address);
+                if (std.mem.eql(u8, std.mem.sliceTo(&segment.segname, 0), "__LINKEDIT")) linkedit = segment;
+            } else if (command.cmd == .SYMTAB) {
+                symtab = @ptrFromInt(command_address);
+            }
+            command_offset += command.cmdsize;
+        }
+
+        const segment = linkedit orelse return null;
+        const table = symtab orelse return null;
+        if (segment.vmaddr < segment.fileoff) return null;
+        const base = applyImageSlide(@intCast(segment.vmaddr - segment.fileoff), slide) orelse return null;
+        const strings: [*]const u8 = @ptrFromInt(base + table.stroff);
+        const symbols: [*]const std.macho.nlist_64 = @ptrFromInt(base + table.symoff);
+
+        var symbol_index: u32 = 0;
+        while (symbol_index < table.nsyms) : (symbol_index += 1) {
+            const symbol = symbols[symbol_index];
+            if (symbol.n_strx == 0 or symbol.n_strx >= table.strsize or symbol.n_value == 0) continue;
+            const available = strings[symbol.n_strx..table.strsize];
+            const terminator = std.mem.indexOfScalar(u8, available, 0) orelse continue;
+            if (!std.mem.eql(u8, available[0..terminator], name)) continue;
+            return applyImageSlide(@intCast(symbol.n_value), slide);
+        }
+        return null;
+    }
+    return null;
+}
+
+fn applyImageSlide(value: usize, slide: isize) ?usize {
+    if (slide >= 0) return std.math.add(usize, value, @intCast(slide)) catch null;
+    const partial_magnitude: usize = @intCast(-(slide + 1));
+    const magnitude = std.math.add(usize, partial_magnitude, 1) catch return null;
+    return std.math.sub(usize, value, magnitude) catch null;
+}
 
 fn cfString(value: [*:0]const u8) ?CFStringRef {
     return c.CFStringCreateWithCString(null, value, c.kCFStringEncodingUTF8);
