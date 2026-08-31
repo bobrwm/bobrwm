@@ -11,6 +11,9 @@ pub const Window = struct {
     wid: WindowId,
     pid: i32,
     title: ?[]const u8,
+    /// Last geometry bobrwm deliberately accepted: either a successful AX
+    /// target or a user/external frame admitted by the ownership coordinator.
+    /// This is not an unconditionally live WindowServer observation.
     frame: Frame,
     is_minimized: bool,
     is_fullscreen: bool = false,
@@ -72,6 +75,21 @@ pub const WindowStore = struct {
         std.debug.assert(window.workspace_id > 0);
         std.debug.assert(window.display_id > 0);
         try self.windows.put(window.wid, window);
+    }
+
+    /// Reserve entries before a mutation that must commit across multiple
+    /// containers. Capacity changes are harmless if a later reservation fails.
+    pub fn ensureUnusedCapacity(self: *WindowStore, additional_count: u32) !void {
+        try self.windows.ensureUnusedCapacity(additional_count);
+    }
+
+    /// Insert after a matching `ensureUnusedCapacity` call.
+    pub fn putAssumeCapacity(self: *WindowStore, window: Window) void {
+        std.debug.assert(window.wid > 0);
+        std.debug.assert(window.pid > 0);
+        std.debug.assert(window.workspace_id > 0);
+        std.debug.assert(window.display_id > 0);
+        self.windows.putAssumeCapacity(window.wid, window);
     }
 
     pub fn get(self: *const WindowStore, wid: WindowId) ?Window {

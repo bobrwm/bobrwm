@@ -16,7 +16,14 @@ const std = @import("std");
 const objc = @import("objc");
 const c = objc.c;
 
-const main = @import("main.zig");
+/// Application-owned event sinks invoked by the runtime ObjC classes.
+pub const Callbacks = struct {
+    app_launched: *const fn (i32) void,
+    app_terminated: *const fn (i32) void,
+    active_app_changed: *const fn (i32) void,
+    space_changed: *const fn () void,
+    display_changed: *const fn () void,
+};
 
 /// `NSWorkspaceApplicationKey` is an `NSString * const` exported by AppKit.
 /// Declared `extern var` (not `extern const`) because Zig's `extern const`
@@ -26,7 +33,8 @@ extern var NSWorkspaceApplicationKey: c.id;
 
 /// Allocate and register all bobrwm ObjC classes. Must be called before any
 /// `objc.getClass("BW…")` lookup (i.e. before `initWorkspaceObservers()`).
-pub fn register(allocator: std.mem.Allocator) void {
+pub fn register(allocator: std.mem.Allocator, callbacks: Callbacks) void {
+    g_callbacks = callbacks;
     g_launch_gates = .init(allocator);
     registerObserver();
     registerLaunchGate();
@@ -60,7 +68,7 @@ fn observerAppLaunched(_: c.id, _: c.SEL, note_id: c.id) callconv(.c) void {
     const launched = app.msgSend(bool, "isFinishedLaunching", .{});
     const policy = app.msgSend(i64, "activationPolicy", .{});
     if (launched and policy == 0) {
-        main.bw_workspace_app_launched(pid);
+        g_callbacks.app_launched(pid);
         return;
     }
 
@@ -72,20 +80,20 @@ fn observerAppLaunched(_: c.id, _: c.SEL, note_id: c.id) callconv(.c) void {
 fn observerAppTerminated(_: c.id, _: c.SEL, note_id: c.id) callconv(.c) void {
     const pid = notificationApp(note_id).msgSend(i32, "processIdentifier", .{});
     dropLaunchGate(pid);
-    main.bw_workspace_app_terminated(pid);
+    g_callbacks.app_terminated(pid);
 }
 
 fn observerActiveAppChanged(_: c.id, _: c.SEL, note_id: c.id) callconv(.c) void {
     const pid = notificationApp(note_id).msgSend(i32, "processIdentifier", .{});
-    main.bw_workspace_active_app_changed(pid);
+    g_callbacks.active_app_changed(pid);
 }
 
 fn observerSpaceChanged(_: c.id, _: c.SEL, _: c.id) callconv(.c) void {
-    main.bw_workspace_space_changed();
+    g_callbacks.space_changed();
 }
 
 fn observerDisplayChanged(_: c.id, _: c.SEL, _: c.id) callconv(.c) void {
-    main.bw_workspace_display_changed();
+    g_callbacks.display_changed();
 }
 
 // BWLaunchGate
@@ -100,6 +108,7 @@ const LaunchGate = struct {
 
 /// `pid → LaunchGate`. Holds owning references outside ObjC.
 var g_launch_gates: std.AutoHashMap(i32, LaunchGate) = undefined;
+var g_callbacks: Callbacks = undefined;
 
 fn registerLaunchGate() void {
     const NSObject = objc.getClass("NSObject").?;
@@ -148,7 +157,7 @@ fn launchGateObserveValue(
     if (!finished or policy != 0) return;
 
     const pid = app.msgSend(i32, "processIdentifier", .{});
-    main.bw_workspace_app_launched(pid);
+    g_callbacks.app_launched(pid);
     dropLaunchGate(pid);
 }
 

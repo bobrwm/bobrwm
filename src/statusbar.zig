@@ -7,15 +7,14 @@
 //! changing one means changing both.
 
 const std = @import("std");
-const objc = @import("objc");
 
 const config_mod = @import("config.zig");
-const main = @import("main.zig");
 const workspace_mod = @import("workspace.zig");
 
 const log = std.log.scoped(.statusbar);
 
-const MenuBarCallbacks = extern struct {
+/// Application-owned actions invoked by the Swift menu bar on the main thread.
+pub const Callbacks = extern struct {
     retile: *const fn () callconv(.c) void,
     open_config: *const fn () callconv(.c) void,
     previous_workspace: *const fn () callconv(.c) void,
@@ -42,7 +41,7 @@ const ActionShortcuts = extern struct {
     next_workspace: ?[*:0]const u8,
 };
 
-extern fn bw_menubar_init(callbacks: MenuBarCallbacks) void;
+extern fn bw_menubar_init(callbacks: Callbacks) void;
 extern fn bw_menubar_deinit() void;
 extern fn bw_menubar_set_workspaces(
     workspaces: ?[*]const Workspace,
@@ -66,21 +65,16 @@ var g_nav_shortcut_storage: [2][max_shortcut_bytes]u8 = undefined;
 
 var g_initialized = false;
 
+/// Create the Swift menu bar and publish the initial workspace identity rows.
 pub fn init(
     workspaces: []const workspace_mod.Workspace,
     config: *const config_mod.Config,
+    callbacks: Callbacks,
 ) void {
     std.debug.assert(!g_initialized);
     std.debug.assert(workspaces.len > 0 and workspaces.len <= workspace_mod.max_workspaces);
 
-    bw_menubar_init(.{
-        .retile = onRetile,
-        .open_config = onOpenConfig,
-        .previous_workspace = onPreviousWorkspace,
-        .next_workspace = onNextWorkspace,
-        .switch_to_workspace = onSwitchToWorkspace,
-        .quit = onQuit,
-    });
+    bw_menubar_init(callbacks);
     g_initialized = true;
 
     updateWorkspaceMenu(workspaces, config);
@@ -194,38 +188,4 @@ test "workspace ABI name truncation preserves valid UTF-8" {
     try std.testing.expect(std.unicode.utf8ValidateSlice(encoded));
     try std.testing.expectEqual(@as(usize, 62), encoded.len);
     try std.testing.expectEqualSlices(u8, name[0..62], encoded);
-}
-
-// Menu callbacks. These run on the main thread while the menu dismisses, so
-// they can mutate Bobrwm state directly.
-
-fn onRetile() callconv(.c) void {
-    main.bw_retile();
-}
-
-fn onOpenConfig() callconv(.c) void {
-    main.bw_status_bar_action(.open_config);
-}
-
-fn onPreviousWorkspace() callconv(.c) void {
-    main.bw_status_bar_action(.previous_workspace);
-}
-
-fn onNextWorkspace() callconv(.c) void {
-    main.bw_status_bar_action(.next_workspace);
-}
-
-fn onSwitchToWorkspace(workspace_id: u8) callconv(.c) void {
-    if (workspace_id == 0 or workspace_id > workspace_mod.max_workspaces) return;
-    main.bw_status_bar_action(.{ .workspace = workspace_id });
-}
-
-/// Shutdown stays on the Zig side so window restoration keeps running before
-/// AppKit tears the process down; the UI library is presentation only.
-fn onQuit() callconv(.c) void {
-    main.bw_will_quit();
-
-    const NSApplication = objc.getClass("NSApplication").?;
-    const app = NSApplication.msgSend(objc.Object, "sharedApplication", .{});
-    app.msgSend(void, "terminate:", .{@as(objc.Object, .{ .value = null })});
 }

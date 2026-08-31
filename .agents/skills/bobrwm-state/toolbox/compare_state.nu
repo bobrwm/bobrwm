@@ -14,7 +14,7 @@ def describe [] {
         inputSchema: {
             type: "object"
             properties: {
-                bobrwm_bin: { type: "string", description: "Path to the bobrwm binary (default: PATH, then <repo>/zig-out/bin/bobrwm)" }
+                bobrwm_bin: { type: "string", description: "Path to the bobrwm CLI (default: PATH, then <repo>/zig-out/Bobrwm.app/Contents/MacOS/bobrwm-cli)" }
                 frame_tolerance: { type: "number", description: "Max px difference between bobrwm frame and CG bounds before flagging drift (default: 2)" }
                 expect_dimming_overlays: { type: "boolean", description: "Require overlays for every inactive visible window, including when none are present (default: false; use when dimming is known enabled)" }
                 output_file: { type: "string", description: "Optional file path to save the raw snapshot + query JSON" }
@@ -33,9 +33,9 @@ def find-bobrwm [explicit] {
     let from_path = (which bobrwm | get -o 0 | get -o path)
     if $from_path != null { return $from_path }
     # Repo checkout: this skill lives at <repo>/.agents/skills/bobrwm-state
-    let repo_bin = ([(skill-dir), "..", "..", "..", "zig-out", "bin", "bobrwm"] | path join | path expand)
+    let repo_bin = ([(skill-dir), "..", "..", "..", "zig-out", "Bobrwm.app", "Contents", "MacOS", "bobrwm-cli"] | path join | path expand)
     if ($repo_bin | path exists) { return $repo_bin }
-    print "error: bobrwm binary not found on PATH or in zig-out/bin. Pass bobrwm_bin."
+    print "error: bobrwm CLI not found on PATH or in zig-out/Bobrwm.app/Contents/MacOS. Pass bobrwm_bin."
     exit 1
 }
 

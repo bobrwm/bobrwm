@@ -12,6 +12,7 @@ const posix = std.posix;
 const build_options = @import("build_options");
 const log_options = @import("log_options.zig");
 const osutil = @import("osutil.zig");
+const runtime_paths = @import("runtime_paths.zig");
 
 pub const std_options = std.Options{
     .log_level = log_options.level,
@@ -135,7 +136,7 @@ const help_text =
     \\  version                  Show version information
     \\
     \\Window Commands (IPC):
-    \\  retile                    Re-tile all windows on the active workspace
+    \\  retile                    Re-tile visible workspaces on all displays
     \\  reload-config             Reload config, keeping current config on failure
     \\  toggle-split              Cycle BSP split mode (auto, horizontal, vertical)
     \\  focus <direction>         Focus window in direction (left, right, up, down)
@@ -149,7 +150,6 @@ const help_text =
     \\BSP Layout Commands (IPC):
     \\  bsp ratio rel <delta>     Adjust focused split ratio relatively
     \\  bsp ratio abs <ratio>     Set focused split ratio absolutely
-    \\  bsp insert-mode <mode>    Set insert mode (split, stack)
     \\  bsp insert-point <point>  Set insertion point (focused, first, last, min_depth)
     \\  bsp mirror <axis>         Mirror layout (horizontal, vertical)
     \\  bsp equalize              Reset all split ratios to default
@@ -186,7 +186,7 @@ fn runClient(cmd: []const u8) u8 {
     var transport_failed = false;
 
     var path_buf: [128]u8 = undefined;
-    const path = std.fmt.bufPrintSentinel(&path_buf, "/tmp/bobrwm_{d}.sock", .{std.c.getuid()}, 0) catch {
+    const path = runtime_paths.socketPathBuf(&path_buf) catch {
         writeStderr("error: socket path too long\n");
         return 1;
     };
@@ -207,8 +207,12 @@ fn runClient(cmd: []const u8) u8 {
     };
 
     var addr: posix.sockaddr.un = .{ .path = undefined, .family = posix.AF.UNIX };
+    if (path.len >= addr.path.len) {
+        writeStderr("error: socket path too long\n");
+        return 1;
+    }
     @memcpy(addr.path[0..path.len], path[0..path.len]);
-    if (path.len < addr.path.len) addr.path[path.len] = 0;
+    addr.path[path.len] = 0;
 
     log.debug("[trace] ipc client connecting path={s} cmd={s}", .{ path, cmd });
 

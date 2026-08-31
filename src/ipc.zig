@@ -2,7 +2,9 @@ const std = @import("std");
 const builtin = @import("builtin");
 const posix = std.posix;
 const tiling = @import("tiling.zig");
+const workspace = @import("workspace.zig");
 const osutil = @import("osutil.zig");
+const runtime_paths = @import("runtime_paths.zig");
 
 const log = std.log.scoped(.ipc);
 
@@ -71,9 +73,9 @@ pub const IpcCommand = union(enum) {
         if (stripPrefix(cmd, "focus-workspace ")) |arg|
             return parseWorkspaceTarget(arg);
         if (stripPrefix(cmd, "move-to-workspace ")) |arg|
-            return parseU8(arg, .move_to_workspace);
+            return parseBoundedU8(arg, workspace.max_workspaces, .move_to_workspace);
         if (stripPrefix(cmd, "move-to-display ")) |arg|
-            return parseU8(arg, .move_to_display);
+            return parseBoundedU8(arg, workspace.max_displays, .move_to_display);
         if (stripPrefix(cmd, "move-workspace-to-display ")) |arg|
             return parseDisplayTarget(arg);
         if (stripPrefix(cmd, "bsp ratio rel ")) |arg|
@@ -102,8 +104,9 @@ pub const IpcCommand = union(enum) {
         return @unionInit(IpcCommand, @tagName(tag), val);
     }
 
-    fn parseU8(arg: []const u8, comptime tag: anytype) ?IpcCommand {
+    fn parseBoundedU8(arg: []const u8, comptime max: u8, comptime tag: anytype) ?IpcCommand {
         const val = std.fmt.parseInt(u8, arg, 10) catch return null;
+        if (val == 0 or val > max) return null;
         return @unionInit(IpcCommand, @tagName(tag), val);
     }
 
@@ -114,6 +117,8 @@ pub const IpcCommand = union(enum) {
 
     fn parseFloat(arg: []const u8, comptime tag: anytype) ?IpcCommand {
         const val = std.fmt.parseFloat(f64, arg) catch return null;
+        if (!std.math.isFinite(val)) return null;
+        if (tag == .bsp_ratio_abs and (val < 0.1 or val > 0.9)) return null;
         return @unionInit(IpcCommand, @tagName(tag), val);
     }
 
@@ -123,6 +128,7 @@ pub const IpcCommand = union(enum) {
         if (std.mem.eql(u8, arg, "next"))
             return .{ .focus_workspace = .next };
         const n = std.fmt.parseInt(u8, arg, 10) catch return null;
+        if (n == 0 or n > workspace.max_workspaces) return null;
         return .{ .focus_workspace = .{ .index = n } };
     }
 
@@ -132,6 +138,7 @@ pub const IpcCommand = union(enum) {
         if (std.mem.eql(u8, arg, "prev"))
             return .{ .move_workspace_to_display = .prev };
         const n = std.fmt.parseInt(u8, arg, 10) catch return null;
+        if (n == 0 or n > workspace.max_displays) return null;
         return .{ .move_workspace_to_display = .{ .index = n } };
     }
 };
@@ -149,7 +156,7 @@ pub const Server = struct {
     path: [:0]const u8,
 
     pub fn init(allocator: std.mem.Allocator) !Server {
-        const path = try std.fmt.allocPrintSentinel(allocator, "/tmp/bobrwm_{d}.sock", .{std.c.getuid()}, 0);
+        const path = try runtime_paths.socketPathAlloc(allocator);
         errdefer allocator.free(path);
 
         // Check if another daemon is already running by probing the socket.
@@ -164,8 +171,9 @@ pub const Server = struct {
             defer _ = std.c.close(probe_fd);
 
             var addr: posix.sockaddr.un = .{ .path = undefined, .family = posix.AF.UNIX };
+            if (path.len >= addr.path.len) return error.NameTooLong;
             @memcpy(addr.path[0..path.len], path[0..path.len]);
-            if (path.len < addr.path.len) addr.path[path.len] = 0;
+            addr.path[path.len] = 0;
 
             if (std.c.connect(probe_fd, @ptrCast(&addr), @sizeOf(posix.sockaddr.un)) == 0) {
                 log.err("another bobrwm instance is already running on {s}", .{path});
@@ -183,13 +191,12 @@ pub const Server = struct {
         disableSigpipe(fd);
 
         var addr: posix.sockaddr.un = .{ .path = undefined, .family = posix.AF.UNIX };
-        if (path.len > addr.path.len) return error.NameTooLong;
+        if (path.len >= addr.path.len) return error.NameTooLong;
         @memcpy(addr.path[0..path.len], path[0..path.len]);
-        if (path.len < addr.path.len) {
-            addr.path[path.len] = 0;
-        }
+        addr.path[path.len] = 0;
 
         if (std.c.bind(fd, @ptrCast(&addr), @sizeOf(posix.sockaddr.un)) != 0) return error.BindFailed;
+        if (std.c.chmod(path, 0o600) != 0) return error.SecureSocketFailed;
         if (std.c.listen(fd, 5) != 0) return error.ListenFailed;
 
         log.info("IPC listening on {s}", .{path});
@@ -282,4 +289,20 @@ test "parse focus workspace target" {
     try t.expectEqual(IpcCommand{ .focus_workspace = .prev }, IpcCommand.parse("focus-workspace prev").?);
     try t.expectEqual(IpcCommand{ .focus_workspace = .next }, IpcCommand.parse("focus-workspace next").?);
     try t.expectEqual(@as(?IpcCommand, null), IpcCommand.parse("focus-workspace previous"));
+    try t.expectEqual(@as(?IpcCommand, null), IpcCommand.parse("focus-workspace 0"));
+}
+
+test "parse rejects invalid numeric command arguments" {
+    const t = std.testing;
+
+    try t.expectEqual(@as(?IpcCommand, null), IpcCommand.parse("move-to-workspace 0"));
+    try t.expectEqual(@as(?IpcCommand, null), IpcCommand.parse("move-to-workspace 11"));
+    try t.expectEqual(@as(?IpcCommand, null), IpcCommand.parse("move-to-display 0"));
+    try t.expectEqual(@as(?IpcCommand, null), IpcCommand.parse("move-to-display 9"));
+    try t.expectEqual(@as(?IpcCommand, null), IpcCommand.parse("move-workspace-to-display 0"));
+    try t.expectEqual(@as(?IpcCommand, null), IpcCommand.parse("move-workspace-to-display 9"));
+    try t.expectEqual(@as(?IpcCommand, null), IpcCommand.parse("bsp ratio rel nan"));
+    try t.expectEqual(@as(?IpcCommand, null), IpcCommand.parse("bsp ratio abs 0"));
+    try t.expectEqual(@as(?IpcCommand, null), IpcCommand.parse("bsp ratio abs 1"));
+    try t.expectEqual(IpcCommand{ .bsp_ratio_abs = 0.5 }, IpcCommand.parse("bsp ratio abs 0.5").?);
 }
