@@ -154,61 +154,30 @@ pub const SkyLight = struct {
         return self.nativeSpacesSupported;
     }
 
-    /// Return the Bobrwm index of the display's current ordinary native space.
-    pub fn currentNativeWorkspace(self: *const SkyLight, display_id: u32, workspace_count: u8) ?u8 {
+    /// Copy the native Space topology for reuse across one reconciliation pass.
+    pub fn nativeSpaceTopology(self: *const SkyLight) ?NativeSpaceTopology {
         const copy_spaces = self.copyManagedDisplaySpaces orelse return null;
         const displays = copy_spaces(self.mainConnectionID()) orelse return null;
-        defer c.CFRelease(displays);
+        return NativeSpaceTopology.init(displays) orelse {
+            c.CFRelease(displays);
+            return null;
+        };
+    }
 
-        const display_key = cfString("Display Identifier") orelse return null;
-        defer c.CFRelease(display_key);
-        const spaces_key = cfString("Spaces") orelse return null;
-        defer c.CFRelease(spaces_key);
-        const current_space_key = cfString("Current Space") orelse return null;
-        defer c.CFRelease(current_space_key);
-        const id_key = cfString("id64") orelse return null;
-        defer c.CFRelease(id_key);
-        const type_key = cfString("type") orelse return null;
-        defer c.CFRelease(type_key);
-
-        const display = managedDisplay(displays, display_id, display_key) orelse return null;
-        const current_space: CFDictionaryRef = @ptrCast(c.CFDictionaryGetValue(@ptrCast(display), current_space_key) orelse return null);
-        const current_sid = spaceId(current_space, id_key) orelse return null;
-        const spaces: CFArrayRef = @ptrCast(c.CFDictionaryGetValue(@ptrCast(display), spaces_key) orelse return null);
-        return workspaceForSpaceId(spaces, current_sid, workspace_count, id_key, type_key);
+    /// Return the Bobrwm index of the display's current ordinary native space.
+    pub fn currentNativeWorkspace(self: *const SkyLight, display_id: u32, workspace_count: u8) ?u8 {
+        var topology = self.nativeSpaceTopology() orelse return null;
+        defer topology.deinit();
+        return topology.currentWorkspace(display_id, workspace_count);
     }
 
     /// Resolve Bobrwm's stable 1-based workspace index to the corresponding
     /// ordinary Mission Control space on a display. Full-screen spaces are
     /// deliberately skipped because Mission Control inserts and removes them.
     pub fn nativeSpaceId(self: *const SkyLight, display_id: u32, workspace_id: u8) ?u64 {
-        const copy_spaces = self.copyManagedDisplaySpaces orelse return null;
-        const displays = copy_spaces(self.mainConnectionID()) orelse return null;
-        defer c.CFRelease(displays);
-
-        const display_uuid = cg_extra.CGDisplayCreateUUIDFromDisplayID(display_id) orelse return null;
-        defer c.CFRelease(display_uuid);
-        const display_name = c.CFUUIDCreateString(null, display_uuid) orelse return null;
-        defer c.CFRelease(display_name);
-
-        const display_key = cfString("Display Identifier") orelse return null;
-        defer c.CFRelease(display_key);
-        const spaces_key = cfString("Spaces") orelse return null;
-        defer c.CFRelease(spaces_key);
-        const id_key = cfString("id64") orelse return null;
-        defer c.CFRelease(id_key);
-        const type_key = cfString("type") orelse return null;
-        defer c.CFRelease(type_key);
-
-        const display_count = c.CFArrayGetCount(@ptrCast(displays));
-        for (0..@intCast(display_count)) |display_index| {
-            const display: CFDictionaryRef = @ptrCast(c.CFArrayGetValueAtIndex(@ptrCast(displays), @intCast(display_index)) orelse continue);
-            const identifier = c.CFDictionaryGetValue(@ptrCast(display), display_key) orelse continue;
-            if (c.CFEqual(identifier, display_name) == 0) continue;
-            const spaces: CFArrayRef = @ptrCast(c.CFDictionaryGetValue(@ptrCast(display), spaces_key) orelse return null);
-            return spaceAtIndex(spaces, workspace_id, id_key, type_key);
-        }
-        return null;
+        var topology = self.nativeSpaceTopology() orelse return null;
+        defer topology.deinit();
+        return topology.spaceIdAtWorkspace(display_id, workspace_id);
     }
 
     /// Ask Dock to perform the native transition using the high-velocity
@@ -309,65 +278,119 @@ pub const SkyLight = struct {
     /// Return the unique ordinary workspace containing a window. Windows
     /// shared across multiple ordinary Spaces are deliberately ambiguous.
     pub fn nativeWorkspaceForWindow(self: *const SkyLight, wid: u32, display_id: u32, workspace_count: u8) ?u8 {
-        const copy_window_spaces = self.copySpacesForWindows orelse return null;
-        const copy_display_spaces = self.copyManagedDisplaySpaces orelse return null;
+        var topology = self.nativeSpaceTopology() orelse return null;
+        defer topology.deinit();
+        return topology.workspaceForWindow(self, wid, display_id, workspace_count);
+    }
 
+    fn nativeSpaceSwitchPlan(self: *const SkyLight, display_id: u32, target_workspace_id: u8) ?NativeSpaceSwitchPlan {
+        var topology = self.nativeSpaceTopology() orelse return null;
+        defer topology.deinit();
+        return topology.switchPlan(display_id, target_workspace_id);
+    }
+};
+
+/// Owned native Space topology snapshot.
+pub const NativeSpaceTopology = struct {
+    displays: CFArrayRef,
+    keys: NativeSpaceKeys,
+
+    fn init(displays: CFArrayRef) ?NativeSpaceTopology {
+        const keys = NativeSpaceKeys.init() orelse return null;
+        return .{ .displays = displays, .keys = keys };
+    }
+
+    /// Release the copied topology and its lookup keys.
+    pub fn deinit(self: *NativeSpaceTopology) void {
+        self.keys.deinit();
+        c.CFRelease(self.displays);
+        self.* = undefined;
+    }
+
+    /// Return the Bobrwm workspace currently visible on a display.
+    pub fn currentWorkspace(self: *const NativeSpaceTopology, display_id: u32, workspace_count: u8) ?u8 {
+        const display = self.managedDisplayInfo(display_id) orelse return null;
+        const current_space: CFDictionaryRef = @ptrCast(c.CFDictionaryGetValue(@ptrCast(display), self.keys.current_space) orelse return null);
+        const current_sid = spaceId(current_space, self.keys.id) orelse return null;
+        const spaces = self.spacesForDisplay(display) orelse return null;
+        return workspaceForSpaceId(spaces, current_sid, workspace_count, self.keys.id, self.keys.space_type);
+    }
+
+    /// Return the unique ordinary workspace containing a window.
+    pub fn workspaceForWindow(
+        self: *const NativeSpaceTopology,
+        sky: *const SkyLight,
+        wid: u32,
+        display_id: u32,
+        workspace_count: u8,
+    ) ?u8 {
+        const copy_window_spaces = sky.copySpacesForWindows orelse return null;
         const number = c.CFNumberCreate(null, c.kCFNumberSInt32Type, &wid) orelse return null;
         defer c.CFRelease(number);
         var values = [_]?*const anyopaque{number};
         const windows = c.CFArrayCreate(null, &values, 1, &c.kCFTypeArrayCallBacks) orelse return null;
         defer c.CFRelease(windows);
-        const window_spaces = copy_window_spaces(self.mainConnectionID(), 0x7, windows) orelse return null;
+        const window_spaces = copy_window_spaces(sky.mainConnectionID(), 0x7, windows) orelse return null;
         defer c.CFRelease(window_spaces);
 
-        const displays = copy_display_spaces(self.mainConnectionID()) orelse return null;
-        defer c.CFRelease(displays);
-        const display_uuid = cg_extra.CGDisplayCreateUUIDFromDisplayID(display_id) orelse return null;
-        defer c.CFRelease(display_uuid);
-        const display_name = c.CFUUIDCreateString(null, display_uuid) orelse return null;
-        defer c.CFRelease(display_name);
-
-        const display_key = cfString("Display Identifier") orelse return null;
-        defer c.CFRelease(display_key);
-        const spaces_key = cfString("Spaces") orelse return null;
-        defer c.CFRelease(spaces_key);
-        const id_key = cfString("id64") orelse return null;
-        defer c.CFRelease(id_key);
-        const type_key = cfString("type") orelse return null;
-        defer c.CFRelease(type_key);
-
-        const display_count = c.CFArrayGetCount(@ptrCast(displays));
-        for (0..@intCast(display_count)) |display_index| {
-            const display: CFDictionaryRef = @ptrCast(c.CFArrayGetValueAtIndex(@ptrCast(displays), @intCast(display_index)) orelse continue);
-            const identifier = c.CFDictionaryGetValue(@ptrCast(display), display_key) orelse continue;
-            if (c.CFEqual(identifier, display_name) == 0) continue;
-            const spaces: CFArrayRef = @ptrCast(c.CFDictionaryGetValue(@ptrCast(display), spaces_key) orelse return null);
-            return workspaceForWindowSpaces(window_spaces, spaces, workspace_count, id_key, type_key);
-        }
-        return null;
+        const display = self.managedDisplayInfo(display_id) orelse return null;
+        const spaces = self.spacesForDisplay(display) orelse return null;
+        return workspaceForWindowSpaces(window_spaces, spaces, workspace_count, self.keys.id, self.keys.space_type);
     }
 
-    fn nativeSpaceSwitchPlan(self: *const SkyLight, display_id: u32, target_workspace_id: u8) ?NativeSpaceSwitchPlan {
-        const copy_spaces = self.copyManagedDisplaySpaces orelse return null;
-        const displays = copy_spaces(self.mainConnectionID()) orelse return null;
-        defer c.CFRelease(displays);
+    fn spaceIdAtWorkspace(self: *const NativeSpaceTopology, display_id: u32, workspace_id: u8) ?u64 {
+        const display = self.managedDisplayInfo(display_id) orelse return null;
+        const spaces = self.spacesForDisplay(display) orelse return null;
+        return spaceAtIndex(spaces, workspace_id, self.keys.id, self.keys.space_type);
+    }
 
-        const display_key = cfString("Display Identifier") orelse return null;
-        defer c.CFRelease(display_key);
-        const spaces_key = cfString("Spaces") orelse return null;
-        defer c.CFRelease(spaces_key);
-        const current_space_key = cfString("Current Space") orelse return null;
-        defer c.CFRelease(current_space_key);
-        const id_key = cfString("id64") orelse return null;
-        defer c.CFRelease(id_key);
-        const type_key = cfString("type") orelse return null;
-        defer c.CFRelease(type_key);
+    fn switchPlan(self: *const NativeSpaceTopology, display_id: u32, target_workspace_id: u8) ?NativeSpaceSwitchPlan {
+        const display = self.managedDisplayInfo(display_id) orelse return null;
+        const current_space: CFDictionaryRef = @ptrCast(c.CFDictionaryGetValue(@ptrCast(display), self.keys.current_space) orelse return null);
+        const current_sid = spaceId(current_space, self.keys.id) orelse return null;
+        const spaces = self.spacesForDisplay(display) orelse return null;
+        return switchPlanForSpaces(spaces, current_sid, target_workspace_id, self.keys.id, self.keys.space_type);
+    }
 
-        const display = managedDisplay(displays, display_id, display_key) orelse return null;
-        const current_space: CFDictionaryRef = @ptrCast(c.CFDictionaryGetValue(@ptrCast(display), current_space_key) orelse return null);
-        const current_sid = spaceId(current_space, id_key) orelse return null;
-        const spaces: CFArrayRef = @ptrCast(c.CFDictionaryGetValue(@ptrCast(display), spaces_key) orelse return null);
-        return switchPlanForSpaces(spaces, current_sid, target_workspace_id, id_key, type_key);
+    fn managedDisplayInfo(self: *const NativeSpaceTopology, display_id: u32) ?CFDictionaryRef {
+        return managedDisplay(self.displays, display_id, self.keys.display);
+    }
+
+    fn spacesForDisplay(self: *const NativeSpaceTopology, display: CFDictionaryRef) ?CFArrayRef {
+        return @ptrCast(c.CFDictionaryGetValue(@ptrCast(display), self.keys.spaces) orelse return null);
+    }
+};
+
+const NativeSpaceKeys = struct {
+    display: CFStringRef,
+    spaces: CFStringRef,
+    current_space: CFStringRef,
+    id: CFStringRef,
+    space_type: CFStringRef,
+
+    fn init() ?NativeSpaceKeys {
+        const names = [_][*:0]const u8{ "Display Identifier", "Spaces", "Current Space", "id64", "type" };
+        var refs: [names.len]CFStringRef = undefined;
+        for (names, 0..) |name, index| {
+            refs[index] = cfString(name) orelse {
+                var created_count = index;
+                while (created_count > 0) : (created_count -= 1) c.CFRelease(refs[created_count - 1]);
+                return null;
+            };
+        }
+        return .{
+            .display = refs[0],
+            .spaces = refs[1],
+            .current_space = refs[2],
+            .id = refs[3],
+            .space_type = refs[4],
+        };
+    }
+
+    fn deinit(self: *NativeSpaceKeys) void {
+        const refs = [_]CFStringRef{ self.space_type, self.id, self.current_space, self.spaces, self.display };
+        for (refs) |ref| c.CFRelease(ref);
+        self.* = undefined;
     }
 };
 

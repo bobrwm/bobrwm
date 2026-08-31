@@ -66,6 +66,9 @@ const EventQueue = spsc_queue.Queue(event_mod.Event, 1024);
 const hide_peek: f64 = 5;
 /// Poll cadence for windows that are waiting on role readiness or visibility.
 const role_poll_interval_ms: u64 = 100;
+/// Keep one slow app AX server from monopolizing the main event drain.
+const role_poll_ax_timeout_s: f32 = 0.025;
+const role_poll_work_budget_ms: i128 = 30;
 /// Retry budget for deferred candidates before they are dropped or fall back.
 /// Electron-family apps can take multiple seconds before publishing stable AX roles.
 const role_poll_attempts_max: u8 = 50;
@@ -2151,6 +2154,10 @@ fn focusEventRecord(wid: u32, kind: u8) [0xf8]u8 {
 }
 
 fn manageStateForWindow(pid: i32, wid: u32) u8 {
+    return manageStateForWindowWithMessagingTimeout(pid, wid, null);
+}
+
+fn manageStateForWindowWithMessagingTimeout(pid: i32, wid: u32, timeout_seconds: ?f32) u8 {
     std.debug.assert(pid > 0);
     std.debug.assert(wid > 0);
 
@@ -2159,19 +2166,22 @@ fn manageStateForWindow(pid: i32, wid: u32) u8 {
     // Remote-hosted panels (open/save dialogs) can be the app's focused window
     // without appearing in AXWindows; without the focused-window fallback they
     // stay PENDING and never reach the AXModal rejection below.
-    const win = findAxWindow(pid, wid) orelse
-        ax_mod.focusedWindowIfMatches(pid, wid) orelse return shim.BW_MANAGE_PENDING;
-    defer c.CFRelease(@ptrCast(win));
+    const win = if (timeout_seconds) |seconds|
+        ax_mod.findWindowWithMessagingTimeout(pid, wid, seconds)
+    else
+        findAxWindow(pid, wid) orelse ax_mod.focusedWindowIfMatches(pid, wid);
+    const win_ref = win orelse return shim.BW_MANAGE_PENDING;
+    defer c.CFRelease(@ptrCast(win_ref));
 
     const ax = ensureAxStrings() orelse return shim.BW_MANAGE_PENDING;
     // Native open/save panels are app-modal AX windows. They expose enough
     // top-level-window signals to pass the dialog heuristic below, but tiling
     // them resizes the parent app while the user is choosing a file.
-    if (axBooleanAttributeTrue(win, ax.modal_attr)) return shim.BW_MANAGE_REJECT;
+    if (axBooleanAttributeTrue(win_ref, ax.modal_attr)) return shim.BW_MANAGE_REJECT;
 
     const role_attr = ax.role_attr;
     var role_any: c.CFTypeRef = null;
-    const role_err = c.AXUIElementCopyAttributeValue(win, role_attr, @ptrCast(&role_any));
+    const role_err = c.AXUIElementCopyAttributeValue(win_ref, role_attr, @ptrCast(&role_any));
     if (role_err != c.kAXErrorSuccess or role_any == null) return shim.BW_MANAGE_PENDING;
     const role_ref: c.CFStringRef = @ptrCast(role_any orelse return shim.BW_MANAGE_PENDING);
     defer c.CFRelease(@ptrCast(role_ref));
@@ -2187,7 +2197,7 @@ fn manageStateForWindow(pid: i32, wid: u32) u8 {
 
     const subrole_attr = ax.subrole_attr;
     var subrole_any: c.CFTypeRef = null;
-    const subrole_err = c.AXUIElementCopyAttributeValue(win, subrole_attr, @ptrCast(&subrole_any));
+    const subrole_err = c.AXUIElementCopyAttributeValue(win_ref, subrole_attr, @ptrCast(&subrole_any));
     if (subrole_err != c.kAXErrorSuccess or subrole_any == null) return shim.BW_MANAGE_PENDING;
     const subrole_ref: c.CFStringRef = @ptrCast(subrole_any orelse return shim.BW_MANAGE_PENDING);
     defer c.CFRelease(@ptrCast(subrole_ref));
@@ -2214,7 +2224,7 @@ fn manageStateForWindow(pid: i32, wid: u32) u8 {
     // that stays pending is tiled by the legacy timeout fallback.
     const is_dialog_like = c.CFEqual(@ptrCast(subrole_ref), @ptrCast(ax.floating_window_subrole)) != 0 or
         c.CFEqual(@ptrCast(subrole_ref), @ptrCast(ax.dialog_subrole)) != 0;
-    if (is_dialog_like and windowHasRealWindowSignal(win, ax)) {
+    if (is_dialog_like and windowHasRealWindowSignal(win_ref, ax)) {
         return shim.BW_MANAGE_READY;
     }
 
@@ -2308,7 +2318,7 @@ fn bw_window_manage_state(pid: i32, wid: u32) u8 {
 /// share the CGWindowList but have Prohibited activation policy. Caching the
 /// accept/reject decision per PID avoids an ObjC message send for every window
 /// belonging to the same rejected process.
-fn bw_discover_windows(out: []shim.bw_window_info) BoundedSnapshotResult {
+fn bw_discover_windows(out: []shim.bw_window_info, on_screen: ?*OnScreenWindows) BoundedSnapshotResult {
     if (out.len == 0) return .{ .count = 0, .truncated = true };
     const out_buf = out;
 
@@ -2335,18 +2345,21 @@ fn bw_discover_windows(out: []shim.bw_window_info) BoundedSnapshotResult {
         const info_any = c.CFArrayGetValueAtIndex(window_list, i) orelse continue;
         const info: c.CFDictionaryRef = @ptrCast(info_any);
 
-        var layer: i32 = 0;
-        if (c.CFDictionaryGetValue(info, cg_extra.kCGWindowLayer)) |layer_ref_any| {
-            const layer_ref: c.CFNumberRef = @ptrCast(layer_ref_any);
-            _ = c.CFNumberGetValue(layer_ref, c.kCFNumberSInt32Type, &layer);
-        }
-        if (layer != 0) continue;
         if (!cgWindowInfoVisible(info)) continue;
 
         const wid_ref_any = c.CFDictionaryGetValue(info, cg_extra.kCGWindowNumber) orelse continue;
         const wid_ref: c.CFNumberRef = @ptrCast(wid_ref_any);
         var wid: u32 = 0;
         _ = c.CFNumberGetValue(wid_ref, c.kCFNumberSInt32Type, &wid);
+        if (on_screen) |snapshot| snapshot.append(wid);
+
+        var layer: i32 = 0;
+        if (c.CFDictionaryGetValue(info, cg_extra.kCGWindowLayer)) |layer_ref_any| {
+            const layer_ref: c.CFNumberRef = @ptrCast(layer_ref_any);
+            _ = c.CFNumberGetValue(layer_ref, c.kCFNumberSInt32Type, &layer);
+        }
+        if (layer != 0) continue;
+        if (g_store.get(wid) != null) continue;
 
         const pid_ref_any = c.CFDictionaryGetValue(info, cg_extra.kCGWindowOwnerPID) orelse continue;
         const pid_ref: c.CFNumberRef = @ptrCast(pid_ref_any);
@@ -2379,6 +2392,7 @@ fn bw_discover_windows(out: []shim.bw_window_info) BoundedSnapshotResult {
 
         if (count == out_buf.len) {
             truncated = true;
+            if (on_screen) |snapshot| snapshot.truncated = true;
             break;
         }
 
@@ -3722,6 +3736,11 @@ fn handleEvent(ev: *const event_mod.Event) void {
         .window_created => {
             log.info("window created pid={} wid={}", .{ ev.pid, ev.wid });
 
+            if (g_pending_role_windows.contains(ev.wid)) {
+                log.debug("window created: role check already pending pid={} wid={}", .{ ev.pid, ev.wid });
+                return;
+            }
+
             // Electron browsers (Chrome, Edge, Brave) fire kAXWindowCreatedNotification
             // mid-drag during tab tear-out, before the window has settled. Defer these
             // into the existing deferred-candidate pipeline so they are picked up after
@@ -3785,6 +3804,7 @@ fn handleEvent(ev: *const event_mod.Event) void {
             processPendingNativeWindowMoves();
             if (processDueNativeSpaceResettle()) return;
             if (processDueDisplayResettle()) return;
+            if (nativeSpacesEnabled() and g_native_space_switch.isActive()) return;
             const promoted_pending = processPendingRoleWindows();
             const promoted_deferred = processDeferredWindowCandidates();
             const retried_launch = processAppLaunchRetries();
@@ -3792,6 +3812,7 @@ fn handleEvent(ev: *const event_mod.Event) void {
             _ = processPendingFocusQueue();
             if (promoted_pending or promoted_deferred or retried_launch) {
                 retile();
+                updateStatusBar();
             }
         },
         .mouse_down => {
@@ -4068,8 +4089,16 @@ fn centerFloatingWindow(wid: u32) void {
 // Window management helpers
 
 fn windowRoleState(pid: i32, wid: u32) WindowRoleState {
+    return windowRoleStateFromRaw(pid, wid, bw_window_manage_state(pid, wid));
+}
+
+fn windowRoleStateWithMessagingTimeout(pid: i32, wid: u32) WindowRoleState {
+    const raw_state = manageStateForWindowWithMessagingTimeout(pid, wid, role_poll_ax_timeout_s);
+    return windowRoleStateFromRaw(pid, wid, raw_state);
+}
+
+fn windowRoleStateFromRaw(pid: i32, wid: u32, raw_state: u8) WindowRoleState {
     std.debug.assert(wid != 0);
-    const raw_state = bw_window_manage_state(pid, wid);
     return switch (raw_state) {
         shim.BW_MANAGE_REJECT => .reject,
         shim.BW_MANAGE_READY => .ready,
@@ -4212,10 +4241,16 @@ fn reconcileNativeSpaces() void {
     if (!nativeSpacesEnabled()) return;
     const started_ns = nanoTimestamp();
     var completed_display_id: ?u32 = null;
+    const sky = &g_sky.?;
+    var topology = sky.nativeSpaceTopology();
+    defer if (topology) |*snapshot| snapshot.deinit();
 
     if (g_native_space_switch.isActive()) {
         const pending = g_native_space_switch;
-        const actual_id = g_sky.?.currentNativeWorkspace(pending.display_id, g_workspaces.workspace_count);
+        const actual_id = if (topology) |*snapshot|
+            snapshot.currentWorkspace(pending.display_id, g_workspaces.workspace_count)
+        else
+            null;
         if (actual_id == null) {
             if (c.CFAbsoluteTimeGetCurrent() < pending.deadline_at_s) {
                 armNativeSpaceResettle();
@@ -4254,12 +4289,11 @@ fn reconcileNativeSpaces() void {
             return;
         }
 
-        refreshTabGroupActiveTabs();
-        discoverWindows();
+        const adopted_count = discoverWindowsAfterNativeSpaceSwitch();
         clearDragPreview();
         requestRetileDisplay(display_id);
         if (!g_event_drain_active) flushRetileRequests();
-        updateStatusBar();
+        if (adopted_count > 0) updateStatusBar();
         refreshRolePolling();
 
         const elapsed_ms = @divTrunc(nanoTimestamp() - started_ns, std.time.ns_per_ms);
@@ -4267,17 +4301,35 @@ fn reconcileNativeSpaces() void {
         return;
     }
 
-    for (0..g_display_count) |slot| {
-        const display_id = g_displays[slot].id;
-        const active_id = g_sky.?.currentNativeWorkspace(display_id, g_workspaces.workspace_count) orelse {
-            log.warn("native workspace reconcile could not map display={d}", .{display_id});
-            continue;
-        };
-        g_workspaces.setActiveForDisplaySlot(slot, active_id);
-        if (g_workspaces.get(active_id)) |ws| ws.display_id = display_id;
+    var has_active_workspace_change = false;
+    var has_complete_workspace_mapping = true;
+    if (topology) |*snapshot| {
+        for (0..g_display_count) |slot| {
+            const display_id = g_displays[slot].id;
+            const active_id = snapshot.currentWorkspace(display_id, g_workspaces.workspace_count) orelse {
+                has_complete_workspace_mapping = false;
+                log.warn("native workspace reconcile could not map display={d}", .{display_id});
+                continue;
+            };
+            if (g_workspaces.activeIdForDisplaySlot(slot) == active_id) continue;
+
+            has_active_workspace_change = true;
+            g_workspaces.setActiveForDisplaySlot(slot, active_id);
+            if (g_workspaces.get(active_id)) |ws| ws.display_id = display_id;
+        }
+    } else {
+        log.warn("native workspace reconcile could not snapshot topology", .{});
     }
 
-    reconcileNativeWindowAssignments();
+    if (topology != null and has_complete_workspace_mapping and !has_active_workspace_change) {
+        _ = drainQueuedNativeSpaceSwitch();
+        refreshRolePolling();
+        const elapsed_ms = @divTrunc(nanoTimestamp() - started_ns, std.time.ns_per_ms);
+        log.debug("[trace] native workspace reconcile managed=false changed=false elapsed_ms={}", .{elapsed_ms});
+        return;
+    }
+
+    if (topology) |*snapshot| reconcileNativeWindowAssignments(snapshot);
     discoverWindows();
     retile();
     updateStatusBar();
@@ -4285,11 +4337,11 @@ fn reconcileNativeSpaces() void {
     _ = drainQueuedNativeSpaceSwitch();
     refreshRolePolling();
     const elapsed_ms = @divTrunc(nanoTimestamp() - started_ns, std.time.ns_per_ms);
-    log.debug("[trace] native workspace reconcile managed=false elapsed_ms={}", .{elapsed_ms});
+    log.debug("[trace] native workspace reconcile managed=false changed=true elapsed_ms={}", .{elapsed_ms});
 }
 
-fn reconcileNativeWindowAssignments() void {
-    const sky = g_sky orelse return;
+fn reconcileNativeWindowAssignments(topology: *const skylight.NativeSpaceTopology) void {
+    const sky = &g_sky.?;
     const on_screen = OnScreenWindows.snapshot();
     if (on_screen.truncated) return;
     var repairs: [256]struct { wid: u32, workspace_id: u8, display_id: u32 } = undefined;
@@ -4303,7 +4355,7 @@ fn reconcileNativeWindowAssignments() void {
         const visible_wid = g_tab_groups.resolveActive(win.wid);
         if (!on_screen.contains(visible_wid)) continue;
 
-        const workspace_id = sky.nativeWorkspaceForWindow(visible_wid, win.display_id, g_workspaces.workspace_count) orelse continue;
+        const workspace_id = topology.workspaceForWindow(sky, visible_wid, win.display_id, g_workspaces.workspace_count) orelse continue;
         if (workspace_id == win.workspace_id) continue;
         if (repair_count == repairs.len) {
             log.warn("native workspace assignment repair truncated limit={d}", .{repairs.len});
@@ -4685,13 +4737,17 @@ fn processPendingRoleWindows() bool {
     var candidates: [128]PendingRoleCandidate = undefined;
     var candidate_count: usize = 0;
     var truncated = false;
+    const started_ns = nanoTimestamp();
 
     var it = g_pending_role_windows.iterator();
     while (it.next()) |entry| {
+        const elapsed_ns = nanoTimestamp() - started_ns;
+        if (elapsed_ns >= role_poll_work_budget_ms * std.time.ns_per_ms) break;
+
         const wid = entry.key_ptr.*;
         const pid = entry.value_ptr.pid;
 
-        const state = windowRoleState(pid, wid);
+        const state = windowRoleStateWithMessagingTimeout(pid, wid);
         switch (state) {
             .reject => {
                 if (remove_count == remove_wids.len) {
@@ -4919,17 +4975,31 @@ fn processDeferredWindowCandidates() bool {
 }
 
 fn discoverWindows() void {
+    _ = discoverWindowsImpl(false);
+}
+
+fn discoverWindowsAfterNativeSpaceSwitch() usize {
+    return discoverWindowsImpl(true);
+}
+
+fn discoverWindowsImpl(should_refresh_tabs: bool) usize {
     // A multi-step native switch exposes intermediate Spaces long enough for
     // CG and AX discovery. Adopt only after SkyLight confirms the destination.
-    if (nativeSpacesEnabled() and g_native_space_switch.isActive()) return;
+    if (nativeSpacesEnabled() and g_native_space_switch.isActive()) return 0;
+    const started_ns = nanoTimestamp();
 
     var buf: [256]shim.bw_window_info = undefined;
-    const discovery = bw_discover_windows(&buf);
+    var on_screen: OnScreenWindows = .{};
+    const discovery = bw_discover_windows(&buf, if (should_refresh_tabs) &on_screen else null);
+    const enumerated_ns = nanoTimestamp();
     if (discovery.truncated) {
         log.warn("window discovery truncated limit={d}; excess windows remain unmanaged", .{buf.len});
     }
+    if (should_refresh_tabs) refreshTabGroupActiveTabsFromSnapshot(&on_screen);
+    const tabs_refreshed_ns = nanoTimestamp();
     var observed_pids: [128]i32 = undefined;
     var observed_pid_count: usize = 0;
+    var adopted_count: usize = 0;
 
     // Sort windows by current x-position so the BSP tree order matches
     // their on-screen placement. Without this, windows discovered in
@@ -4953,7 +5023,11 @@ fn discoverWindows() void {
         // Observe the owning app even if this specific window is not yet
         // manageable (for example AX role/subrole is still pending).
         if (!already_observed) {
-            ax_observer.observeApp(info.pid);
+            if (should_refresh_tabs) {
+                ax_observer.observeAppDeferred(info.pid);
+            } else {
+                ax_observer.observeApp(info.pid);
+            }
             if (observed_pid_count < observed_pids.len) {
                 observed_pids[observed_pid_count] = info.pid;
                 observed_pid_count += 1;
@@ -4968,6 +5042,13 @@ fn discoverWindows() void {
         // belongs to the display's active native Space.
         const target_ws = resolveWorkspace(info.pid, discovered_display);
         const managed_display = target_ws.display_id orelse discovered_display;
+
+        // A landing must not wait on an app's AX server. The role poll applies
+        // the same gate after the switch path is free to accept more input.
+        if (should_refresh_tabs) {
+            trackPendingRoleWindow(info.pid, info.wid, target_ws.id, managed_display);
+            continue;
+        }
 
         switch (windowRoleState(info.pid, info.wid)) {
             .reject => {
@@ -5009,6 +5090,7 @@ fn discoverWindows() void {
             log.err("discover: failed to adopt pid={d} wid={d}: {}", .{ info.pid, info.wid, err });
             continue;
         };
+        adopted_count += 1;
 
         if (!workspaceVisibleOnDisplay(target_ws.id, managed_display)) {
             if (nativeSpacesEnabled()) {
@@ -5038,6 +5120,16 @@ fn discoverWindows() void {
     if (active_ws.focused_wid == null and active_ws.windows.items.len > 0) {
         active_ws.recordFocus(active_ws.windows.items[0]);
     }
+
+    const completed_ns = nanoTimestamp();
+    log.debug("[trace] window discovery candidates={} adopted={} enumerate_ms={} tabs_ms={} adopt_ms={}", .{
+        discovery.count,
+        adopted_count,
+        @divTrunc(enumerated_ns - started_ns, std.time.ns_per_ms),
+        @divTrunc(tabs_refreshed_ns - enumerated_ns, std.time.ns_per_ms),
+        @divTrunc(completed_ns - tabs_refreshed_ns, std.time.ns_per_ms),
+    });
+    return adopted_count;
 }
 
 /// Snapshot of the window ids CG reports on screen, excluding desktop elements
@@ -5071,20 +5163,25 @@ const OnScreenWindows = struct {
             if (c.CFNumberGetValue(wid_ref, c.kCFNumberSInt32Type, &wid) == 0) continue;
             if (!cgWindowInfoVisible(info)) continue;
 
-            if (self.count == self.wids.len) {
-                self.truncated = true;
-                if (!g_on_screen_truncation_logged) {
-                    log.warn("on-screen window snapshot truncated limit={d}", .{self.wids.len});
-                    g_on_screen_truncation_logged = true;
-                }
-                break;
-            }
-
-            self.wids[self.count] = wid;
-            self.count += 1;
+            self.append(wid);
+            if (self.truncated) break;
         }
 
         return self;
+    }
+
+    fn append(self: *OnScreenWindows, wid: u32) void {
+        if (self.truncated) return;
+        if (self.count < self.wids.len) {
+            self.wids[self.count] = wid;
+            self.count += 1;
+            return;
+        }
+
+        self.truncated = true;
+        if (g_on_screen_truncation_logged) return;
+        log.warn("on-screen window snapshot truncated limit={d}", .{self.wids.len});
+        g_on_screen_truncation_logged = true;
     }
 
     fn contains(self: *const OnScreenWindows, wid: u32) bool {
@@ -5345,6 +5442,11 @@ fn refreshTabGroupActiveTabs() void {
     if (g_tab_groups.groups.count() == 0) return;
 
     const on_screen = OnScreenWindows.snapshot();
+    refreshTabGroupActiveTabsFromSnapshot(&on_screen);
+}
+
+fn refreshTabGroupActiveTabsFromSnapshot(on_screen: *const OnScreenWindows) void {
+    if (g_tab_groups.groups.count() == 0) return;
     if (on_screen.truncated) return;
 
     const Move = struct { group_id: tabgroup.GroupId, selected: u32 };
@@ -5364,7 +5466,7 @@ fn refreshTabGroupActiveTabs() void {
         if (on_screen.contains(group.active_wid)) continue;
 
         var app_windows: [128]tabgroup.detect.AppWindow = undefined;
-        const app_snapshot = appWindowSnapshot(group.pid, &on_screen, &app_windows);
+        const app_snapshot = appWindowSnapshot(group.pid, on_screen, &app_windows);
         if (app_snapshot.truncated) {
             log.warn("tab refresh skipped: AX window snapshot truncated pid={d} limit={d}", .{ group.pid, app_windows.len });
             continue;
