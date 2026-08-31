@@ -11,7 +11,7 @@ const CFStringRef = *const anyopaque;
 const CopyManagedDisplaySpacesFn = *const fn (c_int) callconv(.c) ?CFArrayRef;
 const CopySpacesForWindowsFn = *const fn (c_int, c_int, CFArrayRef) callconv(.c) ?CFArrayRef;
 const MoveWindowsToManagedSpaceFn = *const fn (c_int, CFArrayRef, u64) callconv(.c) void;
-const PerformBridgedMoveFn = *const fn (?*anyopaque) callconv(.c) void;
+const PerformBridgedMoveFn = *const fn (?*anyopaque) callconv(.c) i64;
 
 const DockSwipeDirection = enum {
     left,
@@ -121,8 +121,14 @@ pub const SkyLight = struct {
     pub fn supportsNativeSpaces(self: *const SkyLight) bool {
         return self.copyManagedDisplaySpaces != null and
             self.copySpacesForWindows != null and
-            ((self.performBridgedMove != null and self.bridgedMoveClass != null) or
+            ((self.bridgedMoveClass != null and
+                (self.performBridgedMove != null or self.bridgedMoveSupportsSelector())) or
                 self.moveWindowsToManagedSpace != null);
+    }
+
+    fn bridgedMoveSupportsSelector(self: *const SkyLight) bool {
+        const cls = self.bridgedMoveClass orelse return false;
+        return objc.c.class_getInstanceMethod(cls.value, objc.sel("performWithWMBridgeDelegate").value) != null;
     }
 
     /// Return the Bobrwm index of the display's current ordinary native space.
@@ -198,15 +204,22 @@ pub const SkyLight = struct {
         const windows = c.CFArrayCreate(null, &values, 1, &c.kCFTypeArrayCallBacks) orelse return false;
         defer c.CFRelease(windows);
 
-        if (self.performBridgedMove) |perform| {
-            const cls = self.bridgedMoveClass orelse return false;
+        if (self.bridgedMoveClass) |cls| {
             const allocated = cls.msgSend(objc.Object, "alloc", .{});
             if (allocated.value == null) return false;
             const operation = allocated.msgSend(objc.Object, "initWithWindows:spaceID:", .{ windows, sid });
             if (operation.value == null) return false;
             defer operation.msgSend(void, "release", .{});
-            perform(operation.value);
-            return true;
+            // The operation's own bridge keeps the move durable across later
+            // Space switches; the local symbol remains a compatibility path.
+            if (operation.msgSend(bool, "respondsToSelector:", .{objc.sel("performWithWMBridgeDelegate")})) {
+                operation.msgSend(void, "performWithWMBridgeDelegate", .{});
+                return true;
+            }
+            if (self.performBridgedMove) |perform| {
+                _ = perform(operation.value);
+                return true;
+            }
         }
 
         const move = self.moveWindowsToManagedSpace orelse return false;
@@ -237,6 +250,47 @@ pub const SkyLight = struct {
             if (source_sid != 0 and candidate == source_sid) is_on_source = true;
         }
         return is_on_target and !is_on_source;
+    }
+
+    /// Return the unique ordinary workspace containing a window. Windows
+    /// shared across multiple ordinary Spaces are deliberately ambiguous.
+    pub fn nativeWorkspaceForWindow(self: *const SkyLight, wid: u32, display_id: u32, workspace_count: u8) ?u8 {
+        const copy_window_spaces = self.copySpacesForWindows orelse return null;
+        const copy_display_spaces = self.copyManagedDisplaySpaces orelse return null;
+
+        const number = c.CFNumberCreate(null, c.kCFNumberSInt32Type, &wid) orelse return null;
+        defer c.CFRelease(number);
+        var values = [_]?*const anyopaque{number};
+        const windows = c.CFArrayCreate(null, &values, 1, &c.kCFTypeArrayCallBacks) orelse return null;
+        defer c.CFRelease(windows);
+        const window_spaces = copy_window_spaces(self.mainConnectionID(), 0x7, windows) orelse return null;
+        defer c.CFRelease(window_spaces);
+
+        const displays = copy_display_spaces(self.mainConnectionID()) orelse return null;
+        defer c.CFRelease(displays);
+        const display_uuid = cg_extra.CGDisplayCreateUUIDFromDisplayID(display_id) orelse return null;
+        defer c.CFRelease(display_uuid);
+        const display_name = c.CFUUIDCreateString(null, display_uuid) orelse return null;
+        defer c.CFRelease(display_name);
+
+        const display_key = cfString("Display Identifier") orelse return null;
+        defer c.CFRelease(display_key);
+        const spaces_key = cfString("Spaces") orelse return null;
+        defer c.CFRelease(spaces_key);
+        const id_key = cfString("id64") orelse return null;
+        defer c.CFRelease(id_key);
+        const type_key = cfString("type") orelse return null;
+        defer c.CFRelease(type_key);
+
+        const display_count = c.CFArrayGetCount(@ptrCast(displays));
+        for (0..@intCast(display_count)) |display_index| {
+            const display: CFDictionaryRef = @ptrCast(c.CFArrayGetValueAtIndex(@ptrCast(displays), @intCast(display_index)) orelse continue);
+            const identifier = c.CFDictionaryGetValue(@ptrCast(display), display_key) orelse continue;
+            if (c.CFEqual(identifier, display_name) == 0) continue;
+            const spaces: CFArrayRef = @ptrCast(c.CFDictionaryGetValue(@ptrCast(display), spaces_key) orelse return null);
+            return workspaceForWindowSpaces(window_spaces, spaces, workspace_count, id_key, type_key);
+        }
+        return null;
     }
 
     fn currentNativeSpaceId(self: *const SkyLight, display_id: u32) ?u64 {
@@ -390,6 +444,55 @@ fn spaceAtIndex(spaces: CFArrayRef, workspace_id: u8, id_key: CFStringRef, type_
         var sid: i64 = 0;
         if (c.CFNumberGetValue(@ptrCast(id_ref), c.kCFNumberSInt64Type, &sid) == 0 or sid <= 0) return null;
         return @intCast(sid);
+    }
+    return null;
+}
+
+fn workspaceForWindowSpaces(
+    window_spaces: CFArrayRef,
+    display_spaces: CFArrayRef,
+    workspace_count: u8,
+    id_key: CFStringRef,
+    type_key: CFStringRef,
+) ?u8 {
+    var matched_workspace_id: ?u8 = null;
+    const count = c.CFArrayGetCount(@ptrCast(window_spaces));
+    for (0..@intCast(count)) |index| {
+        const space = c.CFArrayGetValueAtIndex(@ptrCast(window_spaces), @intCast(index)) orelse continue;
+        var sid: i64 = 0;
+        if (c.CFNumberGetValue(@ptrCast(space), c.kCFNumberSInt64Type, &sid) == 0 or sid <= 0) continue;
+
+        const workspace_id = workspaceForSpaceId(display_spaces, @intCast(sid), workspace_count, id_key, type_key) orelse continue;
+        if (matched_workspace_id) |matched| {
+            if (matched != workspace_id) return null;
+        } else {
+            matched_workspace_id = workspace_id;
+        }
+    }
+    return matched_workspace_id;
+}
+
+fn workspaceForSpaceId(
+    spaces: CFArrayRef,
+    target_sid: u64,
+    workspace_count: u8,
+    id_key: CFStringRef,
+    type_key: CFStringRef,
+) ?u8 {
+    var workspace_id: u8 = 0;
+    const count = c.CFArrayGetCount(@ptrCast(spaces));
+    for (0..@intCast(count)) |index| {
+        const space: CFDictionaryRef = @ptrCast(c.CFArrayGetValueAtIndex(@ptrCast(spaces), @intCast(index)) orelse continue);
+        const type_ref = c.CFDictionaryGetValue(@ptrCast(space), type_key) orelse continue;
+        var space_type: i32 = -1;
+        if (c.CFNumberGetValue(@ptrCast(type_ref), c.kCFNumberSInt32Type, &space_type) == 0 or space_type != 0) continue;
+
+        workspace_id += 1;
+        if (workspace_id > workspace_count) return null;
+        const id_ref = c.CFDictionaryGetValue(@ptrCast(space), id_key) orelse continue;
+        var sid: i64 = 0;
+        if (c.CFNumberGetValue(@ptrCast(id_ref), c.kCFNumberSInt64Type, &sid) == 0 or sid <= 0) continue;
+        if (@as(u64, @intCast(sid)) == target_sid) return workspace_id;
     }
     return null;
 }
