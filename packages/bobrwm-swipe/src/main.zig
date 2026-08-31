@@ -5,10 +5,11 @@ const objc = @import("objc");
 const c = @import("c");
 const cg_extra = @import("cg_extra");
 const config_mod = @import("bobrwm_config");
+const runtime_paths = @import("runtime_paths");
 
 const log = std.log.scoped(.bobrwm_swipe);
 
-const max_touches: usize = 16;
+const max_touches: usize = config_mod.max_swipe_fingers;
 const nsevent_type_gesture: c.CGEventType = 29;
 const touch_phase_ended: u32 = 1 << 3;
 const touch_phase_cancelled: u32 = 1 << 4;
@@ -100,7 +101,8 @@ const GestureState = struct {
         if (@abs(avg_dx) <= @abs(avg_dy)) return null;
 
         self.fired = true;
-        return if (avg_dx < 0 and !runtime.reverse) .previous else .next;
+        const moves_previous = (avg_dx < 0) != runtime.reverse;
+        return if (moves_previous) .previous else .next;
     }
 };
 
@@ -166,7 +168,7 @@ fn parseCli(process_args: std.process.Args) Cli {
 
 fn validateSwipeConfig(config: config_mod.SwipeConfig) !RuntimeConfig {
     if (config.fingers == 0 or config.fingers > max_touches) return error.InvalidFingerCount;
-    if (config.distance_pct <= 0 or config.distance_pct > 1) return error.InvalidDistancePct;
+    if (!std.math.isFinite(config.distance_pct) or config.distance_pct <= 0 or config.distance_pct > 1) return error.InvalidDistancePct;
     return .{
         .fingers = config.fingers,
         .distance_pct = config.distance_pct,
@@ -294,7 +296,7 @@ fn findSample(samples: []const TouchSample, id: usize) ?TouchSample {
 
 fn sendIpcCommand(cmd: []const u8) IpcResult {
     var path_buf: [128]u8 = undefined;
-    const path = std.fmt.bufPrintSentinel(&path_buf, "/tmp/bobrwm_{d}.sock", .{std.c.getuid()}, 0) catch return .failed;
+    const path = runtime_paths.socketPathBuf(&path_buf) catch return .failed;
 
     const fd = std.c.socket(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0);
     if (fd < 0) return .failed;
@@ -305,8 +307,9 @@ fn sendIpcCommand(cmd: []const u8) IpcResult {
     };
 
     var addr: std.posix.sockaddr.un = .{ .path = undefined, .family = std.posix.AF.UNIX };
+    if (path.len >= addr.path.len) return .failed;
     @memcpy(addr.path[0..path.len], path[0..path.len]);
-    if (path.len < addr.path.len) addr.path[path.len] = 0;
+    addr.path[path.len] = 0;
 
     if (std.c.connect(fd, @ptrCast(&addr), @sizeOf(std.posix.sockaddr.un)) != 0) return .failed;
     if (!writeAll(fd, cmd)) return .failed;
@@ -414,23 +417,45 @@ test "validate swipe config" {
     try t.expectError(error.InvalidDistancePct, validateSwipeConfig(.{ .distance_pct = 1.1 }));
 }
 
-test "gesture frame fires once without wrapping policy" {
+test "gesture frame maps both directions with reverse policy" {
     const t = std.testing;
 
-    var state: GestureState = .{};
-    const runtime: RuntimeConfig = .{ .fingers = 3, .distance_pct = 0.08 };
     const start = [_]TouchSample{
         .{ .id = 1, .x = 0.5, .y = 0.5 },
         .{ .id = 2, .x = 0.6, .y = 0.5 },
         .{ .id = 3, .x = 0.7, .y = 0.5 },
     };
-    state.begin(&start);
-
-    const moved = [_]TouchSample{
+    const moved_left = [_]TouchSample{
         .{ .id = 1, .x = 0.4, .y = 0.51 },
         .{ .id = 2, .x = 0.5, .y = 0.51 },
         .{ .id = 3, .x = 0.6, .y = 0.51 },
     };
-    try t.expectEqual(Direction.previous, state.update(&moved, runtime).?);
-    try t.expectEqual(@as(?Direction, null), state.update(&moved, runtime));
+    const moved_right = [_]TouchSample{
+        .{ .id = 1, .x = 0.6, .y = 0.49 },
+        .{ .id = 2, .x = 0.7, .y = 0.49 },
+        .{ .id = 3, .x = 0.8, .y = 0.49 },
+    };
+
+    const cases = [_]struct {
+        moved: []const TouchSample,
+        reverse: bool,
+        expected: Direction,
+    }{
+        .{ .moved = &moved_left, .reverse = false, .expected = .previous },
+        .{ .moved = &moved_right, .reverse = false, .expected = .next },
+        .{ .moved = &moved_left, .reverse = true, .expected = .next },
+        .{ .moved = &moved_right, .reverse = true, .expected = .previous },
+    };
+
+    for (cases) |case| {
+        var state: GestureState = .{};
+        state.begin(&start);
+        const runtime: RuntimeConfig = .{
+            .fingers = 3,
+            .distance_pct = 0.08,
+            .reverse = case.reverse,
+        };
+        try t.expectEqual(case.expected, state.update(case.moved, runtime).?);
+        try t.expectEqual(@as(?Direction, null), state.update(case.moved, runtime));
+    }
 }

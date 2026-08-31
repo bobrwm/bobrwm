@@ -10,7 +10,7 @@ bobrwm reconciles four state sources — AX, WindowServer/CG, SkyLight, and its 
 
 ## Querying the daemon (IPC)
 
-The daemon listens on `/tmp/bobrwm_<uid>.sock`. Any `bobrwm` binary acts as an IPC client (during development use `zig-out/bin/bobrwm`; the daemon may be running from there rather than PATH — check `ps ax | rg bobrwm`).
+The daemon listens on `/tmp/bobrwm_<uid>.sock`. Use `zig-out/Bobrwm.app/Contents/MacOS/bobrwm-cli` as the development IPC client; check `ps ax | rg '[b]obrwm'` to identify the running daemon.
 
 ```bash
 bobrwm query workspaces --json   # ALL workspaces with their windows, frames, focused_window, visible flag
@@ -45,7 +45,7 @@ Run it once for a baseline, reproduce the bug, then run it again — the delta t
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `bobrwm_bin` | string | PATH, then `<repo>/zig-out/bin/bobrwm` | IPC client binary |
+| `bobrwm_bin` | string | PATH, then `<repo>/zig-out/Bobrwm.app/Contents/MacOS/bobrwm-cli` | IPC client binary |
 | `frame_tolerance` | number | 2 | px slack before flagging frame drift |
 | `expect_dimming_overlays` | boolean | `false` | Require overlays even if none are visible; set when dimming is known enabled |
 | `output_file` | string | — | Save raw queries + snapshot JSON for offline diffing |
@@ -54,10 +54,7 @@ The raw snapshot includes `window_kind`, `owner_name`, and `cg_order` for every 
 
 ## Logs
 
-Where the daemon logs depends on how it was started:
-
-- **launchd service** (`bobrwm service install`): `/tmp/bobrwm_<user>.out.log` and `/tmp/bobrwm_<user>.err.log`
-- **manual / `zig build run`**: stdout/stderr of that terminal
+The daemon writes its log to `~/Library/Caches/bobrwm/bobrwm.log`. A manual foreground run may also expose output in its terminal.
 
 Log level is **compile-time**: a release binary has no `log.debug` output at all. To get the high-signal transition/cleanup/tab/AX-reconciliation logs, rebuild:
 
@@ -74,10 +71,10 @@ Restarting bobrwm resets workspace assignments and re-adopts windows — it dest
 
 ```bash
 bobrwm service restart        # if running as a launchd service
-# or kill the manual process and rerun zig-out/bin/bobrwm
+# or quit the manual process and rerun zig build run
 ```
 
-If the daemon is running from `zig-out/bin/bobrwm` via `zig build run`, rebuilding while it runs is fine; the new binary takes effect on next restart.
+If the daemon is running from the app bundle via `zig build run`, rebuilding while it runs is fine; the new binary takes effect on next restart.
 
 ## Debugging workflow
 

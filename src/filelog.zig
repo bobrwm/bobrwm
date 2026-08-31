@@ -9,8 +9,8 @@
 //! belongs on the terminal.
 
 const std = @import("std");
-const osutil = @import("osutil.zig");
 const log_options = @import("log_options.zig");
+const runtime_paths = @import("runtime_paths.zig");
 
 const log = std.log.scoped(.filelog);
 
@@ -47,20 +47,46 @@ const Tm = extern struct {
 /// Open the log file. Call once from the main thread before any observer
 /// threads start, so `logFn` never races on the descriptor.
 pub fn init() void {
-    var path_buf: [64]u8 = undefined;
-    const path = std.fmt.bufPrintSentinel(
-        &path_buf,
-        "/tmp/bobrwm_{d}.log",
-        .{std.c.getuid()},
-        0,
-    ) catch return;
+    runtime_paths.ensureRuntimeDir(std.heap.c_allocator) catch |err| {
+        log.warn("could not secure runtime directory: {}; logging to stderr only", .{err});
+        return;
+    };
+
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = runtime_paths.logPathBuf(&path_buf) catch |err| {
+        log.warn("could not resolve log path: {}; logging to stderr only", .{err});
+        return;
+    };
 
     // Appending keeps the tail that explains a crash, which matters now that
     // launchd restarts the agent on one.
-    const flags: std.c.O = .{ .ACCMODE = .WRONLY, .CREAT = true, .APPEND = true };
-    const fd = std.c.open(path, flags, @as(std.c.mode_t, 0o644));
+    const flags: std.c.O = .{
+        .ACCMODE = .WRONLY,
+        .CREAT = true,
+        .APPEND = true,
+        .NONBLOCK = true,
+        .NOFOLLOW = true,
+        .CLOEXEC = true,
+    };
+    const fd = std.c.open(path, flags, @as(std.c.mode_t, 0o600));
     if (fd < 0) {
         log.warn("could not open {s}; logging to stderr only", .{path});
+        return;
+    }
+
+    var stat: std.c.Stat = undefined;
+    if (std.c.fstat(fd, &stat) != 0 or
+        !std.c.S.ISREG(stat.mode) or
+        stat.uid != std.c.getuid() or
+        stat.nlink != 1)
+    {
+        log.warn("refusing unsafe log path {s}; logging to stderr only", .{path});
+        _ = std.c.close(fd);
+        return;
+    }
+    if (std.c.fchmod(fd, 0o600) != 0) {
+        log.warn("could not secure {s}; logging to stderr only", .{path});
+        _ = std.c.close(fd);
         return;
     }
 
@@ -71,6 +97,11 @@ pub fn init() void {
 
     g_fd.store(fd, .release);
     log.info("logging to {s}", .{path});
+}
+
+pub fn deinit() void {
+    const fd = g_fd.swap(-1, .acq_rel);
+    if (fd >= 0) _ = std.c.close(fd);
 }
 
 /// `std.Options.logFn`. Writes to stderr as usual, then appends a plain-text

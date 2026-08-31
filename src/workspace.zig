@@ -23,6 +23,18 @@ pub fn followFocusAction(workspace_visible: bool, transition_active: bool) Follo
     return .switch_workspace;
 }
 
+/// Whether `actual` physically covers the complete region assigned by
+/// `target`. Apps may clamp a tile larger than requested, which is safe for a
+/// reveal; exact frame equality would unnecessarily hold the outgoing
+/// workspace in front of an already covered display.
+pub fn frameCoversTarget(actual: Window.Window.Frame, target: Window.Window.Frame) bool {
+    const tolerance = Window.Window.Frame.tolerance;
+    return actual.x <= target.x + tolerance and
+        actual.y <= target.y + tolerance and
+        actual.x + actual.width >= target.x + target.width - tolerance and
+        actual.y + actual.height >= target.y + target.height - tolerance;
+}
+
 /// Bounded so focus bookkeeping never allocates. Entries beyond the cap are
 /// the least recently focused windows; losing them only degrades the
 /// focus-after-close fallback to the first-window heuristic.
@@ -69,6 +81,21 @@ pub const Workspace = struct {
         }
 
         try self.windows.append(self.allocator, wid);
+    }
+
+    /// Reserve entries before a mutation that must commit across multiple
+    /// containers. Capacity changes are harmless if a later reservation fails.
+    pub fn ensureUnusedWindowCapacity(self: *Workspace, additional_count: usize) !void {
+        try self.windows.ensureUnusedCapacity(self.allocator, additional_count);
+    }
+
+    /// Append after a matching `ensureUnusedWindowCapacity` call.
+    pub fn addWindowAssumeCapacity(self: *Workspace, wid: Window.WindowId) void {
+        std.debug.assert(wid != 0);
+        for (self.windows.items) |existing| {
+            std.debug.assert(existing != wid);
+        }
+        self.windows.appendAssumeCapacity(wid);
     }
 
     /// Replace a window ID in-place, preserving its position in the window
@@ -335,4 +362,15 @@ test "follow focus defers hidden windows through the transition settle tail" {
     try t.expectEqual(FollowFocusAction.ignore, followFocusAction(true, true));
     try t.expectEqual(FollowFocusAction.defer_until_settled, followFocusAction(false, true));
     try t.expectEqual(FollowFocusAction.switch_workspace, followFocusAction(false, false));
+}
+
+test "physical reveal accepts exact and clamped-larger frames only" {
+    const t = std.testing;
+    const target: Window.Window.Frame = .{ .x = 4, .y = 37, .width = 750, .height = 941 };
+
+    try t.expect(frameCoversTarget(target, target));
+    try t.expect(frameCoversTarget(.{ .x = 0, .y = 33, .width = 800, .height = 949 }, target));
+    try t.expect(!frameCoversTarget(.{ .x = 100, .y = 37, .width = 750, .height = 941 }, target));
+    try t.expect(!frameCoversTarget(.{ .x = 4, .y = 37, .width = 600, .height = 941 }, target));
+    try t.expect(!frameCoversTarget(.{ .x = 1507, .y = 977, .width = 750, .height = 941 }, target));
 }

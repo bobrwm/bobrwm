@@ -255,6 +255,12 @@ pub fn build(b: *std.Build) !void {
     swipe_mod.addImport("c", c_mod);
     swipe_mod.addImport("cg_extra", cg_extra_mod);
     swipe_mod.addImport("bobrwm_config", swipe_config_mod);
+    swipe_mod.addImport("runtime_paths", b.createModule(.{
+        .root_source_file = b.path("src/runtime_paths.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    }));
     swipe_mod.addAssemblyFile(b.path("packages/bobrwm-swipe/src/info_plist.s"));
     swipe_mod.linkFramework("ApplicationServices", .{});
     swipe_mod.linkFramework("CoreGraphics", .{});
@@ -393,6 +399,32 @@ pub fn build(b: *std.Build) !void {
 
     const run_ipc_tests = b.addRunArtifact(ipc_tests);
 
+    const queue_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/spsc_queue.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    const queue_tests = b.addTest(.{
+        .name = "spsc-queue-tests",
+        .root_module = queue_test_mod,
+    });
+
+    const run_queue_tests = b.addRunArtifact(queue_tests);
+
+    const geometry_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/geometry.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    const geometry_tests = b.addTest(.{
+        .name = "geometry-tests",
+        .root_module = geometry_test_mod,
+    });
+
+    const run_geometry_tests = b.addRunArtifact(geometry_tests);
+
     // tabgroup.zig and tiling.zig are pure Zig (window.zig types only),
     // so their test modules need no SDK or include wiring either.
     const tabgroup_test_mod = b.createModule(.{
@@ -484,6 +516,12 @@ pub fn build(b: *std.Build) !void {
     swipe_test_mod.addImport("c", c_mod);
     swipe_test_mod.addImport("cg_extra", cg_extra_mod);
     swipe_test_mod.addImport("bobrwm_config", swipe_config_mod);
+    swipe_test_mod.addImport("runtime_paths", b.createModule(.{
+        .root_source_file = b.path("src/runtime_paths.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    }));
     swipe_test_mod.linkFramework("ApplicationServices", .{});
     swipe_test_mod.linkFramework("CoreGraphics", .{});
     swipe_test_mod.linkFramework("AppKit", .{});
@@ -502,6 +540,8 @@ pub fn build(b: *std.Build) !void {
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_tests.step);
     test_step.dependOn(&run_ipc_tests.step);
+    test_step.dependOn(&run_queue_tests.step);
+    test_step.dependOn(&run_geometry_tests.step);
     test_step.dependOn(&run_tabgroup_tests.step);
     test_step.dependOn(&run_tiling_tests.step);
     test_step.dependOn(&run_workspace_tests.step);
