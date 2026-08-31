@@ -32,8 +32,21 @@ const dock_swipe_progress: f64 = 1.401298464324817e-45;
 const dock_swipe_modern_progress: f64 = 0.000016;
 const dock_swipe_phase_delay_us: c_uint = 10_000;
 const serialized_event_capacity: usize = 4096;
+const native_window_batch_capacity: usize = 256;
 
 var g_requires_event_augmentation: ?bool = null;
+var g_dock_swipe: DockSwipeState = .{};
+
+const DockSwipeState = struct {
+    direction: DockSwipeDirection = .left,
+    phase: DockSwipePhase = .began,
+    velocity: f64 = 0,
+    steps_remaining: u8 = 0,
+
+    fn isActive(self: DockSwipeState) bool {
+        return self.steps_remaining > 0;
+    }
+};
 
 pub const CGRect = extern struct {
     origin: CGPoint,
@@ -71,6 +84,8 @@ pub const SkyLight = struct {
     moveWindowsToManagedSpace: ?MoveWindowsToManagedSpaceFn,
     performBridgedMove: ?PerformBridgedMoveFn,
     bridgedMoveClass: ?objc.Class,
+    bridgedMoveSelectorSupported: bool,
+    nativeSpacesSupported: bool,
 
     pub fn init() ?SkyLight {
         var lib = std.DynLib.open("/System/Library/PrivateFrameworks/SkyLight.framework/SkyLight") catch {
@@ -102,6 +117,21 @@ pub const SkyLight = struct {
             log.warn("SkyLight focus-activation symbols unavailable; using Cocoa activation fallback", .{});
         }
 
+        const copy_managed_display_spaces = lib.lookup(CopyManagedDisplaySpacesFn, "SLSCopyManagedDisplaySpaces");
+        const copy_spaces_for_windows = lib.lookup(CopySpacesForWindowsFn, "SLSCopySpacesForWindows");
+        const move_windows_to_managed_space = lib.lookup(MoveWindowsToManagedSpaceFn, "SLSMoveWindowsToManagedSpace");
+        const perform_bridged_move = resolveBridgedMove();
+        const bridged_move_class = objc.getClass("SLSBridgedMoveWindowsToManagedSpaceOperation");
+        const bridged_move_selector_supported = if (bridged_move_class) |cls|
+            objc.c.class_getInstanceMethod(cls.value, objc.sel("performWithWMBridgeDelegate").value) != null
+        else
+            false;
+        const native_spaces_supported = copy_managed_display_spaces != null and
+            copy_spaces_for_windows != null and
+            ((bridged_move_class != null and
+                (perform_bridged_move != null or bridged_move_selector_supported)) or
+                move_windows_to_managed_space != null);
+
         log.info("SkyLight.framework loaded", .{});
 
         return .{
@@ -110,37 +140,42 @@ pub const SkyLight = struct {
             .getWindowBounds = get_bounds,
             .setFrontProcessWithOptions = set_front,
             .postEventRecordTo = post_event,
-            .copyManagedDisplaySpaces = lib.lookup(CopyManagedDisplaySpacesFn, "SLSCopyManagedDisplaySpaces"),
-            .copySpacesForWindows = lib.lookup(CopySpacesForWindowsFn, "SLSCopySpacesForWindows"),
-            .moveWindowsToManagedSpace = lib.lookup(MoveWindowsToManagedSpaceFn, "SLSMoveWindowsToManagedSpace"),
-            .performBridgedMove = resolveBridgedMove(),
-            .bridgedMoveClass = objc.getClass("SLSBridgedMoveWindowsToManagedSpaceOperation"),
+            .copyManagedDisplaySpaces = copy_managed_display_spaces,
+            .copySpacesForWindows = copy_spaces_for_windows,
+            .moveWindowsToManagedSpace = move_windows_to_managed_space,
+            .performBridgedMove = perform_bridged_move,
+            .bridgedMoveClass = bridged_move_class,
+            .bridgedMoveSelectorSupported = bridged_move_selector_supported,
+            .nativeSpacesSupported = native_spaces_supported,
         };
     }
 
     pub fn supportsNativeSpaces(self: *const SkyLight) bool {
-        return self.copyManagedDisplaySpaces != null and
-            self.copySpacesForWindows != null and
-            ((self.bridgedMoveClass != null and
-                (self.performBridgedMove != null or self.bridgedMoveSupportsSelector())) or
-                self.moveWindowsToManagedSpace != null);
-    }
-
-    fn bridgedMoveSupportsSelector(self: *const SkyLight) bool {
-        const cls = self.bridgedMoveClass orelse return false;
-        return objc.c.class_getInstanceMethod(cls.value, objc.sel("performWithWMBridgeDelegate").value) != null;
+        return self.nativeSpacesSupported;
     }
 
     /// Return the Bobrwm index of the display's current ordinary native space.
     pub fn currentNativeWorkspace(self: *const SkyLight, display_id: u32, workspace_count: u8) ?u8 {
-        const current_sid = self.currentNativeSpaceId(display_id) orelse return null;
+        const copy_spaces = self.copyManagedDisplaySpaces orelse return null;
+        const displays = copy_spaces(self.mainConnectionID()) orelse return null;
+        defer c.CFRelease(displays);
 
-        var workspace_id: u8 = 1;
-        while (workspace_id <= workspace_count) : (workspace_id += 1) {
-            const sid = self.nativeSpaceId(display_id, workspace_id) orelse continue;
-            if (sid == current_sid) return workspace_id;
-        }
-        return null;
+        const display_key = cfString("Display Identifier") orelse return null;
+        defer c.CFRelease(display_key);
+        const spaces_key = cfString("Spaces") orelse return null;
+        defer c.CFRelease(spaces_key);
+        const current_space_key = cfString("Current Space") orelse return null;
+        defer c.CFRelease(current_space_key);
+        const id_key = cfString("id64") orelse return null;
+        defer c.CFRelease(id_key);
+        const type_key = cfString("type") orelse return null;
+        defer c.CFRelease(type_key);
+
+        const display = managedDisplay(displays, display_id, display_key) orelse return null;
+        const current_space: CFDictionaryRef = @ptrCast(c.CFDictionaryGetValue(@ptrCast(display), current_space_key) orelse return null);
+        const current_sid = spaceId(current_space, id_key) orelse return null;
+        const spaces: CFArrayRef = @ptrCast(c.CFDictionaryGetValue(@ptrCast(display), spaces_key) orelse return null);
+        return workspaceForSpaceId(spaces, current_sid, workspace_count, id_key, type_key);
     }
 
     /// Resolve Bobrwm's stable 1-based workspace index to the corresponding
@@ -178,30 +213,49 @@ pub const SkyLight = struct {
 
     /// Ask Dock to perform the native transition using the high-velocity
     /// gesture sequence from InstantSpaceSwitcher and strafe.
-    pub fn switchNativeSpace(self: *const SkyLight, display_id: u32, from_id: u8, to_id: u8) bool {
+    pub fn switchNativeSpace(self: *const SkyLight, display_id: u32, to_id: u8) bool {
+        const started_at_s = c.CFAbsoluteTimeGetCurrent();
         if (!cg_extra.CGPreflightPostEventAccess()) {
             log.warn("native Space switching requires Accessibility permission to post events", .{});
             return false;
         }
 
-        const current_sid = self.nativeSpaceId(display_id, from_id) orelse return false;
-        const plan = self.nativeSpaceSwitchPlan(display_id, current_sid, to_id) orelse return false;
+        const plan = self.nativeSpaceSwitchPlan(display_id, to_id) orelse return false;
         if (plan.steps == 0) return true;
         if (!routeDockSwipeToDisplay(display_id)) return false;
 
         const velocity = dock_swipe_velocity * @as(f64, @floatFromInt(plan.steps));
-        for (0..plan.steps) |_| {
-            if (!performDockSwipe(plan.direction, velocity)) return false;
-        }
-        return true;
+        const scheduled = performDockSwipes(plan.direction, velocity, plan.steps);
+        const elapsed_ms = (c.CFAbsoluteTimeGetCurrent() - started_at_s) * std.time.ms_per_s;
+        log.debug("[trace] native Space gesture display={d} target={d} steps={d} scheduled={} elapsed_ms={d:.2}", .{
+            display_id,
+            to_id,
+            plan.steps,
+            scheduled,
+            elapsed_ms,
+        });
+        return scheduled;
     }
 
     pub fn moveWindowToNativeSpace(self: *const SkyLight, wid: u32, display_id: u32, workspace_id: u8) bool {
+        return self.moveWindowsToNativeSpace(&.{wid}, display_id, workspace_id);
+    }
+
+    pub fn moveWindowsToNativeSpace(self: *const SkyLight, wids: []const u32, display_id: u32, workspace_id: u8) bool {
+        if (wids.len == 0 or wids.len > native_window_batch_capacity) return false;
+
         const sid = self.nativeSpaceId(display_id, workspace_id) orelse return false;
-        const number = c.CFNumberCreate(null, c.kCFNumberSInt32Type, &wid) orelse return false;
-        defer c.CFRelease(number);
-        var values = [_]?*const anyopaque{number};
-        const windows = c.CFArrayCreate(null, &values, 1, &c.kCFTypeArrayCallBacks) orelse return false;
+        var values: [native_window_batch_capacity]?*const anyopaque = undefined;
+        var value_count: usize = 0;
+        defer for (values[0..value_count]) |value| c.CFRelease(value);
+
+        for (wids) |*wid| {
+            const number = c.CFNumberCreate(null, c.kCFNumberSInt32Type, wid) orelse return false;
+            values[value_count] = number;
+            value_count += 1;
+        }
+
+        const windows = c.CFArrayCreate(null, &values, @intCast(value_count), &c.kCFTypeArrayCallBacks) orelse return false;
         defer c.CFRelease(windows);
 
         if (self.bridgedMoveClass) |cls| {
@@ -212,7 +266,7 @@ pub const SkyLight = struct {
             defer operation.msgSend(void, "release", .{});
             // The operation's own bridge keeps the move durable across later
             // Space switches; the local symbol remains a compatibility path.
-            if (operation.msgSend(bool, "respondsToSelector:", .{objc.sel("performWithWMBridgeDelegate")})) {
+            if (self.bridgedMoveSelectorSupported) {
                 operation.msgSend(void, "performWithWMBridgeDelegate", .{});
                 return true;
             }
@@ -293,65 +347,27 @@ pub const SkyLight = struct {
         return null;
     }
 
-    fn currentNativeSpaceId(self: *const SkyLight, display_id: u32) ?u64 {
+    fn nativeSpaceSwitchPlan(self: *const SkyLight, display_id: u32, target_workspace_id: u8) ?NativeSpaceSwitchPlan {
         const copy_spaces = self.copyManagedDisplaySpaces orelse return null;
         const displays = copy_spaces(self.mainConnectionID()) orelse return null;
         defer c.CFRelease(displays);
-
-        const display_uuid = cg_extra.CGDisplayCreateUUIDFromDisplayID(display_id) orelse return null;
-        defer c.CFRelease(display_uuid);
-        const display_name = c.CFUUIDCreateString(null, display_uuid) orelse return null;
-        defer c.CFRelease(display_name);
-
-        const display_key = cfString("Display Identifier") orelse return null;
-        defer c.CFRelease(display_key);
-        const current_space_key = cfString("Current Space") orelse return null;
-        defer c.CFRelease(current_space_key);
-        const id_key = cfString("id64") orelse return null;
-        defer c.CFRelease(id_key);
-
-        const display_count = c.CFArrayGetCount(@ptrCast(displays));
-        for (0..@intCast(display_count)) |display_index| {
-            const display: CFDictionaryRef = @ptrCast(c.CFArrayGetValueAtIndex(@ptrCast(displays), @intCast(display_index)) orelse continue);
-            const identifier = c.CFDictionaryGetValue(@ptrCast(display), display_key) orelse continue;
-            if (c.CFEqual(identifier, display_name) == 0) continue;
-            const current_space: CFDictionaryRef = @ptrCast(c.CFDictionaryGetValue(@ptrCast(display), current_space_key) orelse return null);
-            const id_ref = c.CFDictionaryGetValue(@ptrCast(current_space), id_key) orelse return null;
-            var sid: i64 = 0;
-            if (c.CFNumberGetValue(@ptrCast(id_ref), c.kCFNumberSInt64Type, &sid) == 0 or sid <= 0) return null;
-            return @intCast(sid);
-        }
-        return null;
-    }
-
-    fn nativeSpaceSwitchPlan(self: *const SkyLight, display_id: u32, current_sid: u64, target_workspace_id: u8) ?NativeSpaceSwitchPlan {
-        const copy_spaces = self.copyManagedDisplaySpaces orelse return null;
-        const displays = copy_spaces(self.mainConnectionID()) orelse return null;
-        defer c.CFRelease(displays);
-
-        const display_uuid = cg_extra.CGDisplayCreateUUIDFromDisplayID(display_id) orelse return null;
-        defer c.CFRelease(display_uuid);
-        const display_name = c.CFUUIDCreateString(null, display_uuid) orelse return null;
-        defer c.CFRelease(display_name);
 
         const display_key = cfString("Display Identifier") orelse return null;
         defer c.CFRelease(display_key);
         const spaces_key = cfString("Spaces") orelse return null;
         defer c.CFRelease(spaces_key);
+        const current_space_key = cfString("Current Space") orelse return null;
+        defer c.CFRelease(current_space_key);
         const id_key = cfString("id64") orelse return null;
         defer c.CFRelease(id_key);
         const type_key = cfString("type") orelse return null;
         defer c.CFRelease(type_key);
 
-        const display_count = c.CFArrayGetCount(@ptrCast(displays));
-        for (0..@intCast(display_count)) |display_index| {
-            const display: CFDictionaryRef = @ptrCast(c.CFArrayGetValueAtIndex(@ptrCast(displays), @intCast(display_index)) orelse continue);
-            const identifier = c.CFDictionaryGetValue(@ptrCast(display), display_key) orelse continue;
-            if (c.CFEqual(identifier, display_name) == 0) continue;
-            const spaces: CFArrayRef = @ptrCast(c.CFDictionaryGetValue(@ptrCast(display), spaces_key) orelse return null);
-            return switchPlanForSpaces(spaces, current_sid, target_workspace_id, id_key, type_key);
-        }
-        return null;
+        const display = managedDisplay(displays, display_id, display_key) orelse return null;
+        const current_space: CFDictionaryRef = @ptrCast(c.CFDictionaryGetValue(@ptrCast(display), current_space_key) orelse return null);
+        const current_sid = spaceId(current_space, id_key) orelse return null;
+        const spaces: CFArrayRef = @ptrCast(c.CFDictionaryGetValue(@ptrCast(display), spaces_key) orelse return null);
+        return switchPlanForSpaces(spaces, current_sid, target_workspace_id, id_key, type_key);
     }
 };
 
@@ -428,6 +444,28 @@ fn applyImageSlide(value: usize, slide: isize) ?usize {
 
 fn cfString(value: [*:0]const u8) ?CFStringRef {
     return c.CFStringCreateWithCString(null, value, c.kCFStringEncodingUTF8);
+}
+
+fn managedDisplay(displays: CFArrayRef, display_id: u32, display_key: CFStringRef) ?CFDictionaryRef {
+    const display_uuid = cg_extra.CGDisplayCreateUUIDFromDisplayID(display_id) orelse return null;
+    defer c.CFRelease(display_uuid);
+    const display_name = c.CFUUIDCreateString(null, display_uuid) orelse return null;
+    defer c.CFRelease(display_name);
+
+    const count = c.CFArrayGetCount(@ptrCast(displays));
+    for (0..@intCast(count)) |index| {
+        const display: CFDictionaryRef = @ptrCast(c.CFArrayGetValueAtIndex(@ptrCast(displays), @intCast(index)) orelse continue);
+        const identifier = c.CFDictionaryGetValue(@ptrCast(display), display_key) orelse continue;
+        if (c.CFEqual(identifier, display_name) != 0) return display;
+    }
+    return null;
+}
+
+fn spaceId(space: CFDictionaryRef, id_key: CFStringRef) ?u64 {
+    const id_ref = c.CFDictionaryGetValue(@ptrCast(space), id_key) orelse return null;
+    var sid: i64 = 0;
+    if (c.CFNumberGetValue(@ptrCast(id_ref), c.kCFNumberSInt64Type, &sid) == 0 or sid <= 0) return null;
+    return @intCast(sid);
 }
 
 fn spaceAtIndex(spaces: CFArrayRef, workspace_id: u8, id_key: CFStringRef, type_key: CFStringRef) ?u64 {
@@ -571,14 +609,68 @@ fn postDockSwipe(phase: DockSwipePhase, direction: DockSwipeDirection, velocity:
     return true;
 }
 
-fn performDockSwipe(direction: DockSwipeDirection, velocity: f64) bool {
-    const phase_delay_us = if (requiresEventAugmentation()) dock_swipe_phase_delay_us else 0;
+fn performDockSwipes(direction: DockSwipeDirection, velocity: f64, steps: u8) bool {
+    std.debug.assert(steps > 0);
+    if (g_dock_swipe.isActive()) return false;
+
+    if (!requiresEventAugmentation()) {
+        for (0..steps) |_| {
+            if (!postDockSwipe(.began, direction, velocity)) return false;
+            if (!postDockSwipe(.changed, direction, velocity)) return false;
+            if (!postDockSwipe(.ended, direction, velocity)) return false;
+        }
+        return true;
+    }
 
     if (!postDockSwipe(.began, direction, velocity)) return false;
-    if (phase_delay_us > 0) _ = c.usleep(phase_delay_us);
-    if (!postDockSwipe(.changed, direction, velocity)) return false;
-    if (phase_delay_us > 0) _ = c.usleep(phase_delay_us);
-    return postDockSwipe(.ended, direction, velocity);
+    g_dock_swipe = .{
+        .direction = direction,
+        .phase = .changed,
+        .velocity = velocity,
+        .steps_remaining = steps,
+    };
+    scheduleDockSwipePhase();
+    return true;
+}
+
+fn scheduleDockSwipePhase() void {
+    const delay_ns = @as(i64, dock_swipe_phase_delay_us) * std.time.ns_per_us;
+    c.dispatch_after_f(
+        c.dispatch_time(c.DISPATCH_TIME_NOW, delay_ns),
+        cg_extra.dispatch_get_main_queue(),
+        null,
+        dockSwipePhaseTick,
+    );
+}
+
+fn dockSwipePhaseTick(_: ?*anyopaque) callconv(.c) void {
+    if (!g_dock_swipe.isActive()) return;
+
+    const direction = g_dock_swipe.direction;
+    const velocity = g_dock_swipe.velocity;
+    if (!postDockSwipe(g_dock_swipe.phase, direction, velocity)) {
+        g_dock_swipe = .{};
+        return;
+    }
+
+    if (g_dock_swipe.phase == .changed) {
+        g_dock_swipe.phase = .ended;
+        scheduleDockSwipePhase();
+        return;
+    }
+
+    g_dock_swipe.steps_remaining -= 1;
+    if (g_dock_swipe.steps_remaining == 0) {
+        g_dock_swipe = .{};
+        return;
+    }
+
+    if (!postDockSwipe(.began, direction, velocity)) {
+        g_dock_swipe = .{};
+        return;
+    }
+    g_dock_swipe.phase = .changed;
+    scheduleDockSwipePhase();
 }
 
 fn augmentDockSwipeEvent(event: c.CGEventRef, phase: DockSwipePhase, progress: f64, velocity: f64) c.CGEventRef {
