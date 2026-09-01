@@ -195,8 +195,6 @@ pub const Workspace = struct {
 
 pub const WorkspaceManager = struct {
     workspaces: [max_workspaces]Workspace,
-    active_ids_by_display: [max_displays]WorkspaceId,
-    focused_display_slot: usize,
     workspace_count: u8,
     allocator: std.mem.Allocator,
 
@@ -204,14 +202,6 @@ pub const WorkspaceManager = struct {
         const clamped: u8 = if (count == 0) max_workspaces else @min(count, max_workspaces);
         var wm: WorkspaceManager = .{
             .workspaces = undefined,
-            .active_ids_by_display = blk: {
-                var ids: [max_displays]WorkspaceId = undefined;
-                for (0..max_displays) |i| {
-                    ids[i] = @intCast(i + 1);
-                }
-                break :blk ids;
-            },
-            .focused_display_slot = 0,
             .workspace_count = clamped,
             .allocator = allocator,
         };
@@ -225,25 +215,6 @@ pub const WorkspaceManager = struct {
         for (&self.workspaces) |*ws| {
             ws.deinit();
         }
-    }
-
-    pub fn active(self: *WorkspaceManager) *Workspace {
-        const active_id = self.active_ids_by_display[self.focused_display_slot];
-        std.debug.assert(active_id > 0 and active_id <= max_workspaces);
-        return &self.workspaces[active_id - 1];
-    }
-
-    pub fn activeIdForDisplaySlot(self: *const WorkspaceManager, display_slot: usize) WorkspaceId {
-        std.debug.assert(display_slot < max_displays);
-        const active_id = self.active_ids_by_display[display_slot];
-        std.debug.assert(active_id > 0 and active_id <= self.workspace_count);
-        return active_id;
-    }
-
-    pub fn setActiveForDisplaySlot(self: *WorkspaceManager, display_slot: usize, workspace_id: WorkspaceId) void {
-        std.debug.assert(display_slot < max_displays);
-        std.debug.assert(workspace_id > 0 and workspace_id <= self.workspace_count);
-        self.active_ids_by_display[display_slot] = workspace_id;
     }
 
     pub fn get(self: *WorkspaceManager, id: WorkspaceId) ?*Workspace {

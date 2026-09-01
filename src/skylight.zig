@@ -183,13 +183,19 @@ pub const SkyLight = struct {
     /// Ask Dock to perform the native transition using the high-velocity
     /// gesture sequence from InstantSpaceSwitcher and strafe.
     pub fn switchNativeSpace(self: *const SkyLight, display_id: u32, to_id: u8) bool {
+        const target_space_id = self.nativeSpaceId(display_id, to_id) orelse return false;
+        return self.switchNativeSpaceId(display_id, target_space_id);
+    }
+
+    /// Switch to a native Space by ID.
+    pub fn switchNativeSpaceId(self: *const SkyLight, display_id: u32, target_space_id: u64) bool {
         const started_at_s = c.CFAbsoluteTimeGetCurrent();
         if (!cg_extra.CGPreflightPostEventAccess()) {
             log.warn("native Space switching requires Accessibility permission to post events", .{});
             return false;
         }
 
-        const plan = self.nativeSpaceSwitchPlan(display_id, to_id) orelse return false;
+        const plan = self.nativeSpaceSwitchPlanToId(display_id, target_space_id) orelse return false;
         if (plan.steps == 0) return true;
         if (!routeDockSwipeToDisplay(display_id)) return false;
 
@@ -198,7 +204,7 @@ pub const SkyLight = struct {
         const elapsed_ms = (c.CFAbsoluteTimeGetCurrent() - started_at_s) * std.time.ms_per_s;
         log.debug("[trace] native Space gesture display={d} target={d} steps={d} scheduled={} elapsed_ms={d:.2}", .{
             display_id,
-            to_id,
+            target_space_id,
             plan.steps,
             scheduled,
             elapsed_ms,
@@ -288,6 +294,12 @@ pub const SkyLight = struct {
         defer topology.deinit();
         return topology.switchPlan(display_id, target_workspace_id);
     }
+
+    fn nativeSpaceSwitchPlanToId(self: *const SkyLight, display_id: u32, target_space_id: u64) ?NativeSpaceSwitchPlan {
+        var topology = self.nativeSpaceTopology() orelse return null;
+        defer topology.deinit();
+        return topology.switchPlanToId(display_id, target_space_id);
+    }
 };
 
 /// Owned native Space topology snapshot.
@@ -310,10 +322,16 @@ pub const NativeSpaceTopology = struct {
     /// Return the Bobrwm workspace currently visible on a display.
     pub fn currentWorkspace(self: *const NativeSpaceTopology, display_id: u32, workspace_count: u8) ?u8 {
         const display = self.managedDisplayInfo(display_id) orelse return null;
-        const current_space: CFDictionaryRef = @ptrCast(c.CFDictionaryGetValue(@ptrCast(display), self.keys.current_space) orelse return null);
-        const current_sid = spaceId(current_space, self.keys.id) orelse return null;
+        const current_sid = self.currentSpaceId(display_id) orelse return null;
         const spaces = self.spacesForDisplay(display) orelse return null;
         return workspaceForSpaceId(spaces, current_sid, workspace_count, self.keys.id, self.keys.space_type);
+    }
+
+    /// Return the current native Space ID.
+    pub fn currentSpaceId(self: *const NativeSpaceTopology, display_id: u32) ?u64 {
+        const display = self.managedDisplayInfo(display_id) orelse return null;
+        const current_space: CFDictionaryRef = @ptrCast(c.CFDictionaryGetValue(@ptrCast(display), self.keys.current_space) orelse return null);
+        return spaceId(current_space, self.keys.id);
     }
 
     /// Return the unique ordinary workspace containing a window.
@@ -338,7 +356,7 @@ pub const NativeSpaceTopology = struct {
         return workspaceForWindowSpaces(window_spaces, spaces, workspace_count, self.keys.id, self.keys.space_type);
     }
 
-    fn spaceIdAtWorkspace(self: *const NativeSpaceTopology, display_id: u32, workspace_id: u8) ?u64 {
+    pub fn spaceIdAtWorkspace(self: *const NativeSpaceTopology, display_id: u32, workspace_id: u8) ?u64 {
         const display = self.managedDisplayInfo(display_id) orelse return null;
         const spaces = self.spacesForDisplay(display) orelse return null;
         return spaceAtIndex(spaces, workspace_id, self.keys.id, self.keys.space_type);
@@ -350,6 +368,13 @@ pub const NativeSpaceTopology = struct {
         const current_sid = spaceId(current_space, self.keys.id) orelse return null;
         const spaces = self.spacesForDisplay(display) orelse return null;
         return switchPlanForSpaces(spaces, current_sid, target_workspace_id, self.keys.id, self.keys.space_type);
+    }
+
+    fn switchPlanToId(self: *const NativeSpaceTopology, display_id: u32, target_space_id: u64) ?NativeSpaceSwitchPlan {
+        const display = self.managedDisplayInfo(display_id) orelse return null;
+        const current_sid = self.currentSpaceId(display_id) orelse return null;
+        const spaces = self.spacesForDisplay(display) orelse return null;
+        return switchPlanForSpaceId(spaces, current_sid, target_space_id, self.keys.id);
     }
 
     fn managedDisplayInfo(self: *const NativeSpaceTopology, display_id: u32) ?CFDictionaryRef {
@@ -576,6 +601,21 @@ fn switchPlanForSpaces(spaces: CFArrayRef, current_sid: u64, target_workspace_id
         if (c.CFNumberGetValue(@ptrCast(type_ref), c.kCFNumberSInt32Type, &space_type) == 0 or space_type != 0) continue;
         ordinary_index += 1;
         if (ordinary_index == target_workspace_id) target_position = position;
+    }
+
+    return makeSwitchPlan(current_position orelse return null, target_position orelse return null);
+}
+
+fn switchPlanForSpaceId(spaces: CFArrayRef, current_sid: u64, target_sid: u64, id_key: CFStringRef) ?NativeSpaceSwitchPlan {
+    var current_position: ?usize = null;
+    var target_position: ?usize = null;
+
+    const count = c.CFArrayGetCount(@ptrCast(spaces));
+    for (0..@intCast(count)) |position| {
+        const space: CFDictionaryRef = @ptrCast(c.CFArrayGetValueAtIndex(@ptrCast(spaces), @intCast(position)) orelse continue);
+        const candidate_sid = spaceId(space, id_key) orelse continue;
+        if (candidate_sid == current_sid) current_position = position;
+        if (candidate_sid == target_sid) target_position = position;
     }
 
     return makeSwitchPlan(current_position orelse return null, target_position orelse return null);
