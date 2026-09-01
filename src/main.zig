@@ -257,9 +257,7 @@ fn applySpaceCatalog(catalog: state_mod.SpaceCatalog) void {
         const space = g_workspaces.get(space_ref.key) orelse continue;
         space.ref = space_ref;
         for (space.windows.items) |wid| {
-            var win = g_store.get(wid) orelse continue;
-            win.space = space_ref;
-            g_store.putAssumeCapacity(win);
+            if (!assignManagedWindowSpace(wid, space_ref)) continue;
             updateTabGroupAssignment(wid, space_ref);
         }
     }
@@ -3043,6 +3041,50 @@ fn insertIntoTiling(space_key: state_mod.SpaceKey, wid: u32) void {
     };
 }
 
+fn adoptWindowIdentity(win: window_mod.Window) bool {
+    if (g_state.window(win.wid) != null) return false;
+
+    dispatchStateEvent(.{ .adopt_window = .{
+        .window_id = win.wid,
+        .process_id = win.pid,
+        .space_key = win.space.key,
+    } });
+    const adopted = g_state.window(win.wid) orelse return false;
+    return adopted.process_id == win.pid and adopted.space_key.eql(win.space.key);
+}
+
+fn removeWindowIdentity(wid: u32) void {
+    dispatchStateEvent(.{ .remove_window = wid });
+}
+
+fn replaceWindowIdentity(old_wid: u32, new_wid: u32) bool {
+    if (g_state.window(old_wid) == null or g_state.window(new_wid) != null) return false;
+
+    dispatchStateEvent(.{ .replace_window_id = .{
+        .old_window_id = old_wid,
+        .new_window_id = new_wid,
+    } });
+    return g_state.window(old_wid) == null and g_state.window(new_wid) != null;
+}
+
+fn assignManagedWindowSpace(wid: u32, space: state_mod.SpaceRef) bool {
+    var win = g_store.get(wid) orelse return false;
+    const managed = g_state.window(wid) orelse return false;
+
+    if (!managed.space_key.eql(space.key)) {
+        dispatchStateEvent(.{ .assign_window_space = .{
+            .window_id = wid,
+            .space_key = space.key,
+        } });
+        const assigned = g_state.window(wid) orelse return false;
+        if (!assigned.space_key.eql(space.key)) return false;
+    }
+
+    win.space = space;
+    g_store.putAssumeCapacity(win);
+    return true;
+}
+
 /// Reserve every allocating container before committing a managed window.
 /// Layout insertion happens before the no-fail store/workspace append, so an
 /// allocation failure cannot leave a window present in only part of the model.
@@ -3052,6 +3094,10 @@ fn adoptWindow(ws: *workspace_mod.Space, win: window_mod.Window) !void {
     try g_store.ensureUnusedCapacity(1);
     try ws.ensureUnusedWindowCapacity(1);
     if (win.mode == .tiled) try tryInsertIntoTiling(ws.ref.key, win.wid);
+    if (!adoptWindowIdentity(win)) {
+        if (win.mode == .tiled) removeFromTiling(ws.ref.key, win.wid);
+        return error.WindowCatalogRejected;
+    }
 
     g_store.putAssumeCapacity(win);
     ws.addWindowAssumeCapacity(win.wid);
@@ -3075,6 +3121,7 @@ fn replaceManagedWindowId(old_wid: u32, new_wid: u32, frame: window_mod.Window.F
     if (g_tab_groups.groupOf(new_wid) != null) return false;
 
     const old = g_store.get(old_wid) orelse return false;
+    g_store.ensureUnusedCapacity(1) catch return false;
     const ws = spaceForWindow(old) orelse return false;
     const sp = tilingStatePtr(old.space.key);
     var replaced_in_layout = false;
@@ -3101,13 +3148,14 @@ fn replaceManagedWindowId(old_wid: u32, new_wid: u32, frame: window_mod.Window.F
     var updated = old;
     updated.wid = new_wid;
     updated.frame = frame;
-    g_store.put(updated) catch {
+    if (!replaceWindowIdentity(old_wid, new_wid)) {
         _ = ws.replaceWindow(new_wid, old_wid);
         if (replaced_in_layout) {
             if (sp.*) |*st| _ = st.replaceWid(new_wid, old_wid);
         }
         return false;
-    };
+    }
+    g_store.putAssumeCapacity(updated);
     g_store.remove(old_wid);
     g_geometry.forget(old_wid);
     seedObservedFrame(new_wid, frame);
@@ -3837,15 +3885,17 @@ fn rollbackNativeWindowMove(wid: u32, pending: state_mod.PendingNativeWindowMove
         if (win.mode == .tiled) removeFromTiling(source_ws.ref.key, wid);
         return false;
     }
+    if (!assignManagedWindowSpace(wid, source_ws.ref)) {
+        if (win.mode == .tiled) removeFromTiling(source_ws.ref.key, wid);
+        return false;
+    }
 
     source_ws.addWindowAssumeCapacity(wid);
     target_ws.removeWindow(wid);
     removeFromTiling(target_ws.ref.key, wid);
     if (source_ws.focused_wid == null) source_ws.recordFocus(wid);
 
-    win.space = source_ws.ref;
-    g_store.putAssumeCapacity(win);
-    updateTabGroupAssignment(wid, win.space);
+    updateTabGroupAssignment(wid, source_ws.ref);
     return true;
 }
 
@@ -4181,11 +4231,7 @@ fn completeNativeSwitch(space: state_mod.SpaceRef, epoch: state_mod.Epoch) void 
     const started_ns = nanoTimestamp();
     const workspace = g_workspaces.get(space.key) orelse return;
     for (workspace.windows.items) |wid| {
-        var win = g_store.get(wid) orelse continue;
-        if (!win.space.key.eql(space.key)) {
-            win.space = workspace.ref;
-            g_store.put(win) catch {};
-        }
+        if (!assignManagedWindowSpace(wid, workspace.ref)) continue;
         updateTabGroupAssignment(wid, workspace.ref);
     }
 
@@ -4288,6 +4334,10 @@ fn reassignManagedWindowToNativeWorkspace(wid: u32, target: state_mod.SpaceRef) 
             return;
         };
     }
+    if (!assignManagedWindowSpace(wid, target_ws.ref)) {
+        if (win.mode == .tiled) removeFromTiling(target_ws.ref.key, wid);
+        return;
+    }
 
     const source_workspace_id = win.space.workspace_id;
     target_ws.addWindowAssumeCapacity(wid);
@@ -4295,8 +4345,6 @@ fn reassignManagedWindowToNativeWorkspace(wid: u32, target: state_mod.SpaceRef) 
     removeFromTiling(source_ws.ref.key, wid);
     if (target_ws.focused_wid == null) target_ws.recordFocus(wid);
 
-    win.space = target_ws.ref;
-    g_store.putAssumeCapacity(win);
     updateTabGroupAssignment(wid, target_ws.ref);
     log.debug("native workspace assignment repaired wid={d} source={d} target={d}", .{ wid, source_workspace_id, target.workspace_id });
 }
@@ -5352,8 +5400,7 @@ fn refreshTabGroupActiveTabsFromSnapshot(on_screen: *const OnScreenWindows) void
         // absent from AXWindows, so they are only discovered as they surface.
         if (g_store.get(move.selected) == null) {
             g_store.ensureUnusedCapacity(1) catch continue;
-            g_tab_groups.addMember(move.group_id, move.selected) catch continue;
-            g_store.putAssumeCapacity(.{
+            const discovered: window_mod.Window = .{
                 .wid = move.selected,
                 .pid = group.pid,
                 .title = null,
@@ -5361,7 +5408,13 @@ fn refreshTabGroupActiveTabsFromSnapshot(on_screen: *const OnScreenWindows) void
                 .is_minimized = false,
                 .mode = leader.mode,
                 .space = leader.space,
-            });
+            };
+            if (!adoptWindowIdentity(discovered)) continue;
+            g_tab_groups.addMember(move.group_id, move.selected) catch {
+                removeWindowIdentity(move.selected);
+                continue;
+            };
+            g_store.putAssumeCapacity(discovered);
             seedObservedFrame(move.selected, group.canonical_frame);
         }
 
@@ -5436,16 +5489,7 @@ fn joinTabGroup(pid: i32, sibling_wid: u32, new_wid: u32, new_frame: window_mod.
     // Reserve the store first. Once the group mutation succeeds, publishing
     // the new member's Window record cannot fail.
     g_store.ensureUnusedCapacity(1) catch return false;
-
-    if (g_tab_groups.groupOf(sibling_wid)) |g| {
-        g_tab_groups.addMember(g.id, new_wid) catch return false;
-    } else {
-        _ = g_tab_groups.createGroupWithMember(pid, sibling_wid, new_wid, sibling.frame) catch return false;
-    }
-
-    g_tab_groups.setActive(new_wid);
-
-    g_store.putAssumeCapacity(.{
+    const member: window_mod.Window = .{
         .wid = new_wid,
         .pid = pid,
         .title = null,
@@ -5453,7 +5497,24 @@ fn joinTabGroup(pid: i32, sibling_wid: u32, new_wid: u32, new_frame: window_mod.
         .is_minimized = false,
         .mode = sibling.mode,
         .space = sibling.space,
-    });
+    };
+    if (!adoptWindowIdentity(member)) return false;
+
+    if (g_tab_groups.groupOf(sibling_wid)) |g| {
+        g_tab_groups.addMember(g.id, new_wid) catch {
+            removeWindowIdentity(new_wid);
+            return false;
+        };
+    } else {
+        _ = g_tab_groups.createGroupWithMember(pid, sibling_wid, new_wid, sibling.frame) catch {
+            removeWindowIdentity(new_wid);
+            return false;
+        };
+    }
+
+    g_tab_groups.setActive(new_wid);
+
+    g_store.putAssumeCapacity(member);
     seedObservedFrame(new_wid, new_frame);
 
     const leader = g_tab_groups.resolveLeader(sibling_wid);
@@ -5468,6 +5529,7 @@ fn joinTabGroup(pid: i32, sibling_wid: u32, new_wid: u32, new_frame: window_mod.
 }
 
 fn removeWindow(wid: u32) void {
+    const win = g_store.get(wid) orelse return;
     g_animator.cancel(wid);
     g_geometry.forget(wid);
     ax_mod.invalidateWindow(wid);
@@ -5481,7 +5543,7 @@ fn removeWindow(wid: u32) void {
     const group_id_before: ?tabgroup.GroupId = if (g_tab_groups.groupOf(wid)) |g| g.id else null;
     const removal = g_tab_groups.removeMember(wid);
 
-    const win = g_store.get(wid) orelse return;
+    removeWindowIdentity(wid);
     g_store.remove(wid);
 
     // removeMember guesses members[0] as the new active tab, but macOS
@@ -5872,6 +5934,7 @@ fn adoptWindowAsBackgroundTab(win: window_mod.Window) tabgroup.detect.OffscreenO
 
     var updated = win;
     if (frame) |f| updated.frame = f;
+    if (!assignManagedWindowSpace(win.wid, sibling.space)) return .reap;
     updated.space = sibling.space;
     g_store.put(updated) catch {};
 
@@ -6846,11 +6909,7 @@ fn switchWorkspace(target_id: u8) void {
         .workspace_id = target_id,
     } });
     for (target_ws.windows.items) |wid| {
-        var win = g_store.get(wid) orelse continue;
-        if (!win.space.key.eql(target_ws.ref.key)) {
-            win.space = target_ws.ref;
-            g_store.put(win) catch {};
-        }
+        if (!assignManagedWindowSpace(wid, target_ws.ref)) continue;
         updateTabGroupAssignment(wid, target_ws.ref);
     }
     log.debug("workspace switch activated target workspace={d} display={d} windows={d}", .{
@@ -7002,9 +7061,7 @@ fn updateTabGroupAssignment(leader_wid: u32, space: state_mod.SpaceRef) void {
 
     for (group.members.items) |member_wid| {
         if (member_wid == leader_wid) continue;
-        var member = g_store.get(member_wid) orelse continue;
-        member.space = space;
-        g_store.put(member) catch {};
+        _ = assignManagedWindowSpace(member_wid, space);
     }
 }
 
@@ -7037,6 +7094,10 @@ fn moveWindowToWorkspace(target_id: u8) void {
         log.warn("failed to move wid={d} to native workspace {d} on display {d}", .{ wid, target_id, target_display });
         return;
     }
+    if (!assignManagedWindowSpace(wid, target_ws.ref)) {
+        if (updated.mode == .tiled) removeFromTiling(target_ws.ref.key, wid);
+        return;
+    }
     target_ws.addWindowAssumeCapacity(wid);
 
     ws.removeWindow(wid);
@@ -7051,7 +7112,6 @@ fn moveWindowToWorkspace(target_id: u8) void {
     // display for hidden workspaces with no assigned display yet —
     // switchWorkspace will correct it when the workspace is activated.
     updated.space = target_ws.ref;
-    g_store.putAssumeCapacity(updated);
     updateTabGroupAssignment(wid, updated.space);
     if (nativeSpacesEnabled()) {
         trackPendingNativeWindowMove(wid, ws.ref, target_ws.ref);
@@ -7100,20 +7160,22 @@ fn reassignManagedWindowToDisplay(wid: u32, target_display_id: u32) bool {
         }
         target_ws.addWindowAssumeCapacity(wid);
 
-        var updated = win;
-        updated.space = target_ws.ref;
-        g_store.putAssumeCapacity(updated);
+        if (!assignManagedWindowSpace(wid, target_ws.ref)) {
+            if (win.mode == .tiled) removeFromTiling(target_ws.ref.key, wid);
+            target_ws.removeWindow(wid);
+            return false;
+        }
         updateTabGroupAssignment(wid, target_ws.ref);
 
         removeFromTiling(source_ws.ref.key, wid);
         source_ws.removeWindow(wid);
         target_ws.recordFocus(wid);
 
-        win = updated;
-    } else {
         win.space = target_ws.ref;
-        g_store.putAssumeCapacity(win);
+    } else {
+        if (!assignManagedWindowSpace(wid, target_ws.ref)) return false;
         updateTabGroupAssignment(wid, target_ws.ref);
+        win.space = target_ws.ref;
     }
 
     return true;

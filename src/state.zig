@@ -418,10 +418,6 @@ pub const WindowCatalog = struct {
     }
 
     fn put(self: *WindowCatalog, entry: ManagedWindow) bool {
-        if (self.findIndex(entry.window_id)) |index| {
-            self.entries[index] = entry;
-            return true;
-        }
         if (self.count == self.entries.len) return false;
 
         self.entries[self.count] = entry;
@@ -439,6 +435,12 @@ pub const WindowCatalog = struct {
     fn assignSpace(self: *WindowCatalog, window_id: WindowId, space_key: SpaceKey) bool {
         const index = self.findIndex(window_id) orelse return false;
         self.entries[index].space_key = space_key;
+        return true;
+    }
+
+    fn replaceId(self: *WindowCatalog, old_window_id: WindowId, new_window_id: WindowId) bool {
+        const index = self.findIndex(old_window_id) orelse return false;
+        self.entries[index].window_id = new_window_id;
         return true;
     }
 
@@ -546,6 +548,10 @@ pub const Event = union(enum) {
     replace_space_catalog: SpaceCatalog,
     adopt_window: ManagedWindow,
     remove_window: WindowId,
+    replace_window_id: struct {
+        old_window_id: WindowId,
+        new_window_id: WindowId,
+    },
     assign_window_space: struct {
         window_id: WindowId,
         space_key: SpaceKey,
@@ -620,6 +626,7 @@ pub const SwitchFailureReason = enum {
 pub const WindowCatalogRejectionReason = enum {
     catalog_full,
     invalid_window,
+    window_exists,
     window_missing,
     space_missing,
 };
@@ -704,6 +711,7 @@ pub fn reduce(model: Model, event: Event) Transition {
         .remove_window => |window_id| {
             _ = transition.model.windows.remove(window_id);
         },
+        .replace_window_id => |replacement| reduceWindowIdReplaced(&transition, replacement),
         .assign_window_space => |assignment| reduceWindowSpaceAssigned(&transition, assignment),
         .replace_workspace_topology => |topology| {
             transition.model.workspace_topology = topology;
@@ -767,6 +775,13 @@ fn reduceWindowAdopted(transition: *Transition, window: ManagedWindow) void {
         } });
         return;
     }
+    if (transition.model.window(window.window_id) != null) {
+        transition.addEffect(.{ .window_catalog_rejected = .{
+            .window_id = window.window_id,
+            .reason = .window_exists,
+        } });
+        return;
+    }
     if (transition.model.space(window.space_key) == null) {
         transition.addEffect(.{ .window_catalog_rejected = .{
             .window_id = window.window_id,
@@ -779,6 +794,32 @@ fn reduceWindowAdopted(transition: *Transition, window: ManagedWindow) void {
     transition.addEffect(.{ .window_catalog_rejected = .{
         .window_id = window.window_id,
         .reason = .catalog_full,
+    } });
+}
+
+fn reduceWindowIdReplaced(
+    transition: *Transition,
+    replacement: @FieldType(Event, "replace_window_id"),
+) void {
+    if (replacement.new_window_id == 0) {
+        transition.addEffect(.{ .window_catalog_rejected = .{
+            .window_id = replacement.new_window_id,
+            .reason = .invalid_window,
+        } });
+        return;
+    }
+    if (transition.model.window(replacement.new_window_id) != null) {
+        transition.addEffect(.{ .window_catalog_rejected = .{
+            .window_id = replacement.new_window_id,
+            .reason = .window_exists,
+        } });
+        return;
+    }
+    if (transition.model.windows.replaceId(replacement.old_window_id, replacement.new_window_id)) return;
+
+    transition.addEffect(.{ .window_catalog_rejected = .{
+        .window_id = replacement.old_window_id,
+        .reason = .window_missing,
     } });
 }
 
@@ -1584,8 +1625,15 @@ test "window catalog owns identity and Space membership" {
     try testing.expectEqual(@as(u16, 1), assigned.model.windows.countInSpace(.{ .virtual = 2 }));
     try testing.expect(assigned.model.window(101).?.space_key.eql(.{ .virtual = 2 }));
 
-    const removed = reduce(assigned.model, .{ .remove_window = 102 });
-    try testing.expect(removed.model.window(102) == null);
+    const replaced = reduce(assigned.model, .{ .replace_window_id = .{
+        .old_window_id = 102,
+        .new_window_id = 202,
+    } });
+    try testing.expect(replaced.model.window(102) == null);
+    try testing.expectEqual(@as(i32, 1002), replaced.model.window(202).?.process_id);
+
+    const removed = reduce(replaced.model, .{ .remove_window = 202 });
+    try testing.expect(removed.model.window(202) == null);
     try testing.expectEqual(@as(u16, 1), removed.model.windows.count);
 }
 
@@ -1623,6 +1671,21 @@ test "window catalog rejects invalid lifecycle events" {
     try testing.expectEqual(
         WindowCatalogRejectionReason.window_missing,
         missing_window.effects[0].window_catalog_rejected.reason,
+    );
+
+    const adopted = reduce(model, .{ .adopt_window = .{
+        .window_id = 101,
+        .process_id = 1001,
+        .space_key = .{ .virtual = 1 },
+    } });
+    const duplicate = reduce(adopted.model, .{ .adopt_window = .{
+        .window_id = 101,
+        .process_id = 1001,
+        .space_key = .{ .virtual = 1 },
+    } });
+    try testing.expectEqual(
+        WindowCatalogRejectionReason.window_exists,
+        duplicate.effects[0].window_catalog_rejected.reason,
     );
 }
 
