@@ -1,9 +1,11 @@
 const std = @import("std");
 const Window = @import("window.zig");
+const space_mod = @import("space.zig");
 
-pub const WorkspaceId = u8;
+pub const WorkspaceId = space_mod.WorkspaceId;
 pub const max_workspaces = 10;
 pub const max_displays = 8;
+pub const max_spaces = max_workspaces * max_displays;
 
 pub const FollowFocusAction = enum {
     ignore,
@@ -40,10 +42,9 @@ pub fn frameCoversTarget(actual: Window.Window.Frame, target: Window.Window.Fram
 /// focus-after-close fallback to the first-window heuristic.
 pub const max_focus_history = 32;
 
-pub const Workspace = struct {
-    id: WorkspaceId,
+pub const Space = struct {
+    ref: space_mod.Ref,
     name: []const u8 = "",
-    display_id: ?u32 = null,
     windows: std.ArrayList(Window.WindowId),
     focused_wid: ?Window.WindowId,
     /// Most recently focused windows, most recent last. Kept duplicate-free;
@@ -52,9 +53,10 @@ pub const Workspace = struct {
     focus_history_len: usize,
     allocator: std.mem.Allocator,
 
-    pub fn init(allocator: std.mem.Allocator, id: WorkspaceId) Workspace {
+    pub fn init(allocator: std.mem.Allocator, ref: space_mod.Ref) Space {
+        ref.assertValid();
         return .{
-            .id = id,
+            .ref = ref,
             .windows = .empty,
             .focused_wid = null,
             .focus_history = @splat(0),
@@ -63,11 +65,11 @@ pub const Workspace = struct {
         };
     }
 
-    pub fn deinit(self: *Workspace) void {
+    pub fn deinit(self: *Space) void {
         self.windows.deinit(self.allocator);
     }
 
-    pub fn addWindow(self: *Workspace, wid: Window.WindowId) !void {
+    pub fn addWindow(self: *Space, wid: Window.WindowId) !void {
         for (self.windows.items) |existing| {
             if (existing == wid) return;
         }
@@ -85,12 +87,12 @@ pub const Workspace = struct {
 
     /// Reserve entries before a mutation that must commit across multiple
     /// containers. Capacity changes are harmless if a later reservation fails.
-    pub fn ensureUnusedWindowCapacity(self: *Workspace, additional_count: usize) !void {
+    pub fn ensureUnusedWindowCapacity(self: *Space, additional_count: usize) !void {
         try self.windows.ensureUnusedCapacity(self.allocator, additional_count);
     }
 
     /// Append after a matching `ensureUnusedWindowCapacity` call.
-    pub fn addWindowAssumeCapacity(self: *Workspace, wid: Window.WindowId) void {
+    pub fn addWindowAssumeCapacity(self: *Space, wid: Window.WindowId) void {
         std.debug.assert(wid != 0);
         for (self.windows.items) |existing| {
             std.debug.assert(existing != wid);
@@ -101,7 +103,7 @@ pub const Workspace = struct {
     /// Replace a window ID in-place, preserving its position in the window
     /// list. Used for tab-group leader succession. Returns true when old_wid
     /// was present and replaced.
-    pub fn replaceWindow(self: *Workspace, old_wid: Window.WindowId, new_wid: Window.WindowId) bool {
+    pub fn replaceWindow(self: *Space, old_wid: Window.WindowId, new_wid: Window.WindowId) bool {
         std.debug.assert(old_wid != 0 and new_wid != 0);
         if (old_wid == new_wid) return false;
 
@@ -124,7 +126,7 @@ pub const Workspace = struct {
         return false;
     }
 
-    pub fn removeWindow(self: *Workspace, wid: Window.WindowId) void {
+    pub fn removeWindow(self: *Space, wid: Window.WindowId) void {
         for (self.windows.items, 0..) |existing, i| {
             if (existing == wid) {
                 _ = self.windows.orderedRemove(i);
@@ -140,7 +142,7 @@ pub const Workspace = struct {
 
     /// Record wid as the most recently focused window. Moves an existing
     /// history entry to the top; drops the oldest entry when full.
-    pub fn recordFocus(self: *Workspace, wid: Window.WindowId) void {
+    pub fn recordFocus(self: *Space, wid: Window.WindowId) void {
         std.debug.assert(wid != 0);
         std.debug.assert(self.focus_history_len <= max_focus_history);
 
@@ -157,7 +159,7 @@ pub const Workspace = struct {
     /// purged on removal, but membership is re-checked defensively because
     /// recordFocus does not require membership (focus events can race window
     /// adoption).
-    fn mostRecentLiveFocus(self: *const Workspace) ?Window.WindowId {
+    fn mostRecentLiveFocus(self: *const Space) ?Window.WindowId {
         var i = self.focus_history_len;
         while (i > 0) {
             i -= 1;
@@ -169,20 +171,20 @@ pub const Workspace = struct {
         return null;
     }
 
-    fn focusHistoryIndexOf(self: *const Workspace, wid: Window.WindowId) ?usize {
+    fn focusHistoryIndexOf(self: *const Space, wid: Window.WindowId) ?usize {
         for (self.focus_history[0..self.focus_history_len], 0..) |entry, i| {
             if (entry == wid) return i;
         }
         return null;
     }
 
-    fn removeFromFocusHistory(self: *Workspace, wid: Window.WindowId) void {
+    fn removeFromFocusHistory(self: *Space, wid: Window.WindowId) void {
         if (self.focusHistoryIndexOf(wid)) |idx| {
             self.dropFocusHistoryAt(idx);
         }
     }
 
-    fn dropFocusHistoryAt(self: *Workspace, idx: usize) void {
+    fn dropFocusHistoryAt(self: *Space, idx: usize) void {
         std.debug.assert(idx < self.focus_history_len);
         var i = idx;
         while (i + 1 < self.focus_history_len) : (i += 1) {
@@ -194,38 +196,72 @@ pub const Workspace = struct {
 };
 
 pub const WorkspaceManager = struct {
-    workspaces: [max_workspaces]Workspace,
+    spaces: [max_spaces]Space,
+    space_count: u8,
     workspace_count: u8,
     allocator: std.mem.Allocator,
 
     pub fn init(allocator: std.mem.Allocator, count: u8) WorkspaceManager {
         const clamped: u8 = if (count == 0) max_workspaces else @min(count, max_workspaces);
         var wm: WorkspaceManager = .{
-            .workspaces = undefined,
+            .spaces = undefined,
+            .space_count = clamped,
             .workspace_count = clamped,
             .allocator = allocator,
         };
-        for (0..max_workspaces) |i| {
-            wm.workspaces[i] = Workspace.init(allocator, @intCast(i + 1));
+        for (0..clamped) |i| {
+            const workspace_id: WorkspaceId = @intCast(i + 1);
+            wm.spaces[i] = Space.init(allocator, .{
+                .key = .{ .virtual = workspace_id },
+                .workspace_id = workspace_id,
+                .display_id = 1,
+            });
         }
         return wm;
     }
 
     pub fn deinit(self: *WorkspaceManager) void {
-        for (&self.workspaces) |*ws| {
-            ws.deinit();
+        for (self.spaces[0..self.space_count]) |*space| {
+            space.deinit();
         }
     }
 
-    pub fn get(self: *WorkspaceManager, id: WorkspaceId) ?*Workspace {
-        if (id == 0 or id > self.workspace_count) return null;
-        return &self.workspaces[id - 1];
+    pub fn configure(self: *WorkspaceManager, refs: []const space_mod.Ref) void {
+        for (self.spaces[0..self.space_count]) |*space| {
+            std.debug.assert(space.windows.items.len == 0);
+            space.deinit();
+        }
+
+        std.debug.assert(refs.len <= self.spaces.len);
+        self.space_count = @intCast(refs.len);
+        for (refs, 0..) |ref, index| {
+            self.spaces[index] = Space.init(self.allocator, ref);
+        }
+    }
+
+    pub fn get(self: *WorkspaceManager, key: space_mod.Key) ?*Space {
+        const index = self.indexOf(key) orelse return null;
+        return &self.spaces[index];
+    }
+
+    pub fn indexOf(self: *const WorkspaceManager, key: space_mod.Key) ?usize {
+        for (self.spaces[0..self.space_count], 0..) |space, index| {
+            if (space.ref.key.eql(key)) return index;
+        }
+        return null;
+    }
+
+    pub fn find(self: *WorkspaceManager, display_id: u32, workspace_id: WorkspaceId) ?*Space {
+        for (self.spaces[0..self.space_count]) |*space| {
+            if (space.ref.display_id == display_id and space.ref.workspace_id == workspace_id) return space;
+        }
+        return null;
     }
 };
 
 test "recordFocus tracks most recent and dedupes" {
     const t = std.testing;
-    var ws = Workspace.init(t.allocator, 1);
+    var ws = Space.init(t.allocator, .{ .key = .{ .virtual = 1 }, .workspace_id = 1, .display_id = 1 });
     defer ws.deinit();
 
     ws.recordFocus(10);
@@ -240,7 +276,7 @@ test "recordFocus tracks most recent and dedupes" {
 
 test "removeWindow falls back to most recently focused remaining window" {
     const t = std.testing;
-    var ws = Workspace.init(t.allocator, 1);
+    var ws = Space.init(t.allocator, .{ .key = .{ .virtual = 1 }, .workspace_id = 1, .display_id = 1 });
     defer ws.deinit();
 
     // Windows added in order A, B, C; focused B, then C.
@@ -263,7 +299,7 @@ test "removeWindow falls back to most recently focused remaining window" {
 
 test "removeWindow without focus history falls back to first window" {
     const t = std.testing;
-    var ws = Workspace.init(t.allocator, 1);
+    var ws = Space.init(t.allocator, .{ .key = .{ .virtual = 1 }, .workspace_id = 1, .display_id = 1 });
     defer ws.deinit();
 
     try ws.addWindow(1);
@@ -276,7 +312,7 @@ test "removeWindow without focus history falls back to first window" {
 
 test "removeWindow of unfocused window keeps focus and purges history" {
     const t = std.testing;
-    var ws = Workspace.init(t.allocator, 1);
+    var ws = Space.init(t.allocator, .{ .key = .{ .virtual = 1 }, .workspace_id = 1, .display_id = 1 });
     defer ws.deinit();
 
     try ws.addWindow(1);
@@ -292,7 +328,7 @@ test "removeWindow of unfocused window keeps focus and purges history" {
 
 test "replaceWindow rewrites focus history in place" {
     const t = std.testing;
-    var ws = Workspace.init(t.allocator, 1);
+    var ws = Space.init(t.allocator, .{ .key = .{ .virtual = 1 }, .workspace_id = 1, .display_id = 1 });
     defer ws.deinit();
 
     try ws.addWindow(1);
@@ -311,7 +347,7 @@ test "replaceWindow rewrites focus history in place" {
 
 test "recordFocus drops oldest entry when history is full" {
     const t = std.testing;
-    var ws = Workspace.init(t.allocator, 1);
+    var ws = Space.init(t.allocator, .{ .key = .{ .virtual = 1 }, .workspace_id = 1, .display_id = 1 });
     defer ws.deinit();
 
     var wid: Window.WindowId = 1;

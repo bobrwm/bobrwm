@@ -1,4 +1,5 @@
 const std = @import("std");
+const space_mod = @import("space.zig");
 
 pub const WindowId = u32;
 
@@ -18,8 +19,7 @@ pub const Window = struct {
     is_minimized: bool,
     is_fullscreen: bool = false,
     mode: WindowMode = .tiled,
-    workspace_id: u8,
-    display_id: u32,
+    space: space_mod.Ref,
 
     /// Last on-screen frame of a floating window, captured before it is parked
     /// off-screen on workspace hide. Restored when the workspace is shown again;
@@ -72,8 +72,7 @@ pub const WindowStore = struct {
     pub fn put(self: *WindowStore, window: Window) !void {
         std.debug.assert(window.wid > 0);
         std.debug.assert(window.pid > 0);
-        std.debug.assert(window.workspace_id > 0);
-        std.debug.assert(window.display_id > 0);
+        window.space.assertValid();
         try self.windows.put(window.wid, window);
     }
 
@@ -87,8 +86,7 @@ pub const WindowStore = struct {
     pub fn putAssumeCapacity(self: *WindowStore, window: Window) void {
         std.debug.assert(window.wid > 0);
         std.debug.assert(window.pid > 0);
-        std.debug.assert(window.workspace_id > 0);
-        std.debug.assert(window.display_id > 0);
+        window.space.assertValid();
         self.windows.putAssumeCapacity(window.wid, window);
     }
 

@@ -1,15 +1,18 @@
 //! Deterministic application state and transitions.
 
 const std = @import("std");
+const space_mod = @import("space.zig");
 
 pub const max_displays = 8;
 pub const max_spaces_per_display = 10;
 pub const native_switch_timeout_ms: u64 = 3200;
 pub const native_observation_delay_ms: u64 = 50;
 
-pub const DisplayId = u32;
-pub const NativeSpaceId = u64;
-pub const WorkspaceId = u8;
+pub const DisplayId = space_mod.DisplayId;
+pub const NativeSpaceId = space_mod.NativeSpaceId;
+pub const WorkspaceId = space_mod.WorkspaceId;
+pub const SpaceKey = space_mod.Key;
+pub const SpaceRef = space_mod.Ref;
 pub const Epoch = u64;
 pub const TimestampMs = u64;
 
@@ -53,6 +56,35 @@ pub const WorkspaceTopology = struct {
             return true;
         }
         return false;
+    }
+};
+
+pub const SpaceCatalog = struct {
+    spaces: [max_displays * max_spaces_per_display]SpaceRef = undefined,
+    space_count: u8 = 0,
+
+    pub fn add(self: *SpaceCatalog, space: SpaceRef) void {
+        space.assertValid();
+        std.debug.assert(self.space_count < self.spaces.len);
+        std.debug.assert(self.find(space.key) == null);
+        std.debug.assert(self.findWorkspace(space.display_id, space.workspace_id) == null);
+
+        self.spaces[self.space_count] = space;
+        self.space_count += 1;
+    }
+
+    pub fn find(self: *const SpaceCatalog, key: SpaceKey) ?SpaceRef {
+        for (self.spaces[0..self.space_count]) |space| {
+            if (space.key.eql(key)) return space;
+        }
+        return null;
+    }
+
+    pub fn findWorkspace(self: *const SpaceCatalog, display_id: DisplayId, workspace_id: WorkspaceId) ?SpaceRef {
+        for (self.spaces[0..self.space_count]) |space| {
+            if (space.display_id == display_id and space.workspace_id == workspace_id) return space;
+        }
+        return null;
     }
 };
 
@@ -165,6 +197,7 @@ pub const ObservationTimer = struct {
 };
 
 pub const Model = struct {
+    spaces: SpaceCatalog = .{},
     workspace_topology: WorkspaceTopology = .{},
     native_topology: NativeTopology = .{},
     pending_switch: ?PendingSwitch = null,
@@ -198,6 +231,14 @@ pub const Model = struct {
         return self.workspace_topology.focused_display_id;
     }
 
+    pub fn spaceForWorkspace(self: *const Model, display_id: DisplayId, workspace_id: WorkspaceId) ?SpaceRef {
+        return self.spaces.findWorkspace(display_id, workspace_id);
+    }
+
+    pub fn space(self: *const Model, key: SpaceKey) ?SpaceRef {
+        return self.spaces.find(key);
+    }
+
     pub fn desiredWorkspace(self: *const Model, display_id: DisplayId) ?WorkspaceId {
         if (self.queued_switch) |queued| {
             if (queued.display_id == display_id) return queued.target_workspace_id;
@@ -210,6 +251,7 @@ pub const Model = struct {
 };
 
 pub const Event = union(enum) {
+    replace_space_catalog: SpaceCatalog,
     replace_workspace_topology: WorkspaceTopology,
     focus_display: DisplayId,
     activate_workspace: struct {
@@ -295,6 +337,9 @@ pub fn reduce(model: Model, event: Event) Transition {
     var transition: Transition = .{ .model = model };
 
     switch (event) {
+        .replace_space_catalog => |catalog| {
+            transition.model.spaces = catalog;
+        },
         .replace_workspace_topology => |topology| {
             transition.model.workspace_topology = topology;
         },
@@ -427,7 +472,16 @@ fn reduceTopologyObserved(
 fn syncNativeWorkspaceTopology(model: *Model) void {
     const focused_display_id = model.workspace_topology.focused_display_id;
     var topology: WorkspaceTopology = .{};
+    var catalog: SpaceCatalog = .{};
     for (model.native_topology.displays[0..model.native_topology.display_count]) |display| {
+        for (display.spaces[0..display.space_count]) |space| {
+            catalog.add(.{
+                .key = .{ .native = space.id },
+                .workspace_id = space.workspace_id,
+                .display_id = display.display_id,
+            });
+        }
+
         const workspace_id = display.workspaceForSpace(display.observed_space_id) orelse continue;
         topology.addDisplay(.{
             .display_id = display.display_id,
@@ -437,6 +491,7 @@ fn syncNativeWorkspaceTopology(model: *Model) void {
     if (focused_display_id) |display_id| {
         if (topology.findDisplay(display_id) != null) topology.focused_display_id = display_id;
     }
+    model.spaces = catalog;
     model.workspace_topology = topology;
 }
 
@@ -581,6 +636,14 @@ fn sameRequest(left: SwitchRequest, right: SwitchRequest) bool {
 
 fn assertModel(model: *const Model) void {
     std.debug.assert(model.next_epoch != 0);
+    std.debug.assert(model.spaces.space_count <= model.spaces.spaces.len);
+    for (model.spaces.spaces[0..model.spaces.space_count], 0..) |space, index| {
+        space.assertValid();
+        for (model.spaces.spaces[0..index]) |prior| {
+            std.debug.assert(!prior.key.eql(space.key));
+            std.debug.assert(prior.display_id != space.display_id or prior.workspace_id != space.workspace_id);
+        }
+    }
     std.debug.assert(model.workspace_topology.display_count <= model.workspace_topology.displays.len);
     for (model.workspace_topology.displays[0..model.workspace_topology.display_count], 0..) |display, index| {
         std.debug.assert(display.display_id != 0);
@@ -730,11 +793,31 @@ test "intermediate Space becomes observed while request remains pending" {
 test "native ordinal is scoped to display Space identity" {
     const testing = std.testing;
     const model = initializedModel(testTopology(102, 202));
+    const first = model.spaceForWorkspace(1, 2).?;
+    const second = model.spaceForWorkspace(2, 2).?;
 
     try testing.expectEqual(@as(?WorkspaceId, 2), model.observedWorkspace(1));
     try testing.expectEqual(@as(?WorkspaceId, 2), model.observedWorkspace(2));
     try testing.expectEqual(@as(?NativeSpaceId, 102), model.native_topology.findDisplay(1).?.spaceForWorkspace(2));
     try testing.expectEqual(@as(?NativeSpaceId, 202), model.native_topology.findDisplay(2).?.spaceForWorkspace(2));
+    try testing.expect(first.key.eql(.{ .native = 102 }));
+    try testing.expect(second.key.eql(.{ .native = 202 }));
+    try testing.expect(!first.key.eql(second.key));
+}
+
+test "virtual catalog preserves identity when placement changes" {
+    const testing = std.testing;
+    var catalog: SpaceCatalog = .{};
+    catalog.add(.{ .key = .{ .virtual = 1 }, .workspace_id = 1, .display_id = 11 });
+    catalog.add(.{ .key = .{ .virtual = 2 }, .workspace_id = 2, .display_id = 22 });
+
+    var model = reduce(.{}, .{ .replace_space_catalog = catalog }).model;
+    catalog.spaces[1].display_id = 11;
+    model = reduce(model, .{ .replace_space_catalog = catalog }).model;
+
+    const moved = model.space(.{ .virtual = 2 }).?;
+    try testing.expectEqual(@as(DisplayId, 11), moved.display_id);
+    try testing.expect(moved.key.eql(.{ .virtual = 2 }));
 }
 
 test "virtual workspace and focused display are reducer owned" {

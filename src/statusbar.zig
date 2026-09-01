@@ -67,17 +67,17 @@ var g_initialized = false;
 
 /// Create the Swift menu bar and publish the initial workspace identity rows.
 pub fn init(
-    workspaces: []const workspace_mod.Workspace,
+    spaces: []const workspace_mod.Space,
     config: *const config_mod.Config,
     callbacks: Callbacks,
 ) void {
     std.debug.assert(!g_initialized);
-    std.debug.assert(workspaces.len > 0 and workspaces.len <= workspace_mod.max_workspaces);
+    std.debug.assert(spaces.len > 0 and spaces.len <= workspace_mod.max_workspaces);
 
     bw_menubar_init(callbacks);
     g_initialized = true;
 
-    updateWorkspaceMenu(workspaces, config);
+    updateWorkspaceMenu(spaces, config);
     log.info("status bar created", .{});
 }
 
@@ -91,28 +91,29 @@ pub fn deinit() void {
 /// Rebuild the workspace rows. Call when names or keybinds change, not when
 /// focus moves; `updateState` carries everything that moves.
 pub fn updateWorkspaceMenu(
-    workspaces: []const workspace_mod.Workspace,
+    spaces: []const workspace_mod.Space,
     config: *const config_mod.Config,
 ) void {
     if (!g_initialized) return;
-    std.debug.assert(workspaces.len > 0 and workspaces.len <= workspace_mod.max_workspaces);
+    std.debug.assert(spaces.len > 0 and spaces.len <= workspace_mod.max_workspaces);
 
     var rows: [workspace_mod.max_workspaces]Workspace = undefined;
-    for (workspaces, 0..) |workspace, index| {
-        std.debug.assert(workspace.id > 0 and workspace.id <= workspace_mod.max_workspaces);
+    for (spaces, 0..) |space, index| {
+        const workspace_id = space.ref.workspace_id;
+        std.debug.assert(workspace_id > 0 and workspace_id <= workspace_mod.max_workspaces);
 
         const name_storage = &g_name_storage[index];
-        _ = encodeWorkspaceName(workspace.name, name_storage);
+        _ = encodeWorkspaceName(space.name, name_storage);
 
-        const keybind = config.findKeybind(.focus_workspace, workspace.id);
+        const keybind = config.findKeybind(.focus_workspace, workspace_id);
         rows[index] = .{
             .name = @ptrCast(name_storage),
             .shortcut = shortcutPtr(keybind, &g_shortcut_storage[index]),
-            .id = workspace.id,
+            .id = workspace_id,
         };
     }
 
-    bw_menubar_set_workspaces(&rows, workspaces.len, .{
+    bw_menubar_set_workspaces(&rows, spaces.len, .{
         .previous_workspace = shortcutPtr(
             config.findKeybind(.focus_previous_workspace, 0),
             &g_nav_shortcut_storage[0],
@@ -126,25 +127,26 @@ pub fn updateWorkspaceMenu(
 
 /// Push window counts and which workspaces are visible where.
 pub fn updateState(
-    workspaces: []const workspace_mod.Workspace,
+    spaces: []const workspace_mod.Space,
     active_ids: []const u8,
     focused_id: u8,
 ) void {
     if (!g_initialized) return;
-    std.debug.assert(workspaces.len <= workspace_mod.max_workspaces);
+    std.debug.assert(spaces.len <= workspace_mod.max_workspaces);
     std.debug.assert(active_ids.len <= workspace_mod.max_displays);
 
     var states: [workspace_mod.max_workspaces]WorkspaceState = undefined;
-    for (workspaces, 0..) |workspace, index| {
+    for (spaces, 0..) |space, index| {
+        const workspace_id = space.ref.workspace_id;
         states[index] = .{
-            .window_count = std.math.lossyCast(u32, workspace.windows.items.len),
-            .id = workspace.id,
-            .is_active = std.mem.indexOfScalar(u8, active_ids, workspace.id) != null,
-            .is_focused = workspace.id == focused_id,
+            .window_count = std.math.lossyCast(u32, space.windows.items.len),
+            .id = workspace_id,
+            .is_active = std.mem.indexOfScalar(u8, active_ids, workspace_id) != null,
+            .is_focused = workspace_id == focused_id,
         };
     }
 
-    bw_menubar_set_state(&states, workspaces.len);
+    bw_menubar_set_state(&states, spaces.len);
 }
 
 /// Temporarily replace the menu bar chips with a status message. The UI copies
