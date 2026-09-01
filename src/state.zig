@@ -4,6 +4,7 @@ const std = @import("std");
 const space_mod = @import("space.zig");
 
 pub const max_displays = 8;
+pub const max_managed_windows = 1024;
 pub const max_pending_focus_entries = 16;
 pub const max_spaces_per_display = 10;
 pub const max_pending_native_window_moves = 256;
@@ -389,6 +390,66 @@ pub const PendingFocusQueue = struct {
     }
 };
 
+pub const ManagedWindow = struct {
+    window_id: WindowId,
+    process_id: i32,
+    space_key: SpaceKey,
+};
+
+pub const WindowCatalog = struct {
+    entries: [max_managed_windows]ManagedWindow = undefined,
+    count: u16 = 0,
+
+    pub fn items(self: *const WindowCatalog) []const ManagedWindow {
+        return self.entries[0..self.count];
+    }
+
+    pub fn get(self: *const WindowCatalog, window_id: WindowId) ?ManagedWindow {
+        const index = self.findIndex(window_id) orelse return null;
+        return self.entries[index];
+    }
+
+    pub fn countInSpace(self: *const WindowCatalog, space_key: SpaceKey) u16 {
+        var count: u16 = 0;
+        for (self.items()) |entry| {
+            if (entry.space_key.eql(space_key)) count += 1;
+        }
+        return count;
+    }
+
+    fn put(self: *WindowCatalog, entry: ManagedWindow) bool {
+        if (self.findIndex(entry.window_id)) |index| {
+            self.entries[index] = entry;
+            return true;
+        }
+        if (self.count == self.entries.len) return false;
+
+        self.entries[self.count] = entry;
+        self.count += 1;
+        return true;
+    }
+
+    fn remove(self: *WindowCatalog, window_id: WindowId) bool {
+        const index = self.findIndex(window_id) orelse return false;
+        self.count -= 1;
+        self.entries[index] = self.entries[self.count];
+        return true;
+    }
+
+    fn assignSpace(self: *WindowCatalog, window_id: WindowId, space_key: SpaceKey) bool {
+        const index = self.findIndex(window_id) orelse return false;
+        self.entries[index].space_key = space_key;
+        return true;
+    }
+
+    fn findIndex(self: *const WindowCatalog, window_id: WindowId) ?usize {
+        for (self.items(), 0..) |entry, index| {
+            if (entry.window_id == window_id) return index;
+        }
+        return null;
+    }
+};
+
 pub const ObservationTimer = struct {
     epoch: Epoch,
     due_at_ms: TimestampMs,
@@ -396,6 +457,7 @@ pub const ObservationTimer = struct {
 
 pub const Model = struct {
     spaces: SpaceCatalog = .{},
+    windows: WindowCatalog = .{},
     workspace_topology: WorkspaceTopology = .{},
     native_topology: NativeTopology = .{},
     pending_switch: ?PendingSwitch = null,
@@ -465,6 +527,10 @@ pub const Model = struct {
         return self.spaces.find(key);
     }
 
+    pub fn window(self: *const Model, window_id: WindowId) ?ManagedWindow {
+        return self.windows.get(window_id);
+    }
+
     pub fn desiredWorkspace(self: *const Model, display_id: DisplayId) ?WorkspaceId {
         if (self.queued_switch) |queued| {
             if (queued.target.display_id == display_id) return queued.target.workspace_id;
@@ -478,6 +544,12 @@ pub const Model = struct {
 
 pub const Event = union(enum) {
     replace_space_catalog: SpaceCatalog,
+    adopt_window: ManagedWindow,
+    remove_window: WindowId,
+    assign_window_space: struct {
+        window_id: WindowId,
+        space_key: SpaceKey,
+    },
     replace_workspace_topology: WorkspaceTopology,
     focus_display: DisplayId,
     activate_workspace: struct {
@@ -545,6 +617,13 @@ pub const SwitchFailureReason = enum {
     unexpected_space,
 };
 
+pub const WindowCatalogRejectionReason = enum {
+    catalog_full,
+    invalid_window,
+    window_missing,
+    space_missing,
+};
+
 pub const Effect = union(enum) {
     switch_native_space: struct {
         request: SwitchRequest,
@@ -564,6 +643,10 @@ pub const Effect = union(enum) {
     },
     native_topology_changed,
     native_switch_rejected: SpaceRef,
+    window_catalog_rejected: struct {
+        window_id: WindowId,
+        reason: WindowCatalogRejectionReason,
+    },
     workspace_transition_started: WorkspaceTransition,
     workspace_transition_settled: WorkspaceTransitionSettlement,
     retry_native_window_move: PendingNativeWindowMove,
@@ -617,6 +700,11 @@ pub fn reduce(model: Model, event: Event) Transition {
             refreshWorkspaceTransition(&transition);
             refreshPendingNativeWindowMoves(&transition.model);
         },
+        .adopt_window => |window| reduceWindowAdopted(&transition, window),
+        .remove_window => |window_id| {
+            _ = transition.model.windows.remove(window_id);
+        },
+        .assign_window_space => |assignment| reduceWindowSpaceAssigned(&transition, assignment),
         .replace_workspace_topology => |topology| {
             transition.model.workspace_topology = topology;
         },
@@ -669,6 +757,48 @@ pub fn reduce(model: Model, event: Event) Transition {
 
     assertModel(&transition.model);
     return transition;
+}
+
+fn reduceWindowAdopted(transition: *Transition, window: ManagedWindow) void {
+    if (window.window_id == 0 or window.process_id <= 0) {
+        transition.addEffect(.{ .window_catalog_rejected = .{
+            .window_id = window.window_id,
+            .reason = .invalid_window,
+        } });
+        return;
+    }
+    if (transition.model.space(window.space_key) == null) {
+        transition.addEffect(.{ .window_catalog_rejected = .{
+            .window_id = window.window_id,
+            .reason = .space_missing,
+        } });
+        return;
+    }
+    if (transition.model.windows.put(window)) return;
+
+    transition.addEffect(.{ .window_catalog_rejected = .{
+        .window_id = window.window_id,
+        .reason = .catalog_full,
+    } });
+}
+
+fn reduceWindowSpaceAssigned(
+    transition: *Transition,
+    assignment: @FieldType(Event, "assign_window_space"),
+) void {
+    if (transition.model.space(assignment.space_key) == null) {
+        transition.addEffect(.{ .window_catalog_rejected = .{
+            .window_id = assignment.window_id,
+            .reason = .space_missing,
+        } });
+        return;
+    }
+    if (transition.model.windows.assignSpace(assignment.window_id, assignment.space_key)) return;
+
+    transition.addEffect(.{ .window_catalog_rejected = .{
+        .window_id = assignment.window_id,
+        .reason = .window_missing,
+    } });
 }
 
 fn reduceSwitchRequest(
@@ -1267,6 +1397,14 @@ fn assertModel(model: *const Model) void {
             std.debug.assert(prior.display_id != space.display_id or prior.workspace_id != space.workspace_id);
         }
     }
+    std.debug.assert(model.windows.count <= model.windows.entries.len);
+    for (model.windows.items(), 0..) |window, index| {
+        std.debug.assert(window.window_id != 0);
+        std.debug.assert(window.process_id > 0);
+        for (model.windows.items()[0..index]) |prior| {
+            std.debug.assert(prior.window_id != window.window_id);
+        }
+    }
     std.debug.assert(model.workspace_topology.display_count <= model.workspace_topology.displays.len);
     for (model.workspace_topology.displays[0..model.workspace_topology.display_count], 0..) |display, index| {
         std.debug.assert(display.display_id != 0);
@@ -1414,6 +1552,78 @@ fn trackNativeWindowMove(model: *const Model, window_id: WindowId, source_worksp
         .source = model.spaceForWorkspace(1, source_workspace_id).?,
         .target = model.spaceForWorkspace(1, target_workspace_id).?,
     } };
+}
+
+test "window catalog owns identity and Space membership" {
+    const testing = std.testing;
+    var catalog: SpaceCatalog = .{};
+    catalog.add(.{ .key = .{ .virtual = 1 }, .workspace_id = 1, .display_id = 11 });
+    catalog.add(.{ .key = .{ .virtual = 2 }, .workspace_id = 2, .display_id = 11 });
+    const model: Model = .{ .spaces = catalog };
+
+    const first = reduce(model, .{ .adopt_window = .{
+        .window_id = 101,
+        .process_id = 1001,
+        .space_key = .{ .virtual = 1 },
+    } });
+    const second = reduce(first.model, .{ .adopt_window = .{
+        .window_id = 102,
+        .process_id = 1002,
+        .space_key = .{ .virtual = 1 },
+    } });
+
+    try testing.expect(model.window(101) == null);
+    try testing.expectEqual(@as(u16, 2), second.model.windows.countInSpace(.{ .virtual = 1 }));
+    try testing.expectEqual(@as(i32, 1001), second.model.window(101).?.process_id);
+
+    const assigned = reduce(second.model, .{ .assign_window_space = .{
+        .window_id = 101,
+        .space_key = .{ .virtual = 2 },
+    } });
+    try testing.expectEqual(@as(u16, 1), assigned.model.windows.countInSpace(.{ .virtual = 1 }));
+    try testing.expectEqual(@as(u16, 1), assigned.model.windows.countInSpace(.{ .virtual = 2 }));
+    try testing.expect(assigned.model.window(101).?.space_key.eql(.{ .virtual = 2 }));
+
+    const removed = reduce(assigned.model, .{ .remove_window = 102 });
+    try testing.expect(removed.model.window(102) == null);
+    try testing.expectEqual(@as(u16, 1), removed.model.windows.count);
+}
+
+test "window catalog rejects invalid lifecycle events" {
+    const testing = std.testing;
+    var catalog: SpaceCatalog = .{};
+    catalog.add(.{ .key = .{ .virtual = 1 }, .workspace_id = 1, .display_id = 11 });
+    const model: Model = .{ .spaces = catalog };
+
+    const invalid = reduce(model, .{ .adopt_window = .{
+        .window_id = 0,
+        .process_id = 1001,
+        .space_key = .{ .virtual = 1 },
+    } });
+    try testing.expectEqual(@as(u8, 1), invalid.effect_count);
+    try testing.expectEqual(
+        WindowCatalogRejectionReason.invalid_window,
+        invalid.effects[0].window_catalog_rejected.reason,
+    );
+
+    const missing_space = reduce(model, .{ .adopt_window = .{
+        .window_id = 101,
+        .process_id = 1001,
+        .space_key = .{ .virtual = 2 },
+    } });
+    try testing.expectEqual(
+        WindowCatalogRejectionReason.space_missing,
+        missing_space.effects[0].window_catalog_rejected.reason,
+    );
+
+    const missing_window = reduce(model, .{ .assign_window_space = .{
+        .window_id = 101,
+        .space_key = .{ .virtual = 1 },
+    } });
+    try testing.expectEqual(
+        WindowCatalogRejectionReason.window_missing,
+        missing_window.effects[0].window_catalog_rejected.reason,
+    );
 }
 
 test "switch request preserves observed Space until confirmation" {

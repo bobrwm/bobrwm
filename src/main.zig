@@ -3927,6 +3927,10 @@ fn executeStateEffect(effect: state_mod.Effect) void {
             space.display_id,
             space.workspace_id,
         }),
+        .window_catalog_rejected => |rejection| log.warn("window catalog rejected wid={d} reason={s}", .{
+            rejection.window_id,
+            @tagName(rejection.reason),
+        }),
         .workspace_transition_started => |transition| executeWorkspaceTransitionStarted(transition),
         .workspace_transition_settled => |settlement| executeWorkspaceTransitionSettled(settlement),
         .retry_native_window_move => |pending| retryNativeWindowMove(pending),
