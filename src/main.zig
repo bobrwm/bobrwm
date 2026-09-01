@@ -478,12 +478,6 @@ fn managedLeaderForFocusedWindow(pid: i32, focused_wid: u32) ?window_mod.Window 
     return leader;
 }
 
-fn focusedManagedLeaderWindow() ?window_mod.Window {
-    const pid = frontmostApplicationPid() orelse return null;
-    const focused_wid = focusedWindowIdForPid(pid) orelse return null;
-    return managedLeaderForFocusedWindow(pid, focused_wid);
-}
-
 /// Resolve the frontmost app's AX-focused window to its visible layout owner.
 fn reconciledFocusedWindowId() ?u32 {
     const pid = frontmostApplicationPid() orelse return null;
@@ -517,10 +511,23 @@ fn reconciledFocusedWindowId() ?u32 {
     return null;
 }
 
-/// Window a hotkey that acts on "the focused window" should target. Falls back
-/// to workspace history for reversible actions when AX is temporarily absent.
-fn hotkeyTargetWindowId() ?u32 {
-    return reconciledFocusedWindowId() orelse activeWorkspace().focused_wid;
+const ActionContext = struct {
+    focused_wid: u32,
+    focused_win: window_mod.Window,
+    workspace: *workspace_mod.Workspace,
+};
+
+fn actionContext() ?ActionContext {
+    const focused_wid = reconciledFocusedWindowId() orelse return null;
+    const focused_win = g_store.get(focused_wid) orelse return null;
+    if (activeWorkspaceIdForDisplay(focused_win.display_id) != focused_win.workspace_id) return null;
+
+    const workspace = g_workspaces.get(focused_win.workspace_id) orelse return null;
+    return .{
+        .focused_wid = focused_wid,
+        .focused_win = focused_win,
+        .workspace = workspace,
+    };
 }
 
 fn clearWorkspaceTransition() void {
@@ -3397,14 +3404,12 @@ const FocusedLayoutContext = struct {
 };
 
 fn focusedLayoutContext() ?FocusedLayoutContext {
-    const ws = activeWorkspace();
-    const focused_wid = ws.focused_wid orelse return null;
-    const focused_win = g_store.get(focused_wid) orelse return null;
-    const sp = tilingStatePtr(focused_win.workspace_id);
+    const ctx = actionContext() orelse return null;
+    const sp = tilingStatePtr(ctx.focused_win.workspace_id);
     if (sp.*) |*st| {
         return .{
-            .focused_wid = focused_wid,
-            .focused_win = focused_win,
+            .focused_wid = ctx.focused_wid,
+            .focused_win = ctx.focused_win,
             .state = st,
         };
     }
@@ -3926,8 +3931,8 @@ fn handleEvent(ev: *const event_mod.Event) void {
             log.info("split mode: {s}", .{@tagName(g_bsp_split_mode)});
         },
         .hk_toggle_fullscreen => {
-            const focused = hotkeyTargetWindowId() orelse return;
-            toggleWindowFullscreen(focused);
+            const ctx = actionContext() orelse return;
+            toggleWindowFullscreen(ctx.focused_wid);
         },
         .hk_move_workspace_to_display => {
             const arg: u8 = @intCast(ev.wid);
@@ -3943,14 +3948,13 @@ fn handleEvent(ev: *const event_mod.Event) void {
             }
         },
         .hk_toggle_float => {
-            const focused = hotkeyTargetWindowId() orelse return;
-            const win = g_store.get(focused) orelse return;
-            const target: window_mod.WindowMode = if (win.mode != .tiled) .tiled else .floating;
-            setWindowMode(focused, target);
+            const ctx = actionContext() orelse return;
+            const target: window_mod.WindowMode = if (ctx.focused_win.mode != .tiled) .tiled else .floating;
+            setWindowMode(ctx.focused_wid, target);
         },
         .hk_center_float => {
-            const focused = hotkeyTargetWindowId() orelse return;
-            centerFloatingWindow(focused);
+            const ctx = actionContext() orelse return;
+            centerFloatingWindow(ctx.focused_wid);
         },
         .hk_reload_config => _ = reloadConfig(),
         .hk_toggle_dimming => {
@@ -7185,12 +7189,13 @@ fn updateTabGroupAssignment(leader_wid: u32, workspace_id: u8, display_id: u32) 
 }
 
 fn moveWindowToWorkspace(target_id: u8) void {
-    const wid = reconciledFocusedWindowId() orelse {
+    const ctx = actionContext() orelse {
         log.debug("move workspace skipped: no visible AX-focused managed window", .{});
         return;
     };
-    var updated = g_store.get(wid) orelse return;
-    const ws = g_workspaces.get(updated.workspace_id) orelse return;
+    const wid = ctx.focused_wid;
+    var updated = ctx.focused_win;
+    const ws = ctx.workspace;
     if (target_id == ws.id) return;
 
     log.debug("move workspace target wid={d} pid={d} source={d} target={d}", .{ wid, updated.pid, ws.id, target_id });
@@ -7322,37 +7327,8 @@ fn moveWindowToDisplay(target_display_slot: u8) void {
     if (slot >= g_display_count) return;
 
     const target_display_id = g_displays[slot].id;
-    if (focusedManagedLeaderWindow()) |focused_win| {
-        _ = moveManagedWindowToDisplay(focused_win.wid, target_display_id);
-        return;
-    }
-
-    const source_display_id = focusedDisplayId();
-    if (source_display_id == target_display_id) return;
-
-    const ws_id = activeWorkspaceIdForDisplay(source_display_id);
-    const ws = g_workspaces.get(ws_id) orelse return;
-    var wid_opt = ws.focused_wid;
-    if (wid_opt) |focused_wid| {
-        if (g_store.get(focused_wid)) |focused_win| {
-            if (focused_win.workspace_id != ws_id or focused_win.display_id != source_display_id) {
-                wid_opt = null;
-            }
-        } else {
-            wid_opt = null;
-        }
-    }
-    if (wid_opt == null) {
-        for (ws.windows.items) |candidate_wid| {
-            const candidate = g_store.get(candidate_wid) orelse continue;
-            if (candidate.workspace_id == ws_id and candidate.display_id == source_display_id) {
-                wid_opt = candidate_wid;
-                break;
-            }
-        }
-    }
-    const wid = wid_opt orelse return;
-    _ = moveManagedWindowToDisplay(wid, target_display_id);
+    const ctx = actionContext() orelse return;
+    _ = moveManagedWindowToDisplay(ctx.focused_wid, target_display_id);
 }
 
 fn moveWorkspaceToDisplay(target_display_slot: usize) void {
@@ -7484,49 +7460,45 @@ fn windowInDirection(ws: *const workspace_mod.Workspace, focused: *const window_
 /// Swap the focused window with its nearest neighbour in the given
 /// direction and retile. No-op when either window is not tiled.
 fn swapDirection(dir: FocusDir) void {
-    const ws = activeWorkspace();
-    const focused_wid = ws.focused_wid orelse return;
-    const focused = g_store.get(focused_wid) orelse return;
+    const ctx = actionContext() orelse return;
 
-    const target_wid = windowInDirection(ws, &focused, dir) orelse return;
+    const target_wid = windowInDirection(ctx.workspace, &ctx.focused_win, dir) orelse return;
 
-    const sp = tilingStatePtr(focused.workspace_id);
+    const sp = tilingStatePtr(ctx.focused_win.workspace_id);
     if (sp.*) |*st| {
-        if (!st.swapWids(focused_wid, target_wid)) return;
-        log.info("swap {s}: wid={d} <-> wid={d}", .{ @tagName(dir), focused_wid, target_wid });
+        if (!st.swapWids(ctx.focused_wid, target_wid)) return;
+        log.info("swap {s}: wid={d} <-> wid={d}", .{ @tagName(dir), ctx.focused_wid, target_wid });
         retile();
     }
 }
 
 fn focusDirection(dir: FocusDir) void {
-    const ws = activeWorkspace();
-    const focused_wid = ws.focused_wid orelse return;
-    const focused = g_store.get(focused_wid) orelse return;
+    const ctx = actionContext() orelse return;
 
-    const best_wid = windowInDirection(ws, &focused, dir);
+    const best_wid = windowInDirection(ctx.workspace, &ctx.focused_win, dir);
 
     if (best_wid) |wid| {
         // If target is a tab group leader, focus the active tab instead
         const actual_wid = g_tab_groups.resolveActive(wid);
         if (g_store.get(actual_wid)) |win| {
             _ = bw_ax_focus_window(win.pid, actual_wid);
-            ws.recordFocus(wid); // track the leader
+            ctx.workspace.recordFocus(wid);
             _ = maybeSetFocusedDisplayForWindow(win, .keyboard);
             setTilingActive(win.workspace_id, actual_wid);
         }
         return;
     }
 
-    const sp = tilingStatePtr(focused.workspace_id);
+    const sp = tilingStatePtr(ctx.focused_win.workspace_id);
     const st = sp.* orelse return;
     const stack_forward = switch (dir) {
         .left, .up => false,
         .right, .down => true,
     };
-    if (st.cycleFocus(focused_wid, stack_forward)) |stack_wid| {
+    if (st.cycleFocus(ctx.focused_wid, stack_forward)) |stack_wid| {
         if (g_store.get(stack_wid)) |win| {
             _ = bw_ax_focus_window(win.pid, stack_wid);
-            ws.recordFocus(stack_wid);
+            ctx.workspace.recordFocus(stack_wid);
             _ = maybeSetFocusedDisplayForWindow(win, .keyboard);
             setTilingActive(win.workspace_id, stack_wid);
         }
