@@ -527,48 +527,8 @@ fn inWorkspaceTransition() bool {
     return g_state.isWorkspaceTransitionActive();
 }
 
-fn shouldAcceptFocusForWindow(win: window_mod.Window, source: FocusEventSource) bool {
-    if (!spaceVisible(win.space)) return false;
-    if (source == .keyboard) return true;
-
-    if (!g_state.isWorkspaceTransitionActive()) return true;
-
-    const transition = g_state.workspace_transition.?;
-    if (!win.space.key.eql(transition.target.key)) return false;
-    return true;
-}
-
-fn queuePendingFocus(win: window_mod.Window, source: FocusEventSource) void {
-    if (!g_state.isWorkspaceTransitionActive()) return;
-    if (source == .keyboard) return;
-    if (win.pid <= 0) return;
-
-    dispatchStateEvent(.{ .defer_focus = .{
-        .process_id = win.pid,
-        .window_id = win.wid,
-        .source = source,
-        .space_key = win.space.key,
-    } });
-    const transition = g_state.workspace_transition.?;
-    const target = transition.target;
-    log.debug("workspace transition pending focus queued epoch={d} wid={d} pid={d} source={s} workspace={d} display={d} target_workspace={d} target_display={d} pending={d}", .{
-        transition.epoch,
-        win.wid,
-        win.pid,
-        @tagName(source),
-        win.space.workspace_id,
-        win.space.display_id,
-        target.workspace_id,
-        target.display_id,
-        g_state.pendingFocusCount(),
-    });
-}
-
 fn applyPendingFocusEntry(entry: state_mod.PendingFocus) void {
-    if (!g_state.isWorkspaceTransitionActive()) {
-        reportPendingFocusApplied(entry, false);
-        return;
-    }
+    if (!g_state.isWorkspaceTransitionActive()) return;
     const transition = g_state.workspace_transition.?;
     const target_space = transition.target;
     if (!entry.space_key.eql(target_space.key)) {
@@ -579,7 +539,6 @@ fn applyPendingFocusEntry(entry: state_mod.PendingFocus) void {
             if (g_state.space(entry.space_key)) |space| space.workspace_id else 0,
             target_space.workspace_id,
         });
-        reportPendingFocusApplied(entry, false);
         return;
     }
 
@@ -589,7 +548,6 @@ fn applyPendingFocusEntry(entry: state_mod.PendingFocus) void {
             entry.window_id,
             entry.process_id,
         });
-        reportPendingFocusApplied(entry, false);
         return;
     };
     if (win.pid != entry.process_id) {
@@ -599,7 +557,6 @@ fn applyPendingFocusEntry(entry: state_mod.PendingFocus) void {
             entry.process_id,
             win.pid,
         });
-        reportPendingFocusApplied(entry, false);
         return;
     }
     if (!win.space.key.eql(entry.space_key)) {
@@ -609,18 +566,10 @@ fn applyPendingFocusEntry(entry: state_mod.PendingFocus) void {
             entry.process_id,
             win.space.workspace_id,
         });
-        reportPendingFocusApplied(entry, false);
         return;
     }
 
-    reportPendingFocusApplied(entry, maybeSetFocusedDisplayForWindow(win, entry.source));
-}
-
-fn reportPendingFocusApplied(entry: state_mod.PendingFocus, accepted: bool) void {
-    dispatchStateEvent(.{ .pending_focus_applied = .{
-        .transition_epoch = entry.transition_epoch,
-        .accepted = accepted,
-    } });
+    observeWindowFocus(win, entry.source, entry.transition_epoch);
 }
 
 fn processPendingFocusQueue() void {
@@ -635,52 +584,16 @@ fn clearPendingFocusQueue() void {
     dispatchStateEvent(.clear_pending_focus);
 }
 
-fn maybeSetFocusedDisplayForWindow(win: window_mod.Window, source: FocusEventSource) bool {
-    if (!shouldAcceptFocusForWindow(win, source)) {
-        if (g_state.isWorkspaceTransitionActive()) {
-            const transition = g_state.workspace_transition.?;
-            const target = transition.target;
-            log.debug("workspace transition focus deferred epoch={d} wid={d} pid={d} source={s} workspace={d} display={d} target_workspace={d} target_display={d} visible={}", .{
-                transition.epoch,
-                win.wid,
-                win.pid,
-                @tagName(source),
-                win.space.workspace_id,
-                win.space.display_id,
-                target.workspace_id,
-                target.display_id,
-                spaceVisible(win.space),
-            });
-        }
-        queuePendingFocus(win, source);
-        return false;
-    }
-
-    setFocusedDisplay(win.space.display_id);
-
-    if (g_state.isWorkspaceTransitionActive()) {
-        const transition = g_state.workspace_transition.?;
-        const target = transition.target;
-        log.debug("workspace transition focus accepted epoch={d} wid={d} pid={d} source={s} workspace={d} display={d} target_workspace={d} target_display={d}", .{
-            transition.epoch,
-            win.wid,
-            win.pid,
-            @tagName(source),
-            win.space.workspace_id,
-            win.space.display_id,
-            target.workspace_id,
-            target.display_id,
-        });
-        markWorkspaceTransitionComplete(.focus_accepted);
-    }
-
-    // Keyboard intent always wins — flush stale queued focus from AX/drag
-    // so they don't replay against an old transition epoch.
-    if (source == .keyboard and g_state.isWorkspaceTransitionActive()) {
-        clearPendingFocusQueue();
-    }
-
-    return true;
+fn observeWindowFocus(win: window_mod.Window, source: FocusEventSource, pending_transition_epoch: ?state_mod.Epoch) void {
+    dispatchStateEvent(.{ .window_focus_observed = .{
+        .process_id = win.pid,
+        .window_id = win.wid,
+        .source = source,
+        .target = win.space,
+        .is_target_visible = spaceVisible(win.space),
+        .at_ms = nativeStateNowMs(),
+        .pending_transition_epoch = pending_transition_epoch,
+    } });
 }
 
 /// Follow focus into a hidden workspace. `focused_wid` is the window the AX
@@ -696,56 +609,14 @@ fn switchToWindowWorkspaceIfHidden(win: window_mod.Window, focused_wid: u32, sou
     std.debug.assert(focused_wid != 0);
     win.space.assertValid();
 
-    if (g_state.pending_switch) |pending| {
-        log.debug("follow focus ignored during native switch wid={d} pid={d} workspace={d} target_workspace={d}", .{
-            focused_wid,
-            win.pid,
-            win.space.workspace_id,
-            pending.request.target.workspace_id,
-        });
-        return;
-    }
-
-    const transition_active = g_state.isWorkspaceTransitionActive();
-    switch (workspace_mod.followFocusAction(
-        spaceVisible(win.space),
-        transition_active,
-    )) {
-        .ignore => {
-            if (!transition_active) clearDeferredFollowFocus();
-            return;
-        },
-        .defer_until_settled => {
-            dispatchStateEvent(.{ .defer_follow_focus = .{
-                .process_id = win.pid,
-                .window_id = focused_wid,
-                .source = source,
-            } });
-            log.debug("follow focus deferred wid={d} leader={d} pid={d} workspace={d} display={d} epoch={d} target_workspace={d} completion={s}", .{
-                focused_wid,
-                win.wid,
-                win.pid,
-                win.space.workspace_id,
-                win.space.display_id,
-                g_state.workspace_transition.?.epoch,
-                g_state.workspace_transition.?.target.workspace_id,
-                if (g_state.workspace_transition.?.completion_reason) |reason| @tagName(reason) else "none",
-            });
-            return;
-        },
-        .switch_workspace => {},
-    }
-
-    clearDeferredFollowFocus();
-    log.debug("follow focus switching wid={d} leader={d} pid={d} workspace={d} display={d}", .{
-        focused_wid,
-        win.wid,
-        win.pid,
-        win.space.workspace_id,
-        win.space.display_id,
-    });
-    setFocusedDisplay(win.space.display_id);
-    switchWorkspace(win.space.workspace_id);
+    dispatchStateEvent(.{ .follow_focus_observed = .{
+        .process_id = win.pid,
+        .window_id = focused_wid,
+        .leader_window_id = win.wid,
+        .source = source,
+        .target = win.space,
+        .is_target_visible = spaceVisible(win.space),
+    } });
 }
 
 /// Replay a follow-focus intent that a mid-flight transition deferred. Called
@@ -779,11 +650,6 @@ fn applyDeferredFollowFocus(deferred: ?state_mod.DeferredFollowFocus) void {
     _ = syncFocusStateForWindowId(focus.window_id, focus.source);
 }
 
-fn clearDeferredFollowFocus() void {
-    if (!g_state.hasDeferredFollowFocus()) return;
-    dispatchStateEvent(.clear_deferred_follow_focus);
-}
-
 /// During a workspace transition, AX focus events from non-target
 /// workspaces/displays are lagging or synthetic (hide/retile side effects,
 /// native-tab ID swaps). Recording them would clobber the source workspace's
@@ -807,7 +673,7 @@ fn syncFocusStateForWindowId(focused_wid: u32, source: FocusEventSource) bool {
     // Window ID is the canonical identity. PID-only notifications are resolved
     // before this point so same-process windows do not overwrite each other.
     g_tab_groups.setActive(focused_wid);
-    _ = maybeSetFocusedDisplayForWindow(win, source);
+    observeWindowFocus(win, source, null);
     if (shouldRecordWorkspaceFocusForWindow(win)) {
         if (spaceForWindow(win)) |ws| {
             ws.recordFocus(leader);
@@ -3732,7 +3598,7 @@ fn handleEvent(ev: *const event_mod.Event) void {
             }
             if (tab_dragged_out) {
                 if (g_store.get(layout_wid)) |win| {
-                    _ = maybeSetFocusedDisplayForWindow(win, .drag);
+                    observeWindowFocus(win, .drag, null);
                 }
                 retile();
             }
@@ -4085,7 +3951,91 @@ fn executeStateEffect(effect: state_mod.Effect) void {
             request.target.workspace_id,
         }),
         .apply_pending_focus => |pending| applyPendingFocusEntry(pending),
+        .window_focus_deferred => |deferred| executeWindowFocusDeferred(deferred),
+        .window_focus_accepted => |accepted| executeWindowFocusAccepted(accepted),
+        .follow_focus_ignored_during_native_switch => |ignored| log.debug("follow focus ignored during native switch wid={d} pid={d} workspace={d} target_workspace={d}", .{
+            ignored.observation.window_id,
+            ignored.observation.process_id,
+            ignored.observation.target.workspace_id,
+            ignored.pending_target.workspace_id,
+        }),
+        .follow_focus_deferred => |deferred| log.debug("follow focus deferred wid={d} leader={d} pid={d} workspace={d} display={d} epoch={d} target_workspace={d} completion={s}", .{
+            deferred.observation.window_id,
+            deferred.observation.leader_window_id,
+            deferred.observation.process_id,
+            deferred.observation.target.workspace_id,
+            deferred.observation.target.display_id,
+            deferred.transition.epoch,
+            deferred.transition.target.workspace_id,
+            if (deferred.transition.completion_reason) |reason| @tagName(reason) else "none",
+        }),
+        .follow_focus_workspace => |observation| executeFollowFocusWorkspace(observation),
     }
+}
+
+fn executeWindowFocusDeferred(deferred: @FieldType(state_mod.Effect, "window_focus_deferred")) void {
+    const observation = deferred.observation;
+    const transition = deferred.transition;
+    log.debug("workspace transition focus deferred epoch={d} wid={d} pid={d} source={s} workspace={d} display={d} target_workspace={d} target_display={d} visible={}", .{
+        transition.epoch,
+        observation.window_id,
+        observation.process_id,
+        @tagName(observation.source),
+        observation.target.workspace_id,
+        observation.target.display_id,
+        transition.target.workspace_id,
+        transition.target.display_id,
+        observation.is_target_visible,
+    });
+    if (observation.source == .keyboard) return;
+
+    log.debug("workspace transition pending focus queued epoch={d} wid={d} pid={d} source={s} workspace={d} display={d} target_workspace={d} target_display={d} pending={d}", .{
+        transition.epoch,
+        observation.window_id,
+        observation.process_id,
+        @tagName(observation.source),
+        observation.target.workspace_id,
+        observation.target.display_id,
+        transition.target.workspace_id,
+        transition.target.display_id,
+        deferred.pending_count,
+    });
+}
+
+fn executeWindowFocusAccepted(accepted: @FieldType(state_mod.Effect, "window_focus_accepted")) void {
+    const observation = accepted.observation;
+    const transition = accepted.transition;
+    log.debug("workspace transition focus accepted epoch={d} wid={d} pid={d} source={s} workspace={d} display={d} target_workspace={d} target_display={d}", .{
+        transition.epoch,
+        observation.window_id,
+        observation.process_id,
+        @tagName(observation.source),
+        observation.target.workspace_id,
+        observation.target.display_id,
+        transition.target.workspace_id,
+        transition.target.display_id,
+    });
+    if (transition.completion_reason != null) return;
+
+    log.debug("workspace transition marked complete epoch={d} kind={s} workspace={d} display={d} reason={s}", .{
+        transition.epoch,
+        @tagName(transition.kind),
+        transition.target.workspace_id,
+        transition.target.display_id,
+        @tagName(state_mod.WorkspaceTransitionCompletionReason.focus_accepted),
+    });
+}
+
+fn executeFollowFocusWorkspace(observation: state_mod.FollowFocusObservation) void {
+    log.debug("follow focus switching wid={d} leader={d} pid={d} workspace={d} display={d}", .{
+        observation.window_id,
+        observation.leader_window_id,
+        observation.process_id,
+        observation.target.workspace_id,
+        observation.target.display_id,
+    });
+    setFocusedDisplay(observation.target.display_id);
+    switchWorkspace(observation.target.workspace_id);
 }
 
 fn retryNativeWindowMove(pending: state_mod.PendingNativeWindowMove) void {
@@ -4236,7 +4186,6 @@ fn completeNativeSwitch(space: state_mod.SpaceRef, epoch: state_mod.Epoch) void 
     }
 
     clearPendingFocusQueue();
-    clearDeferredFollowFocus();
 
     _ = discoverWindowsAfterNativeSpaceSwitch();
     clearDragPreview();
@@ -5952,7 +5901,7 @@ fn updateDraggedWindowGeometry(dragged_wid: u32, frame: window_mod.Window.Frame)
     adoptDraggedFrame(dragged_wid, leader_wid, frame);
 
     if (g_store.get(leader_wid)) |updated| {
-        _ = maybeSetFocusedDisplayForWindow(updated, .drag);
+        observeWindowFocus(updated, .drag, null);
     }
     log.info("window moved to display dragged_wid={d} leader={d} display={d}", .{
         dragged_wid,
@@ -7022,7 +6971,7 @@ fn focusWorkspaceWindow(ws: *workspace_mod.Space) void {
             }
             _ = bw_ax_focus_window(win.pid, actual_wid);
             ws.recordFocus(fwid);
-            _ = maybeSetFocusedDisplayForWindow(win, .keyboard);
+            observeWindowFocus(win, .keyboard, null);
         }
     }
 
@@ -7171,7 +7120,7 @@ fn reassignManagedWindowToDisplay(wid: u32, target_display_id: u32) bool {
 fn moveManagedWindowToDisplay(wid: u32, target_display_id: u32) bool {
     if (!reassignManagedWindowToDisplay(wid, target_display_id)) return false;
     if (g_store.get(wid)) |win| {
-        _ = maybeSetFocusedDisplayForWindow(win, .keyboard);
+        observeWindowFocus(win, .keyboard, null);
     }
     retile();
     return true;
@@ -7331,7 +7280,7 @@ fn focusDirection(dir: FocusDir) void {
         if (g_store.get(actual_wid)) |win| {
             _ = bw_ax_focus_window(win.pid, actual_wid);
             ctx.workspace.recordFocus(wid);
-            _ = maybeSetFocusedDisplayForWindow(win, .keyboard);
+            observeWindowFocus(win, .keyboard, null);
             setTilingActive(win.space.key, actual_wid);
         }
         return;
@@ -7347,7 +7296,7 @@ fn focusDirection(dir: FocusDir) void {
         if (g_store.get(stack_wid)) |win| {
             _ = bw_ax_focus_window(win.pid, stack_wid);
             ctx.workspace.recordFocus(stack_wid);
-            _ = maybeSetFocusedDisplayForWindow(win, .keyboard);
+            observeWindowFocus(win, .keyboard, null);
             setTilingActive(win.space.key, stack_wid);
         }
     }

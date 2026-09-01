@@ -7,24 +7,6 @@ pub const max_workspaces = 10;
 pub const max_displays = 8;
 pub const max_spaces = max_workspaces * max_displays;
 
-pub const FollowFocusAction = enum {
-    ignore,
-    defer_until_settled,
-    switch_workspace,
-};
-
-/// Decide how a focus event should affect workspace visibility.
-///
-/// A transition remains active during its settle tail, after target focus has
-/// already been accepted. Hidden-window AX events in that interval can still
-/// be synthetic fallout from parking the old workspace, so they must wait for
-/// frontmost-app validation rather than immediately reversing the transition.
-pub fn followFocusAction(workspace_visible: bool, transition_active: bool) FollowFocusAction {
-    if (workspace_visible) return .ignore;
-    if (transition_active) return .defer_until_settled;
-    return .switch_workspace;
-}
-
 /// Whether `actual` physically covers the complete region assigned by
 /// `target`. Apps may clamp a tile larger than requested, which is safe for a
 /// reveal; exact frame equality would unnecessarily hold the outgoing
@@ -361,14 +343,6 @@ test "recordFocus drops oldest entry when history is full" {
         @as(Window.WindowId, max_focus_history + 1),
         ws.focus_history[max_focus_history - 1],
     );
-}
-
-test "follow focus defers hidden windows through the transition settle tail" {
-    const t = std.testing;
-
-    try t.expectEqual(FollowFocusAction.ignore, followFocusAction(true, true));
-    try t.expectEqual(FollowFocusAction.defer_until_settled, followFocusAction(false, true));
-    try t.expectEqual(FollowFocusAction.switch_workspace, followFocusAction(false, false));
 }
 
 test "physical reveal accepts exact and clamped-larger frames only" {

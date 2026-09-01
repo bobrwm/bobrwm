@@ -34,6 +34,25 @@ pub const DeferredFollowFocus = struct {
     transition_epoch: Epoch,
 };
 
+pub const FollowFocusObservation = struct {
+    process_id: i32,
+    window_id: WindowId,
+    leader_window_id: WindowId,
+    source: FocusEventSource,
+    target: SpaceRef,
+    is_target_visible: bool,
+};
+
+pub const WindowFocusObservation = struct {
+    process_id: i32,
+    window_id: WindowId,
+    source: FocusEventSource,
+    target: SpaceRef,
+    is_target_visible: bool,
+    at_ms: TimestampMs,
+    pending_transition_epoch: ?Epoch = null,
+};
+
 pub const DisplayWorkspace = struct {
     display_id: DisplayId,
     active_workspace_id: WorkspaceId,
@@ -514,24 +533,10 @@ pub const Event = union(enum) {
         epoch: Epoch,
         succeeded: bool,
     },
-    defer_focus: struct {
-        process_id: i32,
-        window_id: WindowId,
-        source: FocusEventSource,
-        space_key: SpaceKey,
-    },
+    window_focus_observed: WindowFocusObservation,
     request_pending_focus,
-    pending_focus_applied: struct {
-        transition_epoch: Epoch,
-        accepted: bool,
-    },
     clear_pending_focus,
-    defer_follow_focus: struct {
-        process_id: i32,
-        window_id: WindowId,
-        source: FocusEventSource,
-    },
-    clear_deferred_follow_focus,
+    follow_focus_observed: FollowFocusObservation,
 };
 
 pub const SwitchFailureReason = enum {
@@ -569,6 +574,24 @@ pub const Effect = union(enum) {
     native_window_move_rollback_deferred: PendingNativeWindowMove,
     native_window_move_rejected: NativeWindowMoveRequest,
     apply_pending_focus: PendingFocus,
+    window_focus_deferred: struct {
+        observation: WindowFocusObservation,
+        transition: WorkspaceTransition,
+        pending_count: u8,
+    },
+    window_focus_accepted: struct {
+        observation: WindowFocusObservation,
+        transition: WorkspaceTransition,
+    },
+    follow_focus_ignored_during_native_switch: struct {
+        observation: FollowFocusObservation,
+        pending_target: SpaceRef,
+    },
+    follow_focus_deferred: struct {
+        observation: FollowFocusObservation,
+        transition: WorkspaceTransition,
+    },
+    follow_focus_workspace: FollowFocusObservation,
 };
 
 pub const max_effects = 6;
@@ -638,12 +661,10 @@ pub fn reduce(model: Model, event: Event) Transition {
         },
         .native_window_move_observed => |observation| reduceNativeWindowMoveObserved(&transition, observation),
         .native_window_move_rollback_result => |result| reduceNativeWindowMoveRollbackResult(&transition, result),
-        .defer_focus => |focus| reduceFocusDeferred(&transition, focus),
+        .window_focus_observed => |observation| reduceWindowFocusObserved(&transition, observation),
         .request_pending_focus => reducePendingFocusRequest(&transition),
-        .pending_focus_applied => |result| reducePendingFocusApplied(&transition, result),
         .clear_pending_focus => transition.model.pending_focus.clear(),
-        .defer_follow_focus => |focus| reduceFollowFocusDeferred(&transition, focus),
-        .clear_deferred_follow_focus => transition.model.deferred_follow_focus = null,
+        .follow_focus_observed => |observation| reduceFollowFocusObserved(&transition, observation),
     }
 
     assertModel(&transition.model);
@@ -913,23 +934,66 @@ fn reduceNativeWindowMoveRollbackResult(
     transition.addEffect(.{ .native_window_move_rollback_deferred = pending });
 }
 
-fn reduceFocusDeferred(
+fn reduceWindowFocusObserved(
     transition: *Transition,
-    event: @FieldType(Event, "defer_focus"),
+    event: WindowFocusObservation,
 ) void {
-    const workspace_transition = transition.model.workspace_transition orelse return;
-    if (event.process_id <= 0 or event.window_id == 0 or event.source == .keyboard) return;
-    if (transition.model.space(event.space_key) == null) return;
+    if (event.process_id <= 0 or event.window_id == 0) return;
+    var observation = event;
+    observation.target = transition.model.space(event.target.key) orelse return;
 
-    const pending: PendingFocus = .{
-        .process_id = event.process_id,
-        .window_id = event.window_id,
-        .source = event.source,
-        .space_key = event.space_key,
-        .transition_epoch = workspace_transition.epoch,
-        .sequence = transition.model.pending_focus.takeSequence(),
-    };
-    transition.model.pending_focus.insertOrReplace(pending);
+    const workspace_transition = transition.model.workspace_transition;
+    if (observation.pending_transition_epoch) |epoch| {
+        const current = workspace_transition orelse return;
+        if (current.epoch != epoch) return;
+    }
+
+    const is_accepted = observation.is_target_visible and
+        (observation.source == .keyboard or
+            workspace_transition == null or
+            observation.target.key.eql(workspace_transition.?.target.key));
+    if (is_accepted) {
+        if (transition.model.workspace_topology.findDisplay(observation.target.display_id) != null) {
+            transition.model.workspace_topology.focused_display_id = observation.target.display_id;
+        }
+        if (workspace_transition) |current| {
+            transition.addEffect(.{ .window_focus_accepted = .{
+                .observation = observation,
+                .transition = current,
+            } });
+            if (current.completion_reason == null) {
+                completeWorkspaceTransition(
+                    &transition.model,
+                    current.epoch,
+                    .focus_accepted,
+                    observation.at_ms,
+                );
+            }
+            if (observation.source == .keyboard or observation.pending_transition_epoch != null) {
+                transition.model.pending_focus.clear();
+            }
+        }
+        return;
+    }
+
+    const current = workspace_transition orelse return;
+    if (observation.source != .keyboard) {
+        const pending: PendingFocus = .{
+            .process_id = observation.process_id,
+            .window_id = observation.window_id,
+            .source = observation.source,
+            .space_key = observation.target.key,
+            .transition_epoch = current.epoch,
+            .sequence = transition.model.pending_focus.takeSequence(),
+        };
+        transition.model.pending_focus.insertOrReplace(pending);
+    }
+
+    transition.addEffect(.{ .window_focus_deferred = .{
+        .observation = observation,
+        .transition = current,
+        .pending_count = transition.model.pending_focus.count,
+    } });
 }
 
 fn reducePendingFocusRequest(transition: *Transition) void {
@@ -943,30 +1007,44 @@ fn reducePendingFocusRequest(transition: *Transition) void {
     transition.addEffect(.{ .apply_pending_focus = pending });
 }
 
-fn reducePendingFocusApplied(
+fn reduceFollowFocusObserved(
     transition: *Transition,
-    event: @FieldType(Event, "pending_focus_applied"),
+    event: FollowFocusObservation,
 ) void {
-    if (!event.accepted) return;
-    const workspace_transition = transition.model.workspace_transition orelse return;
-    if (workspace_transition.epoch != event.transition_epoch) return;
+    if (event.process_id <= 0 or event.window_id == 0 or event.leader_window_id == 0) return;
+    var observation = event;
+    observation.target = transition.model.space(event.target.key) orelse return;
 
-    transition.model.pending_focus.clear();
-}
+    if (transition.model.pending_switch) |pending| {
+        transition.addEffect(.{ .follow_focus_ignored_during_native_switch = .{
+            .observation = observation,
+            .pending_target = pending.request.target,
+        } });
+        return;
+    }
 
-fn reduceFollowFocusDeferred(
-    transition: *Transition,
-    event: @FieldType(Event, "defer_follow_focus"),
-) void {
-    const workspace_transition = transition.model.workspace_transition orelse return;
-    if (event.process_id <= 0 or event.window_id == 0) return;
+    const workspace_transition = transition.model.workspace_transition;
+    if (observation.is_target_visible) {
+        if (workspace_transition == null) transition.model.deferred_follow_focus = null;
+        return;
+    }
+
+    const current = workspace_transition orelse {
+        transition.model.deferred_follow_focus = null;
+        transition.addEffect(.{ .follow_focus_workspace = observation });
+        return;
+    };
 
     transition.model.deferred_follow_focus = .{
-        .process_id = event.process_id,
-        .window_id = event.window_id,
-        .source = event.source,
-        .transition_epoch = workspace_transition.epoch,
+        .process_id = observation.process_id,
+        .window_id = observation.window_id,
+        .source = observation.source,
+        .transition_epoch = current.epoch,
     };
+    transition.addEffect(.{ .follow_focus_deferred = .{
+        .observation = observation,
+        .transition = current,
+    } });
 }
 
 const FailedSwitch = struct {
@@ -1299,6 +1377,37 @@ fn switchRequest(model: *const Model, display_id: DisplayId, workspace_id: Works
     } };
 }
 
+fn followFocusObservation(model: *const Model, target_key: SpaceKey, is_target_visible: bool) Event {
+    return .{ .follow_focus_observed = .{
+        .process_id = 10,
+        .window_id = 41,
+        .leader_window_id = 40,
+        .source = .ax,
+        .target = model.space(target_key).?,
+        .is_target_visible = is_target_visible,
+    } };
+}
+
+fn windowFocusObservation(
+    model: *const Model,
+    process_id: i32,
+    window_id: WindowId,
+    source: FocusEventSource,
+    target_key: SpaceKey,
+    is_target_visible: bool,
+    pending_transition_epoch: ?Epoch,
+) Event {
+    return .{ .window_focus_observed = .{
+        .process_id = process_id,
+        .window_id = window_id,
+        .source = source,
+        .target = model.space(target_key).?,
+        .is_target_visible = is_target_visible,
+        .at_ms = 300,
+        .pending_transition_epoch = pending_transition_epoch,
+    } };
+}
+
 fn trackNativeWindowMove(model: *const Model, window_id: WindowId, source_workspace_id: WorkspaceId, target_workspace_id: WorkspaceId) Event {
     return .{ .track_native_window_move = .{
         .window_id = window_id,
@@ -1547,24 +1656,9 @@ test "pending focus queue replaces by window and applies newest intent" {
     model = reduce(model, switchRequest(&model, 1, 2, 100)).model;
     const epoch = model.workspace_transition.?.epoch;
 
-    model = reduce(model, .{ .defer_focus = .{
-        .process_id = 10,
-        .window_id = 41,
-        .source = .ax,
-        .space_key = .{ .native = 102 },
-    } }).model;
-    model = reduce(model, .{ .defer_focus = .{
-        .process_id = 20,
-        .window_id = 42,
-        .source = .drag,
-        .space_key = .{ .native = 101 },
-    } }).model;
-    model = reduce(model, .{ .defer_focus = .{
-        .process_id = 10,
-        .window_id = 41,
-        .source = .drag,
-        .space_key = .{ .native = 102 },
-    } }).model;
+    model = reduce(model, windowFocusObservation(&model, 10, 41, .ax, .{ .native = 102 }, false, null)).model;
+    model = reduce(model, windowFocusObservation(&model, 20, 42, .drag, .{ .native = 101 }, false, null)).model;
+    model = reduce(model, windowFocusObservation(&model, 10, 41, .drag, .{ .native = 102 }, false, null)).model;
 
     try testing.expectEqual(@as(u8, 2), model.pendingFocusCount());
     var transition = reduce(model, .request_pending_focus);
@@ -1574,14 +1668,15 @@ test "pending focus queue replaces by window and applies newest intent" {
     try testing.expectEqual(epoch, pending.transition_epoch);
     try testing.expectEqual(@as(u8, 1), transition.model.pendingFocusCount());
 
-    transition = reduce(transition.model, .{ .pending_focus_applied = .{
-        .transition_epoch = epoch,
-        .accepted = true,
-    } });
+    transition = reduce(
+        transition.model,
+        windowFocusObservation(&transition.model, 10, 41, .drag, .{ .native = 102 }, true, epoch),
+    );
     try testing.expect(!transition.model.hasPendingFocus());
+    try testing.expectEqual(std.meta.Tag(Effect).window_focus_accepted, std.meta.activeTag(transition.effects[0]));
 }
 
-test "new workspace transition rejects stale pending focus result" {
+test "new workspace transition rejects stale pending focus observation" {
     const testing = std.testing;
     var catalog: SpaceCatalog = .{};
     catalog.add(.{ .key = .{ .virtual = 1 }, .workspace_id = 1, .display_id = 11 });
@@ -1593,12 +1688,7 @@ test "new workspace transition rejects stale pending focus result" {
         .target = model.space(.{ .virtual = 1 }).?,
         .at_ms = 100,
     } }).model;
-    model = reduce(model, .{ .defer_focus = .{
-        .process_id = 10,
-        .window_id = 41,
-        .source = .ax,
-        .space_key = .{ .virtual = 1 },
-    } }).model;
+    model = reduce(model, windowFocusObservation(&model, 10, 41, .ax, .{ .virtual = 1 }, false, null)).model;
     const stale_epoch = model.workspace_transition.?.epoch;
 
     model = reduce(model, .{ .start_workspace_transition = .{
@@ -1606,21 +1696,40 @@ test "new workspace transition rejects stale pending focus result" {
         .target = model.space(.{ .virtual = 2 }).?,
         .at_ms = 200,
     } }).model;
-    model = reduce(model, .{ .defer_focus = .{
-        .process_id = 20,
-        .window_id = 42,
-        .source = .ax,
-        .space_key = .{ .virtual = 2 },
-    } }).model;
+    model = reduce(model, windowFocusObservation(&model, 20, 42, .ax, .{ .virtual = 2 }, false, null)).model;
 
     const current_epoch = model.workspace_transition.?.epoch;
-    const transition = reduce(model, .{ .pending_focus_applied = .{
-        .transition_epoch = stale_epoch,
-        .accepted = true,
-    } });
+    const transition = reduce(
+        model,
+        windowFocusObservation(&model, 10, 41, .ax, .{ .virtual = 1 }, true, stale_epoch),
+    );
 
     try testing.expectEqual(current_epoch, transition.model.workspace_transition.?.epoch);
     try testing.expectEqual(@as(u8, 1), transition.model.pendingFocusCount());
+}
+
+test "keyboard focus accepts a visible non-target and clears pending focus" {
+    const testing = std.testing;
+    var catalog: SpaceCatalog = .{};
+    catalog.add(.{ .key = .{ .virtual = 1 }, .workspace_id = 1, .display_id = 11 });
+    catalog.add(.{ .key = .{ .virtual = 2 }, .workspace_id = 2, .display_id = 11 });
+
+    var model = reduce(.{}, .{ .replace_space_catalog = catalog }).model;
+    model = reduce(model, .{ .start_workspace_transition = .{
+        .kind = .switch_workspace,
+        .target = model.space(.{ .virtual = 2 }).?,
+        .at_ms = 100,
+    } }).model;
+    model = reduce(model, windowFocusObservation(&model, 10, 41, .ax, .{ .virtual = 1 }, false, null)).model;
+
+    const transition = reduce(
+        model,
+        windowFocusObservation(&model, 10, 41, .keyboard, .{ .virtual = 1 }, true, null),
+    );
+
+    try testing.expect(!transition.model.hasPendingFocus());
+    try testing.expectEqual(WorkspaceTransitionCompletionReason.focus_accepted, transition.model.workspace_transition.?.completion_reason.?);
+    try testing.expectEqual(std.meta.Tag(Effect).window_focus_accepted, std.meta.activeTag(transition.effects[0]));
 }
 
 test "deferred follow focus leaves the model with transition settlement" {
@@ -1637,15 +1746,18 @@ test "deferred follow focus leaves the model with transition settlement" {
     } }).model;
     const epoch = model.workspace_transition.?.epoch;
 
-    model = reduce(model, .{ .defer_follow_focus = .{
-        .process_id = 10,
-        .window_id = 41,
-        .source = .ax,
-    } }).model;
+    var transition = reduce(model, followFocusObservation(&model, .{ .virtual = 1 }, false));
+    model = transition.model;
     try testing.expect(model.hasDeferredFollowFocus());
     try testing.expectEqual(epoch, model.deferred_follow_focus.?.transition_epoch);
+    try testing.expectEqual(std.meta.Tag(Effect).follow_focus_deferred, std.meta.activeTag(transition.effects[0]));
 
-    const transition = reduce(model, .{ .workspace_transition_timer_fired = .{
+    transition = reduce(model, followFocusObservation(&model, .{ .virtual = 2 }, true));
+    model = transition.model;
+    try testing.expect(model.hasDeferredFollowFocus());
+    try testing.expectEqual(@as(u8, 0), transition.effect_count);
+
+    transition = reduce(model, .{ .workspace_transition_timer_fired = .{
         .epoch = epoch,
         .at_ms = 500,
     } });
@@ -1655,32 +1767,25 @@ test "deferred follow focus leaves the model with transition settlement" {
     try testing.expectEqual(epoch, settlement.deferred_follow_focus.?.transition_epoch);
 }
 
-test "native switch completion drops pre-observation follow focus" {
+test "native switch ignores follow focus until Space observation" {
     const testing = std.testing;
     var model = initializedModel(testTopology(101, null));
     model = reduce(model, switchRequest(&model, 1, 2, 100)).model;
-    const epoch = model.pending_switch.?.epoch;
+    const transition = reduce(model, followFocusObservation(&model, .{ .native = 101 }, false));
 
-    model = reduce(model, .{ .defer_follow_focus = .{
-        .process_id = 10,
-        .window_id = 41,
-        .source = .ax,
-    } }).model;
+    try testing.expect(!transition.model.hasDeferredFollowFocus());
+    try testing.expectEqual(std.meta.Tag(Effect).follow_focus_ignored_during_native_switch, std.meta.activeTag(transition.effects[0]));
+}
 
-    var transition = reduce(model, .{ .native_topology_observed = .{
-        .topology = testTopology(102, null),
-        .epoch = epoch,
-        .at_ms = 200,
-    } });
-    model = transition.model;
-    try testing.expect(!model.hasDeferredFollowFocus());
-    try testing.expectEqual(WorkspaceTransitionCompletionReason.native_space_changed, model.workspace_transition.?.completion_reason.?);
+test "hidden focus without a transition requests a workspace switch" {
+    const testing = std.testing;
+    const model = initializedModel(testTopology(101, null));
+    const transition = reduce(model, followFocusObservation(&model, .{ .native = 102 }, false));
+    const observation = transition.effects[0].follow_focus_workspace;
 
-    transition = reduce(model, .{ .workspace_transition_timer_fired = .{
-        .epoch = epoch,
-        .at_ms = 600,
-    } });
-    try testing.expect(transition.effects[0].workspace_transition_settled.deferred_follow_focus == null);
+    try testing.expectEqual(std.meta.Tag(Effect).follow_focus_workspace, std.meta.activeTag(transition.effects[0]));
+    try testing.expect(observation.target.key.eql(.{ .native = 102 }));
+    try testing.expect(!transition.model.hasDeferredFollowFocus());
 }
 
 test "native window move retries then requests rollback" {
