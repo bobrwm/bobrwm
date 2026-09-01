@@ -4,6 +4,7 @@ const std = @import("std");
 const space_mod = @import("space.zig");
 
 pub const max_displays = 8;
+pub const max_pending_focus_entries = 16;
 pub const max_spaces_per_display = 10;
 pub const max_pending_native_window_moves = 256;
 pub const native_switch_timeout_ms: u64 = 3200;
@@ -19,6 +20,12 @@ pub const SpaceRef = space_mod.Ref;
 pub const Epoch = u64;
 pub const TimestampMs = u64;
 pub const WindowId = u32;
+
+pub const FocusEventSource = enum {
+    keyboard,
+    drag,
+    ax,
+};
 
 pub const DisplayWorkspace = struct {
     display_id: DisplayId,
@@ -289,6 +296,72 @@ pub const NativeWindowMoveObservation = enum {
     ownership_changed,
 };
 
+pub const PendingFocus = struct {
+    process_id: i32,
+    window_id: WindowId,
+    source: FocusEventSource,
+    space_key: SpaceKey,
+    transition_epoch: Epoch,
+    sequence: u64,
+};
+
+pub const PendingFocusQueue = struct {
+    entries: [max_pending_focus_entries]PendingFocus = undefined,
+    count: u8 = 0,
+    next_sequence: u64 = 1,
+
+    pub fn hasEntries(self: *const PendingFocusQueue) bool {
+        return self.count > 0;
+    }
+
+    fn clear(self: *PendingFocusQueue) void {
+        self.count = 0;
+    }
+
+    fn insertOrReplace(self: *PendingFocusQueue, entry: PendingFocus) void {
+        var oldest_index: usize = 0;
+        var oldest_sequence: u64 = std.math.maxInt(u64);
+        for (self.entries[0..self.count], 0..) |existing, index| {
+            if (existing.window_id == entry.window_id) {
+                self.entries[index] = entry;
+                return;
+            }
+            if (existing.sequence < oldest_sequence) {
+                oldest_sequence = existing.sequence;
+                oldest_index = index;
+            }
+        }
+
+        if (self.count < self.entries.len) {
+            self.entries[self.count] = entry;
+            self.count += 1;
+            return;
+        }
+        self.entries[oldest_index] = entry;
+    }
+
+    fn takeLatest(self: *PendingFocusQueue) ?PendingFocus {
+        if (self.count == 0) return null;
+
+        var latest_index: usize = 0;
+        for (self.entries[1..self.count], 1..) |entry, index| {
+            if (entry.sequence > self.entries[latest_index].sequence) latest_index = index;
+        }
+
+        const entry = self.entries[latest_index];
+        self.count -= 1;
+        self.entries[latest_index] = self.entries[self.count];
+        return entry;
+    }
+
+    fn takeSequence(self: *PendingFocusQueue) u64 {
+        const sequence = self.next_sequence;
+        self.next_sequence +%= 1;
+        if (self.next_sequence == 0) self.next_sequence = 1;
+        return sequence;
+    }
+};
+
 pub const ObservationTimer = struct {
     epoch: Epoch,
     due_at_ms: TimestampMs,
@@ -303,6 +376,7 @@ pub const Model = struct {
     observation_timer: ?ObservationTimer = null,
     workspace_transition: ?WorkspaceTransition = null,
     pending_native_window_moves: PendingNativeWindowMoves = .{},
+    pending_focus: PendingFocusQueue = .{},
     next_epoch: Epoch = 1,
 
     pub fn isNativeSwitchPending(self: *const Model) bool {
@@ -323,6 +397,14 @@ pub const Model = struct {
 
     pub fn pendingNativeWindowMove(self: *const Model, window_id: WindowId) ?PendingNativeWindowMove {
         return self.pending_native_window_moves.get(window_id);
+    }
+
+    pub fn hasPendingFocus(self: *const Model) bool {
+        return self.pending_focus.hasEntries();
+    }
+
+    pub fn pendingFocusCount(self: *const Model) u8 {
+        return self.pending_focus.count;
     }
 
     pub fn dueObservation(self: *const Model, at_ms: TimestampMs) ?ObservationTimer {
@@ -419,6 +501,18 @@ pub const Event = union(enum) {
         epoch: Epoch,
         succeeded: bool,
     },
+    defer_focus: struct {
+        process_id: i32,
+        window_id: WindowId,
+        source: FocusEventSource,
+        space_key: SpaceKey,
+    },
+    request_pending_focus,
+    pending_focus_applied: struct {
+        transition_epoch: Epoch,
+        accepted: bool,
+    },
+    clear_pending_focus,
 };
 
 pub const SwitchFailureReason = enum {
@@ -455,6 +549,7 @@ pub const Effect = union(enum) {
     native_window_move_rolled_back: PendingNativeWindowMove,
     native_window_move_rollback_deferred: PendingNativeWindowMove,
     native_window_move_rejected: NativeWindowMoveRequest,
+    apply_pending_focus: PendingFocus,
 };
 
 pub const max_effects = 6;
@@ -502,6 +597,7 @@ pub fn reduce(model: Model, event: Event) Transition {
             transition.model.observation_timer = null;
             transition.model.workspace_transition = null;
             transition.model.pending_native_window_moves.count = 0;
+            transition.model.pending_focus.clear();
             syncNativeWorkspaceTopology(&transition);
             if (workspace_transition) |current| {
                 transition.addEffect(.{ .workspace_transition_settled = .{
@@ -525,6 +621,10 @@ pub fn reduce(model: Model, event: Event) Transition {
         },
         .native_window_move_observed => |observation| reduceNativeWindowMoveObserved(&transition, observation),
         .native_window_move_rollback_result => |result| reduceNativeWindowMoveRollbackResult(&transition, result),
+        .defer_focus => |focus| reduceFocusDeferred(&transition, focus),
+        .request_pending_focus => reducePendingFocusRequest(&transition),
+        .pending_focus_applied => |result| reducePendingFocusApplied(&transition, result),
+        .clear_pending_focus => transition.model.pending_focus.clear(),
     }
 
     assertModel(&transition.model);
@@ -708,6 +808,7 @@ fn reduceWorkspaceTransitionTimer(
     if (event.at_ms < current.deadline_at_ms) return;
 
     transition.model.workspace_transition = null;
+    transition.model.pending_focus.clear();
     transition.addEffect(.{ .workspace_transition_settled = .{
         .transition = current,
         .reason = if (current.completion_reason == null) .deadline_expired else .completed,
@@ -792,6 +893,47 @@ fn reduceNativeWindowMoveRollbackResult(
         return;
     }
     transition.addEffect(.{ .native_window_move_rollback_deferred = pending });
+}
+
+fn reduceFocusDeferred(
+    transition: *Transition,
+    event: @FieldType(Event, "defer_focus"),
+) void {
+    const workspace_transition = transition.model.workspace_transition orelse return;
+    if (event.process_id <= 0 or event.window_id == 0 or event.source == .keyboard) return;
+    if (transition.model.space(event.space_key) == null) return;
+
+    const pending: PendingFocus = .{
+        .process_id = event.process_id,
+        .window_id = event.window_id,
+        .source = event.source,
+        .space_key = event.space_key,
+        .transition_epoch = workspace_transition.epoch,
+        .sequence = transition.model.pending_focus.takeSequence(),
+    };
+    transition.model.pending_focus.insertOrReplace(pending);
+}
+
+fn reducePendingFocusRequest(transition: *Transition) void {
+    const workspace_transition = transition.model.workspace_transition orelse {
+        transition.model.pending_focus.clear();
+        return;
+    };
+    const pending = transition.model.pending_focus.takeLatest() orelse return;
+    if (pending.transition_epoch != workspace_transition.epoch) return;
+
+    transition.addEffect(.{ .apply_pending_focus = pending });
+}
+
+fn reducePendingFocusApplied(
+    transition: *Transition,
+    event: @FieldType(Event, "pending_focus_applied"),
+) void {
+    if (!event.accepted) return;
+    const workspace_transition = transition.model.workspace_transition orelse return;
+    if (workspace_transition.epoch != event.transition_epoch) return;
+
+    transition.model.pending_focus.clear();
 }
 
 const FailedSwitch = struct {
@@ -910,6 +1052,7 @@ fn startWorkspaceTransition(
         .deadline_at_ms = at_ms +| timeout_ms,
     };
     transition.model.workspace_transition = workspace_transition;
+    transition.model.pending_focus.clear();
     transition.addEffect(.{ .workspace_transition_started = workspace_transition });
 }
 
@@ -937,6 +1080,7 @@ fn settleWorkspaceTransition(
     if (current.epoch != epoch) return;
 
     transition.model.workspace_transition = null;
+    transition.model.pending_focus.clear();
     transition.addEffect(.{ .workspace_transition_settled = .{
         .transition = current,
         .reason = reason,
@@ -947,6 +1091,7 @@ fn refreshWorkspaceTransition(transition: *Transition) void {
     var current = transition.model.workspace_transition orelse return;
     current.target = transition.model.space(current.target.key) orelse {
         transition.model.workspace_transition = null;
+        transition.model.pending_focus.clear();
         transition.addEffect(.{ .workspace_transition_settled = .{
             .transition = current,
             .reason = .target_unavailable,
@@ -1060,6 +1205,19 @@ fn assertModel(model: *const Model) void {
         std.debug.assert(model.space(pending.source.key) != null);
         std.debug.assert(model.space(pending.target.key) != null);
         for (model.pending_native_window_moves.items()[0..index]) |prior| {
+            std.debug.assert(prior.window_id != pending.window_id);
+        }
+    }
+    std.debug.assert(model.pending_focus.count <= model.pending_focus.entries.len);
+    std.debug.assert(model.pending_focus.next_sequence != 0);
+    if (model.workspace_transition == null) std.debug.assert(!model.pending_focus.hasEntries());
+    for (model.pending_focus.entries[0..model.pending_focus.count], 0..) |pending, index| {
+        std.debug.assert(pending.process_id > 0);
+        std.debug.assert(pending.window_id != 0);
+        std.debug.assert(pending.source != .keyboard);
+        std.debug.assert(pending.sequence != 0);
+        std.debug.assert(pending.transition_epoch == model.workspace_transition.?.epoch);
+        for (model.pending_focus.entries[0..index]) |prior| {
             std.debug.assert(prior.window_id != pending.window_id);
         }
     }
@@ -1334,6 +1492,88 @@ test "stale workspace transition timer cannot settle newer intent" {
     try testing.expectEqual(current_epoch, transition.model.workspace_transition.?.epoch);
     try testing.expect(transition.model.workspace_transition.?.target.key.eql(.{ .virtual = 2 }));
     try testing.expectEqual(@as(u8, 0), transition.effect_count);
+}
+
+test "pending focus queue replaces by window and applies newest intent" {
+    const testing = std.testing;
+    var model = initializedModel(testTopology(101, null));
+    model = reduce(model, switchRequest(&model, 1, 2, 100)).model;
+    const epoch = model.workspace_transition.?.epoch;
+
+    model = reduce(model, .{ .defer_focus = .{
+        .process_id = 10,
+        .window_id = 41,
+        .source = .ax,
+        .space_key = .{ .native = 102 },
+    } }).model;
+    model = reduce(model, .{ .defer_focus = .{
+        .process_id = 20,
+        .window_id = 42,
+        .source = .drag,
+        .space_key = .{ .native = 101 },
+    } }).model;
+    model = reduce(model, .{ .defer_focus = .{
+        .process_id = 10,
+        .window_id = 41,
+        .source = .drag,
+        .space_key = .{ .native = 102 },
+    } }).model;
+
+    try testing.expectEqual(@as(u8, 2), model.pendingFocusCount());
+    var transition = reduce(model, .request_pending_focus);
+    const pending = transition.effects[0].apply_pending_focus;
+    try testing.expectEqual(@as(WindowId, 41), pending.window_id);
+    try testing.expectEqual(FocusEventSource.drag, pending.source);
+    try testing.expectEqual(epoch, pending.transition_epoch);
+    try testing.expectEqual(@as(u8, 1), transition.model.pendingFocusCount());
+
+    transition = reduce(transition.model, .{ .pending_focus_applied = .{
+        .transition_epoch = epoch,
+        .accepted = true,
+    } });
+    try testing.expect(!transition.model.hasPendingFocus());
+}
+
+test "new workspace transition rejects stale pending focus result" {
+    const testing = std.testing;
+    var catalog: SpaceCatalog = .{};
+    catalog.add(.{ .key = .{ .virtual = 1 }, .workspace_id = 1, .display_id = 11 });
+    catalog.add(.{ .key = .{ .virtual = 2 }, .workspace_id = 2, .display_id = 11 });
+
+    var model = reduce(.{}, .{ .replace_space_catalog = catalog }).model;
+    model = reduce(model, .{ .start_workspace_transition = .{
+        .kind = .switch_workspace,
+        .target = model.space(.{ .virtual = 1 }).?,
+        .at_ms = 100,
+    } }).model;
+    model = reduce(model, .{ .defer_focus = .{
+        .process_id = 10,
+        .window_id = 41,
+        .source = .ax,
+        .space_key = .{ .virtual = 1 },
+    } }).model;
+    const stale_epoch = model.workspace_transition.?.epoch;
+
+    model = reduce(model, .{ .start_workspace_transition = .{
+        .kind = .switch_workspace,
+        .target = model.space(.{ .virtual = 2 }).?,
+        .at_ms = 200,
+    } }).model;
+    model = reduce(model, .{ .defer_focus = .{
+        .process_id = 20,
+        .window_id = 42,
+        .source = .ax,
+        .space_key = .{ .virtual = 2 },
+    } }).model;
+
+    const current_epoch = model.workspace_transition.?.epoch;
+    const transition = reduce(model, .{ .pending_focus_applied = .{
+        .transition_epoch = stale_epoch,
+        .accepted = true,
+    } });
+
+    try testing.expectEqual(current_epoch, transition.model.workspace_transition.?.epoch);
+    try testing.expectEqual(@as(u8, 1), transition.model.pendingFocusCount());
 }
 
 test "native window move retries then requests rollback" {
