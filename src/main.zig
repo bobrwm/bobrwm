@@ -160,16 +160,6 @@ const PendingWorkspacePark = struct {
     deadline_at_s: f64,
 };
 
-/// A focus event that wanted to follow its window into a hidden workspace but
-/// arrived while a workspace transition was still in flight. Replayed verbatim
-/// once the transition clears, so `wid` is the originally focused window id
-/// (which may be a tab member) rather than its group leader.
-const DeferredFollowFocus = struct {
-    pid: i32,
-    wid: u32,
-    source: FocusEventSource,
-};
-
 const cleanup_pid_capacity_per_drain: usize = 16;
 
 const PendingRoleWindow = struct {
@@ -722,15 +712,15 @@ fn switchToWindowWorkspaceIfHidden(win: window_mod.Window, focused_wid: u32, sou
         transition_active,
     )) {
         .ignore => {
-            // Keep a hidden deferred event until the transition clears. A
-            // visible target notification may itself be stale; the frontmost
-            // app check at replay time is the authoritative tie-breaker.
-            if (!transition_active) g_deferred_follow_focus = null;
+            if (!transition_active) clearDeferredFollowFocus();
             return;
         },
         .defer_until_settled => {
-            g_deferred_follow_focus = .{ .pid = win.pid, .wid = focused_wid, .source = source };
-            refreshRolePolling();
+            dispatchStateEvent(.{ .defer_follow_focus = .{
+                .process_id = win.pid,
+                .window_id = focused_wid,
+                .source = source,
+            } });
             log.debug("follow focus deferred wid={d} leader={d} pid={d} workspace={d} display={d} epoch={d} target_workspace={d} completion={s}", .{
                 focused_wid,
                 win.wid,
@@ -746,7 +736,7 @@ fn switchToWindowWorkspaceIfHidden(win: window_mod.Window, focused_wid: u32, sou
         .switch_workspace => {},
     }
 
-    g_deferred_follow_focus = null;
+    clearDeferredFollowFocus();
     log.debug("follow focus switching wid={d} leader={d} pid={d} workspace={d} display={d}", .{
         focused_wid,
         win.wid,
@@ -761,34 +751,37 @@ fn switchToWindowWorkspaceIfHidden(win: window_mod.Window, focused_wid: u32, sou
 /// Replay a follow-focus intent that a mid-flight transition deferred. Called
 /// the moment the transition clears. Bails when the window is gone, already
 /// visible, or no longer owns app focus — by then the intent is stale.
-fn applyDeferredFollowFocus() void {
+fn applyDeferredFollowFocus(deferred: ?state_mod.DeferredFollowFocus) void {
     std.debug.assert(!g_state.isWorkspaceTransitionActive());
 
-    const deferred = g_deferred_follow_focus orelse return;
-    g_deferred_follow_focus = null;
-    refreshRolePolling();
+    const focus = deferred orelse return;
 
-    const leader = g_store.get(g_tab_groups.resolveLeader(deferred.wid)) orelse return;
-    if (leader.pid != deferred.pid) return;
+    const leader = g_store.get(g_tab_groups.resolveLeader(focus.window_id)) orelse return;
+    if (leader.pid != focus.process_id) return;
     if (spaceVisible(leader.space)) return;
 
     const front_pid = frontmostApplicationPid() orelse return;
-    if (front_pid != deferred.pid) {
+    if (front_pid != focus.process_id) {
         log.debug("follow focus replay dropped wid={d} pid={d} reason=focus-moved front_pid={d}", .{
-            deferred.wid,
-            deferred.pid,
+            focus.window_id,
+            focus.process_id,
             front_pid,
         });
         return;
     }
 
     log.debug("follow focus replaying wid={d} pid={d} workspace={d} display={d}", .{
-        deferred.wid,
-        deferred.pid,
+        focus.window_id,
+        focus.process_id,
         leader.space.workspace_id,
         leader.space.display_id,
     });
-    _ = syncFocusStateForWindowId(deferred.wid, deferred.source);
+    _ = syncFocusStateForWindowId(focus.window_id, focus.source);
+}
+
+fn clearDeferredFollowFocus() void {
+    if (!g_state.hasDeferredFollowFocus()) return;
+    dispatchStateEvent(.clear_deferred_follow_focus);
 }
 
 /// During a workspace transition, AX focus events from non-target
@@ -1482,7 +1475,6 @@ var g_waker_source: c.CFRunLoopSourceRef = null;
 var g_role_poll_source: c.dispatch_source_t = null;
 var g_tap_port: c.CFMachPortRef = null;
 var g_pending_workspace_parks: [workspace_mod.max_displays]?PendingWorkspacePark = @splat(null);
-var g_deferred_follow_focus: ?DeferredFollowFocus = null;
 var g_layout_entries: std.ArrayList(tiling.LayoutEntry) = .empty;
 var g_retile_requested_all_displays = false;
 var g_retile_dirty_display_ids: [workspace_mod.max_displays]u32 = [_]u32{0} ** workspace_mod.max_displays;
@@ -3952,7 +3944,7 @@ fn refreshRolePolling() void {
         g_app_launch_retries.count() > 0 or
         g_focus_retries.count() > 0 or
         g_state.hasPendingNativeWindowMoves() or
-        g_deferred_follow_focus != null or
+        g_state.hasDeferredFollowFocus() or
         g_state.hasScheduledObservation() or
         g_state.isWorkspaceTransitionActive() or
         g_display_resettle_at_s != 0 or
@@ -4132,7 +4124,6 @@ fn executeWorkspaceTransitionStarted(transition: state_mod.WorkspaceTransition) 
     const current = g_state.workspace_transition orelse return;
     if (current.epoch != transition.epoch) return;
 
-    g_deferred_follow_focus = null;
     log.debug("workspace transition started epoch={d} kind={s} workspace={d} display={d}", .{
         transition.epoch,
         @tagName(transition.kind),
@@ -4182,7 +4173,7 @@ fn executeWorkspaceTransitionSettled(settlement: state_mod.WorkspaceTransitionSe
     }
 
     reconcileVisibleFramesFromWindowServer();
-    applyDeferredFollowFocus();
+    applyDeferredFollowFocus(settlement.deferred_follow_focus);
 }
 
 fn executeNativeSwitch(effect: @FieldType(state_mod.Effect, "switch_native_space")) void {
@@ -4245,7 +4236,7 @@ fn completeNativeSwitch(space: state_mod.SpaceRef, epoch: state_mod.Epoch) void 
     }
 
     clearPendingFocusQueue();
-    g_deferred_follow_focus = null;
+    clearDeferredFollowFocus();
 
     _ = discoverWindowsAfterNativeSpaceSwitch();
     clearDragPreview();

@@ -27,6 +27,13 @@ pub const FocusEventSource = enum {
     ax,
 };
 
+pub const DeferredFollowFocus = struct {
+    process_id: i32,
+    window_id: WindowId,
+    source: FocusEventSource,
+    transition_epoch: Epoch,
+};
+
 pub const DisplayWorkspace = struct {
     display_id: DisplayId,
     active_workspace_id: WorkspaceId,
@@ -231,6 +238,7 @@ pub const WorkspaceTransitionSettlementReason = enum {
 pub const WorkspaceTransitionSettlement = struct {
     transition: WorkspaceTransition,
     reason: WorkspaceTransitionSettlementReason,
+    deferred_follow_focus: ?DeferredFollowFocus,
 };
 
 pub const PendingNativeWindowMove = struct {
@@ -377,6 +385,7 @@ pub const Model = struct {
     workspace_transition: ?WorkspaceTransition = null,
     pending_native_window_moves: PendingNativeWindowMoves = .{},
     pending_focus: PendingFocusQueue = .{},
+    deferred_follow_focus: ?DeferredFollowFocus = null,
     next_epoch: Epoch = 1,
 
     pub fn isNativeSwitchPending(self: *const Model) bool {
@@ -405,6 +414,10 @@ pub const Model = struct {
 
     pub fn pendingFocusCount(self: *const Model) u8 {
         return self.pending_focus.count;
+    }
+
+    pub fn hasDeferredFollowFocus(self: *const Model) bool {
+        return self.deferred_follow_focus != null;
     }
 
     pub fn dueObservation(self: *const Model, at_ms: TimestampMs) ?ObservationTimer {
@@ -513,6 +526,12 @@ pub const Event = union(enum) {
         accepted: bool,
     },
     clear_pending_focus,
+    defer_follow_focus: struct {
+        process_id: i32,
+        window_id: WindowId,
+        source: FocusEventSource,
+    },
+    clear_deferred_follow_focus,
 };
 
 pub const SwitchFailureReason = enum {
@@ -595,16 +614,14 @@ pub fn reduce(model: Model, event: Event) Transition {
             transition.model.pending_switch = null;
             transition.model.queued_switch = null;
             transition.model.observation_timer = null;
-            transition.model.workspace_transition = null;
             transition.model.pending_native_window_moves.count = 0;
-            transition.model.pending_focus.clear();
-            syncNativeWorkspaceTopology(&transition);
             if (workspace_transition) |current| {
-                transition.addEffect(.{ .workspace_transition_settled = .{
-                    .transition = current,
-                    .reason = .topology_reinitialized,
-                } });
+                finalizeWorkspaceTransition(&transition, current, .topology_reinitialized);
+            } else {
+                transition.model.pending_focus.clear();
+                transition.model.deferred_follow_focus = null;
             }
+            syncNativeWorkspaceTopology(&transition);
         },
         .request_native_switch => |request| reduceSwitchRequest(&transition, request),
         .native_space_changed => |at_ms| reduceSpaceChanged(&transition, at_ms),
@@ -625,6 +642,8 @@ pub fn reduce(model: Model, event: Event) Transition {
         .request_pending_focus => reducePendingFocusRequest(&transition),
         .pending_focus_applied => |result| reducePendingFocusApplied(&transition, result),
         .clear_pending_focus => transition.model.pending_focus.clear(),
+        .defer_follow_focus => |focus| reduceFollowFocusDeferred(&transition, focus),
+        .clear_deferred_follow_focus => transition.model.deferred_follow_focus = null,
     }
 
     assertModel(&transition.model);
@@ -807,12 +826,11 @@ fn reduceWorkspaceTransitionTimer(
     if (current.epoch != event.epoch) return;
     if (event.at_ms < current.deadline_at_ms) return;
 
-    transition.model.workspace_transition = null;
-    transition.model.pending_focus.clear();
-    transition.addEffect(.{ .workspace_transition_settled = .{
-        .transition = current,
-        .reason = if (current.completion_reason == null) .deadline_expired else .completed,
-    } });
+    finalizeWorkspaceTransition(
+        transition,
+        current,
+        if (current.completion_reason == null) .deadline_expired else .completed,
+    );
 }
 
 fn reduceNativeWindowMoveTracked(
@@ -936,6 +954,21 @@ fn reducePendingFocusApplied(
     transition.model.pending_focus.clear();
 }
 
+fn reduceFollowFocusDeferred(
+    transition: *Transition,
+    event: @FieldType(Event, "defer_follow_focus"),
+) void {
+    const workspace_transition = transition.model.workspace_transition orelse return;
+    if (event.process_id <= 0 or event.window_id == 0) return;
+
+    transition.model.deferred_follow_focus = .{
+        .process_id = event.process_id,
+        .window_id = event.window_id,
+        .source = event.source,
+        .transition_epoch = workspace_transition.epoch,
+    };
+}
+
 const FailedSwitch = struct {
     reason: SwitchFailureReason,
     actual: ?SpaceRef,
@@ -951,6 +984,7 @@ fn finishSwitch(
     transition.model.observation_timer = null;
 
     if (failure == null) {
+        transition.model.deferred_follow_focus = null;
         completeWorkspaceTransition(
             &transition.model,
             pending.epoch,
@@ -1053,6 +1087,7 @@ fn startWorkspaceTransition(
     };
     transition.model.workspace_transition = workspace_transition;
     transition.model.pending_focus.clear();
+    transition.model.deferred_follow_focus = null;
     transition.addEffect(.{ .workspace_transition_started = workspace_transition });
 }
 
@@ -1079,23 +1114,29 @@ fn settleWorkspaceTransition(
     const current = transition.model.workspace_transition orelse return;
     if (current.epoch != epoch) return;
 
+    finalizeWorkspaceTransition(transition, current, reason);
+}
+
+fn finalizeWorkspaceTransition(
+    transition: *Transition,
+    current: WorkspaceTransition,
+    reason: WorkspaceTransitionSettlementReason,
+) void {
     transition.model.workspace_transition = null;
     transition.model.pending_focus.clear();
+    const deferred_follow_focus = transition.model.deferred_follow_focus;
+    transition.model.deferred_follow_focus = null;
     transition.addEffect(.{ .workspace_transition_settled = .{
         .transition = current,
         .reason = reason,
+        .deferred_follow_focus = deferred_follow_focus,
     } });
 }
 
 fn refreshWorkspaceTransition(transition: *Transition) void {
     var current = transition.model.workspace_transition orelse return;
     current.target = transition.model.space(current.target.key) orelse {
-        transition.model.workspace_transition = null;
-        transition.model.pending_focus.clear();
-        transition.addEffect(.{ .workspace_transition_settled = .{
-            .transition = current,
-            .reason = .target_unavailable,
-        } });
+        finalizeWorkspaceTransition(transition, current, .target_unavailable);
         return;
     };
     transition.model.workspace_transition = current;
@@ -1220,6 +1261,12 @@ fn assertModel(model: *const Model) void {
         for (model.pending_focus.entries[0..index]) |prior| {
             std.debug.assert(prior.window_id != pending.window_id);
         }
+    }
+    if (model.workspace_transition == null) std.debug.assert(model.deferred_follow_focus == null);
+    if (model.deferred_follow_focus) |deferred| {
+        std.debug.assert(deferred.process_id > 0);
+        std.debug.assert(deferred.window_id != 0);
+        std.debug.assert(deferred.transition_epoch == model.workspace_transition.?.epoch);
     }
 }
 
@@ -1574,6 +1621,66 @@ test "new workspace transition rejects stale pending focus result" {
 
     try testing.expectEqual(current_epoch, transition.model.workspace_transition.?.epoch);
     try testing.expectEqual(@as(u8, 1), transition.model.pendingFocusCount());
+}
+
+test "deferred follow focus leaves the model with transition settlement" {
+    const testing = std.testing;
+    var catalog: SpaceCatalog = .{};
+    catalog.add(.{ .key = .{ .virtual = 1 }, .workspace_id = 1, .display_id = 11 });
+    catalog.add(.{ .key = .{ .virtual = 2 }, .workspace_id = 2, .display_id = 11 });
+
+    var model = reduce(.{}, .{ .replace_space_catalog = catalog }).model;
+    model = reduce(model, .{ .start_workspace_transition = .{
+        .kind = .switch_workspace,
+        .target = model.space(.{ .virtual = 2 }).?,
+        .at_ms = 100,
+    } }).model;
+    const epoch = model.workspace_transition.?.epoch;
+
+    model = reduce(model, .{ .defer_follow_focus = .{
+        .process_id = 10,
+        .window_id = 41,
+        .source = .ax,
+    } }).model;
+    try testing.expect(model.hasDeferredFollowFocus());
+    try testing.expectEqual(epoch, model.deferred_follow_focus.?.transition_epoch);
+
+    const transition = reduce(model, .{ .workspace_transition_timer_fired = .{
+        .epoch = epoch,
+        .at_ms = 500,
+    } });
+    const settlement = transition.effects[0].workspace_transition_settled;
+    try testing.expect(!transition.model.hasDeferredFollowFocus());
+    try testing.expectEqual(@as(WindowId, 41), settlement.deferred_follow_focus.?.window_id);
+    try testing.expectEqual(epoch, settlement.deferred_follow_focus.?.transition_epoch);
+}
+
+test "native switch completion drops pre-observation follow focus" {
+    const testing = std.testing;
+    var model = initializedModel(testTopology(101, null));
+    model = reduce(model, switchRequest(&model, 1, 2, 100)).model;
+    const epoch = model.pending_switch.?.epoch;
+
+    model = reduce(model, .{ .defer_follow_focus = .{
+        .process_id = 10,
+        .window_id = 41,
+        .source = .ax,
+    } }).model;
+
+    var transition = reduce(model, .{ .native_topology_observed = .{
+        .topology = testTopology(102, null),
+        .epoch = epoch,
+        .at_ms = 200,
+    } });
+    model = transition.model;
+    try testing.expect(!model.hasDeferredFollowFocus());
+    try testing.expectEqual(WorkspaceTransitionCompletionReason.native_space_changed, model.workspace_transition.?.completion_reason.?);
+
+    transition = reduce(model, .{ .workspace_transition_timer_fired = .{
+        .epoch = epoch,
+        .at_ms = 600,
+    } });
+    try testing.expect(transition.effects[0].workspace_transition_settled.deferred_follow_focus == null);
 }
 
 test "native window move retries then requests rollback" {
