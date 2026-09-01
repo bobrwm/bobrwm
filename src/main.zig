@@ -89,8 +89,6 @@ const app_launch_retry_capacity: usize = 64;
 const focus_retry_attempts_max: u8 = 10;
 /// Capacity reserved for focus retries (pid-keyed, bounded by observers).
 const focus_retry_capacity: usize = 64;
-const native_window_move_attempts_max: u8 = 3;
-const native_window_move_capacity: usize = 256;
 /// Debounce workspace/display notifications that can fire in short bursts.
 const workspace_event_debounce_interval_s: f64 = 0.05;
 /// Quiet period after the last display notification before the trailing
@@ -212,18 +210,10 @@ const DeferredWindowPromotion = struct {
     space: state_mod.SpaceRef,
 };
 
-const PendingNativeWindowMove = struct {
-    source: state_mod.SpaceRef,
-    target: state_mod.SpaceRef,
-    attempts_remaining: u8 = native_window_move_attempts_max,
-    has_retried: bool = false,
-};
-
 const PendingRoleWindowMap = std.AutoHashMap(u32, PendingRoleWindow);
 const DeferredWindowCandidateMap = std.AutoHashMap(u32, DeferredWindowCandidate);
 const AppLaunchRetryMap = std.AutoHashMap(i32, u8);
 const FocusRetryMap = std.AutoHashMap(i32, u8);
-const PendingNativeWindowMoveMap = std.AutoHashMap(u32, PendingNativeWindowMove);
 
 fn nsString(str: [*:0]const u8) objc.Object {
     const NSString = objc.getClass("NSString") orelse
@@ -1462,7 +1452,6 @@ var g_pending_role_windows: PendingRoleWindowMap = undefined;
 var g_deferred_window_candidates: DeferredWindowCandidateMap = undefined;
 var g_app_launch_retries: AppLaunchRetryMap = undefined;
 var g_focus_retries: FocusRetryMap = undefined;
-var g_pending_native_window_moves: PendingNativeWindowMoveMap = undefined;
 var g_workspace_observer: ?objc.Object = null;
 var g_ipc: ipc.Server = undefined;
 var g_config: config_mod.Config = .{};
@@ -1493,29 +1482,23 @@ fn moveTabGroupToNativeSpace(wid: u32, target: state_mod.SpaceRef) bool {
     return sky.moveWindowToNativeSpace(wid, space_id);
 }
 
-fn trackPendingNativeWindowMove(wid: u32, initial: PendingNativeWindowMove) void {
-    initial.source.assertValid();
-    initial.target.assertValid();
-    std.debug.assert(std.meta.activeTag(initial.source.key) == .native);
-    std.debug.assert(std.meta.activeTag(initial.target.key) == .native);
-
+fn trackPendingNativeWindowMove(wid: u32, source: state_mod.SpaceRef, target: state_mod.SpaceRef) void {
+    source.assertValid();
+    target.assertValid();
     const leader_wid = g_tab_groups.resolveLeader(wid);
-    if (g_pending_native_window_moves.getPtr(leader_wid)) |existing| {
-        existing.* = initial;
-    } else {
-        g_pending_native_window_moves.put(leader_wid, initial) catch {
-            log.err("native window move: failed to track wid={d}", .{leader_wid});
-            return;
-        };
-    }
-    refreshRolePolling();
+    dispatchStateEvent(.{ .track_native_window_move = .{
+        .window_id = leader_wid,
+        .source = source,
+        .target = target,
+    } });
 }
 
 fn untrackPendingNativeWindowMove(wid: u32) void {
-    if (g_pending_native_window_moves.remove(wid)) refreshRolePolling();
+    if (g_state.pendingNativeWindowMove(wid) == null) return;
+    dispatchStateEvent(.{ .cancel_native_window_move = wid });
 }
 
-fn nativeTabGroupMoveConfirmed(wid: u32, pending: *PendingNativeWindowMove) ?bool {
+fn nativeTabGroupMoveConfirmed(wid: u32, pending: state_mod.PendingNativeWindowMove) ?bool {
     const sky = &g_sky.?;
     const target_space_id = switch (pending.target.key) {
         .native => |value| value,
@@ -2810,12 +2793,6 @@ pub fn main(init: std.process.Init.Minimal) !void {
         log.err("focus-retry map reserve failed: {}", .{err});
         return err;
     };
-    g_pending_native_window_moves = PendingNativeWindowMoveMap.init(g_allocator);
-    defer g_pending_native_window_moves.deinit();
-    g_pending_native_window_moves.ensureTotalCapacity(native_window_move_capacity) catch |err| {
-        log.err("native-window-move map reserve failed: {}", .{err});
-        return err;
-    };
     defer {
         setRolePolling(false);
         g_layout_entries.deinit(g_allocator);
@@ -4033,7 +4010,7 @@ fn refreshRolePolling() void {
         g_deferred_window_candidates.count() > 0 or
         g_app_launch_retries.count() > 0 or
         g_focus_retries.count() > 0 or
-        g_pending_native_window_moves.count() > 0 or
+        g_state.hasPendingNativeWindowMoves() or
         g_deferred_follow_focus != null or
         g_state.hasScheduledObservation() or
         g_state.isWorkspaceTransitionActive() or
@@ -4044,7 +4021,7 @@ fn refreshRolePolling() void {
     setRolePolling(has_pending);
 }
 
-fn rollbackNativeWindowMove(wid: u32, pending: PendingNativeWindowMove) bool {
+fn rollbackNativeWindowMove(wid: u32, pending: state_mod.PendingNativeWindowMove) bool {
     var win = g_store.get(wid) orelse return true;
     if (!win.space.key.eql(pending.target.key)) return true;
 
@@ -4074,74 +4051,26 @@ fn rollbackNativeWindowMove(wid: u32, pending: PendingNativeWindowMove) bool {
 }
 
 fn processPendingNativeWindowMoves() void {
-    if (g_pending_native_window_moves.count() == 0) return;
+    if (!g_state.hasPendingNativeWindowMoves()) return;
 
-    var remove_wids: [native_window_move_capacity]u32 = undefined;
-    var remove_count: usize = 0;
-    var rollback_wids: [native_window_move_capacity]u32 = undefined;
-    var rollback_count: usize = 0;
-    var has_rolled_back = false;
-
-    var it = g_pending_native_window_moves.iterator();
-    while (it.next()) |entry| {
-        const wid = entry.key_ptr.*;
-        const pending = entry.value_ptr;
+    const snapshot = g_state.pending_native_window_moves;
+    for (snapshot.items()) |pending| {
+        const wid = pending.window_id;
         const win = g_store.get(wid);
-        if (win == null or
-            !win.?.space.key.eql(pending.target.key))
-        {
-            remove_wids[remove_count] = wid;
-            remove_count += 1;
-            continue;
-        }
+        const observation: state_mod.NativeWindowMoveObservation = if (win == null)
+            .window_missing
+        else if (!win.?.space.key.eql(pending.target.key))
+            .ownership_changed
+        else if (nativeTabGroupMoveConfirmed(wid, pending) == true)
+            .confirmed
+        else
+            .pending;
 
-        if (nativeTabGroupMoveConfirmed(wid, pending) == true) {
-            log.debug("native window move: confirmed wid={d} workspace={d}", .{ wid, pending.target.workspace_id });
-            remove_wids[remove_count] = wid;
-            remove_count += 1;
-            continue;
-        }
-
-        if (!pending.has_retried) {
-            pending.has_retried = true;
-            _ = moveTabGroupToNativeSpace(wid, pending.target);
-            log.debug("native window move: retry wid={d} workspace={d}", .{ wid, pending.target.workspace_id });
-            continue;
-        }
-        if (pending.attempts_remaining > 1) {
-            pending.attempts_remaining -= 1;
-            continue;
-        }
-
-        rollback_wids[rollback_count] = wid;
-        rollback_count += 1;
-    }
-
-    for (remove_wids[0..remove_count]) |wid| {
-        _ = g_pending_native_window_moves.remove(wid);
-    }
-    for (rollback_wids[0..rollback_count]) |wid| {
-        const pending = g_pending_native_window_moves.get(wid) orelse continue;
-        if (!rollbackNativeWindowMove(wid, pending)) {
-            if (g_pending_native_window_moves.getPtr(wid)) |move| move.attempts_remaining = 1;
-            log.warn("native window move: rollback deferred wid={d} source={d} target={d}", .{
-                wid,
-                pending.source.workspace_id,
-                pending.target.workspace_id,
-            });
-            continue;
-        }
-        _ = g_pending_native_window_moves.remove(wid);
-        has_rolled_back = true;
-        log.warn("native window move: destination not confirmed; restored wid={d} workspace={d}", .{
-            wid,
-            pending.source.workspace_id,
-        });
-    }
-    refreshRolePolling();
-    if (has_rolled_back) {
-        retile();
-        updateStatusBar();
+        dispatchStateEvent(.{ .native_window_move_observed = .{
+            .window_id = wid,
+            .epoch = pending.epoch,
+            .observation = observation,
+        } });
     }
 }
 
@@ -4201,7 +4130,60 @@ fn executeStateEffect(effect: state_mod.Effect) void {
         }),
         .workspace_transition_started => |transition| executeWorkspaceTransitionStarted(transition),
         .workspace_transition_settled => |settlement| executeWorkspaceTransitionSettled(settlement),
+        .retry_native_window_move => |pending| retryNativeWindowMove(pending),
+        .rollback_native_window_move => |pending| executeNativeWindowMoveRollback(pending),
+        .native_window_move_confirmed => |pending| log.debug("native window move: confirmed wid={d} workspace={d}", .{
+            pending.window_id,
+            pending.target.workspace_id,
+        }),
+        .native_window_move_cancelled => |pending| log.debug("native window move: cancelled wid={d} workspace={d}", .{
+            pending.window_id,
+            pending.target.workspace_id,
+        }),
+        .native_window_move_rolled_back => |pending| completeNativeWindowMoveRollback(pending),
+        .native_window_move_rollback_deferred => |pending| log.warn("native window move: rollback deferred wid={d} source={d} target={d}", .{
+            pending.window_id,
+            pending.source.workspace_id,
+            pending.target.workspace_id,
+        }),
+        .native_window_move_rejected => |request| log.warn("native window move: tracking rejected wid={d} source={d} target={d}", .{
+            request.window_id,
+            request.source.workspace_id,
+            request.target.workspace_id,
+        }),
     }
+}
+
+fn retryNativeWindowMove(pending: state_mod.PendingNativeWindowMove) void {
+    if (!moveTabGroupToNativeSpace(pending.window_id, pending.target)) {
+        log.warn("native window move: retry failed wid={d} workspace={d}", .{
+            pending.window_id,
+            pending.target.workspace_id,
+        });
+        return;
+    }
+    log.debug("native window move: retry wid={d} workspace={d}", .{
+        pending.window_id,
+        pending.target.workspace_id,
+    });
+}
+
+fn executeNativeWindowMoveRollback(pending: state_mod.PendingNativeWindowMove) void {
+    const succeeded = rollbackNativeWindowMove(pending.window_id, pending);
+    dispatchStateEvent(.{ .native_window_move_rollback_result = .{
+        .window_id = pending.window_id,
+        .epoch = pending.epoch,
+        .succeeded = succeeded,
+    } });
+}
+
+fn completeNativeWindowMoveRollback(pending: state_mod.PendingNativeWindowMove) void {
+    log.warn("native window move: destination not confirmed; restored wid={d} workspace={d}", .{
+        pending.window_id,
+        pending.source.workspace_id,
+    });
+    retile();
+    updateStatusBar();
 }
 
 fn executeWorkspaceTransitionStarted(transition: state_mod.WorkspaceTransition) void {
@@ -4390,7 +4372,7 @@ fn reconcileNativeWindowAssignments(topology: *const skylight.NativeSpaceTopolog
     while (store_it.next()) |entry| {
         const win = entry.value_ptr.*;
         if (g_tab_groups.resolveLeader(win.wid) != win.wid) continue;
-        if (g_pending_native_window_moves.get(win.wid) != null) continue;
+        if (g_state.pendingNativeWindowMove(win.wid) != null) continue;
         const visible_wid = g_tab_groups.resolveActive(win.wid);
         if (!on_screen.contains(visible_wid)) continue;
 
@@ -5109,10 +5091,8 @@ fn discoverWindowsImpl(should_refresh_tabs: bool) usize {
                         target_display,
                     });
                 } else {
-                    trackPendingNativeWindowMove(info.wid, .{
-                        .source = (spaceForWorkspace(discovered_display, activeWorkspaceIdForDisplay(discovered_display)) orelse continue).ref,
-                        .target = target_ws.ref,
-                    });
+                    const source = (spaceForWorkspace(discovered_display, activeWorkspaceIdForDisplay(discovered_display)) orelse continue).ref;
+                    trackPendingNativeWindowMove(info.wid, source, target_ws.ref);
                 }
             } else {
                 hideWindow(info.pid, info.wid);
@@ -5371,10 +5351,8 @@ fn addNewWindowManagedWithAssignment(pid: i32, wid: u32, assigned_space: state_m
             if (!moveTabGroupToNativeSpace(wid, ws.ref)) {
                 log.warn("failed to move new wid={d} to native workspace {d} on display {d}", .{ wid, ws.ref.workspace_id, target_display });
             } else {
-                trackPendingNativeWindowMove(wid, .{
-                    .source = (spaceForWorkspace(source_display, activeWorkspaceIdForDisplay(source_display)) orelse return true).ref,
-                    .target = ws.ref,
-                });
+                const source = (spaceForWorkspace(source_display, activeWorkspaceIdForDisplay(source_display)) orelse return true).ref;
+                trackPendingNativeWindowMove(wid, source, ws.ref);
             }
         } else {
             hideWindow(pid, wid);
@@ -7193,10 +7171,7 @@ fn moveWindowToWorkspace(target_id: u8) void {
     g_store.putAssumeCapacity(updated);
     updateTabGroupAssignment(wid, updated.space);
     if (nativeSpacesEnabled()) {
-        trackPendingNativeWindowMove(wid, .{
-            .source = ws.ref,
-            .target = target_ws.ref,
-        });
+        trackPendingNativeWindowMove(wid, ws.ref, target_ws.ref);
     }
 
     // If target is not visible on the window's new display, hide it.

@@ -5,8 +5,10 @@ const space_mod = @import("space.zig");
 
 pub const max_displays = 8;
 pub const max_spaces_per_display = 10;
+pub const max_pending_native_window_moves = 256;
 pub const native_switch_timeout_ms: u64 = 3200;
 pub const native_observation_delay_ms: u64 = 50;
+pub const native_window_move_attempts_max: u8 = 3;
 pub const workspace_transition_settle_ms: u64 = 400;
 
 pub const DisplayId = space_mod.DisplayId;
@@ -16,6 +18,7 @@ pub const SpaceKey = space_mod.Key;
 pub const SpaceRef = space_mod.Ref;
 pub const Epoch = u64;
 pub const TimestampMs = u64;
+pub const WindowId = u32;
 
 pub const DisplayWorkspace = struct {
     display_id: DisplayId,
@@ -223,6 +226,69 @@ pub const WorkspaceTransitionSettlement = struct {
     reason: WorkspaceTransitionSettlementReason,
 };
 
+pub const PendingNativeWindowMove = struct {
+    window_id: WindowId,
+    source: SpaceRef,
+    target: SpaceRef,
+    epoch: Epoch,
+    attempts_remaining: u8 = native_window_move_attempts_max,
+    has_retried: bool = false,
+};
+
+pub const PendingNativeWindowMoves = struct {
+    entries: [max_pending_native_window_moves]PendingNativeWindowMove = undefined,
+    count: u16 = 0,
+
+    pub fn items(self: *const PendingNativeWindowMoves) []const PendingNativeWindowMove {
+        return self.entries[0..self.count];
+    }
+
+    pub fn get(self: *const PendingNativeWindowMoves, window_id: WindowId) ?PendingNativeWindowMove {
+        const index = self.findIndex(window_id) orelse return null;
+        return self.entries[index];
+    }
+
+    fn put(self: *PendingNativeWindowMoves, pending: PendingNativeWindowMove) bool {
+        if (self.findIndex(pending.window_id)) |index| {
+            self.entries[index] = pending;
+            return true;
+        }
+        if (self.count == self.entries.len) return false;
+
+        self.entries[self.count] = pending;
+        self.count += 1;
+        return true;
+    }
+
+    fn remove(self: *PendingNativeWindowMoves, window_id: WindowId) ?PendingNativeWindowMove {
+        const index = self.findIndex(window_id) orelse return null;
+        const removed = self.entries[index];
+        self.count -= 1;
+        self.entries[index] = self.entries[self.count];
+        return removed;
+    }
+
+    fn findIndex(self: *const PendingNativeWindowMoves, window_id: WindowId) ?usize {
+        for (self.items(), 0..) |pending, index| {
+            if (pending.window_id == window_id) return index;
+        }
+        return null;
+    }
+};
+
+pub const NativeWindowMoveRequest = struct {
+    window_id: WindowId,
+    source: SpaceRef,
+    target: SpaceRef,
+};
+
+pub const NativeWindowMoveObservation = enum {
+    confirmed,
+    pending,
+    window_missing,
+    ownership_changed,
+};
+
 pub const ObservationTimer = struct {
     epoch: Epoch,
     due_at_ms: TimestampMs,
@@ -236,6 +302,7 @@ pub const Model = struct {
     queued_switch: ?SwitchRequest = null,
     observation_timer: ?ObservationTimer = null,
     workspace_transition: ?WorkspaceTransition = null,
+    pending_native_window_moves: PendingNativeWindowMoves = .{},
     next_epoch: Epoch = 1,
 
     pub fn isNativeSwitchPending(self: *const Model) bool {
@@ -248,6 +315,14 @@ pub const Model = struct {
 
     pub fn isWorkspaceTransitionActive(self: *const Model) bool {
         return self.workspace_transition != null;
+    }
+
+    pub fn hasPendingNativeWindowMoves(self: *const Model) bool {
+        return self.pending_native_window_moves.count > 0;
+    }
+
+    pub fn pendingNativeWindowMove(self: *const Model, window_id: WindowId) ?PendingNativeWindowMove {
+        return self.pending_native_window_moves.get(window_id);
     }
 
     pub fn dueObservation(self: *const Model, at_ms: TimestampMs) ?ObservationTimer {
@@ -332,6 +407,18 @@ pub const Event = union(enum) {
         epoch: Epoch,
         at_ms: TimestampMs,
     },
+    track_native_window_move: NativeWindowMoveRequest,
+    cancel_native_window_move: WindowId,
+    native_window_move_observed: struct {
+        window_id: WindowId,
+        epoch: Epoch,
+        observation: NativeWindowMoveObservation,
+    },
+    native_window_move_rollback_result: struct {
+        window_id: WindowId,
+        epoch: Epoch,
+        succeeded: bool,
+    },
 };
 
 pub const SwitchFailureReason = enum {
@@ -361,6 +448,13 @@ pub const Effect = union(enum) {
     native_switch_rejected: SpaceRef,
     workspace_transition_started: WorkspaceTransition,
     workspace_transition_settled: WorkspaceTransitionSettlement,
+    retry_native_window_move: PendingNativeWindowMove,
+    rollback_native_window_move: PendingNativeWindowMove,
+    native_window_move_confirmed: PendingNativeWindowMove,
+    native_window_move_cancelled: PendingNativeWindowMove,
+    native_window_move_rolled_back: PendingNativeWindowMove,
+    native_window_move_rollback_deferred: PendingNativeWindowMove,
+    native_window_move_rejected: NativeWindowMoveRequest,
 };
 
 pub const max_effects = 6;
@@ -384,6 +478,7 @@ pub fn reduce(model: Model, event: Event) Transition {
         .replace_space_catalog => |catalog| {
             transition.model.spaces = catalog;
             refreshWorkspaceTransition(&transition);
+            refreshPendingNativeWindowMoves(&transition.model);
         },
         .replace_workspace_topology => |topology| {
             transition.model.workspace_topology = topology;
@@ -406,6 +501,7 @@ pub fn reduce(model: Model, event: Event) Transition {
             transition.model.queued_switch = null;
             transition.model.observation_timer = null;
             transition.model.workspace_transition = null;
+            transition.model.pending_native_window_moves.count = 0;
             syncNativeWorkspaceTopology(&transition);
             if (workspace_transition) |current| {
                 transition.addEffect(.{ .workspace_transition_settled = .{
@@ -423,6 +519,12 @@ pub fn reduce(model: Model, event: Event) Transition {
         .start_workspace_transition => |start| reduceWorkspaceTransitionStart(&transition, start),
         .complete_workspace_transition => |completion| reduceWorkspaceTransitionCompletion(&transition, completion),
         .workspace_transition_timer_fired => |timer| reduceWorkspaceTransitionTimer(&transition, timer),
+        .track_native_window_move => |request| reduceNativeWindowMoveTracked(&transition, request),
+        .cancel_native_window_move => |window_id| {
+            _ = transition.model.pending_native_window_moves.remove(window_id);
+        },
+        .native_window_move_observed => |observation| reduceNativeWindowMoveObserved(&transition, observation),
+        .native_window_move_rollback_result => |result| reduceNativeWindowMoveRollbackResult(&transition, result),
     }
 
     assertModel(&transition.model);
@@ -539,6 +641,7 @@ fn syncNativeWorkspaceTopology(transition: *Transition) void {
     transition.model.spaces = catalog;
     transition.model.workspace_topology = topology;
     refreshWorkspaceTransition(transition);
+    refreshPendingNativeWindowMoves(&transition.model);
 }
 
 fn reduceTopologyUnavailable(
@@ -609,6 +712,86 @@ fn reduceWorkspaceTransitionTimer(
         .transition = current,
         .reason = if (current.completion_reason == null) .deadline_expired else .completed,
     } });
+}
+
+fn reduceNativeWindowMoveTracked(
+    transition: *Transition,
+    request: NativeWindowMoveRequest,
+) void {
+    if (request.window_id == 0) {
+        transition.addEffect(.{ .native_window_move_rejected = request });
+        return;
+    }
+    const source = transition.model.space(request.source.key) orelse {
+        transition.addEffect(.{ .native_window_move_rejected = request });
+        return;
+    };
+    const target = transition.model.space(request.target.key) orelse {
+        transition.addEffect(.{ .native_window_move_rejected = request });
+        return;
+    };
+    if (nativeSpaceId(source) == null or nativeSpaceId(target) == null or source.key.eql(target.key)) {
+        transition.addEffect(.{ .native_window_move_rejected = request });
+        return;
+    }
+
+    const pending: PendingNativeWindowMove = .{
+        .window_id = request.window_id,
+        .source = source,
+        .target = target,
+        .epoch = takeEpoch(&transition.model),
+    };
+    if (!transition.model.pending_native_window_moves.put(pending)) {
+        transition.addEffect(.{ .native_window_move_rejected = request });
+    }
+}
+
+fn reduceNativeWindowMoveObserved(
+    transition: *Transition,
+    event: @FieldType(Event, "native_window_move_observed"),
+) void {
+    var pending = transition.model.pending_native_window_moves.get(event.window_id) orelse return;
+    if (pending.epoch != event.epoch) return;
+
+    switch (event.observation) {
+        .confirmed => {
+            _ = transition.model.pending_native_window_moves.remove(event.window_id);
+            transition.addEffect(.{ .native_window_move_confirmed = pending });
+        },
+        .window_missing, .ownership_changed => {
+            _ = transition.model.pending_native_window_moves.remove(event.window_id);
+            transition.addEffect(.{ .native_window_move_cancelled = pending });
+        },
+        .pending => {
+            if (!pending.has_retried) {
+                pending.has_retried = true;
+                std.debug.assert(transition.model.pending_native_window_moves.put(pending));
+                transition.addEffect(.{ .retry_native_window_move = pending });
+                return;
+            }
+            if (pending.attempts_remaining > 1) {
+                pending.attempts_remaining -= 1;
+                std.debug.assert(transition.model.pending_native_window_moves.put(pending));
+                return;
+            }
+            transition.addEffect(.{ .rollback_native_window_move = pending });
+        },
+    }
+}
+
+fn reduceNativeWindowMoveRollbackResult(
+    transition: *Transition,
+    event: @FieldType(Event, "native_window_move_rollback_result"),
+) void {
+    const pending = transition.model.pending_native_window_moves.get(event.window_id) orelse return;
+    if (pending.epoch != event.epoch) return;
+
+    if (event.succeeded) {
+        _ = transition.model.pending_native_window_moves.remove(event.window_id);
+        transition.addEffect(.{ .native_window_move_rolled_back = pending });
+        return;
+    }
+    transition.addEffect(.{ .native_window_move_rollback_deferred = pending });
 }
 
 const FailedSwitch = struct {
@@ -773,6 +956,18 @@ fn refreshWorkspaceTransition(transition: *Transition) void {
     transition.model.workspace_transition = current;
 }
 
+fn refreshPendingNativeWindowMoves(model: *Model) void {
+    var write_index: usize = 0;
+    for (model.pending_native_window_moves.items()) |pending| {
+        var refreshed = pending;
+        refreshed.source = model.space(pending.source.key) orelse continue;
+        refreshed.target = model.space(pending.target.key) orelse continue;
+        model.pending_native_window_moves.entries[write_index] = refreshed;
+        write_index += 1;
+    }
+    model.pending_native_window_moves.count = @intCast(write_index);
+}
+
 fn schedulePendingObservation(model: *Model, pending: PendingSwitch, at_ms: TimestampMs) void {
     model.observation_timer = .{
         .epoch = pending.epoch,
@@ -854,6 +1049,20 @@ fn assertModel(model: *const Model) void {
         std.debug.assert(target.workspace_id == workspace_transition.target.workspace_id);
         std.debug.assert(workspace_transition.deadline_at_ms >= workspace_transition.started_at_ms);
     }
+    std.debug.assert(model.pending_native_window_moves.count <= model.pending_native_window_moves.entries.len);
+    for (model.pending_native_window_moves.items(), 0..) |pending, index| {
+        std.debug.assert(pending.window_id != 0);
+        std.debug.assert(pending.epoch != 0);
+        std.debug.assert(pending.attempts_remaining > 0);
+        std.debug.assert(nativeSpaceId(pending.source) != null);
+        std.debug.assert(nativeSpaceId(pending.target) != null);
+        std.debug.assert(!pending.source.key.eql(pending.target.key));
+        std.debug.assert(model.space(pending.source.key) != null);
+        std.debug.assert(model.space(pending.target.key) != null);
+        for (model.pending_native_window_moves.items()[0..index]) |prior| {
+            std.debug.assert(prior.window_id != pending.window_id);
+        }
+    }
 }
 
 fn testTopology(first_observed: NativeSpaceId, second_observed: ?NativeSpaceId) NativeTopology {
@@ -882,6 +1091,14 @@ fn switchRequest(model: *const Model, display_id: DisplayId, workspace_id: Works
     return .{ .request_native_switch = .{
         .target = model.spaceForWorkspace(display_id, workspace_id).?,
         .at_ms = at_ms,
+    } };
+}
+
+fn trackNativeWindowMove(model: *const Model, window_id: WindowId, source_workspace_id: WorkspaceId, target_workspace_id: WorkspaceId) Event {
+    return .{ .track_native_window_move = .{
+        .window_id = window_id,
+        .source = model.spaceForWorkspace(1, source_workspace_id).?,
+        .target = model.spaceForWorkspace(1, target_workspace_id).?,
     } };
 }
 
@@ -1117,6 +1334,125 @@ test "stale workspace transition timer cannot settle newer intent" {
     try testing.expectEqual(current_epoch, transition.model.workspace_transition.?.epoch);
     try testing.expect(transition.model.workspace_transition.?.target.key.eql(.{ .virtual = 2 }));
     try testing.expectEqual(@as(u8, 0), transition.effect_count);
+}
+
+test "native window move retries then requests rollback" {
+    const testing = std.testing;
+    var model = initializedModel(testTopology(101, null));
+    var transition = reduce(model, trackNativeWindowMove(&model, 42, 1, 2));
+    model = transition.model;
+    const epoch = model.pendingNativeWindowMove(42).?.epoch;
+
+    try testing.expectEqual(@as(u16, 1), model.pending_native_window_moves.count);
+    try testing.expectEqual(@as(u8, native_window_move_attempts_max), model.pendingNativeWindowMove(42).?.attempts_remaining);
+
+    transition = reduce(model, .{ .native_window_move_observed = .{
+        .window_id = 42,
+        .epoch = epoch,
+        .observation = .pending,
+    } });
+    model = transition.model;
+    try testing.expect(model.pendingNativeWindowMove(42).?.has_retried);
+    try testing.expectEqual(std.meta.Tag(Effect).retry_native_window_move, std.meta.activeTag(transition.effects[0]));
+
+    var checks_remaining: u8 = native_window_move_attempts_max - 1;
+    while (checks_remaining > 0) : (checks_remaining -= 1) {
+        transition = reduce(model, .{ .native_window_move_observed = .{
+            .window_id = 42,
+            .epoch = epoch,
+            .observation = .pending,
+        } });
+        model = transition.model;
+        try testing.expectEqual(@as(u8, 0), transition.effect_count);
+    }
+
+    transition = reduce(model, .{ .native_window_move_observed = .{
+        .window_id = 42,
+        .epoch = epoch,
+        .observation = .pending,
+    } });
+    try testing.expectEqual(std.meta.Tag(Effect).rollback_native_window_move, std.meta.activeTag(transition.effects[0]));
+}
+
+test "native window move rollback result is epoch checked" {
+    const testing = std.testing;
+    var model = initializedModel(testTopology(101, null));
+    model = reduce(model, trackNativeWindowMove(&model, 42, 1, 2)).model;
+    const stale_epoch = model.pendingNativeWindowMove(42).?.epoch;
+    model = reduce(model, trackNativeWindowMove(&model, 42, 1, 3)).model;
+    const current_epoch = model.pendingNativeWindowMove(42).?.epoch;
+
+    var transition = reduce(model, .{ .native_window_move_rollback_result = .{
+        .window_id = 42,
+        .epoch = stale_epoch,
+        .succeeded = true,
+    } });
+    try testing.expectEqual(current_epoch, transition.model.pendingNativeWindowMove(42).?.epoch);
+    try testing.expectEqual(@as(u8, 0), transition.effect_count);
+
+    transition = reduce(transition.model, .{ .native_window_move_rollback_result = .{
+        .window_id = 42,
+        .epoch = current_epoch,
+        .succeeded = false,
+    } });
+    try testing.expect(transition.model.pendingNativeWindowMove(42) != null);
+    try testing.expectEqual(std.meta.Tag(Effect).native_window_move_rollback_deferred, std.meta.activeTag(transition.effects[0]));
+
+    transition = reduce(transition.model, .{ .native_window_move_rollback_result = .{
+        .window_id = 42,
+        .epoch = current_epoch,
+        .succeeded = true,
+    } });
+    try testing.expect(transition.model.pendingNativeWindowMove(42) == null);
+    try testing.expectEqual(std.meta.Tag(Effect).native_window_move_rolled_back, std.meta.activeTag(transition.effects[0]));
+}
+
+test "native window move confirmation and ownership change terminate intent" {
+    const testing = std.testing;
+    var model = initializedModel(testTopology(101, null));
+    model = reduce(model, trackNativeWindowMove(&model, 42, 1, 2)).model;
+    var epoch = model.pendingNativeWindowMove(42).?.epoch;
+
+    var transition = reduce(model, .{ .native_window_move_observed = .{
+        .window_id = 42,
+        .epoch = epoch,
+        .observation = .confirmed,
+    } });
+    try testing.expect(transition.model.pendingNativeWindowMove(42) == null);
+    try testing.expectEqual(std.meta.Tag(Effect).native_window_move_confirmed, std.meta.activeTag(transition.effects[0]));
+
+    model = reduce(transition.model, trackNativeWindowMove(&transition.model, 42, 1, 2)).model;
+    epoch = model.pendingNativeWindowMove(42).?.epoch;
+    transition = reduce(model, .{ .native_window_move_observed = .{
+        .window_id = 42,
+        .epoch = epoch,
+        .observation = .ownership_changed,
+    } });
+    try testing.expect(transition.model.pendingNativeWindowMove(42) == null);
+    try testing.expectEqual(std.meta.Tag(Effect).native_window_move_cancelled, std.meta.activeTag(transition.effects[0]));
+}
+
+test "pending native window move follows Space identity across ordinal changes" {
+    const testing = std.testing;
+    var model = initializedModel(testTopology(101, null));
+    model = reduce(model, trackNativeWindowMove(&model, 42, 1, 2)).model;
+
+    var topology: NativeTopology = .{};
+    var display = DisplayTopology.init(1, 101);
+    display.addSpace(.{ .id = 101, .workspace_id = 1 });
+    display.addSpace(.{ .id = 103, .workspace_id = 2 });
+    display.addSpace(.{ .id = 102, .workspace_id = 3 });
+    topology.addDisplay(display);
+
+    const transition = reduce(model, .{ .native_topology_observed = .{
+        .topology = topology,
+        .epoch = 99,
+        .at_ms = 100,
+    } });
+    const pending = transition.model.pendingNativeWindowMove(42).?;
+
+    try testing.expect(pending.target.key.eql(.{ .native = 102 }));
+    try testing.expectEqual(@as(WorkspaceId, 3), pending.target.workspace_id);
 }
 
 test "stale timer cannot observe for newer switch" {
