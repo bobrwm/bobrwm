@@ -171,22 +171,6 @@ pub const SkyLight = struct {
         return topology.currentWorkspace(display_id, workspace_count);
     }
 
-    /// Resolve Bobrwm's stable 1-based workspace index to the corresponding
-    /// ordinary Mission Control space on a display. Full-screen spaces are
-    /// deliberately skipped because Mission Control inserts and removes them.
-    pub fn nativeSpaceId(self: *const SkyLight, display_id: u32, workspace_id: u8) ?u64 {
-        var topology = self.nativeSpaceTopology() orelse return null;
-        defer topology.deinit();
-        return topology.spaceIdAtWorkspace(display_id, workspace_id);
-    }
-
-    /// Ask Dock to perform the native transition using the high-velocity
-    /// gesture sequence from InstantSpaceSwitcher and strafe.
-    pub fn switchNativeSpace(self: *const SkyLight, display_id: u32, to_id: u8) bool {
-        const target_space_id = self.nativeSpaceId(display_id, to_id) orelse return false;
-        return self.switchNativeSpaceId(display_id, target_space_id);
-    }
-
     /// Switch to a native Space by ID.
     pub fn switchNativeSpaceId(self: *const SkyLight, display_id: u32, target_space_id: u64) bool {
         const started_at_s = c.CFAbsoluteTimeGetCurrent();
@@ -212,14 +196,13 @@ pub const SkyLight = struct {
         return scheduled;
     }
 
-    pub fn moveWindowToNativeSpace(self: *const SkyLight, wid: u32, display_id: u32, workspace_id: u8) bool {
-        return self.moveWindowsToNativeSpace(&.{wid}, display_id, workspace_id);
+    pub fn moveWindowToNativeSpace(self: *const SkyLight, wid: u32, space_id: u64) bool {
+        return self.moveWindowsToNativeSpace(&.{wid}, space_id);
     }
 
-    pub fn moveWindowsToNativeSpace(self: *const SkyLight, wids: []const u32, display_id: u32, workspace_id: u8) bool {
+    pub fn moveWindowsToNativeSpace(self: *const SkyLight, wids: []const u32, space_id: u64) bool {
         if (wids.len == 0 or wids.len > native_window_batch_capacity) return false;
 
-        const sid = self.nativeSpaceId(display_id, workspace_id) orelse return false;
         var values: [native_window_batch_capacity]?*const anyopaque = undefined;
         var value_count: usize = 0;
         defer for (values[0..value_count]) |value| c.CFRelease(value);
@@ -236,7 +219,7 @@ pub const SkyLight = struct {
         if (self.bridgedMoveClass) |cls| {
             const allocated = cls.msgSend(objc.Object, "alloc", .{});
             if (allocated.value == null) return false;
-            const operation = allocated.msgSend(objc.Object, "initWithWindows:spaceID:", .{ windows, sid });
+            const operation = allocated.msgSend(objc.Object, "initWithWindows:spaceID:", .{ windows, space_id });
             if (operation.value == null) return false;
             defer operation.msgSend(void, "release", .{});
             // The operation's own bridge keeps the move durable across later
@@ -252,7 +235,7 @@ pub const SkyLight = struct {
         }
 
         const move = self.moveWindowsToManagedSpace orelse return false;
-        move(self.mainConnectionID(), windows, sid);
+        move(self.mainConnectionID(), windows, space_id);
         return true;
     }
 

@@ -177,8 +177,7 @@ const WorkspaceTransitionState = struct {
     epoch: u64 = 0,
     started_at_s: f64 = 0,
     deadline_at_s: f64 = 0,
-    target_workspace_id: u8 = 0,
-    target_display_id: u32 = 0,
+    target_space: ?state_mod.SpaceRef = null,
 
     fn isActive(self: WorkspaceTransitionState) bool {
         return self.kind != .idle;
@@ -186,9 +185,8 @@ const WorkspaceTransitionState = struct {
 };
 
 const PendingWorkspacePark = struct {
-    outgoing_workspace_id: u8,
-    target_workspace_id: u8,
-    display_id: u32,
+    outgoing: state_mod.SpaceRef,
+    target: state_mod.SpaceRef,
     deadline_at_s: f64,
 };
 
@@ -216,39 +214,31 @@ const cleanup_pid_capacity_per_drain: usize = 16;
 const PendingRoleWindow = struct {
     pid: i32,
     attempts_remaining: u8,
-    workspace_id: u8,
-    display_id: u32,
+    space: state_mod.SpaceRef,
 };
 
 const PendingRoleCandidate = struct {
     pid: i32,
     wid: u32,
     from_timeout: bool,
-    workspace_id: u8,
-    display_id: u32,
+    space: state_mod.SpaceRef,
 };
 
 const DeferredWindowCandidate = struct {
     pid: i32,
     attempts_remaining: u8,
-    workspace_id: u8,
-    display_id: u32,
+    space: state_mod.SpaceRef,
 };
 
 const DeferredWindowPromotion = struct {
     pid: i32,
     wid: u32,
-    workspace_id: u8,
-    display_id: u32,
+    space: state_mod.SpaceRef,
 };
 
 const PendingNativeWindowMove = struct {
-    source_workspace_id: u8,
-    target_workspace_id: u8,
-    source_display_id: u32,
-    target_display_id: u32,
-    source_sid: u64 = 0,
-    target_sid: u64 = 0,
+    source: state_mod.SpaceRef,
+    target: state_mod.SpaceRef,
     attempts_remaining: u8 = native_window_move_attempts_max,
     has_retried: bool = false,
 };
@@ -398,21 +388,9 @@ fn dispatchForHotkeyBinding(binding: shim.bw_keybind) HotkeyDispatch {
     return .{ .emit = .{ .kind = binding.action, .arg = binding.arg } };
 }
 
-fn workspaceVisibleOnDisplay(workspace_id: u8, display_id: u32) bool {
-    if (displayIndexById(display_id) == null) return false;
-    return activeWorkspaceIdForDisplay(display_id) == workspace_id;
-}
-
 fn spaceVisible(space: state_mod.SpaceRef) bool {
     const active = g_state.spaceForWorkspace(space.display_id, activeWorkspaceIdForDisplay(space.display_id)) orelse return false;
     return active.key.eql(space.key);
-}
-
-fn workspaceVisibleAnywhere(workspace_id: u8) bool {
-    for (0..g_display_count) |slot| {
-        if (activeWorkspaceIdForDisplay(g_displays[slot].id) == workspace_id) return true;
-    }
-    return false;
 }
 
 /// A managed window is "visible" for borders/dimming when it is on a visible
@@ -592,19 +570,20 @@ fn markWorkspaceTransitionComplete(reason: WorkspaceTransitionCompletionReason) 
 
     g_workspace_transition_completion_reason = reason;
     const transition = g_workspace_transition;
+    const target = transition.target_space.?;
     log.debug("workspace transition marked complete epoch={d} kind={s} workspace={d} display={d} reason={s}", .{
         transition.epoch,
         @tagName(transition.kind),
-        transition.target_workspace_id,
-        transition.target_display_id,
+        target.workspace_id,
+        target.display_id,
         @tagName(reason),
     });
 }
 
-fn startWorkspaceTransition(kind: WorkspaceTransitionKind, target_workspace_id: u8, target_display_id: u32) void {
+fn startWorkspaceTransition(kind: WorkspaceTransitionKind, target_space: state_mod.SpaceRef) void {
     std.debug.assert(kind != .idle);
-    std.debug.assert(target_workspace_id > 0 and target_workspace_id <= g_workspaces.workspace_count);
-    std.debug.assert(target_display_id != 0);
+    target_space.assertValid();
+    std.debug.assert(g_state.space(target_space.key) != null);
 
     const now_s = c.CFAbsoluteTimeGetCurrent();
     const next_epoch = g_workspace_transition.epoch + 1;
@@ -613,8 +592,7 @@ fn startWorkspaceTransition(kind: WorkspaceTransitionKind, target_workspace_id: 
         .epoch = next_epoch,
         .started_at_s = now_s,
         .deadline_at_s = now_s + workspace_transition_watchdog_interval_s,
-        .target_workspace_id = target_workspace_id,
-        .target_display_id = target_display_id,
+        .target_space = target_space,
     };
     g_workspace_transition_completion_reason = .none;
     g_pending_focus_count = 0;
@@ -627,8 +605,8 @@ fn startWorkspaceTransition(kind: WorkspaceTransitionKind, target_workspace_id: 
     log.debug("workspace transition started epoch={d} kind={s} workspace={d} display={d}", .{
         next_epoch,
         @tagName(kind),
-        target_workspace_id,
-        target_display_id,
+        target_space.workspace_id,
+        target_space.display_id,
     });
 }
 
@@ -648,8 +626,7 @@ fn shouldAcceptFocusForWindow(win: window_mod.Window, source: FocusEventSource) 
     if (!g_workspace_transition.isActive()) return true;
 
     const transition = g_workspace_transition;
-    if (win.space.workspace_id != transition.target_workspace_id) return false;
-    if (win.space.display_id != transition.target_display_id) return false;
+    if (!win.space.key.eql(transition.target_space.?.key)) return false;
     return true;
 }
 
@@ -705,6 +682,7 @@ fn queuePendingFocus(win: window_mod.Window, source: FocusEventSource) void {
         .space_key = win.space.key,
     });
     const transition = g_workspace_transition;
+    const target = transition.target_space.?;
     log.debug("workspace transition pending focus queued epoch={d} wid={d} pid={d} source={s} workspace={d} display={d} target_workspace={d} target_display={d} pending={d}", .{
         transition.epoch,
         win.wid,
@@ -712,8 +690,8 @@ fn queuePendingFocus(win: window_mod.Window, source: FocusEventSource) void {
         @tagName(source),
         win.space.workspace_id,
         win.space.display_id,
-        transition.target_workspace_id,
-        transition.target_display_id,
+        target.workspace_id,
+        target.display_id,
         g_pending_focus_count,
     });
 }
@@ -721,14 +699,14 @@ fn queuePendingFocus(win: window_mod.Window, source: FocusEventSource) void {
 fn applyPendingFocusEntry(entry: PendingFocusEntry) bool {
     if (!g_workspace_transition.isActive()) return false;
     const transition = g_workspace_transition;
-    const target_space = g_state.spaceForWorkspace(transition.target_display_id, transition.target_workspace_id) orelse return false;
+    const target_space = transition.target_space.?;
     if (!entry.space_key.eql(target_space.key)) {
         log.debug("workspace transition pending focus skipped epoch={d} wid={d} pid={d} reason=workspace-mismatch entry_workspace={d} target_workspace={d}", .{
             transition.epoch,
             entry.wid,
             entry.pid,
             if (g_state.space(entry.space_key)) |space| space.workspace_id else 0,
-            transition.target_workspace_id,
+            target_space.workspace_id,
         });
         return false;
     }
@@ -796,6 +774,7 @@ fn maybeSetFocusedDisplayForWindow(win: window_mod.Window, source: FocusEventSou
     if (!shouldAcceptFocusForWindow(win, source)) {
         if (g_workspace_transition.isActive()) {
             const transition = g_workspace_transition;
+            const target = transition.target_space.?;
             log.debug("workspace transition focus deferred epoch={d} wid={d} pid={d} source={s} workspace={d} display={d} target_workspace={d} target_display={d} visible={}", .{
                 transition.epoch,
                 win.wid,
@@ -803,8 +782,8 @@ fn maybeSetFocusedDisplayForWindow(win: window_mod.Window, source: FocusEventSou
                 @tagName(source),
                 win.space.workspace_id,
                 win.space.display_id,
-                transition.target_workspace_id,
-                transition.target_display_id,
+                target.workspace_id,
+                target.display_id,
                 spaceVisible(win.space),
             });
         }
@@ -816,6 +795,7 @@ fn maybeSetFocusedDisplayForWindow(win: window_mod.Window, source: FocusEventSou
 
     if (g_workspace_transition.isActive()) {
         const transition = g_workspace_transition;
+        const target = transition.target_space.?;
         log.debug("workspace transition focus accepted epoch={d} wid={d} pid={d} source={s} workspace={d} display={d} target_workspace={d} target_display={d}", .{
             transition.epoch,
             win.wid,
@@ -823,8 +803,8 @@ fn maybeSetFocusedDisplayForWindow(win: window_mod.Window, source: FocusEventSou
             @tagName(source),
             win.space.workspace_id,
             win.space.display_id,
-            transition.target_workspace_id,
-            transition.target_display_id,
+            target.workspace_id,
+            target.display_id,
         });
         markWorkspaceTransitionComplete(.focus_accepted);
     }
@@ -856,7 +836,7 @@ fn switchToWindowWorkspaceIfHidden(win: window_mod.Window, focused_wid: u32, sou
             focused_wid,
             win.pid,
             win.space.workspace_id,
-            pending.request.target_workspace_id,
+            pending.request.target.workspace_id,
         });
         return;
     }
@@ -883,7 +863,7 @@ fn switchToWindowWorkspaceIfHidden(win: window_mod.Window, focused_wid: u32, sou
                 win.space.workspace_id,
                 win.space.display_id,
                 g_workspace_transition.epoch,
-                g_workspace_transition.target_workspace_id,
+                g_workspace_transition.target_space.?.workspace_id,
                 @tagName(g_workspace_transition_completion_reason),
             });
             return;
@@ -944,8 +924,7 @@ fn shouldRecordWorkspaceFocusForWindow(win: window_mod.Window) bool {
     if (!g_workspace_transition.isActive()) return true;
 
     const transition = g_workspace_transition;
-    return win.space.workspace_id == transition.target_workspace_id and
-        win.space.display_id == transition.target_display_id;
+    return win.space.key.eql(transition.target_space.?.key);
 }
 
 fn syncFocusStateForWindowId(focused_wid: u32, source: FocusEventSource) bool {
@@ -968,6 +947,7 @@ fn syncFocusStateForWindowId(focused_wid: u32, source: FocusEventSource) bool {
         setTilingActive(win.space.key, focused_wid);
     } else {
         const transition = g_workspace_transition;
+        const target = transition.target_space.?;
         log.debug("workspace transition focus memory skipped epoch={d} wid={d} leader={d} source={s} workspace={d} display={d} target_workspace={d} target_display={d}", .{
             transition.epoch,
             focused_wid,
@@ -975,8 +955,8 @@ fn syncFocusStateForWindowId(focused_wid: u32, source: FocusEventSource) bool {
             @tagName(source),
             win.space.workspace_id,
             win.space.display_id,
-            transition.target_workspace_id,
-            transition.target_display_id,
+            target.workspace_id,
+            target.display_id,
         });
     }
     switchToWindowWorkspaceIfHidden(win, focused_wid, source);
@@ -1034,12 +1014,13 @@ fn tickWorkspaceTransitionState() void {
     if (!workspaceTransitionTimedOut()) return;
 
     const transition = g_workspace_transition;
+    const target = transition.target_space.?;
     if (g_workspace_transition_completion_reason != .none) {
         log.debug("workspace transition completed epoch={d} kind={s} workspace={d} display={d} reason={s}", .{
             transition.epoch,
             @tagName(transition.kind),
-            transition.target_workspace_id,
-            transition.target_display_id,
+            target.workspace_id,
+            target.display_id,
             @tagName(g_workspace_transition_completion_reason),
         });
         clearWorkspaceTransition();
@@ -1049,14 +1030,14 @@ fn tickWorkspaceTransitionState() void {
 
     const front_pid = frontmostApplicationPid() orelse 0;
     const front_wid = if (front_pid > 0) focusedWindowIdForPid(front_pid) orelse 0 else 0;
-    const active_workspace_id = activeWorkspaceIdForDisplay(transition.target_display_id);
+    const active_workspace_id = activeWorkspaceIdForDisplay(target.display_id);
     log.warn(
         "workspace transition watchdog expired epoch={d} kind={s} workspace={d} display={d} active_workspace={d} focused_display={d} front_pid={d} front_wid={d} pending={d}",
         .{
             transition.epoch,
             @tagName(transition.kind),
-            transition.target_workspace_id,
-            transition.target_display_id,
+            target.workspace_id,
+            target.display_id,
             active_workspace_id,
             focusedDisplayId(),
             front_pid,
@@ -1586,16 +1567,25 @@ fn nativeSpacesEnabled() bool {
     return g_config.native_spaces and g_sky != null and g_sky.?.supportsNativeSpaces();
 }
 
-fn moveTabGroupToNativeSpace(wid: u32, display_id: u32, workspace_id: u8) bool {
+fn moveTabGroupToNativeSpace(wid: u32, target: state_mod.SpaceRef) bool {
     if (!nativeSpacesEnabled()) return false;
+    const space_id = switch (target.key) {
+        .native => |value| value,
+        .virtual => return false,
+    };
     const sky = &g_sky.?;
     if (g_tab_groups.groupOf(wid)) |group| {
-        return sky.moveWindowsToNativeSpace(group.members.items, display_id, workspace_id);
+        return sky.moveWindowsToNativeSpace(group.members.items, space_id);
     }
-    return sky.moveWindowToNativeSpace(wid, display_id, workspace_id);
+    return sky.moveWindowToNativeSpace(wid, space_id);
 }
 
 fn trackPendingNativeWindowMove(wid: u32, initial: PendingNativeWindowMove) void {
+    initial.source.assertValid();
+    initial.target.assertValid();
+    std.debug.assert(std.meta.activeTag(initial.source.key) == .native);
+    std.debug.assert(std.meta.activeTag(initial.target.key) == .native);
+
     const leader_wid = g_tab_groups.resolveLeader(wid);
     if (g_pending_native_window_moves.getPtr(leader_wid)) |existing| {
         existing.* = initial;
@@ -1614,23 +1604,25 @@ fn untrackPendingNativeWindowMove(wid: u32) void {
 
 fn nativeTabGroupMoveConfirmed(wid: u32, pending: *PendingNativeWindowMove) ?bool {
     const sky = &g_sky.?;
-    if (pending.target_sid == 0) {
-        pending.target_sid = sky.nativeSpaceId(pending.target_display_id, pending.target_workspace_id) orelse return null;
-    }
-    if (pending.source_sid == 0) {
-        pending.source_sid = sky.nativeSpaceId(pending.source_display_id, pending.source_workspace_id) orelse return null;
-    }
+    const target_space_id = switch (pending.target.key) {
+        .native => |value| value,
+        .virtual => return null,
+    };
+    const source_space_id = switch (pending.source.key) {
+        .native => |value| value,
+        .virtual => return null,
+    };
     if (g_tab_groups.groupOf(wid)) |group| {
         var checked_count: usize = 0;
         for (group.members.items) |member_wid| {
             if (g_store.get(member_wid) == null) continue;
             checked_count += 1;
-            if (!(sky.nativeWindowMoveConfirmed(member_wid, pending.target_sid, pending.source_sid) orelse return null)) return false;
+            if (!(sky.nativeWindowMoveConfirmed(member_wid, target_space_id, source_space_id) orelse return null)) return false;
         }
         return checked_count > 0;
     }
     if (g_store.get(wid) == null) return false;
-    return sky.nativeWindowMoveConfirmed(wid, pending.target_sid, pending.source_sid);
+    return sky.nativeWindowMoveConfirmed(wid, target_space_id, source_space_id);
 }
 
 /// PID of the last window we focused via bw_ax_focus_window. Used to detect
@@ -3773,7 +3765,7 @@ fn handleEvent(ev: *const event_mod.Event) void {
                     // promotion (it goes through addNewWindowManaged again).
                     const display_id = inferDisplayIdForWindow(ev.wid) orelse focusedDisplayId();
                     const ws = resolveWorkspaceForWindow(ev.pid, ev.wid, display_id);
-                    trackDeferredWindowCandidate(ev.pid, ev.wid, ws.ref.workspace_id, display_id);
+                    trackDeferredWindowCandidate(ev.pid, ev.wid, ws.ref);
                     log.info("window created: deferred pid={} wid={} while mouse is down (tab tear-off guard)", .{ ev.pid, ev.wid });
                 }
                 return;
@@ -4142,10 +4134,10 @@ fn refreshRolePolling() void {
 
 fn rollbackNativeWindowMove(wid: u32, pending: PendingNativeWindowMove) bool {
     var win = g_store.get(wid) orelse return true;
-    if (win.space.workspace_id != pending.target_workspace_id or win.space.display_id != pending.target_display_id) return true;
+    if (!win.space.key.eql(pending.target.key)) return true;
 
-    const source_ws = spaceForWorkspace(pending.source_display_id, pending.source_workspace_id) orelse return false;
-    const target_ws = spaceForWorkspace(pending.target_display_id, pending.target_workspace_id) orelse return false;
+    const source_ws = g_workspaces.get(pending.source.key) orelse return false;
+    const target_ws = g_workspaces.get(pending.target.key) orelse return false;
     source_ws.ensureUnusedWindowCapacity(1) catch return false;
     if (win.mode == .tiled) {
         tryInsertIntoTiling(source_ws.ref.key, wid) catch |err| {
@@ -4153,7 +4145,7 @@ fn rollbackNativeWindowMove(wid: u32, pending: PendingNativeWindowMove) bool {
             return false;
         };
     }
-    if (!moveTabGroupToNativeSpace(wid, pending.source_display_id, pending.source_workspace_id)) {
+    if (!moveTabGroupToNativeSpace(wid, pending.source)) {
         if (win.mode == .tiled) removeFromTiling(source_ws.ref.key, wid);
         return false;
     }
@@ -4184,8 +4176,7 @@ fn processPendingNativeWindowMoves() void {
         const pending = entry.value_ptr;
         const win = g_store.get(wid);
         if (win == null or
-            win.?.space.workspace_id != pending.target_workspace_id or
-            win.?.space.display_id != pending.target_display_id)
+            !win.?.space.key.eql(pending.target.key))
         {
             remove_wids[remove_count] = wid;
             remove_count += 1;
@@ -4193,7 +4184,7 @@ fn processPendingNativeWindowMoves() void {
         }
 
         if (nativeTabGroupMoveConfirmed(wid, pending) == true) {
-            log.debug("native window move: confirmed wid={d} workspace={d}", .{ wid, pending.target_workspace_id });
+            log.debug("native window move: confirmed wid={d} workspace={d}", .{ wid, pending.target.workspace_id });
             remove_wids[remove_count] = wid;
             remove_count += 1;
             continue;
@@ -4201,8 +4192,8 @@ fn processPendingNativeWindowMoves() void {
 
         if (!pending.has_retried) {
             pending.has_retried = true;
-            _ = moveTabGroupToNativeSpace(wid, pending.target_display_id, pending.target_workspace_id);
-            log.debug("native window move: retry wid={d} workspace={d}", .{ wid, pending.target_workspace_id });
+            _ = moveTabGroupToNativeSpace(wid, pending.target);
+            log.debug("native window move: retry wid={d} workspace={d}", .{ wid, pending.target.workspace_id });
             continue;
         }
         if (pending.attempts_remaining > 1) {
@@ -4223,8 +4214,8 @@ fn processPendingNativeWindowMoves() void {
             if (g_pending_native_window_moves.getPtr(wid)) |move| move.attempts_remaining = 1;
             log.warn("native window move: rollback deferred wid={d} source={d} target={d}", .{
                 wid,
-                pending.source_workspace_id,
-                pending.target_workspace_id,
+                pending.source.workspace_id,
+                pending.target.workspace_id,
             });
             continue;
         }
@@ -4232,7 +4223,7 @@ fn processPendingNativeWindowMoves() void {
         has_rolled_back = true;
         log.warn("native window move: destination not confirmed; restored wid={d} workspace={d}", .{
             wid,
-            pending.source_workspace_id,
+            pending.source.workspace_id,
         });
     }
     refreshRolePolling();
@@ -4288,20 +4279,24 @@ fn executeStateEffect(effect: state_mod.Effect) void {
     switch (effect) {
         .switch_native_space => |value| executeNativeSwitch(value),
         .observe_native_topology => |epoch| observeNativeTopology(epoch),
-        .focus_observed_workspace => |value| focusObservedNativeWorkspace(value.display_id, value.workspace_id),
-        .native_switch_completed => |value| completeNativeSwitch(value.display_id, value.workspace_id, value.epoch),
+        .focus_observed_space => |space| focusObservedNativeSpace(space),
+        .native_switch_completed => |value| completeNativeSwitch(value.space, value.epoch),
         .native_switch_failed => |value| failNativeSwitch(value),
         .native_topology_changed => reconcileObservedNativeTopology(),
-        .native_switch_rejected => |value| log.warn("native workspace switch rejected display={d} workspace={d}", .{
-            value.display_id,
-            value.workspace_id,
+        .native_switch_rejected => |space| log.warn("native workspace switch rejected display={d} workspace={d}", .{
+            space.display_id,
+            space.workspace_id,
         }),
     }
 }
 
 fn executeNativeSwitch(effect: @FieldType(state_mod.Effect, "switch_native_space")) void {
     const request = effect.request;
-    if (!g_sky.?.switchNativeSpaceId(request.display_id, request.target_space_id)) {
+    const native_space_id = switch (request.target.key) {
+        .native => |space_id| space_id,
+        .virtual => unreachable,
+    };
+    if (!g_sky.?.switchNativeSpaceId(request.target.display_id, native_space_id)) {
         dispatchStateEvent(.{ .native_switch_effect_failed = .{
             .epoch = effect.epoch,
             .at_ms = nativeStateNowMs(),
@@ -4311,14 +4306,14 @@ fn executeNativeSwitch(effect: @FieldType(state_mod.Effect, "switch_native_space
 
     log.debug("native workspace switch requested epoch={d} display={d} workspace={d} space={d}", .{
         effect.epoch,
-        request.display_id,
-        request.target_workspace_id,
-        request.target_space_id,
+        request.target.display_id,
+        request.target.workspace_id,
+        native_space_id,
     });
-    startWorkspaceTransition(.switch_workspace, request.target_workspace_id, request.display_id);
+    startWorkspaceTransition(.switch_workspace, request.target);
     g_workspace_transition.deadline_at_s = c.CFAbsoluteTimeGetCurrent() +
         @as(f64, @floatFromInt(state_mod.native_switch_timeout_ms)) / std.time.ms_per_s;
-    setFocusedDisplay(request.display_id);
+    setFocusedDisplay(request.target.display_id);
     updateStatusBar();
 }
 
@@ -4338,19 +4333,19 @@ fn observeNativeTopology(epoch: state_mod.Epoch) void {
     } });
 }
 
-fn focusObservedNativeWorkspace(display_id: u32, workspace_id: u8) void {
-    const workspace = spaceForWorkspace(display_id, workspace_id) orelse return;
-    setFocusedDisplay(display_id);
+fn focusObservedNativeSpace(space: state_mod.SpaceRef) void {
+    const workspace = g_workspaces.get(space.key) orelse return;
+    setFocusedDisplay(space.display_id);
     updateStatusBar();
     focusWorkspaceWindow(workspace);
 }
 
-fn completeNativeSwitch(display_id: u32, workspace_id: u8, epoch: state_mod.Epoch) void {
+fn completeNativeSwitch(space: state_mod.SpaceRef, epoch: state_mod.Epoch) void {
     const started_ns = nanoTimestamp();
-    const workspace = spaceForWorkspace(display_id, workspace_id) orelse return;
+    const workspace = g_workspaces.get(space.key) orelse return;
     for (workspace.windows.items) |wid| {
         var win = g_store.get(wid) orelse continue;
-        if (win.space.display_id != display_id) {
+        if (!win.space.key.eql(space.key)) {
             win.space = workspace.ref;
             g_store.put(win) catch {};
         }
@@ -4358,10 +4353,9 @@ fn completeNativeSwitch(display_id: u32, workspace_id: u8, epoch: state_mod.Epoc
     }
 
     if (!g_workspace_transition.isActive() or
-        g_workspace_transition.target_workspace_id != workspace_id or
-        g_workspace_transition.target_display_id != display_id)
+        !g_workspace_transition.target_space.?.key.eql(space.key))
     {
-        startWorkspaceTransition(.switch_workspace, workspace_id, display_id);
+        startWorkspaceTransition(.switch_workspace, space);
     }
     g_pending_focus_count = 0;
     g_deferred_follow_focus = null;
@@ -4369,15 +4363,15 @@ fn completeNativeSwitch(display_id: u32, workspace_id: u8, epoch: state_mod.Epoc
 
     _ = discoverWindowsAfterNativeSpaceSwitch();
     clearDragPreview();
-    requestRetileDisplay(display_id);
+    requestRetileDisplay(space.display_id);
     if (!g_event_drain_active) flushRetileRequests();
     updateStatusBar();
 
     const elapsed_ms = @divTrunc(nanoTimestamp() - started_ns, std.time.ns_per_ms);
     log.debug("[trace] native workspace switch completed state_epoch={d} workspace={d} display={d} elapsed_ms={}", .{
         epoch,
-        workspace_id,
-        display_id,
+        space.workspace_id,
+        space.display_id,
         elapsed_ms,
     });
 }
@@ -4385,12 +4379,18 @@ fn completeNativeSwitch(display_id: u32, workspace_id: u8, epoch: state_mod.Epoc
 fn failNativeSwitch(failure: @FieldType(state_mod.Effect, "native_switch_failed")) void {
     log.warn("native workspace switch failed state_epoch={d} display={d} workspace={d} target_space={d} reason={s} actual_space={d} actual_workspace={d}", .{
         failure.epoch,
-        failure.request.display_id,
-        failure.request.target_workspace_id,
-        failure.request.target_space_id,
+        failure.request.target.display_id,
+        failure.request.target.workspace_id,
+        switch (failure.request.target.key) {
+            .native => |space_id| space_id,
+            .virtual => 0,
+        },
         @tagName(failure.reason),
-        failure.actual_space_id orelse 0,
-        failure.actual_workspace_id orelse 0,
+        if (failure.actual) |actual| switch (actual.key) {
+            .native => |space_id| space_id,
+            .virtual => 0,
+        } else 0,
+        if (failure.actual) |actual| actual.workspace_id else 0,
     });
     if (g_workspace_transition.isActive()) {
         clearWorkspaceTransition();
@@ -4422,7 +4422,7 @@ fn reconcileNativeWindowAssignments(topology: *const skylight.NativeSpaceTopolog
     const sky = &g_sky.?;
     const on_screen = OnScreenWindows.snapshot();
     if (on_screen.truncated) return;
-    var repairs: [256]struct { wid: u32, workspace_id: u8, display_id: u32 } = undefined;
+    var repairs: [256]struct { wid: u32, target: state_mod.SpaceRef } = undefined;
     var repair_count: usize = 0;
 
     var store_it = g_store.windows.iterator();
@@ -4439,25 +4439,26 @@ fn reconcileNativeWindowAssignments(topology: *const skylight.NativeSpaceTopolog
             log.warn("native workspace assignment repair truncated limit={d}", .{repairs.len});
             break;
         }
-        repairs[repair_count] = .{ .wid = win.wid, .workspace_id = workspace_id, .display_id = win.space.display_id };
+        const target = g_state.spaceForWorkspace(win.space.display_id, workspace_id) orelse continue;
+        repairs[repair_count] = .{ .wid = win.wid, .target = target };
         repair_count += 1;
     }
 
     for (repairs[0..repair_count]) |repair| {
-        reassignManagedWindowToNativeWorkspace(repair.wid, repair.workspace_id, repair.display_id);
+        reassignManagedWindowToNativeWorkspace(repair.wid, repair.target);
     }
 }
 
-fn reassignManagedWindowToNativeWorkspace(wid: u32, workspace_id: u8, display_id: u32) void {
+fn reassignManagedWindowToNativeWorkspace(wid: u32, target: state_mod.SpaceRef) void {
     var win = g_store.get(wid) orelse return;
-    if (win.space.workspace_id == workspace_id) return;
+    if (win.space.key.eql(target.key)) return;
 
     const source_ws = spaceForWindow(win) orelse return;
-    const target_ws = spaceForWorkspace(display_id, workspace_id) orelse return;
+    const target_ws = g_workspaces.get(target.key) orelse return;
     target_ws.ensureUnusedWindowCapacity(1) catch return;
     if (win.mode == .tiled) {
         tryInsertIntoTiling(target_ws.ref.key, wid) catch |err| {
-            log.warn("native workspace assignment layout repair failed wid={d} workspace={d}: {}", .{ wid, workspace_id, err });
+            log.warn("native workspace assignment layout repair failed wid={d} workspace={d}: {}", .{ wid, target.workspace_id, err });
             return;
         };
     }
@@ -4471,7 +4472,7 @@ fn reassignManagedWindowToNativeWorkspace(wid: u32, workspace_id: u8, display_id
     win.space = target_ws.ref;
     g_store.putAssumeCapacity(win);
     updateTabGroupAssignment(wid, target_ws.ref);
-    log.debug("native workspace assignment repaired wid={d} source={d} target={d}", .{ wid, source_workspace_id, workspace_id });
+    log.debug("native workspace assignment repaired wid={d} source={d} target={d}", .{ wid, source_workspace_id, target.workspace_id });
 }
 
 fn processDueNativeStateObservation() bool {
@@ -4648,23 +4649,20 @@ fn processAppLaunchRetries() bool {
     return true;
 }
 
-fn trackPendingRoleWindow(pid: i32, wid: u32, workspace_id: u8, display_id: u32) void {
+fn trackPendingRoleWindow(pid: i32, wid: u32, space: state_mod.SpaceRef) void {
     std.debug.assert(wid != 0);
-    std.debug.assert(workspace_id > 0 and workspace_id <= workspace_mod.max_workspaces);
-    std.debug.assert(display_id != 0);
+    space.assertValid();
     if (g_store.get(wid) != null) return;
 
     if (g_pending_role_windows.getPtr(wid)) |pending| {
         pending.pid = pid;
         pending.attempts_remaining = role_poll_attempts_max;
-        pending.workspace_id = workspace_id;
-        pending.display_id = display_id;
+        pending.space = space;
     } else {
         g_pending_role_windows.put(wid, .{
             .pid = pid,
             .attempts_remaining = role_poll_attempts_max,
-            .workspace_id = workspace_id,
-            .display_id = display_id,
+            .space = space,
         }) catch {
             log.err("pending-role: failed to track pid={d} wid={d}", .{ pid, wid });
             return;
@@ -4727,10 +4725,9 @@ fn untrackPendingRoleWindowsForPid(pid: i32) void {
     }
 }
 
-fn trackDeferredWindowCandidate(pid: i32, wid: u32, workspace_id: u8, display_id: u32) void {
+fn trackDeferredWindowCandidate(pid: i32, wid: u32, space: state_mod.SpaceRef) void {
     std.debug.assert(wid != 0);
-    std.debug.assert(workspace_id > 0 and workspace_id <= workspace_mod.max_workspaces);
-    std.debug.assert(display_id != 0);
+    space.assertValid();
     if (g_store.get(wid) != null) {
         if (g_deferred_window_candidates.remove(wid)) {
             refreshRolePolling();
@@ -4745,14 +4742,12 @@ fn trackDeferredWindowCandidate(pid: i32, wid: u32, workspace_id: u8, display_id
         // promotion (e.g. permanently degenerate bounds) re-arm its budget
         // every cycle and poll forever.
         candidate.pid = pid;
-        candidate.workspace_id = workspace_id;
-        candidate.display_id = display_id;
+        candidate.space = space;
     } else {
         g_deferred_window_candidates.put(wid, .{
             .pid = pid,
             .attempts_remaining = role_poll_attempts_max,
-            .workspace_id = workspace_id,
-            .display_id = display_id,
+            .space = space,
         }) catch {
             log.err("deferred-window: failed to track pid={d} wid={d}", .{ pid, wid });
             return;
@@ -4776,14 +4771,14 @@ fn untrackDeferredWindowCandidatesForPid(pid: i32) void {
     }
 }
 
-fn addNewWindowLegacyPendingFallback(pid: i32, wid: u32, workspace_id: u8, display_id: u32) bool {
+fn addNewWindowLegacyPendingFallback(pid: i32, wid: u32, space: state_mod.SpaceRef) bool {
     std.debug.assert(wid != 0);
     if (g_store.get(wid) != null) return false;
     if (!bw_should_manage_window(pid, wid)) {
         log.debug("pending-role: fallback rejected pid={d} wid={d}", .{ pid, wid });
         return false;
     }
-    return addNewWindowManagedWithAssignment(pid, wid, workspace_id, display_id);
+    return addNewWindowManagedWithAssignment(pid, wid, space);
 }
 
 fn processPendingRoleWindows() bool {
@@ -4828,8 +4823,7 @@ fn processPendingRoleWindows() bool {
                     .pid = pid,
                     .wid = wid,
                     .from_timeout = false,
-                    .workspace_id = entry.value_ptr.workspace_id,
-                    .display_id = entry.value_ptr.display_id,
+                    .space = entry.value_ptr.space,
                 };
                 candidate_count += 1;
             },
@@ -4845,8 +4839,7 @@ fn processPendingRoleWindows() bool {
                         .pid = pid,
                         .wid = wid,
                         .from_timeout = true,
-                        .workspace_id = entry.value_ptr.workspace_id,
-                        .display_id = entry.value_ptr.display_id,
+                        .space = entry.value_ptr.space,
                     };
                     candidate_count += 1;
                 } else {
@@ -4881,11 +4874,8 @@ fn processPendingRoleWindows() bool {
             // The workspace home is reconciled by UUID and is the single
             // source of truth for where its windows live, so always derive
             // the fallback display from it.
-            const fallback_display_id = blk: {
-                if (spaceForCommand(candidate.display_id, candidate.workspace_id)) |ws| break :blk ws.ref.display_id;
-                break :blk primaryDisplayId();
-            };
-            if (addNewWindowLegacyPendingFallback(candidate.pid, candidate.wid, candidate.workspace_id, fallback_display_id)) {
+            const current_space = g_state.space(candidate.space.key) orelse continue;
+            if (addNewWindowLegacyPendingFallback(candidate.pid, candidate.wid, current_space)) {
                 added_any = true;
             }
             continue;
@@ -4966,8 +4956,7 @@ fn processDeferredWindowCandidates() bool {
                     promote_candidates[promote_count] = .{
                         .pid = pid,
                         .wid = wid,
-                        .workspace_id = entry.value_ptr.workspace_id,
-                        .display_id = entry.value_ptr.display_id,
+                        .space = entry.value_ptr.space,
                     };
                     promote_count += 1;
                 } else {
@@ -5101,12 +5090,10 @@ fn discoverWindowsImpl(should_refresh_tabs: bool) usize {
         // Discovery only returns visible windows, so an unassigned window
         // belongs to the display's active native Space.
         const target_ws = resolveWorkspace(info.pid, discovered_display);
-        const managed_display = target_ws.ref.display_id;
-
         // A landing must not wait on an app's AX server. The role poll applies
         // the same gate after the switch path is free to accept more input.
         if (should_refresh_tabs) {
-            trackPendingRoleWindow(info.pid, info.wid, target_ws.ref.workspace_id, managed_display);
+            trackPendingRoleWindow(info.pid, info.wid, target_ws.ref);
             continue;
         }
 
@@ -5116,7 +5103,7 @@ fn discoverWindowsImpl(should_refresh_tabs: bool) usize {
                 continue;
             },
             .pending => {
-                trackPendingRoleWindow(info.pid, info.wid, target_ws.ref.workspace_id, managed_display);
+                trackPendingRoleWindow(info.pid, info.wid, target_ws.ref);
                 continue;
             },
             .ready => {
@@ -5127,7 +5114,7 @@ fn discoverWindowsImpl(should_refresh_tabs: bool) usize {
                 // at zero size. Deliberately not untracked first: tracking an
                 // existing candidate preserves its remaining retry budget.
                 if (frame.width <= 1 or frame.height <= 1) {
-                    trackDeferredWindowCandidate(info.pid, info.wid, target_ws.ref.workspace_id, managed_display);
+                    trackDeferredWindowCandidate(info.pid, info.wid, target_ws.ref);
                     log.info("discover: deferred pid={d} wid={d} unsettled bounds", .{ info.pid, info.wid });
                     continue;
                 }
@@ -5154,7 +5141,7 @@ fn discoverWindowsImpl(should_refresh_tabs: bool) usize {
         if (!spaceVisible(target_ws.ref)) {
             if (nativeSpacesEnabled()) {
                 const target_display = target_ws.ref.display_id;
-                if (!moveTabGroupToNativeSpace(info.wid, target_display, target_ws.ref.workspace_id)) {
+                if (!moveTabGroupToNativeSpace(info.wid, target_ws.ref)) {
                     log.warn("failed to move discovered wid={d} to native workspace {d} on display {d}", .{
                         info.wid,
                         target_ws.ref.workspace_id,
@@ -5162,10 +5149,8 @@ fn discoverWindowsImpl(should_refresh_tabs: bool) usize {
                     });
                 } else {
                     trackPendingNativeWindowMove(info.wid, .{
-                        .source_workspace_id = activeWorkspaceIdForDisplay(discovered_display),
-                        .target_workspace_id = target_ws.ref.workspace_id,
-                        .source_display_id = discovered_display,
-                        .target_display_id = target_display,
+                        .source = (spaceForWorkspace(discovered_display, activeWorkspaceIdForDisplay(discovered_display)) orelse continue).ref,
+                        .target = target_ws.ref,
                     });
                 }
             } else {
@@ -5320,10 +5305,9 @@ fn appWindowSnapshot(
     return .{ .count = count, .truncated = truncated };
 }
 
-fn addNewWindowManagedWithAssignment(pid: i32, wid: u32, workspace_id: u8, assigned_display_id: u32) bool {
+fn addNewWindowManagedWithAssignment(pid: i32, wid: u32, assigned_space: state_mod.SpaceRef) bool {
     log.debug("addNewWindow: pid={d} wid={d}", .{ pid, wid });
-    std.debug.assert(workspace_id > 0 and workspace_id <= workspace_mod.max_workspaces);
-    std.debug.assert(assigned_display_id != 0);
+    assigned_space.assertValid();
     if (g_store.get(wid) != null) {
         log.debug("addNewWindow: already in store, skipping", .{});
         return false;
@@ -5340,12 +5324,12 @@ fn addNewWindowManagedWithAssignment(pid: i32, wid: u32, workspace_id: u8, assig
     // reports them as on-screen. Queue them for bounded re-evaluation rather
     // than dropping them on a one-shot check.
     if (!on_screen) {
-        trackDeferredWindowCandidate(pid, wid, workspace_id, assigned_display_id);
+        trackDeferredWindowCandidate(pid, wid, assigned_space);
         log.info("addNewWindow: deferred pid={d} wid={d} while off-screen", .{ pid, wid });
         return false;
     }
     var window_frame: window_mod.Window.Frame = .{ .x = 0, .y = 0, .width = 0, .height = 0 };
-    const display_id = assigned_display_id;
+    const display_id = assigned_space.display_id;
     if (g_sky) |sky| {
         var rect: skylight.CGRect = undefined;
         if (sky.getWindowBounds(sky.mainConnectionID(), wid, &rect) == 0) {
@@ -5366,7 +5350,7 @@ fn addNewWindowManagedWithAssignment(pid: i32, wid: u32, workspace_id: u8, assig
     // are always zero, and deferring would leave every new window unmanaged;
     // keep the legacy zero-frame path in that degraded mode.
     if (g_sky != null and (window_frame.width <= 1 or window_frame.height <= 1)) {
-        trackDeferredWindowCandidate(pid, wid, workspace_id, assigned_display_id);
+        trackDeferredWindowCandidate(pid, wid, assigned_space);
         log.info("addNewWindow: deferred pid={d} wid={d} unsettled bounds", .{ pid, wid });
         return false;
     }
@@ -5397,7 +5381,8 @@ fn addNewWindowManagedWithAssignment(pid: i32, wid: u32, workspace_id: u8, assig
         break :blk !axCanResize(ax_win, ax);
     };
 
-    const ws = spaceForCommand(display_id, workspace_id) orelse resolveWorkspace(pid, display_id);
+    const current_space = g_state.space(assigned_space.key) orelse return false;
+    const ws = g_workspaces.get(current_space.key) orelse return false;
     const mode: window_mod.WindowMode = if (should_float) .floating else .tiled;
 
     const win = window_mod.Window{
@@ -5422,14 +5407,12 @@ fn addNewWindowManagedWithAssignment(pid: i32, wid: u32, workspace_id: u8, assig
         if (nativeSpacesEnabled()) {
             const target_display = ws.ref.display_id;
             const source_display = inferDisplayIdForWindow(wid) orelse display_id;
-            if (!moveTabGroupToNativeSpace(wid, target_display, ws.ref.workspace_id)) {
+            if (!moveTabGroupToNativeSpace(wid, ws.ref)) {
                 log.warn("failed to move new wid={d} to native workspace {d} on display {d}", .{ wid, ws.ref.workspace_id, target_display });
             } else {
                 trackPendingNativeWindowMove(wid, .{
-                    .source_workspace_id = activeWorkspaceIdForDisplay(source_display),
-                    .target_workspace_id = ws.ref.workspace_id,
-                    .source_display_id = source_display,
-                    .target_display_id = target_display,
+                    .source = (spaceForWorkspace(source_display, activeWorkspaceIdForDisplay(source_display)) orelse return true).ref,
+                    .target = ws.ref,
                 });
             }
         } else {
@@ -5453,7 +5436,7 @@ fn addNewWindowManaged(pid: i32, wid: u32) bool {
     // A rule-pinned app's transient launch position is meaningless: place it
     // on the display that currently owns its assigned workspace, not wherever
     // it happened to launch.
-    return addNewWindowManagedWithAssignment(pid, wid, ws.ref.workspace_id, ws.ref.display_id);
+    return addNewWindowManagedWithAssignment(pid, wid, ws.ref);
 }
 
 fn addNewWindow(pid: i32, wid: u32) void {
@@ -5476,8 +5459,8 @@ fn addNewWindow(pid: i32, wid: u32) void {
             // promoted onto the correct workspace+display.
             const display_id = inferDisplayIdForWindow(wid) orelse focusedDisplayId();
             const ws = resolveWorkspaceForWindow(pid, wid, display_id);
-            trackPendingRoleWindow(pid, wid, ws.ref.workspace_id, ws.ref.display_id);
-            trackDeferredWindowCandidate(pid, wid, ws.ref.workspace_id, ws.ref.display_id);
+            trackPendingRoleWindow(pid, wid, ws.ref);
+            trackDeferredWindowCandidate(pid, wid, ws.ref);
             log.debug("addNewWindow: role gate pending pid={d} wid={d}", .{ pid, wid });
         },
     }
@@ -6858,7 +6841,8 @@ fn frameCenterOnDisplay(frame: window_mod.Window.Frame, display: shim.bw_frame) 
 /// request; WindowServer can expose the parked frame for several more
 /// milliseconds. An empty workspace is immediately ready because revealing
 /// the wallpaper is the requested result.
-fn workspaceRevealSettled(ws: *const workspace_mod.Space, display_id: u32) bool {
+fn workspaceRevealSettled(ws: *const workspace_mod.Space) bool {
+    const display_id = ws.ref.display_id;
     const display_slot = displayIndexById(display_id) orelse return false;
     const display = g_displays[display_slot].visible;
     const on_screen = OnScreenWindows.snapshot();
@@ -6880,13 +6864,13 @@ fn workspaceRevealSettled(ws: *const workspace_mod.Space, display_id: u32) bool 
     return true;
 }
 
-fn waitForWorkspaceReveal(ws: *const workspace_mod.Space, display_id: u32) bool {
+fn waitForWorkspaceReveal(ws: *const workspace_mod.Space) bool {
     var waited_us: u32 = 0;
     while (waited_us < workspace_reveal_wait_max_us) : (waited_us += workspace_reveal_poll_interval_us) {
-        if (workspaceRevealSettled(ws, display_id)) return true;
+        if (workspaceRevealSettled(ws)) return true;
         _ = c.usleep(workspace_reveal_poll_interval_us);
     }
-    return workspaceRevealSettled(ws, display_id);
+    return workspaceRevealSettled(ws);
 }
 
 /// Park immediately once the incoming pixels are visible. Slow AX servers use
@@ -6895,20 +6879,20 @@ fn waitForWorkspaceReveal(ws: *const workspace_mod.Space, display_id: u32) bool 
 fn parkOutgoingWhenRevealed(
     outgoing_ws: *workspace_mod.Space,
     target_ws: *const workspace_mod.Space,
-    display_id: u32,
 ) void {
+    const display_id = target_ws.ref.display_id;
     const display_slot = displayIndexById(display_id) orelse return;
     const prior = g_pending_workspace_parks[display_slot];
 
-    if (waitForWorkspaceReveal(target_ws, display_id)) {
+    if (waitForWorkspaceReveal(target_ws)) {
         g_pending_workspace_parks[display_slot] = null;
-        parkOutgoingWorkspace(outgoing_ws, target_ws.ref.workspace_id, display_id);
+        parkOutgoingWorkspace(outgoing_ws, target_ws.ref);
         if (prior) |pending| {
-            if (pending.outgoing_workspace_id != outgoing_ws.ref.workspace_id and
-                pending.outgoing_workspace_id != target_ws.ref.workspace_id)
+            if (!pending.outgoing.key.eql(outgoing_ws.ref.key) and
+                !pending.outgoing.key.eql(target_ws.ref.key))
             {
-                if (spaceForWorkspace(display_id, pending.outgoing_workspace_id)) |prior_outgoing| {
-                    parkOutgoingWorkspace(prior_outgoing, target_ws.ref.workspace_id, display_id);
+                if (g_workspaces.get(pending.outgoing.key)) |prior_outgoing| {
+                    parkOutgoingWorkspace(prior_outgoing, target_ws.ref);
                 }
             }
         }
@@ -6919,24 +6903,23 @@ fn parkOutgoingWhenRevealed(
     // A prior deferred outgoing workspace still covers this display. Keep it
     // as the cover and park the logical current workspace now, otherwise a
     // rapid A → B → C sequence would leak both A and B over C.
-    const cover_workspace_id: u8 = if (prior) |pending| blk: {
-        if (pending.outgoing_workspace_id != target_ws.ref.workspace_id and
-            pending.outgoing_workspace_id != outgoing_ws.ref.workspace_id)
+    const cover: state_mod.SpaceRef = if (prior) |pending| blk: {
+        if (!pending.outgoing.key.eql(target_ws.ref.key) and
+            !pending.outgoing.key.eql(outgoing_ws.ref.key))
         {
-            parkOutgoingWorkspace(outgoing_ws, target_ws.ref.workspace_id, display_id);
-            break :blk pending.outgoing_workspace_id;
+            parkOutgoingWorkspace(outgoing_ws, target_ws.ref);
+            break :blk pending.outgoing;
         }
-        break :blk outgoing_ws.ref.workspace_id;
-    } else outgoing_ws.ref.workspace_id;
+        break :blk outgoing_ws.ref;
+    } else outgoing_ws.ref;
 
     g_pending_workspace_parks[display_slot] = .{
-        .outgoing_workspace_id = cover_workspace_id,
-        .target_workspace_id = target_ws.ref.workspace_id,
-        .display_id = display_id,
+        .outgoing = cover,
+        .target = target_ws.ref,
         .deadline_at_s = c.CFAbsoluteTimeGetCurrent() + workspace_reveal_deferred_timeout_s,
     };
     log.debug("workspace switch deferring outgoing park current_workspace={d} target_workspace={d} display={d}", .{
-        cover_workspace_id,
+        cover.workspace_id,
         target_ws.ref.workspace_id,
         display_id,
     });
@@ -6954,24 +6937,26 @@ fn processPendingWorkspaceParks() void {
     var changed = false;
     for (0..g_display_count) |display_slot| {
         const pending = g_pending_workspace_parks[display_slot] orelse continue;
-        const active_workspace_id = activeWorkspaceIdForDisplay(g_displays[display_slot].id);
-        if (active_workspace_id != pending.target_workspace_id) {
+        const display_id = g_displays[display_slot].id;
+        const active_workspace_id = activeWorkspaceIdForDisplay(display_id);
+        const active = g_state.spaceForWorkspace(display_id, active_workspace_id) orelse continue;
+        if (!active.key.eql(pending.target.key)) {
             g_pending_workspace_parks[display_slot] = null;
             changed = true;
-            if (pending.outgoing_workspace_id != active_workspace_id) {
-                if (spaceForWorkspace(pending.display_id, pending.outgoing_workspace_id)) |outgoing_ws| {
-                    parkOutgoingWorkspace(outgoing_ws, active_workspace_id, pending.display_id);
+            if (!pending.outgoing.key.eql(active.key)) {
+                if (g_workspaces.get(pending.outgoing.key)) |outgoing_ws| {
+                    parkOutgoingWorkspace(outgoing_ws, active);
                 }
             }
             continue;
         }
 
-        const target_ws = spaceForWorkspace(pending.display_id, pending.target_workspace_id) orelse {
+        const target_ws = g_workspaces.get(pending.target.key) orelse {
             g_pending_workspace_parks[display_slot] = null;
             changed = true;
             continue;
         };
-        const reveal_settled = workspaceRevealSettled(target_ws, pending.display_id);
+        const reveal_settled = workspaceRevealSettled(target_ws);
         const timed_out = c.CFAbsoluteTimeGetCurrent() >= pending.deadline_at_s;
         if (!reveal_settled and !timed_out) continue;
 
@@ -6979,13 +6964,13 @@ fn processPendingWorkspaceParks() void {
         changed = true;
         if (!reveal_settled) {
             log.warn("workspace switch reveal timed out current_workspace={d} target_workspace={d} display={d}; parking outgoing workspace", .{
-                pending.outgoing_workspace_id,
-                pending.target_workspace_id,
-                pending.display_id,
+                pending.outgoing.workspace_id,
+                pending.target.workspace_id,
+                pending.target.display_id,
             });
         }
-        if (spaceForWorkspace(pending.display_id, pending.outgoing_workspace_id)) |outgoing_ws| {
-            parkOutgoingWorkspace(outgoing_ws, pending.target_workspace_id, pending.display_id);
+        if (g_workspaces.get(pending.outgoing.key)) |outgoing_ws| {
+            parkOutgoingWorkspace(outgoing_ws, pending.target);
         }
     }
     if (changed) refreshRolePolling();
@@ -6995,8 +6980,7 @@ fn switchWorkspace(target_id: u8) void {
     if (nativeSpacesEnabled()) {
         const target_display = focusedDisplayId();
         dispatchStateEvent(.{ .request_native_switch = .{
-            .display_id = target_display,
-            .target_workspace_id = target_id,
+            .target = (spaceForWorkspace(target_display, target_id) orelse return).ref,
             .at_ms = nativeStateNowMs(),
         } });
         return;
@@ -7005,14 +6989,14 @@ fn switchWorkspace(target_id: u8) void {
     const target_ws = spaceForCommand(focusedDisplayId(), target_id) orelse return;
 
     // If target is already visible on some display, just focus there.
-    if (workspaceVisibleAnywhere(target_id)) {
+    if (spaceVisible(target_ws.ref)) {
         const target_display = target_ws.ref.display_id;
         log.debug("workspace switch target already visible workspace={d} display={d} windows={d}", .{
             target_id,
             target_display,
             target_ws.windows.items.len,
         });
-        startWorkspaceTransition(.switch_workspace, target_id, target_display);
+        startWorkspaceTransition(.switch_workspace, target_ws.ref);
         setFocusedDisplay(target_display);
         updateStatusBar();
         focusWorkspaceWindow(target_ws);
@@ -7055,7 +7039,7 @@ fn switchWorkspace(target_id: u8) void {
 
     assertDisplayCoverage();
 
-    startWorkspaceTransition(.switch_workspace, target_id, target_display);
+    startWorkspaceTransition(.switch_workspace, target_ws.ref);
     ax_mod.beginGeometryBatch();
     defer ax_mod.endGeometryBatch();
 
@@ -7069,7 +7053,7 @@ fn switchWorkspace(target_id: u8) void {
     updateStatusBar();
 
     focusWorkspaceWindow(target_ws);
-    parkOutgoingWhenRevealed(old_ws, target_ws, target_display);
+    parkOutgoingWhenRevealed(old_ws, target_ws);
 }
 
 /// Park every window the outgoing workspace has on `display_id`.
@@ -7083,7 +7067,8 @@ fn switchWorkspace(target_id: u8) void {
 /// Safe to defer: the workspace transition stays active until its settle
 /// deadline even once focus lands, so the synthetic AX move events these writes
 /// generate are still suppressed.
-fn parkOutgoingWorkspace(ws: *workspace_mod.Space, target_workspace_id: u8, display_id: u32) void {
+fn parkOutgoingWorkspace(ws: *workspace_mod.Space, target: state_mod.SpaceRef) void {
+    const display_id = target.display_id;
     const hctx = HideCtx.init(display_id);
 
     var hidden_count: usize = 0;
@@ -7119,8 +7104,7 @@ fn parkOutgoingWorkspace(ws: *workspace_mod.Space, target_workspace_id: u8, disp
     var pending_it = g_pending_role_windows.iterator();
     while (pending_it.next()) |entry| {
         const pending = entry.value_ptr.*;
-        if (pending.workspace_id != ws.ref.workspace_id) continue;
-        if (pending.display_id != display_id) continue;
+        if (!pending.space.key.eql(ws.ref.key)) continue;
         g_animator.finish(entry.key_ptr.*);
         hctx.hide(pending.pid, entry.key_ptr.*);
         hidden_pending_count += 1;
@@ -7128,7 +7112,7 @@ fn parkOutgoingWorkspace(ws: *workspace_mod.Space, target_workspace_id: u8, disp
 
     log.debug("workspace switch hid current windows current_workspace={d} target_workspace={d} display={d} hidden={d} hidden_pending={d}", .{
         ws.ref.workspace_id,
-        target_workspace_id,
+        target.workspace_id,
         display_id,
         hidden_count,
         hidden_pending_count,
@@ -7176,7 +7160,7 @@ fn focusWorkspaceWindow(ws: *workspace_mod.Space) void {
     if (focus_wid == null) {
         log.debug("workspace focus target workspace={d} focused_wid=0 actual_wid=0 reason=empty", .{ws.ref.workspace_id});
         if (g_workspace_transition.isActive() and
-            g_workspace_transition.target_workspace_id == ws.ref.workspace_id)
+            g_workspace_transition.target_space.?.key.eql(ws.ref.key))
         {
             markWorkspaceTransitionComplete(.empty_workspace);
         }
@@ -7216,8 +7200,6 @@ fn moveWindowToWorkspace(target_id: u8) void {
     log.debug("move workspace target wid={d} pid={d} source={d} target={d}", .{ wid, updated.pid, ws.ref.workspace_id, target_id });
 
     const target_ws = spaceForCommand(updated.space.display_id, target_id) orelse return;
-    const source_display = updated.space.display_id;
-
     // Prepare the destination completely before removing the source slot.
     // After these fallible steps, the move commits without allocation.
     target_ws.ensureUnusedWindowCapacity(1) catch return;
@@ -7228,7 +7210,7 @@ fn moveWindowToWorkspace(target_id: u8) void {
         };
     }
     const target_display = target_ws.ref.display_id;
-    if (nativeSpacesEnabled() and !moveTabGroupToNativeSpace(wid, target_display, target_id)) {
+    if (nativeSpacesEnabled() and !moveTabGroupToNativeSpace(wid, target_ws.ref)) {
         if (updated.mode == .tiled) removeFromTiling(target_ws.ref.key, wid);
         log.warn("failed to move wid={d} to native workspace {d} on display {d}", .{ wid, target_id, target_display });
         return;
@@ -7251,10 +7233,8 @@ fn moveWindowToWorkspace(target_id: u8) void {
     updateTabGroupAssignment(wid, updated.space);
     if (nativeSpacesEnabled()) {
         trackPendingNativeWindowMove(wid, .{
-            .source_workspace_id = ws.ref.workspace_id,
-            .target_workspace_id = target_id,
-            .source_display_id = source_display,
-            .target_display_id = target_display,
+            .source = ws.ref,
+            .target = target_ws.ref,
         });
     }
 
@@ -7388,7 +7368,7 @@ fn moveWorkspaceToDisplay(target_display_slot: usize) void {
     applySpaceCatalog(catalog);
     assertDisplayCoverage();
 
-    startWorkspaceTransition(.move_workspace_to_display, moving_ws_id, target_display_id);
+    startWorkspaceTransition(.move_workspace_to_display, g_state.space(.{ .virtual = moving_ws_id }).?);
     retile();
     setFocusedDisplay(target_display_id);
     updateStatusBar();

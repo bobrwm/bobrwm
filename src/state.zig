@@ -180,9 +180,7 @@ pub const NativeTopology = struct {
 };
 
 pub const SwitchRequest = struct {
-    display_id: DisplayId,
-    target_space_id: NativeSpaceId,
-    target_workspace_id: WorkspaceId,
+    target: SpaceRef,
 };
 
 pub const PendingSwitch = struct {
@@ -241,10 +239,10 @@ pub const Model = struct {
 
     pub fn desiredWorkspace(self: *const Model, display_id: DisplayId) ?WorkspaceId {
         if (self.queued_switch) |queued| {
-            if (queued.display_id == display_id) return queued.target_workspace_id;
+            if (queued.target.display_id == display_id) return queued.target.workspace_id;
         }
         if (self.pending_switch) |pending| {
-            if (pending.request.display_id == display_id) return pending.request.target_workspace_id;
+            if (pending.request.target.display_id == display_id) return pending.request.target.workspace_id;
         }
         return self.activeWorkspace(display_id);
     }
@@ -260,8 +258,7 @@ pub const Event = union(enum) {
     },
     initialize_native_topology: NativeTopology,
     request_native_switch: struct {
-        display_id: DisplayId,
-        target_workspace_id: WorkspaceId,
+        target: SpaceRef,
         at_ms: TimestampMs,
     },
     native_space_changed: TimestampMs,
@@ -296,27 +293,19 @@ pub const Effect = union(enum) {
         epoch: Epoch,
     },
     observe_native_topology: Epoch,
-    focus_observed_workspace: struct {
-        display_id: DisplayId,
-        workspace_id: WorkspaceId,
-    },
+    focus_observed_space: SpaceRef,
     native_switch_completed: struct {
-        display_id: DisplayId,
-        workspace_id: WorkspaceId,
+        space: SpaceRef,
         epoch: Epoch,
     },
     native_switch_failed: struct {
         request: SwitchRequest,
         epoch: Epoch,
         reason: SwitchFailureReason,
-        actual_space_id: ?NativeSpaceId,
-        actual_workspace_id: ?WorkspaceId,
+        actual: ?SpaceRef,
     },
     native_topology_changed,
-    native_switch_rejected: struct {
-        display_id: DisplayId,
-        workspace_id: WorkspaceId,
-    },
+    native_switch_rejected: SpaceRef,
 };
 
 pub const max_effects = 6;
@@ -377,25 +366,19 @@ fn reduceSwitchRequest(
     transition: *Transition,
     event: @FieldType(Event, "request_native_switch"),
 ) void {
-    const display = transition.model.native_topology.findDisplay(event.display_id) orelse {
-        transition.addEffect(.{ .native_switch_rejected = .{
-            .display_id = event.display_id,
-            .workspace_id = event.target_workspace_id,
-        } });
+    const target = transition.model.spaces.find(event.target.key) orelse {
+        transition.addEffect(.{ .native_switch_rejected = event.target });
         return;
     };
-    const target_space_id = display.spaceForWorkspace(event.target_workspace_id) orelse {
-        transition.addEffect(.{ .native_switch_rejected = .{
-            .display_id = event.display_id,
-            .workspace_id = event.target_workspace_id,
-        } });
+    if (target.display_id != event.target.display_id or target.workspace_id != event.target.workspace_id) {
+        transition.addEffect(.{ .native_switch_rejected = event.target });
         return;
-    };
-    const request: SwitchRequest = .{
-        .display_id = event.display_id,
-        .target_space_id = target_space_id,
-        .target_workspace_id = event.target_workspace_id,
-    };
+    }
+    if (nativeSpaceId(target) == null) {
+        transition.addEffect(.{ .native_switch_rejected = event.target });
+        return;
+    }
+    const request: SwitchRequest = .{ .target = target };
 
     if (transition.model.pending_switch) |pending| {
         transition.model.queued_switch = if (sameRequest(request, pending.request)) null else request;
@@ -446,9 +429,9 @@ fn reduceTopologyObserved(
     };
     if (event.epoch != pending.epoch) return;
 
-    const display = event.topology.findDisplay(pending.request.display_id);
+    const display = event.topology.findDisplay(pending.request.target.display_id);
     const actual_space_id = if (display) |value| value.observed_space_id else null;
-    if (actual_space_id == pending.request.target_space_id) {
+    if (actual_space_id == nativeSpaceId(pending.request.target)) {
         finishSwitch(transition, pending, event.at_ms, null);
         return;
     }
@@ -458,14 +441,9 @@ fn reduceTopologyObserved(
         return;
     }
 
-    const actual_workspace_id = if (display) |value|
-        value.workspaceForSpace(value.observed_space_id)
-    else
-        null;
     finishSwitch(transition, pending, event.at_ms, .{
         .reason = .unexpected_space,
-        .actual_space_id = actual_space_id,
-        .actual_workspace_id = actual_workspace_id,
+        .actual = if (actual_space_id) |space_id| transition.model.space(.{ .native = space_id }) else null,
     });
 }
 
@@ -509,8 +487,7 @@ fn reduceTopologyUnavailable(
 
     finishSwitch(transition, pending, event.at_ms, .{
         .reason = .observation_unavailable,
-        .actual_space_id = null,
-        .actual_workspace_id = null,
+        .actual = null,
     });
 }
 
@@ -521,23 +498,17 @@ fn reduceSwitchEffectFailed(
     const pending = transition.model.pending_switch orelse return;
     if (event.epoch != pending.epoch) return;
 
-    const display = transition.model.native_topology.findDisplay(pending.request.display_id);
+    const display = transition.model.native_topology.findDisplay(pending.request.target.display_id);
     const actual_space_id = if (display) |value| value.observed_space_id else null;
-    const actual_workspace_id = if (display) |value|
-        value.workspaceForSpace(value.observed_space_id)
-    else
-        null;
     finishSwitch(transition, pending, event.at_ms, .{
         .reason = .effect_failed,
-        .actual_space_id = actual_space_id,
-        .actual_workspace_id = actual_workspace_id,
+        .actual = if (actual_space_id) |space_id| transition.model.space(.{ .native = space_id }) else null,
     });
 }
 
 const FailedSwitch = struct {
     reason: SwitchFailureReason,
-    actual_space_id: ?NativeSpaceId,
-    actual_workspace_id: ?WorkspaceId,
+    actual: ?SpaceRef,
 };
 
 fn finishSwitch(
@@ -554,16 +525,14 @@ fn finishSwitch(
             .request = pending.request,
             .epoch = pending.epoch,
             .reason = failed.reason,
-            .actual_space_id = failed.actual_space_id,
-            .actual_workspace_id = failed.actual_workspace_id,
+            .actual = failed.actual,
         } });
     }
 
     const queued = transition.model.queued_switch orelse {
         if (failure == null) {
             transition.addEffect(.{ .native_switch_completed = .{
-                .display_id = pending.request.display_id,
-                .workspace_id = pending.request.target_workspace_id,
+                .space = transition.model.space(pending.request.target.key) orelse pending.request.target,
                 .epoch = pending.epoch,
             } });
         }
@@ -579,23 +548,21 @@ fn startSwitch(
     at_ms: TimestampMs,
     should_focus_if_observed: bool,
 ) void {
-    const display = transition.model.native_topology.findDisplay(request.display_id) orelse {
-        transition.addEffect(.{ .native_switch_rejected = .{
-            .display_id = request.display_id,
-            .workspace_id = request.target_workspace_id,
-        } });
+    const target = transition.model.space(request.target.key) orelse {
+        transition.addEffect(.{ .native_switch_rejected = request.target });
         return;
     };
-    if (display.observed_space_id == request.target_space_id) {
+    const current_request: SwitchRequest = .{ .target = target };
+    const display = transition.model.native_topology.findDisplay(target.display_id) orelse {
+        transition.addEffect(.{ .native_switch_rejected = target });
+        return;
+    };
+    if (display.observed_space_id == nativeSpaceId(target).?) {
         if (should_focus_if_observed) {
-            transition.addEffect(.{ .focus_observed_workspace = .{
-                .display_id = request.display_id,
-                .workspace_id = request.target_workspace_id,
-            } });
+            transition.addEffect(.{ .focus_observed_space = target });
         } else {
             transition.addEffect(.{ .native_switch_completed = .{
-                .display_id = request.display_id,
-                .workspace_id = request.target_workspace_id,
+                .space = target,
                 .epoch = 0,
             } });
         }
@@ -604,14 +571,14 @@ fn startSwitch(
 
     const epoch = takeEpoch(&transition.model);
     const pending: PendingSwitch = .{
-        .request = request,
+        .request = current_request,
         .epoch = epoch,
         .deadline_at_ms = at_ms +| native_switch_timeout_ms,
     };
     transition.model.pending_switch = pending;
     schedulePendingObservation(&transition.model, pending, at_ms);
     transition.addEffect(.{ .switch_native_space = .{
-        .request = request,
+        .request = current_request,
         .epoch = epoch,
     } });
 }
@@ -631,7 +598,14 @@ fn takeEpoch(model: *Model) Epoch {
 }
 
 fn sameRequest(left: SwitchRequest, right: SwitchRequest) bool {
-    return left.display_id == right.display_id and left.target_space_id == right.target_space_id;
+    return left.target.key.eql(right.target.key);
+}
+
+fn nativeSpaceId(space: SpaceRef) ?NativeSpaceId {
+    return switch (space.key) {
+        .native => |space_id| space_id,
+        .virtual => null,
+    };
 }
 
 fn assertModel(model: *const Model) void {
@@ -674,10 +648,13 @@ fn assertModel(model: *const Model) void {
     }
     if (model.pending_switch) |pending| {
         std.debug.assert(pending.epoch != 0);
-        std.debug.assert(pending.request.display_id != 0);
-        std.debug.assert(pending.request.target_space_id != 0);
-        std.debug.assert(pending.request.target_workspace_id != 0);
+        pending.request.target.assertValid();
+        std.debug.assert(nativeSpaceId(pending.request.target) != null);
         if (model.observation_timer) |timer| std.debug.assert(timer.epoch == pending.epoch);
+    }
+    if (model.queued_switch) |queued| {
+        queued.target.assertValid();
+        std.debug.assert(nativeSpaceId(queued.target) != null);
     }
 }
 
@@ -703,15 +680,18 @@ fn initializedModel(topology: NativeTopology) Model {
     return reduce(.{}, .{ .initialize_native_topology = topology }).model;
 }
 
+fn switchRequest(model: *const Model, display_id: DisplayId, workspace_id: WorkspaceId, at_ms: TimestampMs) Event {
+    return .{ .request_native_switch = .{
+        .target = model.spaceForWorkspace(display_id, workspace_id).?,
+        .at_ms = at_ms,
+    } };
+}
+
 test "switch request preserves observed Space until confirmation" {
     const testing = std.testing;
     const model = initializedModel(testTopology(101, null));
 
-    const transition = reduce(model, .{ .request_native_switch = .{
-        .display_id = 1,
-        .target_workspace_id = 2,
-        .at_ms = 100,
-    } });
+    const transition = reduce(model, switchRequest(&model, 1, 2, 100));
 
     try testing.expectEqual(@as(?WorkspaceId, 1), transition.model.observedWorkspace(1));
     try testing.expectEqual(@as(?WorkspaceId, 2), transition.model.desiredWorkspace(1));
@@ -723,11 +703,7 @@ test "switch request preserves observed Space until confirmation" {
 test "observed target completes native switch" {
     const testing = std.testing;
     var model = initializedModel(testTopology(101, null));
-    var transition = reduce(model, .{ .request_native_switch = .{
-        .display_id = 1,
-        .target_workspace_id = 2,
-        .at_ms = 100,
-    } });
+    var transition = reduce(model, switchRequest(&model, 1, 2, 100));
     model = transition.model;
     const epoch = model.pending_switch.?.epoch;
 
@@ -747,11 +723,7 @@ test "observed target completes native switch" {
 test "unexpected landing commits observation and fails request" {
     const testing = std.testing;
     var model = initializedModel(testTopology(101, null));
-    var transition = reduce(model, .{ .request_native_switch = .{
-        .display_id = 1,
-        .target_workspace_id = 2,
-        .at_ms = 100,
-    } });
+    var transition = reduce(model, switchRequest(&model, 1, 2, 100));
     model = transition.model;
     const pending = model.pending_switch.?;
 
@@ -770,11 +742,7 @@ test "unexpected landing commits observation and fails request" {
 test "intermediate Space becomes observed while request remains pending" {
     const testing = std.testing;
     var model = initializedModel(testTopology(101, null));
-    var transition = reduce(model, .{ .request_native_switch = .{
-        .display_id = 1,
-        .target_workspace_id = 2,
-        .at_ms = 100,
-    } });
+    var transition = reduce(model, switchRequest(&model, 1, 2, 100));
     model = transition.model;
     const pending = model.pending_switch.?;
 
@@ -803,6 +771,17 @@ test "native ordinal is scoped to display Space identity" {
     try testing.expect(first.key.eql(.{ .native = 102 }));
     try testing.expect(second.key.eql(.{ .native = 202 }));
     try testing.expect(!first.key.eql(second.key));
+}
+
+test "switch effect preserves target Space identity across displays" {
+    const testing = std.testing;
+    const model = initializedModel(testTopology(102, 201));
+    const transition = reduce(model, switchRequest(&model, 2, 2, 100));
+    const effect = transition.effects[0].switch_native_space;
+
+    try testing.expect(effect.request.target.key.eql(.{ .native = 202 }));
+    try testing.expectEqual(@as(DisplayId, 2), effect.request.target.display_id);
+    try testing.expectEqual(@as(WorkspaceId, 2), effect.request.target.workspace_id);
 }
 
 test "virtual catalog preserves identity when placement changes" {
@@ -842,11 +821,7 @@ test "virtual workspace and focused display are reducer owned" {
 test "stale timer cannot observe for newer switch" {
     const testing = std.testing;
     var model = initializedModel(testTopology(101, null));
-    var transition = reduce(model, .{ .request_native_switch = .{
-        .display_id = 1,
-        .target_workspace_id = 2,
-        .at_ms = 100,
-    } });
+    var transition = reduce(model, switchRequest(&model, 1, 2, 100));
     model = transition.model;
     const stale_epoch = model.pending_switch.?.epoch;
 
@@ -855,11 +830,7 @@ test "stale timer cannot observe for newer switch" {
         .at_ms = 110,
     } });
     model = transition.model;
-    transition = reduce(model, .{ .request_native_switch = .{
-        .display_id = 1,
-        .target_workspace_id = 3,
-        .at_ms = 120,
-    } });
+    transition = reduce(model, switchRequest(&model, 1, 3, 120));
     model = transition.model;
 
     transition = reduce(model, .{ .observation_timer_fired = .{
@@ -874,24 +845,12 @@ test "stale timer cannot observe for newer switch" {
 test "rapid switch requests keep only latest target" {
     const testing = std.testing;
     var model = initializedModel(testTopology(101, null));
-    var transition = reduce(model, .{ .request_native_switch = .{
-        .display_id = 1,
-        .target_workspace_id = 2,
-        .at_ms = 100,
-    } });
+    var transition = reduce(model, switchRequest(&model, 1, 2, 100));
     model = transition.model;
-    transition = reduce(model, .{ .request_native_switch = .{
-        .display_id = 1,
-        .target_workspace_id = 3,
-        .at_ms = 110,
-    } });
+    transition = reduce(model, switchRequest(&model, 1, 3, 110));
     model = transition.model;
-    transition = reduce(model, .{ .request_native_switch = .{
-        .display_id = 1,
-        .target_workspace_id = 1,
-        .at_ms = 120,
-    } });
+    transition = reduce(model, switchRequest(&model, 1, 1, 120));
 
     try testing.expectEqual(@as(?WorkspaceId, 1), transition.model.desiredWorkspace(1));
-    try testing.expectEqual(@as(?WorkspaceId, 1), if (transition.model.queued_switch) |queued| queued.target_workspace_id else null);
+    try testing.expectEqual(@as(?WorkspaceId, 1), if (transition.model.queued_switch) |queued| queued.target.workspace_id else null);
 }
