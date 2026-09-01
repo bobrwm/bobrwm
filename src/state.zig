@@ -7,6 +7,7 @@ pub const max_displays = 8;
 pub const max_spaces_per_display = 10;
 pub const native_switch_timeout_ms: u64 = 3200;
 pub const native_observation_delay_ms: u64 = 50;
+pub const workspace_transition_settle_ms: u64 = 400;
 
 pub const DisplayId = space_mod.DisplayId;
 pub const NativeSpaceId = space_mod.NativeSpaceId;
@@ -189,6 +190,39 @@ pub const PendingSwitch = struct {
     deadline_at_ms: TimestampMs,
 };
 
+pub const WorkspaceTransitionKind = enum {
+    switch_workspace,
+    move_workspace_to_display,
+};
+
+pub const WorkspaceTransitionCompletionReason = enum {
+    focus_accepted,
+    empty_workspace,
+    native_space_changed,
+};
+
+pub const WorkspaceTransition = struct {
+    kind: WorkspaceTransitionKind,
+    target: SpaceRef,
+    epoch: Epoch,
+    started_at_ms: TimestampMs,
+    deadline_at_ms: TimestampMs,
+    completion_reason: ?WorkspaceTransitionCompletionReason = null,
+};
+
+pub const WorkspaceTransitionSettlementReason = enum {
+    completed,
+    deadline_expired,
+    native_switch_failed,
+    target_unavailable,
+    topology_reinitialized,
+};
+
+pub const WorkspaceTransitionSettlement = struct {
+    transition: WorkspaceTransition,
+    reason: WorkspaceTransitionSettlementReason,
+};
+
 pub const ObservationTimer = struct {
     epoch: Epoch,
     due_at_ms: TimestampMs,
@@ -201,6 +235,7 @@ pub const Model = struct {
     pending_switch: ?PendingSwitch = null,
     queued_switch: ?SwitchRequest = null,
     observation_timer: ?ObservationTimer = null,
+    workspace_transition: ?WorkspaceTransition = null,
     next_epoch: Epoch = 1,
 
     pub fn isNativeSwitchPending(self: *const Model) bool {
@@ -209,6 +244,10 @@ pub const Model = struct {
 
     pub fn hasScheduledObservation(self: *const Model) bool {
         return self.observation_timer != null;
+    }
+
+    pub fn isWorkspaceTransitionActive(self: *const Model) bool {
+        return self.workspace_transition != null;
     }
 
     pub fn dueObservation(self: *const Model, at_ms: TimestampMs) ?ObservationTimer {
@@ -279,6 +318,20 @@ pub const Event = union(enum) {
         epoch: Epoch,
         at_ms: TimestampMs,
     },
+    start_workspace_transition: struct {
+        kind: WorkspaceTransitionKind,
+        target: SpaceRef,
+        at_ms: TimestampMs,
+    },
+    complete_workspace_transition: struct {
+        epoch: Epoch,
+        reason: WorkspaceTransitionCompletionReason,
+        at_ms: TimestampMs,
+    },
+    workspace_transition_timer_fired: struct {
+        epoch: Epoch,
+        at_ms: TimestampMs,
+    },
 };
 
 pub const SwitchFailureReason = enum {
@@ -306,6 +359,8 @@ pub const Effect = union(enum) {
     },
     native_topology_changed,
     native_switch_rejected: SpaceRef,
+    workspace_transition_started: WorkspaceTransition,
+    workspace_transition_settled: WorkspaceTransitionSettlement,
 };
 
 pub const max_effects = 6;
@@ -328,6 +383,7 @@ pub fn reduce(model: Model, event: Event) Transition {
     switch (event) {
         .replace_space_catalog => |catalog| {
             transition.model.spaces = catalog;
+            refreshWorkspaceTransition(&transition);
         },
         .replace_workspace_topology => |topology| {
             transition.model.workspace_topology = topology;
@@ -344,11 +400,19 @@ pub fn reduce(model: Model, event: Event) Transition {
             );
         },
         .initialize_native_topology => |topology| {
+            const workspace_transition = transition.model.workspace_transition;
             transition.model.native_topology = topology;
-            syncNativeWorkspaceTopology(&transition.model);
             transition.model.pending_switch = null;
             transition.model.queued_switch = null;
             transition.model.observation_timer = null;
+            transition.model.workspace_transition = null;
+            syncNativeWorkspaceTopology(&transition);
+            if (workspace_transition) |current| {
+                transition.addEffect(.{ .workspace_transition_settled = .{
+                    .transition = current,
+                    .reason = .topology_reinitialized,
+                } });
+            }
         },
         .request_native_switch => |request| reduceSwitchRequest(&transition, request),
         .native_space_changed => |at_ms| reduceSpaceChanged(&transition, at_ms),
@@ -356,6 +420,9 @@ pub fn reduce(model: Model, event: Event) Transition {
         .native_topology_observed => |observation| reduceTopologyObserved(&transition, observation),
         .native_topology_unavailable => |unavailable| reduceTopologyUnavailable(&transition, unavailable),
         .native_switch_effect_failed => |failure| reduceSwitchEffectFailed(&transition, failure),
+        .start_workspace_transition => |start| reduceWorkspaceTransitionStart(&transition, start),
+        .complete_workspace_transition => |completion| reduceWorkspaceTransitionCompletion(&transition, completion),
+        .workspace_transition_timer_fired => |timer| reduceWorkspaceTransitionTimer(&transition, timer),
     }
 
     assertModel(&transition.model);
@@ -420,7 +487,7 @@ fn reduceTopologyObserved(
 ) void {
     const has_changed = !transition.model.native_topology.eql(&event.topology);
     transition.model.native_topology = event.topology;
-    syncNativeWorkspaceTopology(&transition.model);
+    syncNativeWorkspaceTopology(transition);
 
     const pending = transition.model.pending_switch orelse {
         transition.model.observation_timer = null;
@@ -447,11 +514,11 @@ fn reduceTopologyObserved(
     });
 }
 
-fn syncNativeWorkspaceTopology(model: *Model) void {
-    const focused_display_id = model.workspace_topology.focused_display_id;
+fn syncNativeWorkspaceTopology(transition: *Transition) void {
+    const focused_display_id = transition.model.workspace_topology.focused_display_id;
     var topology: WorkspaceTopology = .{};
     var catalog: SpaceCatalog = .{};
-    for (model.native_topology.displays[0..model.native_topology.display_count]) |display| {
+    for (transition.model.native_topology.displays[0..transition.model.native_topology.display_count]) |display| {
         for (display.spaces[0..display.space_count]) |space| {
             catalog.add(.{
                 .key = .{ .native = space.id },
@@ -469,8 +536,9 @@ fn syncNativeWorkspaceTopology(model: *Model) void {
     if (focused_display_id) |display_id| {
         if (topology.findDisplay(display_id) != null) topology.focused_display_id = display_id;
     }
-    model.spaces = catalog;
-    model.workspace_topology = topology;
+    transition.model.spaces = catalog;
+    transition.model.workspace_topology = topology;
+    refreshWorkspaceTransition(transition);
 }
 
 fn reduceTopologyUnavailable(
@@ -506,6 +574,43 @@ fn reduceSwitchEffectFailed(
     });
 }
 
+fn reduceWorkspaceTransitionStart(
+    transition: *Transition,
+    event: @FieldType(Event, "start_workspace_transition"),
+) void {
+    const target = transition.model.space(event.target.key) orelse return;
+    startWorkspaceTransition(transition, event.kind, target, event.at_ms, workspace_transition_settle_ms, null);
+}
+
+fn reduceWorkspaceTransitionCompletion(
+    transition: *Transition,
+    event: @FieldType(Event, "complete_workspace_transition"),
+) void {
+    const current = transition.model.workspace_transition orelse return;
+    if (current.epoch != event.epoch) return;
+    if (current.completion_reason != null) return;
+
+    var completed = current;
+    completed.completion_reason = event.reason;
+    completed.deadline_at_ms = event.at_ms +| workspace_transition_settle_ms;
+    transition.model.workspace_transition = completed;
+}
+
+fn reduceWorkspaceTransitionTimer(
+    transition: *Transition,
+    event: @FieldType(Event, "workspace_transition_timer_fired"),
+) void {
+    const current = transition.model.workspace_transition orelse return;
+    if (current.epoch != event.epoch) return;
+    if (event.at_ms < current.deadline_at_ms) return;
+
+    transition.model.workspace_transition = null;
+    transition.addEffect(.{ .workspace_transition_settled = .{
+        .transition = current,
+        .reason = if (current.completion_reason == null) .deadline_expired else .completed,
+    } });
+}
+
 const FailedSwitch = struct {
     reason: SwitchFailureReason,
     actual: ?SpaceRef,
@@ -519,6 +624,17 @@ fn finishSwitch(
 ) void {
     transition.model.pending_switch = null;
     transition.model.observation_timer = null;
+
+    if (failure == null) {
+        completeWorkspaceTransition(
+            &transition.model,
+            pending.epoch,
+            .native_space_changed,
+            at_ms,
+        );
+    } else {
+        settleWorkspaceTransition(transition, pending.epoch, .native_switch_failed);
+    }
 
     if (failure) |failed| {
         transition.addEffect(.{ .native_switch_failed = .{
@@ -576,11 +692,85 @@ fn startSwitch(
         .deadline_at_ms = at_ms +| native_switch_timeout_ms,
     };
     transition.model.pending_switch = pending;
+    startWorkspaceTransition(
+        transition,
+        .switch_workspace,
+        target,
+        at_ms,
+        native_switch_timeout_ms,
+        pending.epoch,
+    );
     schedulePendingObservation(&transition.model, pending, at_ms);
     transition.addEffect(.{ .switch_native_space = .{
         .request = current_request,
         .epoch = epoch,
     } });
+}
+
+fn startWorkspaceTransition(
+    transition: *Transition,
+    kind: WorkspaceTransitionKind,
+    target: SpaceRef,
+    at_ms: TimestampMs,
+    timeout_ms: TimestampMs,
+    requested_epoch: ?Epoch,
+) void {
+    target.assertValid();
+    std.debug.assert(timeout_ms > 0);
+
+    const transition_epoch = requested_epoch orelse takeEpoch(&transition.model);
+    const workspace_transition: WorkspaceTransition = .{
+        .kind = kind,
+        .target = target,
+        .epoch = transition_epoch,
+        .started_at_ms = at_ms,
+        .deadline_at_ms = at_ms +| timeout_ms,
+    };
+    transition.model.workspace_transition = workspace_transition;
+    transition.addEffect(.{ .workspace_transition_started = workspace_transition });
+}
+
+fn completeWorkspaceTransition(
+    model: *Model,
+    epoch: Epoch,
+    reason: WorkspaceTransitionCompletionReason,
+    at_ms: TimestampMs,
+) void {
+    const current = model.workspace_transition orelse return;
+    if (current.epoch != epoch) return;
+
+    var completed = current;
+    completed.completion_reason = reason;
+    completed.deadline_at_ms = at_ms +| workspace_transition_settle_ms;
+    model.workspace_transition = completed;
+}
+
+fn settleWorkspaceTransition(
+    transition: *Transition,
+    epoch: Epoch,
+    reason: WorkspaceTransitionSettlementReason,
+) void {
+    const current = transition.model.workspace_transition orelse return;
+    if (current.epoch != epoch) return;
+
+    transition.model.workspace_transition = null;
+    transition.addEffect(.{ .workspace_transition_settled = .{
+        .transition = current,
+        .reason = reason,
+    } });
+}
+
+fn refreshWorkspaceTransition(transition: *Transition) void {
+    var current = transition.model.workspace_transition orelse return;
+    current.target = transition.model.space(current.target.key) orelse {
+        transition.model.workspace_transition = null;
+        transition.addEffect(.{ .workspace_transition_settled = .{
+            .transition = current,
+            .reason = .target_unavailable,
+        } });
+        return;
+    };
+    transition.model.workspace_transition = current;
 }
 
 fn schedulePendingObservation(model: *Model, pending: PendingSwitch, at_ms: TimestampMs) void {
@@ -656,6 +846,14 @@ fn assertModel(model: *const Model) void {
         queued.target.assertValid();
         std.debug.assert(nativeSpaceId(queued.target) != null);
     }
+    if (model.workspace_transition) |workspace_transition| {
+        std.debug.assert(workspace_transition.epoch != 0);
+        workspace_transition.target.assertValid();
+        const target = model.space(workspace_transition.target.key).?;
+        std.debug.assert(target.display_id == workspace_transition.target.display_id);
+        std.debug.assert(target.workspace_id == workspace_transition.target.workspace_id);
+        std.debug.assert(workspace_transition.deadline_at_ms >= workspace_transition.started_at_ms);
+    }
 }
 
 fn testTopology(first_observed: NativeSpaceId, second_observed: ?NativeSpaceId) NativeTopology {
@@ -696,8 +894,10 @@ test "switch request preserves observed Space until confirmation" {
     try testing.expectEqual(@as(?WorkspaceId, 1), transition.model.observedWorkspace(1));
     try testing.expectEqual(@as(?WorkspaceId, 2), transition.model.desiredWorkspace(1));
     try testing.expect(transition.model.isNativeSwitchPending());
-    try testing.expectEqual(@as(u8, 1), transition.effect_count);
-    try testing.expectEqual(std.meta.Tag(Effect).switch_native_space, std.meta.activeTag(transition.effects[0]));
+    try testing.expectEqual(transition.model.pending_switch.?.epoch, transition.model.workspace_transition.?.epoch);
+    try testing.expectEqual(@as(u8, 2), transition.effect_count);
+    try testing.expectEqual(std.meta.Tag(Effect).workspace_transition_started, std.meta.activeTag(transition.effects[0]));
+    try testing.expectEqual(std.meta.Tag(Effect).switch_native_space, std.meta.activeTag(transition.effects[1]));
 }
 
 test "observed target completes native switch" {
@@ -716,6 +916,9 @@ test "observed target completes native switch" {
     try testing.expectEqual(@as(?WorkspaceId, 2), transition.model.observedWorkspace(1));
     try testing.expectEqual(@as(?WorkspaceId, 2), transition.model.activeWorkspace(1));
     try testing.expect(!transition.model.isNativeSwitchPending());
+    try testing.expect(transition.model.isWorkspaceTransitionActive());
+    try testing.expectEqual(WorkspaceTransitionCompletionReason.native_space_changed, transition.model.workspace_transition.?.completion_reason.?);
+    try testing.expectEqual(@as(TimestampMs, 600), transition.model.workspace_transition.?.deadline_at_ms);
     try testing.expectEqual(@as(u8, 1), transition.effect_count);
     try testing.expectEqual(std.meta.Tag(Effect).native_switch_completed, std.meta.activeTag(transition.effects[0]));
 }
@@ -735,8 +938,10 @@ test "unexpected landing commits observation and fails request" {
 
     try testing.expectEqual(@as(?WorkspaceId, 3), transition.model.observedWorkspace(1));
     try testing.expect(!transition.model.isNativeSwitchPending());
-    try testing.expectEqual(std.meta.Tag(Effect).native_switch_failed, std.meta.activeTag(transition.effects[0]));
-    try testing.expectEqual(SwitchFailureReason.unexpected_space, transition.effects[0].native_switch_failed.reason);
+    try testing.expectEqual(std.meta.Tag(Effect).workspace_transition_settled, std.meta.activeTag(transition.effects[0]));
+    try testing.expectEqual(WorkspaceTransitionSettlementReason.native_switch_failed, transition.effects[0].workspace_transition_settled.reason);
+    try testing.expectEqual(std.meta.Tag(Effect).native_switch_failed, std.meta.activeTag(transition.effects[1]));
+    try testing.expectEqual(SwitchFailureReason.unexpected_space, transition.effects[1].native_switch_failed.reason);
 }
 
 test "intermediate Space becomes observed while request remains pending" {
@@ -777,7 +982,7 @@ test "switch effect preserves target Space identity across displays" {
     const testing = std.testing;
     const model = initializedModel(testTopology(102, 201));
     const transition = reduce(model, switchRequest(&model, 2, 2, 100));
-    const effect = transition.effects[0].switch_native_space;
+    const effect = transition.effects[1].switch_native_space;
 
     try testing.expect(effect.request.target.key.eql(.{ .native = 202 }));
     try testing.expectEqual(@as(DisplayId, 2), effect.request.target.display_id);
@@ -815,6 +1020,102 @@ test "virtual workspace and focused display are reducer owned" {
     try testing.expectEqual(@as(?WorkspaceId, 3), transition.model.activeWorkspace(11));
     try testing.expectEqual(@as(?WorkspaceId, 2), transition.model.activeWorkspace(22));
     try testing.expectEqual(@as(?DisplayId, 22), transition.model.focusedDisplay());
+    try testing.expectEqual(@as(u8, 0), transition.effect_count);
+}
+
+test "virtual workspace transition settles from explicit focus and time events" {
+    const testing = std.testing;
+    var catalog: SpaceCatalog = .{};
+    catalog.add(.{ .key = .{ .virtual = 1 }, .workspace_id = 1, .display_id = 11 });
+    catalog.add(.{ .key = .{ .virtual = 2 }, .workspace_id = 2, .display_id = 11 });
+
+    var model = reduce(.{}, .{ .replace_space_catalog = catalog }).model;
+    var transition = reduce(model, .{ .start_workspace_transition = .{
+        .kind = .switch_workspace,
+        .target = model.space(.{ .virtual = 2 }).?,
+        .at_ms = 100,
+    } });
+    model = transition.model;
+    const epoch = model.workspace_transition.?.epoch;
+
+    try testing.expect(model.workspace_transition.?.target.key.eql(.{ .virtual = 2 }));
+    try testing.expectEqual(@as(TimestampMs, 500), model.workspace_transition.?.deadline_at_ms);
+    try testing.expectEqual(std.meta.Tag(Effect).workspace_transition_started, std.meta.activeTag(transition.effects[0]));
+
+    transition = reduce(model, .{ .complete_workspace_transition = .{
+        .epoch = epoch,
+        .reason = .focus_accepted,
+        .at_ms = 250,
+    } });
+    model = transition.model;
+    try testing.expectEqual(WorkspaceTransitionCompletionReason.focus_accepted, model.workspace_transition.?.completion_reason.?);
+    try testing.expectEqual(@as(TimestampMs, 650), model.workspace_transition.?.deadline_at_ms);
+
+    transition = reduce(model, .{ .workspace_transition_timer_fired = .{
+        .epoch = epoch,
+        .at_ms = 649,
+    } });
+    try testing.expect(transition.model.isWorkspaceTransitionActive());
+    try testing.expectEqual(@as(u8, 0), transition.effect_count);
+
+    transition = reduce(transition.model, .{ .workspace_transition_timer_fired = .{
+        .epoch = epoch,
+        .at_ms = 650,
+    } });
+    try testing.expect(!transition.model.isWorkspaceTransitionActive());
+    try testing.expectEqual(std.meta.Tag(Effect).workspace_transition_settled, std.meta.activeTag(transition.effects[0]));
+    try testing.expectEqual(WorkspaceTransitionSettlementReason.completed, transition.effects[0].workspace_transition_settled.reason);
+}
+
+test "virtual display move transition follows stable Space identity" {
+    const testing = std.testing;
+    var catalog: SpaceCatalog = .{};
+    catalog.add(.{ .key = .{ .virtual = 1 }, .workspace_id = 1, .display_id = 11 });
+    catalog.add(.{ .key = .{ .virtual = 2 }, .workspace_id = 2, .display_id = 22 });
+
+    var model = reduce(.{}, .{ .replace_space_catalog = catalog }).model;
+    model = reduce(model, .{ .start_workspace_transition = .{
+        .kind = .move_workspace_to_display,
+        .target = model.space(.{ .virtual = 2 }).?,
+        .at_ms = 100,
+    } }).model;
+
+    catalog.spaces[1].display_id = 11;
+    model = reduce(model, .{ .replace_space_catalog = catalog }).model;
+
+    try testing.expect(model.workspace_transition.?.target.key.eql(.{ .virtual = 2 }));
+    try testing.expectEqual(@as(DisplayId, 11), model.workspace_transition.?.target.display_id);
+    try testing.expectEqual(WorkspaceTransitionKind.move_workspace_to_display, model.workspace_transition.?.kind);
+}
+
+test "stale workspace transition timer cannot settle newer intent" {
+    const testing = std.testing;
+    var catalog: SpaceCatalog = .{};
+    catalog.add(.{ .key = .{ .virtual = 1 }, .workspace_id = 1, .display_id = 11 });
+    catalog.add(.{ .key = .{ .virtual = 2 }, .workspace_id = 2, .display_id = 11 });
+
+    var model = reduce(.{}, .{ .replace_space_catalog = catalog }).model;
+    model = reduce(model, .{ .start_workspace_transition = .{
+        .kind = .switch_workspace,
+        .target = model.space(.{ .virtual = 1 }).?,
+        .at_ms = 100,
+    } }).model;
+    const stale_epoch = model.workspace_transition.?.epoch;
+
+    model = reduce(model, .{ .start_workspace_transition = .{
+        .kind = .switch_workspace,
+        .target = model.space(.{ .virtual = 2 }).?,
+        .at_ms = 200,
+    } }).model;
+    const current_epoch = model.workspace_transition.?.epoch;
+
+    const transition = reduce(model, .{ .workspace_transition_timer_fired = .{
+        .epoch = stale_epoch,
+        .at_ms = 1000,
+    } });
+
+    try testing.expectEqual(current_epoch, transition.model.workspace_transition.?.epoch);
+    try testing.expect(transition.model.workspace_transition.?.target.key.eql(.{ .virtual = 2 }));
     try testing.expectEqual(@as(u8, 0), transition.effect_count);
 }
 
