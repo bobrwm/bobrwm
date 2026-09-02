@@ -77,6 +77,7 @@ pub const ObservationOwner = enum {
 
 pub const SettlementOwner = enum {
     manager,
+    manager_unsettled,
     external,
 };
 
@@ -378,9 +379,9 @@ pub fn observe(
 }
 
 /// Record the mandatory trailing WindowServer sample. A manager intent keeps
-/// ownership while it is still settling; a divergent sample after its
-/// deadline is external. Matching samples retain the intent until its deadline
-/// so another late notification from the same AX write cannot steal ownership.
+/// ownership while it is still settling. Matching samples retain the intent
+/// until its deadline so another late notification from the same AX write
+/// cannot steal ownership.
 pub fn settle(self: *Self, wid: WindowId, observed: Frame, now_ns: i128) SettlementOwner {
     const entry = self.getPtr(wid) orelse return .external;
     entry.observed = observed;
@@ -397,6 +398,7 @@ pub fn settle(self: *Self, wid: WindowId, observed: Frame, now_ns: i128) Settlem
         }
         entry.intent = null;
         if (reached_target) return .manager;
+        return .manager_unsettled;
     }
 
     return .external;
@@ -679,6 +681,20 @@ test "trailing manager divergence resamples until its deadline" {
         @as(usize, 1),
         coordinator.dueResamples(1_100 + default_resample_delay_ns, &due),
     );
+}
+
+test "unreached manager intent does not become external input" {
+    var coordinator = Self.initWithSettleInterval(100);
+
+    _ = try coordinator.recordFrameAccepted(10, fullscreen, .layout, 1_000);
+    try testing.expectEqual(
+        SettlementOwner.manager_unsettled,
+        coordinator.settle(10, tiled, 1_101),
+    );
+    try testing.expect(coordinator.get(10).?.intent == null);
+
+    var due: [1]WindowId = undefined;
+    try testing.expectEqual(@as(usize, 0), coordinator.dueResamples(1_101, &due));
 }
 
 test "value copies do not share geometry entries" {

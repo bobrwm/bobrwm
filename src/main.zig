@@ -3862,16 +3862,38 @@ fn executeWindowGeometryObserved(
 fn executeWindowGeometrySettled(
     observation: @FieldType(geometry_mod.Effect, "settled"),
 ) void {
-    if (observation.owner == .manager) {
-        log.debug("geometry: trailing sample manager-owned wid={d}", .{observation.window_id});
-        return;
-    }
+    switch (observation.owner) {
+        .manager => return,
+        .manager_unsettled => {
+            const intent = observation.pending_intent orelse return;
+            if (reconcileDivergedGeometryIntent(observation.window_id, intent)) return;
 
-    log.debug("geometry: trailing sample external wid={d}", .{observation.window_id});
-    if (observation.pending_intent) |intent| {
-        if (reconcileDivergedGeometryIntent(observation.window_id, intent)) return;
+            switch (intent.target) {
+                .frame => |target| log.warn("geometry: frame intent did not converge wid={d} source={s} target=({d:.0},{d:.0},{d:.0},{d:.0}) observed=({d:.0},{d:.0},{d:.0},{d:.0})", .{
+                    observation.window_id,
+                    @tagName(intent.source),
+                    target.x,
+                    target.y,
+                    target.width,
+                    target.height,
+                    observation.frame.x,
+                    observation.frame.y,
+                    observation.frame.width,
+                    observation.frame.height,
+                }),
+                .position => |target| log.warn("geometry: position intent did not converge wid={d} source={s} target=({d:.0},{d:.0}) observed=({d:.0},{d:.0})", .{
+                    observation.window_id,
+                    @tagName(intent.source),
+                    target.x,
+                    target.y,
+                    observation.frame.x,
+                    observation.frame.y,
+                }),
+            }
+            return;
+        },
+        .external => handleExternalWindowGeometry(observation.window_id, observation.frame),
     }
-    handleExternalWindowGeometry(observation.window_id, observation.frame);
 }
 
 fn executeWindowFocusDeferred(deferred: @FieldType(state_mod.Effect, "window_focus_deferred")) void {
