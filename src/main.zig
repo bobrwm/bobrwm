@@ -3971,18 +3971,20 @@ fn executeNativeWorkspaceMoveRollback(pending: state_mod.PendingNativeWorkspaceM
 }
 
 fn moveNativeWorkspaceContents(pending: state_mod.PendingNativeWorkspaceMove, is_forward: bool) bool {
-    const source_ws = g_workspaces.get(pending.source.key) orelse return false;
-    const target_ws = g_workspaces.get(pending.target.key) orelse return false;
     const source_target = if (is_forward) pending.target else pending.source;
     const target_target = if (is_forward) pending.source else pending.target;
+    var source_window_ids: [state_mod.max_managed_windows]u32 = undefined;
+    var target_window_ids: [state_mod.max_managed_windows]u32 = undefined;
+    const source_windows = g_state.workspaceWindowIds(pending.source.key, &source_window_ids);
+    const target_windows = g_state.workspaceWindowIds(pending.target.key, &target_window_ids);
 
-    for (source_ws.windows.items) |wid| {
+    for (source_windows) |wid| {
         if (!moveTabGroupToNativeSpace(wid, source_target)) {
             if (is_forward) _ = moveNativeWorkspaceContents(pending, false);
             return false;
         }
     }
-    for (target_ws.windows.items) |wid| {
+    for (target_windows) |wid| {
         if (!moveTabGroupToNativeSpace(wid, target_target)) {
             if (is_forward) _ = moveNativeWorkspaceContents(pending, false);
             return false;
@@ -4003,10 +4005,12 @@ fn processPendingNativeWorkspaceMove() void {
 }
 
 fn nativeWorkspaceContentsConfirmed(pending: state_mod.PendingNativeWorkspaceMove) bool {
-    const source_ws = g_workspaces.get(pending.source.key) orelse return false;
-    const target_ws = g_workspaces.get(pending.target.key) orelse return false;
+    var source_window_ids: [state_mod.max_managed_windows]u32 = undefined;
+    var target_window_ids: [state_mod.max_managed_windows]u32 = undefined;
+    const source_windows = g_state.workspaceWindowIds(pending.source.key, &source_window_ids);
+    const target_windows = g_state.workspaceWindowIds(pending.target.key, &target_window_ids);
 
-    for (source_ws.windows.items) |wid| {
+    for (source_windows) |wid| {
         const move: state_mod.PendingNativeWindowMove = .{
             .window_id = wid,
             .source = pending.source,
@@ -4015,7 +4019,7 @@ fn nativeWorkspaceContentsConfirmed(pending: state_mod.PendingNativeWorkspaceMov
         };
         if (nativeTabGroupMoveConfirmed(wid, move) != true) return false;
     }
-    for (target_ws.windows.items) |wid| {
+    for (target_windows) |wid| {
         const move: state_mod.PendingNativeWindowMove = .{
             .window_id = wid,
             .source = pending.target,
@@ -4046,7 +4050,12 @@ fn completeNativeWorkspaceMove(pending: state_mod.PendingNativeWorkspaceMove) vo
 }
 
 fn refreshLegacyWorkspaceWindows(space: *workspace_mod.Space) void {
-    for (space.windows.items) |wid| {
+    var window_ids: [state_mod.max_managed_windows]u32 = undefined;
+    const workspace_windows = g_state.workspaceWindowIds(space.ref.key, &window_ids);
+    std.debug.assert(workspace_windows.len == space.windows.items.len);
+
+    for (workspace_windows) |wid| {
+        std.debug.assert(legacyWorkspaceContainsWindow(space, wid));
         if (g_store.get(wid)) |window| {
             var updated = window;
             updated.space = space.ref;
@@ -4054,6 +4063,13 @@ fn refreshLegacyWorkspaceWindows(space: *workspace_mod.Space) void {
         }
         updateTabGroupAssignment(wid, space.ref);
     }
+}
+
+fn legacyWorkspaceContainsWindow(space: *const workspace_mod.Space, wid: u32) bool {
+    for (space.windows.items) |candidate| {
+        if (candidate == wid) return true;
+    }
+    return false;
 }
 
 /// Full reconcile after a topology change: rebuild display/workspace state,

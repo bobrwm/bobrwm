@@ -826,6 +826,23 @@ pub const Model = struct {
         return self.windows.get(window_id);
     }
 
+    /// Returns the tab-group leaders that own workspace and layout slots.
+    pub fn workspaceWindowIds(
+        self: *const Model,
+        space_key: SpaceKey,
+        window_ids: *[max_managed_windows]WindowId,
+    ) []const WindowId {
+        var count: usize = 0;
+        for (self.windows.items()) |managed_window| {
+            if (!managed_window.space_key.eql(space_key)) continue;
+            if (managed_window.tab_leader_window_id != managed_window.window_id) continue;
+
+            window_ids[count] = managed_window.window_id;
+            count += 1;
+        }
+        return window_ids[0..count];
+    }
+
     pub fn desiredWorkspace(self: *const Model, display_id: DisplayId) ?WorkspaceId {
         if (self.queued_switch) |queued| {
             if (queued.target.display_id == display_id) return queued.target.workspace_id;
@@ -2329,6 +2346,11 @@ test "window catalog owns tab identity and group Space assignment" {
         .space_key = .{ .virtual = 2 },
     } }).model;
     try testing.expectEqual(@as(u16, 3), model.windows.countInSpace(.{ .virtual = 2 }));
+
+    var window_ids: [max_managed_windows]WindowId = undefined;
+    const workspace_windows = model.workspaceWindowIds(.{ .virtual = 2 }, &window_ids);
+    try testing.expectEqual(@as(usize, 1), workspace_windows.len);
+    try testing.expectEqual(@as(WindowId, 101), workspace_windows[0]);
 
     group.active_window_id = 103;
     model = reduce(model, .{ .observe_window_tab_group = group }).model;
