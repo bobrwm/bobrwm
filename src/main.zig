@@ -78,9 +78,6 @@ const app_launch_retry_attempts_max: u8 = 10;
 /// Capacity reserved for wid-keyed role/deferred maps to avoid growth churn.
 const pending_role_window_capacity: usize = 256;
 const deferred_window_candidate_capacity: usize = 256;
-/// Geometry entries are wid-keyed and include suppressed native-tab members.
-/// Match the bounded WindowServer snapshots used by discovery and cleanup.
-const geometry_window_capacity: u32 = 512;
 /// Capacity reserved for app launch retries (pid-keyed, bounded by observers).
 const app_launch_retry_capacity: usize = 64;
 /// Focus query retry budget. Electron apps (Discord) can report no AX
@@ -1048,9 +1045,10 @@ fn liveWindowFrame(wid: u32) ?window_mod.Window.Frame {
 }
 
 fn seedObservedFrame(wid: u32, frame: window_mod.Window.Frame) void {
-    g_geometry.seedObserved(wid, frame) catch |err| {
-        log.warn("geometry: failed to seed observed frame wid={d}: {}", .{ wid, err });
-    };
+    dispatchStateEvent(.{ .geometry = .{ .seed = .{
+        .window_id = wid,
+        .observed = frame,
+    } } });
 }
 
 /// Pick the bottom corner that does not border an adjacent monitor.
@@ -1268,7 +1266,6 @@ var g_tiling_slots: [workspace_mod.max_spaces]TilingSlot = undefined;
 var g_displays: [workspace_mod.max_displays]DisplayInfo = undefined;
 var g_display_count: usize = 0;
 var g_bsp_split_mode: tiling.SplitMode = .auto;
-var g_geometry: geometry_mod = undefined;
 var g_pending_role_windows: PendingRoleWindowMap = undefined;
 var g_deferred_window_candidates: DeferredWindowCandidateMap = undefined;
 var g_app_launch_retries: AppLaunchRetryMap = undefined;
@@ -2576,12 +2573,6 @@ pub fn main(init: std.process.Init.Minimal) !void {
     // Free per-workspace tiling states on exit. BSP allocates Split nodes and
     // leaf ArrayLists via g_allocator; without this, DebugAllocator reports leaks.
     defer destroyAllTilingStates();
-    g_geometry = geometry_mod.init(g_allocator);
-    defer g_geometry.deinit();
-    g_geometry.ensureTotalCapacity(geometry_window_capacity) catch |err| {
-        log.err("geometry coordinator reserve failed: {}", .{err});
-        return err;
-    };
     g_pending_role_windows = PendingRoleWindowMap.init(g_allocator);
     defer g_pending_role_windows.deinit();
     g_pending_role_windows.ensureTotalCapacity(pending_role_window_capacity) catch |err| {
@@ -2780,7 +2771,7 @@ fn recoverFromEventOverflow() void {
     g_mouse_left_down = false;
     g_pointer_drag_candidate_wid = null;
     g_pointer_drag_wid = null;
-    g_geometry.clearIntents();
+    dispatchStateEvent(.{ .geometry = .clear_intents });
     g_drag_reconcile_on_drop = false;
     clearDragPreview();
 
@@ -2805,24 +2796,31 @@ fn recoverFromEventOverflow() void {
 /// no follow-up notification after the physical geometry finally changes.
 fn reconcileDueGeometryObservations() void {
     const now_ns = nanoTimestamp();
-    var due_wids: [geometry_window_capacity]u32 = undefined;
-    const due_count = g_geometry.collectDueResamples(now_ns, &due_wids);
+    var due_wids: [state_mod.max_managed_windows]u32 = undefined;
+    const due_count = g_state.geometry.dueResamples(now_ns, &due_wids);
 
     for (due_wids[0..due_count]) |wid| {
+        dispatchStateEvent(.{ .geometry = .{ .begin_resample = wid } });
         if (g_pointer_drag_wid == wid) {
-            g_geometry.deferResample(wid, now_ns);
+            dispatchStateEvent(.{ .geometry = .{ .defer_resample = .{
+                .window_id = wid,
+                .at_ns = now_ns,
+            } } });
             continue;
         }
 
         const observed = liveWindowFrame(wid) orelse {
-            if (g_geometry.get(wid)) |entry| {
+            if (g_state.geometry.get(wid)) |entry| {
                 if (entry.intent) |intent| {
                     if (now_ns <= intent.settle_deadline_ns) {
-                        g_geometry.deferResample(wid, now_ns);
+                        dispatchStateEvent(.{ .geometry = .{ .defer_resample = .{
+                            .window_id = wid,
+                            .at_ns = now_ns,
+                        } } });
                         continue;
                     }
                     if (reconcileDivergedGeometryIntent(wid, intent)) {
-                        g_geometry.forget(wid);
+                        dispatchStateEvent(.{ .geometry = .{ .forget = wid } });
                         continue;
                     }
                 }
@@ -2830,20 +2828,14 @@ fn reconcileDueGeometryObservations() void {
             // No physical window exists after the ownership interval. Drop
             // the sample state; cleanup/tab reconciliation owns any remaining
             // managed entry and a later write will create fresh provenance.
-            g_geometry.forget(wid);
+            dispatchStateEvent(.{ .geometry = .{ .forget = wid } });
             continue;
         };
-        const pending_intent = if (g_geometry.get(wid)) |entry| entry.intent else null;
-        switch (g_geometry.settle(wid, observed, now_ns)) {
-            .manager => log.debug("geometry: trailing sample manager-owned wid={d}", .{wid}),
-            .external => {
-                log.debug("geometry: trailing sample external wid={d}", .{wid});
-                if (pending_intent) |intent| {
-                    if (reconcileDivergedGeometryIntent(wid, intent)) continue;
-                }
-                handleExternalWindowGeometry(wid, observed);
-            },
-        }
+        dispatchStateEvent(.{ .geometry = .{ .settle = .{
+            .window_id = wid,
+            .observed = observed,
+            .at_ns = now_ns,
+        } } });
     }
 }
 
@@ -3166,8 +3158,6 @@ fn adoptWindow(ws: state_mod.SpaceRef, win: window_mod.Window) !void {
         if (win.mode == .tiled) removeFromTiling(ws.key, win.wid);
         return error.WindowCatalogRejected;
     }
-
-    seedObservedFrame(win.wid, win.frame);
 }
 
 fn setTilingActive(space_key: state_mod.SpaceKey, wid: u32) void {
@@ -3214,7 +3204,6 @@ fn replaceManagedWindowId(old_wid: u32, new_wid: u32, frame: window_mod.Window.F
         return false;
     }
     _ = updateManagedWindow(updated);
-    g_geometry.forget(old_wid);
     seedObservedFrame(new_wid, frame);
     ax_mod.invalidateWindow(old_wid);
     log.info("window id replaced old={d} new={d} pid={d} workspace={d} display={d}", .{
@@ -3679,64 +3668,16 @@ fn handleEvent(ev: *const event_mod.Event) void {
                 ev.wid,
             });
 
+            if (managedWindow(ev.wid) == null) return;
             const observed = liveWindowFrame(ev.wid) orelse return;
-            const owner = g_geometry.observe(
-                ev.wid,
-                observed,
-                nanoTimestamp(),
-                g_pointer_drag_wid,
-            ) catch |err| {
-                log.warn("geometry: failed to record observation wid={d}: {}", .{ ev.wid, err });
-                return;
-            };
-            refreshRolePolling();
-
-            if (owner == .manager) {
-                log.debug("geometry: ignored manager echo wid={d}", .{ev.wid});
-                return;
-            }
-            if (owner == .external) {
-                handleExternalWindowGeometry(ev.wid, observed);
-                return;
-            }
-
-            // A suppressed tab can become a standalone window during the
-            // drag. Resolve layout ownership only after that reconciliation:
-            // native-tab AX notifications carry the physical member wid,
-            // while workspace and BSP state carry the group leader.
-            const tab_dragged_out = checkTabDragOut(ev.pid, ev.wid);
-            const layout_wid = g_state.windowTabLeader(ev.wid);
-
-            if (updateDraggedWindowGeometry(ev.wid, observed)) {
-                retile();
-                return;
-            }
-            if (tab_dragged_out) {
-                if (managedWindow(layout_wid)) |win| {
-                    observeWindowFocus(win, .drag, null);
-                }
-                retile();
-            }
-            // Snap fullscreen windows back to display frame
-            if (managedWindow(layout_wid)) |win| {
-                if (win.is_fullscreen) {
-                    retile();
-                    return;
-                }
-            }
-            if (g_pointer_drag_wid == ev.wid) {
-                if (managedWindow(layout_wid)) |win| {
-                    const space = managedWindowSpace(win.wid) orelse return;
-                    if (win.mode == .tiled and !win.is_fullscreen and spaceVisible(space)) {
-                        g_drag_reconcile_on_drop = true;
-                    }
-                }
-            }
-            if (ev.kind == .window_moved) {
-                updateWindowMovePreview(layout_wid);
-            } else {
-                clearDragPreview();
-            }
+            dispatchStateEvent(.{ .geometry = .{ .observe = .{
+                .process_id = ev.pid,
+                .window_id = ev.wid,
+                .observed = observed,
+                .is_move = ev.kind == .window_moved,
+                .at_ns = nanoTimestamp(),
+                .dragged_window_id = g_pointer_drag_wid,
+            } } });
         },
 
         // -- Hotkey actions --
@@ -3935,7 +3876,7 @@ fn refreshRolePolling() void {
         g_display_resettle_at_s != 0 or
         hasPendingWorkspaceParks() or
         g_event_overflow_recovery_pending or
-        g_geometry.hasPendingResamples();
+        g_state.geometry.hasPendingResamples();
     setRolePolling(has_pending);
 }
 
@@ -4225,7 +4166,80 @@ fn executeStateEffect(effect: state_mod.Effect) void {
             if (deferred.transition.completion_reason) |reason| @tagName(reason) else "none",
         }),
         .follow_focus_workspace => |observation| executeFollowFocusWorkspace(observation),
+        .geometry => |geometry_effect| executeGeometryEffect(geometry_effect),
     }
+}
+
+fn executeGeometryEffect(effect: geometry_mod.Effect) void {
+    switch (effect) {
+        .observed => |observation| executeWindowGeometryObserved(observation),
+        .settled => |observation| executeWindowGeometrySettled(observation),
+        .rejected => |rejection| log.warn("geometry state rejected wid={d} reason={s}", .{
+            rejection.window_id,
+            @tagName(rejection.reason),
+        }),
+    }
+}
+
+fn executeWindowGeometryObserved(
+    observation: @FieldType(geometry_mod.Effect, "observed"),
+) void {
+    if (observation.owner == .manager) {
+        log.debug("geometry: ignored manager echo wid={d}", .{observation.window_id});
+        return;
+    }
+    if (observation.owner == .external) {
+        handleExternalWindowGeometry(observation.window_id, observation.frame);
+        return;
+    }
+
+    const tab_dragged_out = checkTabDragOut(observation.process_id, observation.window_id);
+    const layout_wid = g_state.windowTabLeader(observation.window_id);
+
+    if (updateDraggedWindowGeometry(observation.window_id, observation.frame)) {
+        retile();
+        return;
+    }
+    if (tab_dragged_out) {
+        if (managedWindow(layout_wid)) |win| {
+            observeWindowFocus(win, .drag, null);
+        }
+        retile();
+    }
+    if (managedWindow(layout_wid)) |win| {
+        if (win.is_fullscreen) {
+            retile();
+            return;
+        }
+    }
+    if (g_pointer_drag_wid == observation.window_id) {
+        if (managedWindow(layout_wid)) |win| {
+            const space = managedWindowSpace(win.wid) orelse return;
+            if (win.mode == .tiled and !win.is_fullscreen and spaceVisible(space)) {
+                g_drag_reconcile_on_drop = true;
+            }
+        }
+    }
+    if (observation.is_move) {
+        updateWindowMovePreview(layout_wid);
+    } else {
+        clearDragPreview();
+    }
+}
+
+fn executeWindowGeometrySettled(
+    observation: @FieldType(geometry_mod.Effect, "settled"),
+) void {
+    if (observation.owner == .manager) {
+        log.debug("geometry: trailing sample manager-owned wid={d}", .{observation.window_id});
+        return;
+    }
+
+    log.debug("geometry: trailing sample external wid={d}", .{observation.window_id});
+    if (observation.pending_intent) |intent| {
+        if (reconcileDivergedGeometryIntent(observation.window_id, intent)) return;
+    }
+    handleExternalWindowGeometry(observation.window_id, observation.frame);
 }
 
 fn executeWindowFocusDeferred(deferred: @FieldType(state_mod.Effect, "window_focus_deferred")) void {
@@ -4750,7 +4764,7 @@ fn forgetGeometryIfUnmanaged(wid: u32) void {
     if (managedWindow(wid) != null) return;
     if (g_pending_role_windows.contains(wid)) return;
     if (g_deferred_window_candidates.contains(wid)) return;
-    g_geometry.forget(wid);
+    dispatchStateEvent(.{ .geometry = .{ .forget = wid } });
 }
 
 /// Remove all entries matching `pid` from a wid-keyed map whose values
@@ -5598,7 +5612,6 @@ fn refreshTabGroupActiveTabsFromSnapshot(on_screen: *const OnScreenWindows) void
                 removeWindowIdentity(move.selected_window_id);
                 continue;
             }
-            seedObservedFrame(move.selected_window_id, leader.frame);
         }
 
         if (g_state.windowTabLeader(move.selected_window_id) != group.leader_window_id) continue;
@@ -5681,8 +5694,6 @@ fn joinTabGroup(pid: i32, sibling_wid: u32, new_wid: u32, new_frame: window_mod.
         return false;
     }
 
-    seedObservedFrame(new_wid, new_frame);
-
     const leader = g_state.windowTabLeader(sibling_wid);
     const member_count = if (g_state.windowTabGroup(leader)) |group| group.member_count else 1;
     recordWorkspaceFocus(ws, leader);
@@ -5701,7 +5712,6 @@ fn removeWindow(wid: u32) void {
     const tab_group = g_state.windowTabGroup(wid);
     const was_group_leader = if (tab_group) |group| group.leader_window_id == wid else false;
     g_animator.cancel(wid);
-    g_geometry.forget(wid);
     ax_mod.invalidateWindow(wid);
     untrackPendingRoleWindow(wid);
     untrackDeferredWindowCandidate(wid);
@@ -6383,7 +6393,7 @@ fn applyWindowFrame(
     // target. External resize drift can leave the model already equal to the
     // desired layout while WindowServer has a different size; consulting the
     // model there would issue a move and permanently leave the bad size.
-    const physical = if (g_geometry.get(wid)) |entry| entry.observed orelse current else current;
+    const physical = if (g_state.geometry.get(wid)) |entry| entry.observed orelse current else current;
     if (!two_pass and physical.sizeApproxEqual(target, window_mod.Window.Frame.tolerance)) {
         return setWindowPositionTracked(pid, wid, target.x, target.y, source);
     }
@@ -6417,37 +6427,36 @@ fn setWindowPositionTracked(
 ) bool {
     const ok = ax_mod.setWindowPosition(pid, wid, x, y);
     if (ok) {
-        _ = g_geometry.recordPositionAccepted(wid, x, y, source, nanoTimestamp()) catch |err| {
-            log.warn("geometry: failed to record position intent wid={d}: {}", .{ wid, err });
-            return ok;
-        };
-        refreshRolePolling();
+        dispatchStateEvent(.{ .geometry = .{ .accept_position = .{
+            .window_id = wid,
+            .x = x,
+            .y = y,
+            .source = source,
+            .at_ns = nanoTimestamp(),
+        } } });
     }
     return ok;
 }
 
 fn recordFrameIntent(wid: u32, target: window_mod.Window.Frame, source: geometry_mod.IntentSource) void {
-    _ = g_geometry.recordFrameAccepted(wid, target, source, nanoTimestamp()) catch |err| {
-        log.warn("geometry: failed to record frame intent wid={d}: {}", .{ wid, err });
-        return;
-    };
-    refreshRolePolling();
+    dispatchStateEvent(.{ .geometry = .{ .accept_frame = .{
+        .window_id = wid,
+        .target = target,
+        .source = source,
+        .at_ns = nanoTimestamp(),
+    } } });
 }
 
 fn recordAnimationIntent(wid: u32, target: window_mod.Window.Frame) void {
     const animation_ns = @as(i128, @intCast(g_config.animation.duration_ms)) * std.time.ns_per_ms;
     const settle_ns = animation_ns + geometry_mod.default_settle_interval_ns;
-    _ = g_geometry.recordFrameAcceptedFor(
-        wid,
-        target,
-        .animation,
-        nanoTimestamp(),
-        settle_ns,
-    ) catch |err| {
-        log.warn("geometry: failed to record animation intent wid={d}: {}", .{ wid, err });
-        return;
-    };
-    refreshRolePolling();
+    dispatchStateEvent(.{ .geometry = .{ .accept_frame = .{
+        .window_id = wid,
+        .target = target,
+        .source = .animation,
+        .at_ns = nanoTimestamp(),
+        .settle_interval_ns = settle_ns,
+    } } });
 }
 
 fn clampFrameToDisplay(frame: window_mod.Window.Frame, display: shim.bw_frame) window_mod.Window.Frame {
@@ -6501,7 +6510,7 @@ fn restoreFloatingWindows(ws: state_mod.SpaceRef, display: shim.bw_frame, conten
         // re-enter here forever, but write two-pass because macOS clamps
         // fullscreen sizes mid-flight.
         if (leader.is_fullscreen) {
-            if (!framesEqual(win.frame, content) or g_geometry.needsRepair(wid, content, nanoTimestamp())) {
+            if (!framesEqual(win.frame, content) or g_state.geometry.needsRepair(wid, content, nanoTimestamp())) {
                 if (applyWindowFrame(win.pid, wid, win.frame, content, true, .floating_restore)) {
                     win.frame = content;
                     _ = updateManagedWindow(win);
@@ -6553,7 +6562,7 @@ fn applyFrameToTabGroup(leader_wid: u32, frame: window_mod.Window.Frame) void {
 
     for (group.members()) |member_wid| {
         const member = managedWindow(member_wid) orelse continue;
-        if (framesEqual(member.frame, frame) and !g_geometry.needsRepair(member_wid, frame, nanoTimestamp())) continue;
+        if (framesEqual(member.frame, frame) and !g_state.geometry.needsRepair(member_wid, frame, nanoTimestamp())) continue;
 
         if (applyWindowFrame(member.pid, member_wid, member.frame, frame, false, .tab_sync)) {
             var updated = member;
@@ -6620,7 +6629,7 @@ fn retileDisplay(display_id: u32) void {
         const target_frame = if (win.is_fullscreen) frame else entry.frame;
 
         if (!framesEqual(visible.frame, target_frame) or
-            g_geometry.needsRepair(visible_wid, target_frame, nanoTimestamp()))
+            g_state.geometry.needsRepair(visible_wid, target_frame, nanoTimestamp()))
         {
             // Fullscreen windows are never animated: macOS clamps their size
             // mid-flight and they need the two-pass set below to land on the

@@ -1,6 +1,7 @@
 //! Deterministic application state and transitions.
 
 const std = @import("std");
+const geometry_mod = @import("geometry.zig");
 const space_mod = @import("space.zig");
 const window_mod = @import("window.zig");
 
@@ -15,6 +16,10 @@ pub const native_observation_delay_ms: u64 = 50;
 pub const native_window_move_attempts_max: u8 = 3;
 pub const native_workspace_move_timeout_ms: u64 = 3200;
 pub const workspace_transition_settle_ms: u64 = 400;
+
+comptime {
+    std.debug.assert(geometry_mod.max_entries >= max_managed_windows);
+}
 
 pub const DisplayId = space_mod.DisplayId;
 pub const NativeSpaceId = space_mod.NativeSpaceId;
@@ -853,6 +858,7 @@ pub const ObservationTimer = struct {
 pub const Model = struct {
     spaces: SpaceCatalog = .{},
     windows: WindowCatalog = .{},
+    geometry: geometry_mod = .{},
     workspace_focus: [max_spaces_per_display]WorkspaceFocus = @splat(.{}),
     workspace_topology: WorkspaceTopology = .{},
     native_topology: NativeTopology = .{},
@@ -1170,6 +1176,7 @@ pub const Event = union(enum) {
     request_pending_focus,
     clear_pending_focus,
     follow_focus_observed: FollowFocusObservation,
+    geometry: geometry_mod.Event,
 };
 
 pub const SwitchFailureReason = enum {
@@ -1249,6 +1256,7 @@ pub const Effect = union(enum) {
         transition: WorkspaceTransition,
     },
     follow_focus_workspace: FollowFocusObservation,
+    geometry: geometry_mod.Effect,
 };
 
 pub const max_effects = 6;
@@ -1280,6 +1288,7 @@ pub fn reduce(model: Model, event: Event) Transition {
         .update_window => |window| reduceWindowUpdated(&transition, window),
         .remove_window => |window_id| {
             _ = transition.model.windows.remove(window_id);
+            transition.model.geometry.forget(window_id);
             should_refresh_workspace_focus = true;
         },
         .replace_window_id => |replacement| reduceWindowIdReplaced(&transition, replacement),
@@ -1356,6 +1365,11 @@ pub fn reduce(model: Model, event: Event) Transition {
         .request_pending_focus => reducePendingFocusRequest(&transition),
         .clear_pending_focus => transition.model.pending_focus.clear(),
         .follow_focus_observed => |observation| reduceFollowFocusObserved(&transition, observation),
+        .geometry => |geometry_event| {
+            const geometry_transition = geometry_mod.reduce(transition.model.geometry, geometry_event);
+            transition.model.geometry = geometry_transition.state;
+            if (geometry_transition.effect) |effect| transition.addEffect(.{ .geometry = effect });
+        },
     }
 
     if (should_refresh_workspace_focus) refreshWorkspaceFocus(&transition.model);
@@ -1388,7 +1402,10 @@ fn reduceWindowAdopted(transition: *Transition, window: ManagedWindow) void {
     var adopted = window;
     adopted.tab_leader_window_id = adopted.window_id;
     adopted.is_suppressed = false;
-    if (transition.model.windows.put(adopted)) return;
+    if (transition.model.windows.put(adopted)) {
+        transition.model.geometry.seedObserved(adopted.window_id, adopted.frame) catch unreachable;
+        return;
+    }
 
     transition.addEffect(.{ .window_catalog_rejected = .{
         .window_id = window.window_id,
@@ -1423,6 +1440,7 @@ fn reduceWindowIdReplaced(
         return;
     }
     if (transition.model.windows.replaceId(replacement.old_window_id, replacement.new_window_id)) {
+        transition.model.geometry.replaceWindowId(replacement.old_window_id, replacement.new_window_id);
         for (&transition.model.workspace_focus) |*focus| {
             focus.replaceWindowId(replacement.old_window_id, replacement.new_window_id);
         }
@@ -2540,6 +2558,10 @@ test "window catalog owns identity and Space membership" {
     const initial_snapshot = second.model.windowSnapshot(101).?;
     try testing.expectEqual(window_mod.WindowMode.floating, initial_snapshot.mode);
     try testing.expectEqual(@as(f64, 800), initial_snapshot.frame.width);
+    try testing.expect(second.model.geometry.get(101).?.observed.?.approxEqual(
+        initial_snapshot.frame,
+        window_mod.Window.Frame.tolerance,
+    ));
 
     var updated_window = initial_snapshot;
     updated_window.frame.x = 30;
@@ -2562,9 +2584,12 @@ test "window catalog owns identity and Space membership" {
     } });
     try testing.expect(replaced.model.window(102) == null);
     try testing.expectEqual(@as(i32, 1002), replaced.model.window(202).?.process_id);
+    try testing.expect(replaced.model.geometry.get(102) == null);
+    try testing.expect(replaced.model.geometry.get(202) != null);
 
     const removed = reduce(replaced.model, .{ .remove_window = 202 });
     try testing.expect(removed.model.window(202) == null);
+    try testing.expect(removed.model.geometry.get(202) == null);
     try testing.expectEqual(@as(u16, 1), removed.model.windows.count);
 }
 
