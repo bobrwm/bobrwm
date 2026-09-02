@@ -322,7 +322,7 @@ fn workspaceTraversalDirectionFromAction(action: u8) ?WorkspaceTraversalDirectio
 
 fn adjacentWorkspaceId(direction: WorkspaceTraversalDirection) ?u8 {
     const focused_display_id = focusedDisplayId();
-    const workspace_count = g_workspaces.workspace_count;
+    const workspace_count = workspaceCount();
     std.debug.assert(workspace_count > 0);
     std.debug.assert(workspace_count <= workspace_mod.max_workspaces);
 
@@ -794,8 +794,9 @@ fn assertDisplayCoverage() void {
 }
 
 fn updateStatusBar() void {
-    const summaries = g_state.workspaceSummaries(g_workspaces.workspace_count);
-    statusbar.updateState(summaries[0..g_workspaces.workspace_count]);
+    const workspace_count = workspaceCount();
+    const summaries = g_state.workspaceSummaries(workspace_count);
+    statusbar.updateState(summaries[0..workspace_count]);
 }
 
 fn clearTilingStates() void {
@@ -957,12 +958,13 @@ fn refreshDisplays() void {
     // so at most workspace_count displays can be managed. Ignore the excess
     // instead of silently giving two displays the same active workspace,
     // which corrupts workspace visibility checks everywhere downstream.
-    if (next_count > g_workspaces.workspace_count) {
+    const workspace_count = workspaceCount();
+    if (next_count > workspace_count) {
         log.warn("{d} displays but only {d} workspaces; ignoring the excess displays", .{
             next_count,
-            g_workspaces.workspace_count,
+            workspace_count,
         });
-        next_count = g_workspaces.workspace_count;
+        next_count = workspace_count;
         has_primary = false;
         for (g_displays[0..next_count]) |display| {
             if (display.is_primary) has_primary = true;
@@ -1273,6 +1275,12 @@ var g_drag_reconcile_on_drop = false;
 
 fn nativeSpacesEnabled() bool {
     return g_config.native_spaces and g_sky != null and g_sky.?.supportsNativeSpaces();
+}
+
+fn workspaceCount() u8 {
+    const count = config_mod.workspaceCount(&g_config);
+    std.debug.assert(count > 0 and count <= workspace_mod.max_workspaces);
+    return count;
 }
 
 fn moveTabGroupToNativeSpace(wid: u32, target: state_mod.SpaceRef) bool {
@@ -2188,7 +2196,7 @@ fn rebuildTilingStatesForConfig() void {
 }
 
 fn applyReloadedConfig(next: ConfigRuntime) void {
-    std.debug.assert(config_mod.workspaceCount(&next.config) == g_workspaces.workspace_count);
+    std.debug.assert(config_mod.workspaceCount(&next.config) == workspaceCount());
 
     var replacement = next;
     replacement.config.applyKeybinds(&replacement.keybind_table);
@@ -2203,14 +2211,10 @@ fn applyReloadedConfig(next: ConfigRuntime) void {
     dim.configure(g_config.dimmed_inactive);
     loginitem.reconcile(g_config.start_at_login);
 
-    for (g_workspaces.spaces[0..g_workspaces.space_count]) |*ws| {
-        const index = ws.ref.workspace_id - 1;
-        ws.name = if (index < g_config.workspace_names.len) g_config.workspace_names[index] else "";
-    }
     // Preserve BSP topology and runtime split edits for ordinary config saves.
     // Only changing the layout algorithm requires reconstructing state.
     if (layout_changed) rebuildTilingStatesForConfig();
-    statusbar.updateWorkspaceMenu(g_workspaces.workspace_count, &g_config);
+    statusbar.updateWorkspaceMenu(workspaceCount(), &g_config);
     updateStatusBar();
     retile();
     if (dim.enabled) pushDimSnapshot();
@@ -2246,9 +2250,9 @@ fn reloadConfig() bool {
         return false;
     };
     const configured_count = config_mod.workspaceCount(&next.config);
-    if (configured_count != g_workspaces.workspace_count) {
+    if (configured_count != workspaceCount()) {
         log.err("config reload cannot change workspace count ({d} running, {d} configured); restart to apply it", .{
-            g_workspaces.workspace_count,
+            workspaceCount(),
             configured_count,
         });
         next.deinit();
@@ -2557,8 +2561,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     // -- Core state --
     g_store = window_mod.WindowStore.init(g_allocator);
     defer g_store.deinit();
-    const ws_count = config_mod.workspaceCount(&g_config);
-    g_workspaces = workspace_mod.WorkspaceManager.init(ws_count);
+    g_workspaces = workspace_mod.WorkspaceManager.init();
     clearTilingStates();
     // Free per-workspace tiling states on exit. BSP allocates Split nodes and
     // leaf ArrayLists via g_allocator; without this, DebugAllocator reports leaks.
@@ -2602,7 +2605,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     refreshDisplays();
 
     const primary_id = primaryDisplayId();
-    const wsc = g_workspaces.workspace_count;
+    const wsc = workspaceCount();
     const primary_slot = displayIndexById(primary_id) orelse 0;
     var workspace_topology: state_mod.WorkspaceTopology = .{};
     var space_catalog: state_mod.SpaceCatalog = .{};
@@ -2655,13 +2658,6 @@ pub fn main(init: std.process.Init.Minimal) !void {
         g_workspaces.configure(g_state.spaces.spaces[0..g_state.spaces.space_count]);
     }
 
-    // -- Apply workspace names from config --
-    for (g_workspaces.spaces[0..g_workspaces.space_count]) |*space| {
-        const index = space.ref.workspace_id - 1;
-        if (index >= g_config.workspace_names.len) continue;
-        space.name = g_config.workspace_names[index];
-    }
-
     // -- Signal transport (handler writes only; cleanup runs on main) --
     try signal_transport.init(gracefulStopNSApp);
     defer signal_transport.deinit();
@@ -2697,7 +2693,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
 
     // Status bar (zig-objc) --
     statusbar.init(
-        g_workspaces.workspace_count,
+        workspaceCount(),
         &g_config,
         .{
             .retile = statusBarRetile,
@@ -2943,7 +2939,7 @@ fn statusBarNextWorkspace() callconv(.c) void {
 }
 
 fn statusBarSwitchToWorkspace(workspace_id: u8) callconv(.c) void {
-    if (workspace_id == 0 or workspace_id > g_workspaces.workspace_count) return;
+    if (workspace_id == 0 or workspace_id > workspaceCount()) return;
     switchWorkspace(workspace_id);
 }
 
@@ -4111,7 +4107,7 @@ fn captureNativeTopology() ?state_mod.NativeTopology {
         &g_state.native_topology,
         &g_state.workspace_topology,
         &g_state.spaces,
-        g_workspaces.workspace_count,
+        workspaceCount(),
     );
 }
 
@@ -6189,9 +6185,9 @@ fn handleExternalWindowGeometry(wid: u32, frame: window_mod.Window.Frame) void {
 /// refreshDisplays caps the display count at workspace_count, so a caller that
 /// has claimed at most one workspace per display always finds one.
 fn firstUnclaimedWorkspace(claimed: []const bool) u8 {
-    std.debug.assert(g_display_count <= g_workspaces.workspace_count);
+    std.debug.assert(g_display_count <= workspaceCount());
     var id: u8 = 1;
-    while (id <= g_workspaces.workspace_count) : (id += 1) {
+    while (id <= workspaceCount()) : (id += 1) {
         if (!claimed[id]) return id;
     }
     unreachable;
@@ -7279,7 +7275,7 @@ fn reassignManagedWindowToDisplay(wid: u32, target_display_id: u32) bool {
     if (win.space.display_id == target_display_id) return false;
 
     const target_workspace_id = activeWorkspaceIdForDisplay(target_display_id);
-    std.debug.assert(target_workspace_id > 0 and target_workspace_id <= g_workspaces.workspace_count);
+    std.debug.assert(target_workspace_id > 0 and target_workspace_id <= workspaceCount());
 
     const source_ws = spaceForWindow(win) orelse return false;
     const target_ws = spaceForWorkspace(target_display_id, target_workspace_id) orelse return false;
@@ -7822,12 +7818,12 @@ fn ipcQueryWorkspaces(fd: posix.socket_t, format: ipc.IpcCommand.QueryFormat) vo
     const payload = out.written();
     ipc.writeResponse(fd, payload);
     const elapsed_ms = @divTrunc(nanoTimestamp() - started_ns, std.time.ns_per_ms);
-    log.debug("[trace] query workspaces rows={} bytes={} elapsed_ms={}", .{ g_workspaces.workspace_count, payload.len, elapsed_ms });
+    log.debug("[trace] query workspaces rows={} bytes={} elapsed_ms={}", .{ workspaceCount(), payload.len, elapsed_ms });
 }
 
 fn writeWorkspaceText(writer: *std.Io.Writer) void {
     var workspace_id: u8 = 1;
-    while (workspace_id <= g_workspaces.workspace_count) : (workspace_id += 1) {
+    while (workspace_id <= workspaceCount()) : (workspace_id += 1) {
         const space = g_state.logicalWorkspace(workspace_id) orelse unreachable;
         var window_ids: [state_mod.max_managed_windows]u32 = undefined;
         const windows = g_state.workspaceWindowIds(space.key, &window_ids);
@@ -7845,7 +7841,7 @@ fn writeWorkspaceJson(writer: *std.Io.Writer) void {
     json.beginArray() catch return;
 
     var workspace_id: u8 = 1;
-    while (workspace_id <= g_workspaces.workspace_count) : (workspace_id += 1) {
+    while (workspace_id <= workspaceCount()) : (workspace_id += 1) {
         const space = g_state.logicalWorkspace(workspace_id) orelse unreachable;
         writeWorkspaceJsonEntry(&json, space) catch break;
     }

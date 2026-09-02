@@ -2,7 +2,6 @@ const std = @import("std");
 const Window = @import("window.zig");
 const space_mod = @import("space.zig");
 
-pub const WorkspaceId = space_mod.WorkspaceId;
 pub const max_workspaces = 10;
 pub const max_displays = 8;
 pub const max_spaces = max_workspaces * max_displays;
@@ -21,7 +20,6 @@ pub fn frameCoversTarget(actual: Window.Window.Frame, target: Window.Window.Fram
 
 pub const Space = struct {
     ref: space_mod.Ref,
-    name: []const u8 = "",
 
     pub fn init(ref: space_mod.Ref) Space {
         ref.assertValid();
@@ -32,24 +30,12 @@ pub const Space = struct {
 pub const WorkspaceManager = struct {
     spaces: [max_spaces]Space,
     space_count: u8,
-    workspace_count: u8,
 
-    pub fn init(count: u8) WorkspaceManager {
-        const clamped: u8 = if (count == 0) max_workspaces else @min(count, max_workspaces);
-        var wm: WorkspaceManager = .{
+    pub fn init() WorkspaceManager {
+        return .{
             .spaces = undefined,
-            .space_count = clamped,
-            .workspace_count = clamped,
+            .space_count = 0,
         };
-        for (0..clamped) |i| {
-            const workspace_id: WorkspaceId = @intCast(i + 1);
-            wm.spaces[i] = Space.init(.{
-                .key = .{ .virtual = workspace_id },
-                .workspace_id = workspace_id,
-                .display_id = 1,
-            });
-        }
-        return wm;
     }
 
     pub fn configure(self: *WorkspaceManager, refs: []const space_mod.Ref) void {
