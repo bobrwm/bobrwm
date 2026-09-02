@@ -3,6 +3,7 @@
 const std = @import("std");
 const geometry_mod = @import("geometry.zig");
 const space_mod = @import("space.zig");
+const tiling_mod = @import("tiling.zig");
 const window_mod = @import("window.zig");
 
 pub const max_displays = 8;
@@ -19,6 +20,8 @@ pub const workspace_transition_settle_ms: u64 = 400;
 
 comptime {
     std.debug.assert(geometry_mod.max_entries >= max_managed_windows);
+    std.debug.assert(tiling_mod.max_windows >= max_managed_windows);
+    std.debug.assert(tiling_mod.max_layouts >= max_displays * max_spaces_per_display);
 }
 
 pub const DisplayId = space_mod.DisplayId;
@@ -859,6 +862,7 @@ pub const Model = struct {
     spaces: SpaceCatalog = .{},
     windows: WindowCatalog = .{},
     geometry: geometry_mod = .{},
+    layout: tiling_mod = .{},
     workspace_focus: [max_spaces_per_display]WorkspaceFocus = @splat(.{}),
     workspace_topology: WorkspaceTopology = .{},
     native_topology: NativeTopology = .{},
@@ -1177,6 +1181,7 @@ pub const Event = union(enum) {
     clear_pending_focus,
     follow_focus_observed: FollowFocusObservation,
     geometry: geometry_mod.Event,
+    layout: tiling_mod.Event,
 };
 
 pub const SwitchFailureReason = enum {
@@ -1257,6 +1262,7 @@ pub const Effect = union(enum) {
     },
     follow_focus_workspace: FollowFocusObservation,
     geometry: geometry_mod.Effect,
+    layout: tiling_mod.Effect,
 };
 
 pub const max_effects = 6;
@@ -1369,6 +1375,11 @@ pub fn reduce(model: Model, event: Event) Transition {
             const geometry_transition = geometry_mod.reduce(transition.model.geometry, geometry_event);
             transition.model.geometry = geometry_transition.state;
             if (geometry_transition.effect) |effect| transition.addEffect(.{ .geometry = effect });
+        },
+        .layout => |layout_event| {
+            const layout_transition = tiling_mod.reduce(transition.model.layout, layout_event);
+            transition.model.layout = layout_transition.model;
+            if (layout_transition.effect) |effect| transition.addEffect(.{ .layout = effect });
         },
     }
 
@@ -2275,6 +2286,7 @@ fn firstWorkspaceWindow(model: *const Model, space_key: SpaceKey) ?WindowId {
 
 fn assertModel(model: *const Model) void {
     std.debug.assert(model.next_epoch != 0);
+    model.layout.assertValid();
     std.debug.assert(model.spaces.space_count <= model.spaces.spaces.len);
     for (model.spaces.spaces[0..model.spaces.space_count], 0..) |space, index| {
         space.assertValid();
