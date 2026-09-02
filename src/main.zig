@@ -277,6 +277,22 @@ fn activeWorkspace() *workspace_mod.Space {
     return spaceForWorkspace(focusedDisplayId(), workspace_id) orelse unreachable;
 }
 
+fn focusedWorkspaceWindow(space: *const workspace_mod.Space) ?u32 {
+    const focused_wid = g_state.focusedWorkspaceWindow(space.ref.workspace_id);
+    std.debug.assert(focused_wid == space.focused_wid);
+    return focused_wid;
+}
+
+fn recordWorkspaceFocus(space: *workspace_mod.Space, wid: u32) void {
+    dispatchStateEvent(.{ .record_workspace_focus = .{
+        .workspace_id = space.ref.workspace_id,
+        .window_id = wid,
+    } });
+    const focused_wid = g_state.focusedWorkspaceWindow(space.ref.workspace_id) orelse return;
+    space.recordFocus(focused_wid);
+    std.debug.assert(focused_wid == space.focused_wid);
+}
+
 fn nativeStateNowMs() state_mod.TimestampMs {
     const seconds = c.CFAbsoluteTimeGetCurrent();
     if (seconds <= 0) return 0;
@@ -384,7 +400,7 @@ fn pushDimSnapshot() void {
     for (0..g_display_count) |slot| {
         const ws_id = activeWorkspaceIdForDisplay(g_displays[slot].id);
         const ws = spaceForWorkspace(g_displays[slot].id, ws_id) orelse continue;
-        const wid = ws.focused_wid orelse continue;
+        const wid = focusedWorkspaceWindow(ws) orelse continue;
         // Workspace focus records the tab-group leader, but the window on
         // screen (and in `entries`) is the group's active tab. Resolve so a
         // focused non-leader tab is exempted instead of dimmed.
@@ -674,9 +690,7 @@ fn syncFocusStateForWindowId(focused_wid: u32, source: FocusEventSource) bool {
     setTabGroupActive(focused_wid);
     observeWindowFocus(win, source, null);
     if (shouldRecordWorkspaceFocusForWindow(win)) {
-        if (spaceForWindow(win)) |ws| {
-            ws.recordFocus(leader);
-        }
+        if (spaceForWindow(win)) |ws| recordWorkspaceFocus(ws, leader);
         setTilingActive(win.space.key, focused_wid);
     } else {
         const transition = g_state.workspace_transition.?;
@@ -2173,7 +2187,7 @@ fn rebuildTilingStatesForConfig() void {
             if (win.mode != .tiled) continue;
             insertIntoTiling(ws.ref.key, wid);
         }
-        if (ws.focused_wid) |focused_wid| setTilingActive(ws.ref.key, focused_wid);
+        if (focusedWorkspaceWindow(ws)) |focused_wid| setTilingActive(ws.ref.key, focused_wid);
     }
 }
 
@@ -3011,7 +3025,7 @@ fn tryInsertIntoTiling(space_key: state_mod.SpaceKey, wid: u32) !void {
         const st = sp.* orelse break :blk null;
         switch (g_config.bsp_insert_point) {
             .focused => {
-                const focused_wid = ws.focused_wid orelse break :blk null;
+                const focused_wid = focusedWorkspaceWindow(ws) orelse break :blk null;
                 if (focused_wid == wid) break :blk null;
                 break :blk focused_wid;
             },
@@ -3923,7 +3937,7 @@ fn rollbackNativeWindowMove(wid: u32, pending: state_mod.PendingNativeWindowMove
     source_ws.addWindowAssumeCapacity(wid);
     target_ws.removeWindow(wid);
     removeFromTiling(target_ws.ref.key, wid);
-    if (source_ws.focused_wid == null) source_ws.recordFocus(wid);
+    if (focusedWorkspaceWindow(source_ws) == null) recordWorkspaceFocus(source_ws, wid);
 
     updateTabGroupAssignment(wid, source_ws.ref);
     return true;
@@ -4533,7 +4547,7 @@ fn reassignManagedWindowToNativeWorkspace(wid: u32, target: state_mod.SpaceRef) 
     target_ws.addWindowAssumeCapacity(wid);
     source_ws.removeWindow(wid);
     removeFromTiling(source_ws.ref.key, wid);
-    if (target_ws.focused_wid == null) target_ws.recordFocus(wid);
+    if (focusedWorkspaceWindow(target_ws) == null) recordWorkspaceFocus(target_ws, wid);
 
     updateTabGroupAssignment(wid, target_ws.ref);
     log.debug("native workspace assignment repaired wid={d} source={d} target={d}", .{ wid, source_workspace_id, target.workspace_id });
@@ -5223,8 +5237,8 @@ fn discoverWindowsImpl(should_refresh_tabs: bool) usize {
 
     // Ensure a focused window is set on the active workspace
     const active_ws = activeWorkspace();
-    if (active_ws.focused_wid == null and active_ws.windows.items.len > 0) {
-        active_ws.recordFocus(active_ws.windows.items[0]);
+    if (focusedWorkspaceWindow(active_ws) == null and active_ws.windows.items.len > 0) {
+        recordWorkspaceFocus(active_ws, active_ws.windows.items[0]);
     }
 
     const completed_ns = nanoTimestamp();
@@ -5461,7 +5475,7 @@ fn addNewWindowManagedWithAssignment(pid: i32, wid: u32, assigned_space: state_m
         log.err("addNewWindow: failed to adopt pid={d} wid={d}: {}", .{ pid, wid, err });
         return false;
     };
-    ws.recordFocus(wid);
+    recordWorkspaceFocus(ws, wid);
 
     // A native-space move must happen after the window exists in WindowServer
     // but before it can flash on the current workspace as managed content.
@@ -5708,7 +5722,7 @@ fn joinTabGroup(pid: i32, sibling_wid: u32, new_wid: u32, new_frame: window_mod.
     seedObservedFrame(new_wid, new_frame);
 
     const leader = g_tab_groups.resolveLeader(sibling_wid);
-    ws.recordFocus(leader);
+    recordWorkspaceFocus(ws, leader);
     log.info("tab group formed pid={d} leader={d} active={d} members={d}", .{
         pid,
         leader,
@@ -5781,6 +5795,8 @@ fn removeWindow(wid: u32) void {
             }
         },
     }
+
+    if (spaceForWindow(win)) |space| _ = focusedWorkspaceWindow(space);
 }
 
 /// Align a surviving tab group's active tab with the window the app actually
@@ -6853,7 +6869,7 @@ fn checkTabDragOut(_: i32, wid: u32) bool {
         ws.addWindow(wid) catch return false;
         insertIntoTiling(win.space.key, wid);
     }
-    ws.recordFocus(wid);
+    recordWorkspaceFocus(ws, wid);
 
     // If the group dissolved, verify the survivor is still managed
     switch (removal) {
@@ -7209,7 +7225,7 @@ fn parkOutgoingWorkspace(ws: *workspace_mod.Space, target: state_mod.SpaceRef) v
 
 /// Focus the remembered (or first available) window on a workspace.
 fn focusWorkspaceWindow(ws: *workspace_mod.Space) void {
-    var focus_wid = ws.focused_wid;
+    var focus_wid = focusedWorkspaceWindow(ws);
     if (focus_wid) |fwid| {
         if (g_store.get(fwid) == null) focus_wid = null;
     }
@@ -7240,7 +7256,7 @@ fn focusWorkspaceWindow(ws: *workspace_mod.Space) void {
                 });
             }
             _ = bw_ax_focus_window(win.pid, actual_wid);
-            ws.recordFocus(fwid);
+            recordWorkspaceFocus(ws, fwid);
             observeWindowFocus(win, .keyboard, null);
         }
     }
@@ -7309,8 +7325,8 @@ fn moveWindowToWorkspace(target_id: u8) void {
 
     ws.removeWindow(wid);
     removeFromTiling(ws.ref.key, wid);
-    if (target_ws.focused_wid == null) {
-        target_ws.recordFocus(wid);
+    if (focusedWorkspaceWindow(target_ws) == null) {
+        recordWorkspaceFocus(target_ws, wid);
     }
 
     // Update window metadata. Use the target workspace's display so that
@@ -7376,7 +7392,7 @@ fn reassignManagedWindowToDisplay(wid: u32, target_display_id: u32) bool {
 
         removeFromTiling(source_ws.ref.key, wid);
         source_ws.removeWindow(wid);
-        target_ws.recordFocus(wid);
+        recordWorkspaceFocus(target_ws, wid);
 
         win.space = target_ws.ref;
     } else {
@@ -7564,7 +7580,7 @@ fn focusDirection(dir: FocusDir) void {
         const actual_wid = g_tab_groups.resolveActive(wid);
         if (g_store.get(actual_wid)) |win| {
             _ = bw_ax_focus_window(win.pid, actual_wid);
-            ctx.workspace.recordFocus(wid);
+            recordWorkspaceFocus(ctx.workspace, wid);
             observeWindowFocus(win, .keyboard, null);
             setTilingActive(win.space.key, actual_wid);
         }
@@ -7580,7 +7596,7 @@ fn focusDirection(dir: FocusDir) void {
     if (st.cycleFocus(ctx.focused_wid, stack_forward)) |stack_wid| {
         if (g_store.get(stack_wid)) |win| {
             _ = bw_ax_focus_window(win.pid, stack_wid);
-            ctx.workspace.recordFocus(stack_wid);
+            recordWorkspaceFocus(ctx.workspace, stack_wid);
             observeWindowFocus(win, .keyboard, null);
             setTilingActive(win.space.key, stack_wid);
         }
@@ -7891,7 +7907,7 @@ fn ipcQueryWorkspaces(fd: posix.socket_t, format: ipc.IpcCommand.QueryFormat) vo
 
     switch (format) {
         .text => for (presentationSpaces()) |*ws| {
-            const focused: u32 = ws.focused_wid orelse 0;
+            const focused: u32 = focusedWorkspaceWindow(ws) orelse 0;
             w.print("{d} {s} {d} {d}\n", .{
                 ws.ref.workspace_id,
                 if (spaceVisible(ws.ref)) "visible" else "hidden",
@@ -7909,7 +7925,7 @@ fn ipcQueryWorkspaces(fd: posix.socket_t, format: ipc.IpcCommand.QueryFormat) vo
                 json.objectField("visible") catch break;
                 json.write(spaceVisible(ws.ref)) catch break;
                 json.objectField("focused_window") catch break;
-                json.write(ws.focused_wid) catch break;
+                json.write(focusedWorkspaceWindow(ws)) catch break;
                 json.objectField("windows") catch break;
                 json.beginArray() catch break;
                 for (ws.windows.items) |wid| {

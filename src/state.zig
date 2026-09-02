@@ -7,6 +7,7 @@ pub const max_displays = 8;
 pub const max_managed_windows = 1024;
 pub const max_pending_focus_entries = 16;
 pub const max_spaces_per_display = 10;
+pub const max_workspace_focus_history = 32;
 pub const max_pending_native_window_moves = 256;
 pub const native_switch_timeout_ms: u64 = 3200;
 pub const native_observation_delay_ms: u64 = 50;
@@ -66,6 +67,47 @@ pub const WorkspaceSummary = struct {
     window_count: u32,
     is_active: bool,
     is_focused: bool,
+};
+
+/// Reducer-owned focus memory for one logical workspace.
+pub const WorkspaceFocus = struct {
+    focused_window_id: ?WindowId = null,
+    history: [max_workspace_focus_history]WindowId = @splat(0),
+    history_count: u8 = 0,
+
+    fn record(self: *WorkspaceFocus, window_id: WindowId) void {
+        self.removeFromHistory(window_id);
+        if (self.history_count == self.history.len) self.dropHistoryAt(0);
+
+        self.history[self.history_count] = window_id;
+        self.history_count += 1;
+        self.focused_window_id = window_id;
+    }
+
+    fn replaceWindowId(self: *WorkspaceFocus, old_window_id: WindowId, new_window_id: WindowId) void {
+        for (self.history[0..self.history_count]) |*window_id| {
+            if (window_id.* == old_window_id) window_id.* = new_window_id;
+        }
+        if (self.focused_window_id == old_window_id) self.focused_window_id = new_window_id;
+    }
+
+    fn removeFromHistory(self: *WorkspaceFocus, window_id: WindowId) void {
+        for (self.history[0..self.history_count], 0..) |candidate, index| {
+            if (candidate != window_id) continue;
+            self.dropHistoryAt(index);
+            return;
+        }
+    }
+
+    fn dropHistoryAt(self: *WorkspaceFocus, index: usize) void {
+        std.debug.assert(index < self.history_count);
+        var cursor = index;
+        while (cursor + 1 < self.history_count) : (cursor += 1) {
+            self.history[cursor] = self.history[cursor + 1];
+        }
+        self.history_count -= 1;
+        self.history[self.history_count] = 0;
+    }
 };
 
 pub const WorkspaceTopology = struct {
@@ -653,8 +695,11 @@ pub const WindowCatalog = struct {
     fn remove(self: *WindowCatalog, window_id: WindowId) bool {
         const index = self.findIndex(window_id) orelse return false;
         const removed = self.entries[index];
+        var cursor = index;
+        while (cursor + 1 < self.count) : (cursor += 1) {
+            self.entries[cursor] = self.entries[cursor + 1];
+        }
         self.count -= 1;
-        self.entries[index] = self.entries[self.count];
 
         if (removed.tab_leader_window_id == removed.window_id) {
             self.dissolveTabGroupByLeader(removed.window_id);
@@ -744,6 +789,7 @@ pub const ObservationTimer = struct {
 pub const Model = struct {
     spaces: SpaceCatalog = .{},
     windows: WindowCatalog = .{},
+    workspace_focus: [max_spaces_per_display]WorkspaceFocus = @splat(.{}),
     workspace_topology: WorkspaceTopology = .{},
     native_topology: NativeTopology = .{},
     pending_switch: ?PendingSwitch = null,
@@ -826,6 +872,12 @@ pub const Model = struct {
         return self.windows.get(window_id);
     }
 
+    /// Returns the most recently focused layout owner for a logical workspace.
+    pub fn focusedWorkspaceWindow(self: *const Model, workspace_id: WorkspaceId) ?WindowId {
+        if (workspace_id == 0 or workspace_id > self.workspace_focus.len) return null;
+        return self.workspace_focus[workspace_id - 1].focused_window_id;
+    }
+
     /// Returns the tab-group leaders that own workspace and layout slots.
     pub fn workspaceWindowIds(
         self: *const Model,
@@ -902,6 +954,10 @@ pub const Event = union(enum) {
     },
     observe_window_tab_group: WindowTabGroupObservation,
     dissolve_window_tab_group: WindowId,
+    record_workspace_focus: struct {
+        workspace_id: WorkspaceId,
+        window_id: WindowId,
+    },
     replace_workspace_topology: WorkspaceTopology,
     focus_display: DisplayId,
     activate_workspace: struct {
@@ -1077,21 +1133,31 @@ pub const Transition = struct {
 
 pub fn reduce(model: Model, event: Event) Transition {
     var transition: Transition = .{ .model = model };
+    var should_refresh_workspace_focus = false;
 
     switch (event) {
         .replace_space_catalog => |catalog| {
             transition.model.spaces = catalog;
             refreshWorkspaceTransition(&transition);
             refreshPendingNativeWindowMoves(&transition.model);
+            should_refresh_workspace_focus = true;
         },
         .adopt_window => |window| reduceWindowAdopted(&transition, window),
         .remove_window => |window_id| {
             _ = transition.model.windows.remove(window_id);
+            should_refresh_workspace_focus = true;
         },
         .replace_window_id => |replacement| reduceWindowIdReplaced(&transition, replacement),
-        .assign_window_space => |assignment| reduceWindowSpaceAssigned(&transition, assignment),
-        .observe_window_tab_group => |observation| reduceWindowTabGroupObserved(&transition, observation),
+        .assign_window_space => |assignment| {
+            reduceWindowSpaceAssigned(&transition, assignment);
+            should_refresh_workspace_focus = true;
+        },
+        .observe_window_tab_group => |observation| {
+            reduceWindowTabGroupObserved(&transition, observation);
+            should_refresh_workspace_focus = true;
+        },
         .dissolve_window_tab_group => |window_id| reduceWindowTabGroupDissolved(&transition, window_id),
+        .record_workspace_focus => |focus| reduceWorkspaceFocusRecorded(&transition, focus),
         .replace_workspace_topology => |topology| {
             transition.model.workspace_topology = topology;
         },
@@ -1121,11 +1187,15 @@ pub fn reduce(model: Model, event: Event) Transition {
                 transition.model.deferred_follow_focus = null;
             }
             syncNativeWorkspaceTopology(&transition);
+            should_refresh_workspace_focus = true;
         },
         .request_native_switch => |request| reduceSwitchRequest(&transition, request),
         .native_space_changed => |at_ms| reduceSpaceChanged(&transition, at_ms),
         .observation_timer_fired => |timer| reduceObservationTimer(&transition, timer),
-        .native_topology_observed => |observation| reduceTopologyObserved(&transition, observation),
+        .native_topology_observed => |observation| {
+            reduceTopologyObserved(&transition, observation);
+            should_refresh_workspace_focus = true;
+        },
         .native_topology_unavailable => |unavailable| reduceTopologyUnavailable(&transition, unavailable),
         .native_switch_effect_failed => |failure| reduceSwitchEffectFailed(&transition, failure),
         .start_workspace_transition => |start| reduceWorkspaceTransitionStart(&transition, start),
@@ -1139,7 +1209,10 @@ pub fn reduce(model: Model, event: Event) Transition {
         .native_window_move_rollback_result => |result| reduceNativeWindowMoveRollbackResult(&transition, result),
         .request_native_workspace_move => |request| reduceNativeWorkspaceMoveRequest(&transition, request),
         .native_workspace_move_started => |result| reduceNativeWorkspaceMoveStarted(&transition, result),
-        .native_workspace_move_observed => |observation| reduceNativeWorkspaceMoveObserved(&transition, observation),
+        .native_workspace_move_observed => |observation| {
+            reduceNativeWorkspaceMoveObserved(&transition, observation);
+            should_refresh_workspace_focus = true;
+        },
         .native_workspace_move_rollback_result => |result| reduceNativeWorkspaceMoveRollbackResult(&transition, result),
         .window_focus_observed => |observation| reduceWindowFocusObserved(&transition, observation),
         .request_pending_focus => reducePendingFocusRequest(&transition),
@@ -1147,6 +1220,7 @@ pub fn reduce(model: Model, event: Event) Transition {
         .follow_focus_observed => |observation| reduceFollowFocusObserved(&transition, observation),
     }
 
+    if (should_refresh_workspace_focus) refreshWorkspaceFocus(&transition.model);
     assertModel(&transition.model);
     return transition;
 }
@@ -1202,7 +1276,12 @@ fn reduceWindowIdReplaced(
         } });
         return;
     }
-    if (transition.model.windows.replaceId(replacement.old_window_id, replacement.new_window_id)) return;
+    if (transition.model.windows.replaceId(replacement.old_window_id, replacement.new_window_id)) {
+        for (&transition.model.workspace_focus) |*focus| {
+            focus.replaceWindowId(replacement.old_window_id, replacement.new_window_id);
+        }
+        return;
+    }
 
     transition.addEffect(.{ .window_catalog_rejected = .{
         .window_id = replacement.old_window_id,
@@ -1277,6 +1356,18 @@ fn reduceWindowTabGroupDissolved(transition: *Transition, window_id: WindowId) v
         return;
     }
     transition.model.windows.dissolveTabGroup(window_id);
+}
+
+fn reduceWorkspaceFocusRecorded(
+    transition: *Transition,
+    focus: @FieldType(Event, "record_workspace_focus"),
+) void {
+    const space = transition.model.logicalWorkspace(focus.workspace_id) orelse return;
+    const window = transition.model.window(focus.window_id) orelse return;
+    const leader = transition.model.window(window.tab_leader_window_id).?;
+    if (!leader.space_key.eql(space.key)) return;
+
+    transition.model.workspace_focus[focus.workspace_id - 1].record(leader.window_id);
 }
 
 fn rejectWindowTabGroup(transition: *Transition, window_id: WindowId) void {
@@ -1988,6 +2079,36 @@ fn nativeSpaceId(space: SpaceRef) ?NativeSpaceId {
     };
 }
 
+fn refreshWorkspaceFocus(model: *Model) void {
+    for (&model.workspace_focus, 0..) |*focus, index| {
+        const had_focus = focus.focused_window_id != null;
+        const history = focus.history;
+        const history_count = focus.history_count;
+        focus.* = .{};
+
+        const workspace_id: WorkspaceId = @intCast(index + 1);
+        const space = model.logicalWorkspace(workspace_id) orelse continue;
+        for (history[0..history_count]) |window_id| {
+            const window = model.window(window_id) orelse continue;
+            const leader = model.window(window.tab_leader_window_id).?;
+            if (!leader.space_key.eql(space.key)) continue;
+            focus.record(leader.window_id);
+        }
+        if (focus.focused_window_id == null and had_focus) {
+            if (firstWorkspaceWindow(model, space.key)) |window_id| focus.record(window_id);
+        }
+    }
+}
+
+fn firstWorkspaceWindow(model: *const Model, space_key: SpaceKey) ?WindowId {
+    for (model.windows.items()) |window| {
+        if (!window.space_key.eql(space_key)) continue;
+        if (window.tab_leader_window_id != window.window_id) continue;
+        return window.window_id;
+    }
+    return null;
+}
+
 fn assertModel(model: *const Model) void {
     std.debug.assert(model.next_epoch != 0);
     std.debug.assert(model.spaces.space_count <= model.spaces.spaces.len);
@@ -2022,6 +2143,25 @@ fn assertModel(model: *const Model) void {
         }
         std.debug.assert(member_count > 0);
         std.debug.assert(active_count == 1);
+    }
+    for (model.workspace_focus, 0..) |focus, index| {
+        std.debug.assert(focus.history_count <= focus.history.len);
+        const workspace_id: WorkspaceId = @intCast(index + 1);
+        const space = model.logicalWorkspace(workspace_id);
+        for (focus.history[0..focus.history_count], 0..) |window_id, history_index| {
+            const window = model.window(window_id).?;
+            std.debug.assert(window.tab_leader_window_id == window.window_id);
+            std.debug.assert(space != null and window.space_key.eql(space.?.key));
+            for (focus.history[0..history_index]) |prior| {
+                std.debug.assert(prior != window_id);
+            }
+        }
+        if (focus.focused_window_id) |window_id| {
+            std.debug.assert(focus.history_count > 0);
+            std.debug.assert(focus.history[focus.history_count - 1] == window_id);
+        } else {
+            std.debug.assert(focus.history_count == 0);
+        }
     }
     std.debug.assert(model.workspace_topology.display_count <= model.workspace_topology.displays.len);
     for (model.workspace_topology.displays[0..model.workspace_topology.display_count], 0..) |display, index| {
@@ -2208,7 +2348,6 @@ test "workspace summaries preserve globally unique active workspaces" {
         .process_id = 2001,
         .space_key = .{ .native = 201 },
     } }).model;
-
     const summaries = model.workspaceSummaries(3);
 
     try testing.expectEqual(@as(u32, 1), summaries[0].window_count);
@@ -2259,6 +2398,48 @@ test "window catalog owns identity and Space membership" {
     const removed = reduce(replaced.model, .{ .remove_window = 202 });
     try testing.expect(removed.model.window(202) == null);
     try testing.expectEqual(@as(u16, 1), removed.model.windows.count);
+}
+
+test "workspace focus memory follows window lifecycle" {
+    const testing = std.testing;
+    var catalog: SpaceCatalog = .{};
+    catalog.add(.{ .key = .{ .virtual = 1 }, .workspace_id = 1, .display_id = 11 });
+    catalog.add(.{ .key = .{ .virtual = 2 }, .workspace_id = 2, .display_id = 11 });
+    var model: Model = .{ .spaces = catalog };
+
+    for ([_]WindowId{ 101, 102 }) |window_id| {
+        model = reduce(model, .{ .adopt_window = .{
+            .window_id = window_id,
+            .process_id = 1001,
+            .space_key = .{ .virtual = 1 },
+        } }).model;
+        model = reduce(model, .{ .record_workspace_focus = .{
+            .workspace_id = 1,
+            .window_id = window_id,
+        } }).model;
+    }
+
+    model = reduce(model, .{ .remove_window = 102 }).model;
+    try testing.expectEqual(@as(?WindowId, 101), model.focusedWorkspaceWindow(1));
+
+    model = reduce(model, .{ .replace_window_id = .{
+        .old_window_id = 101,
+        .new_window_id = 201,
+    } }).model;
+    try testing.expectEqual(@as(?WindowId, 201), model.focusedWorkspaceWindow(1));
+
+    model = reduce(model, .{ .assign_window_space = .{
+        .window_id = 201,
+        .space_key = .{ .virtual = 2 },
+    } }).model;
+    try testing.expectEqual(@as(?WindowId, null), model.focusedWorkspaceWindow(1));
+    try testing.expectEqual(@as(?WindowId, null), model.focusedWorkspaceWindow(2));
+
+    model = reduce(model, .{ .record_workspace_focus = .{
+        .workspace_id = 2,
+        .window_id = 201,
+    } }).model;
+    try testing.expectEqual(@as(?WindowId, 201), model.focusedWorkspaceWindow(2));
 }
 
 test "window catalog rejects invalid lifecycle events" {
@@ -2571,6 +2752,14 @@ test "native workspace move commits placement and ownership atomically" {
         .process_id = 2001,
         .space_key = .{ .native = 201 },
     } }).model;
+    model = reduce(model, .{ .record_workspace_focus = .{
+        .workspace_id = 1,
+        .window_id = 101,
+    } }).model;
+    model = reduce(model, .{ .record_workspace_focus = .{
+        .workspace_id = 4,
+        .window_id = 201,
+    } }).model;
 
     var transition = reduce(model, .{ .request_native_workspace_move = .{
         .source = model.space(.{ .native = 101 }).?,
@@ -2601,6 +2790,8 @@ test "native workspace move commits placement and ownership atomically" {
     try testing.expectEqual(@as(WorkspaceId, 1), transition.model.space(.{ .native = 201 }).?.workspace_id);
     try testing.expect(transition.model.window(101).?.space_key.eql(.{ .native = 201 }));
     try testing.expect(transition.model.window(201).?.space_key.eql(.{ .native = 101 }));
+    try testing.expectEqual(@as(?WindowId, 101), transition.model.focusedWorkspaceWindow(1));
+    try testing.expectEqual(@as(?WindowId, 201), transition.model.focusedWorkspaceWindow(4));
     try testing.expectEqual(std.meta.Tag(Effect).native_workspace_move_completed, std.meta.activeTag(transition.effects[0]));
 }
 
