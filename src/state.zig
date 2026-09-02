@@ -9,6 +9,10 @@ const window_mod = @import("window.zig");
 pub const max_displays = 8;
 pub const max_managed_windows = 1024;
 pub const max_pending_focus_entries = 16;
+pub const max_pending_window_candidates = 256;
+pub const max_process_retries = 64;
+pub const max_display_memory_entries = 16;
+pub const max_cleanup_processes = 16;
 pub const max_spaces_per_display = 10;
 pub const max_workspace_focus_history = 32;
 pub const max_pending_native_window_moves = 256;
@@ -17,6 +21,7 @@ pub const native_observation_delay_ms: u64 = 50;
 pub const native_window_move_attempts_max: u8 = 3;
 pub const native_workspace_move_timeout_ms: u64 = 3200;
 pub const workspace_transition_settle_ms: u64 = 400;
+pub const display_event_debounce_ms: u64 = 50;
 
 comptime {
     std.debug.assert(geometry_mod.max_entries >= max_managed_windows);
@@ -39,6 +44,13 @@ pub const FocusEventSource = enum {
     ax,
 };
 
+pub const FocusDirection = enum {
+    left,
+    right,
+    up,
+    down,
+};
+
 pub const DeferredFollowFocus = struct {
     process_id: i32,
     window_id: WindowId,
@@ -53,6 +65,7 @@ pub const FollowFocusObservation = struct {
     source: FocusEventSource,
     target: SpaceRef,
     is_target_visible: bool,
+    at_ms: TimestampMs,
 };
 
 pub const WindowFocusObservation = struct {
@@ -191,6 +204,15 @@ pub const SpaceCatalog = struct {
         }
         return null;
     }
+
+    fn setDisplay(self: *SpaceCatalog, key: SpaceKey, display_id: DisplayId) bool {
+        for (self.spaces[0..self.space_count]) |*space| {
+            if (!space.key.eql(key)) continue;
+            space.display_id = display_id;
+            return true;
+        }
+        return false;
+    }
 };
 
 pub const Space = struct {
@@ -322,6 +344,11 @@ pub const NativeTopology = struct {
         }
         return true;
     }
+};
+
+pub const NativeTopologyInitialization = struct {
+    topology: NativeTopology,
+    focused_display_id: ?DisplayId = null,
 };
 
 pub const NativeDisplayObservation = struct {
@@ -569,6 +596,79 @@ pub const NativeWindowMoveObservation = enum {
     ownership_changed,
 };
 
+pub const DeferredWindowExpiryReason = enum {
+    role_pending,
+    off_screen,
+    unsettled_bounds,
+};
+
+pub const WorkspaceParkEffect = struct {
+    outgoing: SpaceRef,
+    target: SpaceRef,
+    did_time_out: bool = false,
+};
+
+pub const WorkspaceSwitchEffect = struct {
+    target: SpaceRef,
+    outgoing: ?SpaceRef = null,
+};
+
+pub const VirtualWorkspaceMoveEffect = struct {
+    moving: SpaceRef,
+    displaced: SpaceRef,
+};
+
+pub const FocusWindowEffect = struct {
+    window_id: WindowId,
+    process_id: i32,
+};
+
+pub const WindowSwapEffect = struct {
+    first_window_id: WindowId,
+    second_window_id: WindowId,
+    direction: FocusDirection,
+};
+
+pub const WindowModeEffect = struct {
+    window_id: WindowId,
+    previous: window_mod.WindowMode,
+    current: window_mod.WindowMode,
+};
+
+pub const FullscreenEffect = struct {
+    leader_window_id: WindowId,
+    window_id: WindowId,
+    process_id: i32,
+    is_fullscreen: bool,
+    mode: window_mod.WindowMode,
+    restore_frame: ?window_mod.Window.Frame,
+};
+
+pub const CenterWindowEffect = struct {
+    leader_window_id: WindowId,
+    window_id: WindowId,
+    process_id: i32,
+    current_frame: window_mod.Window.Frame,
+    target_frame: window_mod.Window.Frame,
+};
+
+pub const WindowMoveRequest = struct {
+    window_id: WindowId,
+    target: SpaceRef,
+    layout: ?LayoutInsertion = null,
+    should_move_native: bool,
+    should_follow_focus: bool = false,
+};
+
+pub const WindowMoveEffect = struct {
+    window_id: WindowId,
+    process_id: i32,
+    source: SpaceRef,
+    target: SpaceRef,
+    should_hide: bool,
+    should_follow_focus: bool,
+};
+
 pub const PendingFocus = struct {
     process_id: i32,
     window_id: WindowId,
@@ -632,6 +732,311 @@ pub const PendingFocusQueue = struct {
         self.next_sequence +%= 1;
         if (self.next_sequence == 0) self.next_sequence = 1;
         return sequence;
+    }
+};
+
+pub const WindowReadiness = enum {
+    reject,
+    ready,
+    pending,
+};
+
+pub const WindowCandidate = struct {
+    process_id: i32,
+    window_id: WindowId,
+    space_key: SpaceKey,
+    attempts_remaining: u8,
+};
+
+pub const WindowCandidates = struct {
+    entries: [max_pending_window_candidates]WindowCandidate = undefined,
+    count: u16 = 0,
+
+    pub fn items(self: *const WindowCandidates) []const WindowCandidate {
+        return self.entries[0..self.count];
+    }
+
+    pub fn get(self: *const WindowCandidates, window_id: WindowId) ?WindowCandidate {
+        const index = self.findIndex(window_id) orelse return null;
+        return self.entries[index];
+    }
+
+    fn getPtr(self: *WindowCandidates, window_id: WindowId) ?*WindowCandidate {
+        const index = self.findIndex(window_id) orelse return null;
+        return &self.entries[index];
+    }
+
+    fn track(self: *WindowCandidates, candidate: WindowCandidate, should_reset_attempts: bool) bool {
+        if (self.findIndex(candidate.window_id)) |index| {
+            const attempts_remaining = self.entries[index].attempts_remaining;
+            self.entries[index] = candidate;
+            if (!should_reset_attempts) self.entries[index].attempts_remaining = attempts_remaining;
+            return true;
+        }
+        if (self.count == self.entries.len) return false;
+
+        self.entries[self.count] = candidate;
+        self.count += 1;
+        return true;
+    }
+
+    fn remove(self: *WindowCandidates, window_id: WindowId) ?WindowCandidate {
+        const index = self.findIndex(window_id) orelse return null;
+        const removed = self.entries[index];
+        self.count -= 1;
+        self.entries[index] = self.entries[self.count];
+        return removed;
+    }
+
+    fn removeProcess(self: *WindowCandidates, process_id: i32) void {
+        var index: usize = 0;
+        while (index < self.count) {
+            if (self.entries[index].process_id != process_id) {
+                index += 1;
+                continue;
+            }
+            _ = self.remove(self.entries[index].window_id);
+        }
+    }
+
+    fn findIndex(self: *const WindowCandidates, window_id: WindowId) ?usize {
+        for (self.items(), 0..) |candidate, index| {
+            if (candidate.window_id == window_id) return index;
+        }
+        return null;
+    }
+};
+
+pub const ProcessRetry = struct {
+    process_id: i32,
+    attempts_remaining: u8,
+};
+
+pub const ProcessRetries = struct {
+    entries: [max_process_retries]ProcessRetry = undefined,
+    count: u8 = 0,
+
+    pub fn items(self: *const ProcessRetries) []const ProcessRetry {
+        return self.entries[0..self.count];
+    }
+
+    pub fn get(self: *const ProcessRetries, process_id: i32) ?ProcessRetry {
+        const index = self.findIndex(process_id) orelse return null;
+        return self.entries[index];
+    }
+
+    fn getPtr(self: *ProcessRetries, process_id: i32) ?*ProcessRetry {
+        const index = self.findIndex(process_id) orelse return null;
+        return &self.entries[index];
+    }
+
+    fn track(self: *ProcessRetries, retry: ProcessRetry) bool {
+        if (self.findIndex(retry.process_id)) |index| {
+            self.entries[index] = retry;
+            return true;
+        }
+        if (self.count == self.entries.len) return false;
+
+        self.entries[self.count] = retry;
+        self.count += 1;
+        return true;
+    }
+
+    fn remove(self: *ProcessRetries, process_id: i32) ?ProcessRetry {
+        const index = self.findIndex(process_id) orelse return null;
+        const removed = self.entries[index];
+        self.count -= 1;
+        self.entries[index] = self.entries[self.count];
+        return removed;
+    }
+
+    fn findIndex(self: *const ProcessRetries, process_id: i32) ?usize {
+        for (self.items(), 0..) |retry, index| {
+            if (retry.process_id == process_id) return index;
+        }
+        return null;
+    }
+};
+
+pub const PendingWorkspacePark = struct {
+    outgoing: SpaceRef,
+    target: SpaceRef,
+    deadline_at_ms: TimestampMs,
+};
+
+pub const PendingWorkspaceParks = struct {
+    entries: [max_displays]PendingWorkspacePark = undefined,
+    count: u8 = 0,
+
+    pub fn items(self: *const PendingWorkspaceParks) []const PendingWorkspacePark {
+        return self.entries[0..self.count];
+    }
+
+    pub fn get(self: *const PendingWorkspaceParks, display_id: DisplayId) ?PendingWorkspacePark {
+        const index = self.findIndex(display_id) orelse return null;
+        return self.entries[index];
+    }
+
+    fn put(self: *PendingWorkspaceParks, pending: PendingWorkspacePark) bool {
+        if (self.findIndex(pending.target.display_id)) |index| {
+            self.entries[index] = pending;
+            return true;
+        }
+        if (self.count == self.entries.len) return false;
+
+        self.entries[self.count] = pending;
+        self.count += 1;
+        return true;
+    }
+
+    fn remove(self: *PendingWorkspaceParks, display_id: DisplayId) ?PendingWorkspacePark {
+        const index = self.findIndex(display_id) orelse return null;
+        const removed = self.entries[index];
+        self.count -= 1;
+        self.entries[index] = self.entries[self.count];
+        return removed;
+    }
+
+    fn findIndex(self: *const PendingWorkspaceParks, display_id: DisplayId) ?usize {
+        for (self.items(), 0..) |pending, index| {
+            if (pending.target.display_id == display_id) return index;
+        }
+        return null;
+    }
+};
+
+pub const PointerDragState = struct {
+    is_down: bool = false,
+    candidate_window_id: ?WindowId = null,
+    active_window_id: ?WindowId = null,
+    should_reconcile_on_drop: bool = false,
+};
+
+pub const DragPreviewState = struct {
+    source_window_id: ?WindowId = null,
+    target_window_id: ?WindowId = null,
+    is_visible: bool = false,
+};
+
+pub const PointerDragCompletion = struct {
+    should_retile: bool,
+    swapped_window_ids: ?struct {
+        first: WindowId,
+        second: WindowId,
+    } = null,
+};
+
+pub const DisplayMemoryEntry = struct {
+    uuid: [16]u8,
+    active_workspace_id: WorkspaceId,
+};
+
+pub const DisplayIdentity = struct {
+    display_id: DisplayId,
+    uuid: ?[16]u8,
+};
+
+pub const WorkspaceInitialization = struct {
+    display_ids: [max_displays]DisplayId = @splat(0),
+    display_count: u8 = 0,
+    workspace_count: WorkspaceId,
+    primary_display_id: DisplayId,
+
+    pub fn addDisplay(self: *WorkspaceInitialization, display_id: DisplayId) bool {
+        if (display_id == 0 or self.display_count == self.display_ids.len) return false;
+        for (self.display_ids[0..self.display_count]) |existing| {
+            if (existing == display_id) return false;
+        }
+        self.display_ids[self.display_count] = display_id;
+        self.display_count += 1;
+        return true;
+    }
+};
+
+pub const VirtualDisplayObservation = struct {
+    displays: [max_displays]DisplayIdentity = undefined,
+    display_count: u8 = 0,
+    primary_display_id: DisplayId,
+    focused_display_id: DisplayId,
+    workspace_home_uuids: [max_spaces_per_display]?[16]u8 = @splat(null),
+
+    pub fn addDisplay(self: *VirtualDisplayObservation, display: DisplayIdentity) bool {
+        if (display.display_id == 0 or self.display_count == self.displays.len) return false;
+        for (self.displays[0..self.display_count]) |existing| {
+            if (existing.display_id == display.display_id) return false;
+        }
+        self.displays[self.display_count] = display;
+        self.display_count += 1;
+        return true;
+    }
+};
+
+pub const DisplayMemory = struct {
+    entries: [max_display_memory_entries]DisplayMemoryEntry = undefined,
+    count: u8 = 0,
+
+    pub fn get(self: *const DisplayMemory, uuid: [16]u8) ?DisplayMemoryEntry {
+        for (self.entries[0..self.count]) |entry| {
+            if (std.mem.eql(u8, &entry.uuid, &uuid)) return entry;
+        }
+        return null;
+    }
+
+    fn remember(self: *DisplayMemory, entry: DisplayMemoryEntry) void {
+        for (self.entries[0..self.count]) |*existing| {
+            if (!std.mem.eql(u8, &existing.uuid, &entry.uuid)) continue;
+            existing.* = entry;
+            return;
+        }
+        if (self.count == self.entries.len) {
+            std.mem.copyForwards(
+                DisplayMemoryEntry,
+                self.entries[0 .. self.entries.len - 1],
+                self.entries[1..],
+            );
+            self.count -= 1;
+        }
+        self.entries[self.count] = entry;
+        self.count += 1;
+    }
+};
+
+pub const RetileRequest = struct {
+    all_displays: bool = false,
+    display_ids: [max_displays]DisplayId = @splat(0),
+    display_count: u8 = 0,
+};
+
+pub const CleanupRequest = struct {
+    process_ids: [max_cleanup_processes]i32 = @splat(0),
+    process_count: u8 = 0,
+    should_clean_offscreen: bool = false,
+};
+
+pub const LayoutSpaceFrame = struct {
+    space_key: SpaceKey,
+    root_frame: ?window_mod.Window.Frame,
+};
+
+pub const LayoutRebuild = struct {
+    kind: tiling_mod.LayoutKind,
+    split_mode: tiling_mod.SplitMode,
+    insert_child: tiling_mod.InsertChild,
+    insert_point: tiling_mod.InsertionPointPolicy,
+    inner_gap: f64,
+    split_ratio: f64,
+    spaces: [tiling_mod.max_layouts]LayoutSpaceFrame = undefined,
+    space_count: u8 = 0,
+
+    /// Add one configured Space and its current content frame.
+    pub fn addSpace(self: *LayoutRebuild, space_key: SpaceKey, root_frame: ?window_mod.Window.Frame) bool {
+        if (self.space_count == self.spaces.len) return false;
+        for (self.spaces[0..self.space_count]) |space| {
+            if (space.space_key.eql(space_key)) return false;
+        }
+        self.spaces[self.space_count] = .{ .space_key = space_key, .root_frame = root_frame };
+        self.space_count += 1;
+        return true;
     }
 };
 
@@ -919,7 +1324,25 @@ pub const Model = struct {
     pending_native_workspace_move: ?PendingNativeWorkspaceMove = null,
     pending_focus: PendingFocusQueue = .{},
     deferred_follow_focus: ?DeferredFollowFocus = null,
+    pending_role_windows: WindowCandidates = .{},
+    deferred_window_candidates: WindowCandidates = .{},
+    app_launch_retries: ProcessRetries = .{},
+    focus_retries: ProcessRetries = .{},
+    pending_workspace_parks: PendingWorkspaceParks = .{},
+    display_resettle_due_at_ms: ?TimestampMs = null,
+    bsp_split_mode: tiling_mod.SplitMode = .auto,
+    bsp_insert_point: tiling_mod.InsertionPointPolicy = .focused,
+    pointer_drag: PointerDragState = .{},
+    drag_preview: DragPreviewState = .{},
+    display_memory: DisplayMemory = .{},
+    retile_request: RetileRequest = .{},
+    cleanup_request: CleanupRequest = .{},
+    last_display_change_at_ms: ?TimestampMs = null,
     next_epoch: Epoch = 1,
+
+    pub fn rememberedDisplayWorkspace(self: *const Model, uuid: [16]u8) ?WorkspaceId {
+        return if (self.display_memory.get(uuid)) |entry| entry.active_workspace_id else null;
+    }
 
     pub fn isNativeSwitchPending(self: *const Model) bool {
         return self.pending_switch != null;
@@ -955,6 +1378,29 @@ pub const Model = struct {
 
     pub fn hasDeferredFollowFocus(self: *const Model) bool {
         return self.deferred_follow_focus != null;
+    }
+
+    pub fn hasPendingDiscovery(self: *const Model) bool {
+        return self.pending_role_windows.count > 0 or
+            self.deferred_window_candidates.count > 0 or
+            self.app_launch_retries.count > 0 or
+            self.focus_retries.count > 0;
+    }
+
+    pub fn hasPendingWorkspaceParks(self: *const Model) bool {
+        return self.pending_workspace_parks.count > 0;
+    }
+
+    pub fn hasDisplayResettleScheduled(self: *const Model) bool {
+        return self.display_resettle_due_at_ms != null;
+    }
+
+    pub fn hasPendingRoleWindow(self: *const Model, window_id: WindowId) bool {
+        return self.pending_role_windows.get(window_id) != null;
+    }
+
+    pub fn hasDeferredWindowCandidate(self: *const Model, window_id: WindowId) bool {
+        return self.deferred_window_candidates.get(window_id) != null;
     }
 
     pub fn dueObservation(self: *const Model, at_ms: TimestampMs) ?ObservationTimer {
@@ -1129,6 +1575,7 @@ pub const Model = struct {
 };
 
 pub const Event = union(enum) {
+    initialize_workspaces: WorkspaceInitialization,
     replace_space_catalog: SpaceCatalog,
     adopt_window: WindowAdoption,
     update_window: WindowUpdate,
@@ -1150,9 +1597,18 @@ pub const Event = union(enum) {
         display_id: DisplayId,
         workspace_id: WorkspaceId,
     },
-    initialize_native_topology: NativeTopology,
+    initialize_native_topology: NativeTopologyInitialization,
     request_native_switch: struct {
         target: SpaceRef,
+        at_ms: TimestampMs,
+    },
+    request_workspace_switch: struct {
+        target: SpaceRef,
+        at_ms: TimestampMs,
+    },
+    request_virtual_workspace_move: struct {
+        source_display_id: DisplayId,
+        target_display_id: DisplayId,
         at_ms: TimestampMs,
     },
     native_space_changed: TimestampMs,
@@ -1198,6 +1654,7 @@ pub const Event = union(enum) {
         window_id: WindowId,
         epoch: Epoch,
         succeeded: bool,
+        layout: ?LayoutInsertion = null,
     },
     request_native_workspace_move: struct {
         source: SpaceRef,
@@ -1220,8 +1677,108 @@ pub const Event = union(enum) {
     },
     window_focus_observed: WindowFocusObservation,
     request_pending_focus,
-    clear_pending_focus,
     follow_focus_observed: FollowFocusObservation,
+    track_pending_role_window: WindowCandidate,
+    untrack_pending_role_window: WindowId,
+    pending_role_observed: struct {
+        window_id: WindowId,
+        readiness: WindowReadiness,
+    },
+    track_deferred_window_candidate: WindowCandidate,
+    untrack_deferred_window_candidate: WindowId,
+    deferred_window_observed: struct {
+        window_id: WindowId,
+        readiness: WindowReadiness,
+        is_visible: bool,
+    },
+    deferred_window_promotion_failed: WindowId,
+    untrack_window_candidates_for_process: i32,
+    track_app_launch_retry: ProcessRetry,
+    untrack_app_launch_retry: i32,
+    app_launch_retry_timer_fired: i32,
+    track_focus_retry: ProcessRetry,
+    untrack_focus_retry: i32,
+    focus_retry_observed: struct {
+        process_id: i32,
+        focused_window_id: WindowId,
+    },
+    workspace_reveal_observed: struct {
+        outgoing: SpaceRef,
+        target: SpaceRef,
+        is_revealed: bool,
+        deadline_at_ms: TimestampMs,
+    },
+    workspace_park_timer_fired: struct {
+        display_id: DisplayId,
+        is_revealed: bool,
+        at_ms: TimestampMs,
+    },
+    clear_workspace_parks,
+    display_changed: struct {
+        at_ms: TimestampMs,
+        resettle_at_ms: TimestampMs,
+    },
+    display_resettle_timer_fired: TimestampMs,
+    configure_layout_interaction: struct {
+        split_mode: tiling_mod.SplitMode,
+        insert_point: tiling_mod.InsertionPointPolicy,
+    },
+    toggle_split_mode,
+    set_insert_point: tiling_mod.InsertionPointPolicy,
+    focus_direction: struct {
+        window_id: WindowId,
+        direction: FocusDirection,
+    },
+    swap_direction: struct {
+        window_id: WindowId,
+        direction: FocusDirection,
+    },
+    set_window_mode: struct {
+        window_id: WindowId,
+        mode: window_mod.WindowMode,
+        layout: ?LayoutInsertion = null,
+    },
+    toggle_window_fullscreen: struct {
+        window_id: WindowId,
+        observed_frame: ?window_mod.Window.Frame,
+    },
+    center_floating_window: struct {
+        window_id: WindowId,
+        observed_frame: window_mod.Window.Frame,
+        display_frame: window_mod.Window.Frame,
+    },
+    window_frame_command_result: struct {
+        leader_window_id: WindowId,
+        window_id: WindowId,
+        target_frame: window_mod.Window.Frame,
+        should_save_float_frame: bool,
+        succeeded: bool,
+    },
+    request_window_move: WindowMoveRequest,
+    pointer_down: ?WindowId,
+    pointer_dragged,
+    pointer_geometry_reconcile_requested: WindowId,
+    drag_preview_observed: struct {
+        source_window_id: WindowId,
+        target_window_id: ?WindowId,
+        target_frame: ?window_mod.Window.Frame,
+    },
+    clear_drag_preview,
+    pointer_up,
+    remember_display_workspace: DisplayMemoryEntry,
+    virtual_displays_observed: VirtualDisplayObservation,
+    request_retile_all_displays,
+    request_retile_display: DisplayId,
+    flush_retile_requests,
+    request_cleanup_process: i32,
+    request_offscreen_cleanup,
+    clear_cleanup_requests,
+    flush_cleanup_requests,
+    rebuild_layout: LayoutRebuild,
+    layout_command: struct {
+        event: tiling_mod.Event,
+        display_id: DisplayId,
+    },
     geometry: geometry_mod.Event,
     layout: tiling_mod.Event,
 };
@@ -1248,7 +1805,6 @@ pub const Effect = union(enum) {
         epoch: Epoch,
     },
     observe_native_topology: Epoch,
-    focus_observed_space: SpaceRef,
     native_switch_completed: struct {
         space: SpaceRef,
         epoch: Epoch,
@@ -1261,12 +1817,15 @@ pub const Effect = union(enum) {
     },
     native_topology_changed,
     native_switch_rejected: SpaceRef,
+    workspace_switch_ready: WorkspaceSwitchEffect,
+    virtual_workspace_move_ready: VirtualWorkspaceMoveEffect,
     window_catalog_rejected: struct {
         window_id: WindowId,
         reason: WindowCatalogRejectionReason,
     },
     workspace_transition_started: WorkspaceTransition,
     workspace_transition_settled: WorkspaceTransitionSettlement,
+    move_native_window: PendingNativeWindowMove,
     retry_native_window_move: PendingNativeWindowMove,
     rollback_native_window_move: PendingNativeWindowMove,
     native_window_move_confirmed: PendingNativeWindowMove,
@@ -1303,7 +1862,35 @@ pub const Effect = union(enum) {
         observation: FollowFocusObservation,
         transition: WorkspaceTransition,
     },
-    follow_focus_workspace: FollowFocusObservation,
+    pending_role_ready: WindowCandidate,
+    pending_role_expired: WindowCandidate,
+    deferred_window_ready: WindowCandidate,
+    deferred_window_expired: struct {
+        candidate: WindowCandidate,
+        reason: DeferredWindowExpiryReason,
+    },
+    app_launch_retry_ready: i32,
+    focus_retry_resolved: struct {
+        process_id: i32,
+        window_id: WindowId,
+    },
+    focus_retry_expired: i32,
+    park_workspace: WorkspaceParkEffect,
+    display_resettle_due,
+    reconcile_displays,
+    virtual_displays_reconciled,
+    focus_window: FocusWindowEffect,
+    windows_swapped: WindowSwapEffect,
+    window_mode_changed: WindowModeEffect,
+    fullscreen_changed: FullscreenEffect,
+    center_window: CenterWindowEffect,
+    window_moved: WindowMoveEffect,
+    show_drag_preview: window_mod.Window.Frame,
+    hide_drag_preview,
+    pointer_drag_completed: PointerDragCompletion,
+    retile_requested: RetileRequest,
+    cleanup_requested: CleanupRequest,
+    cleanup_request_overflow: i32,
     geometry: geometry_mod.Effect,
     layout: tiling_mod.Effect,
 };
@@ -1327,8 +1914,12 @@ pub fn reduce(model: Model, event: Event) Transition {
     var should_refresh_workspace_focus = false;
 
     switch (event) {
+        .initialize_workspaces => |initialization| reduceWorkspaceInitialization(&transition, initialization),
         .replace_space_catalog => |catalog| {
             transition.model.spaces = catalog;
+            pruneWindowCandidates(&transition.model.pending_role_windows, &catalog);
+            pruneWindowCandidates(&transition.model.deferred_window_candidates, &catalog);
+            refreshPendingWorkspaceParks(&transition.model.pending_workspace_parks, &catalog);
             refreshWorkspaceTransition(&transition);
             refreshPendingNativeWindowMoves(&transition.model);
             should_refresh_workspace_focus = true;
@@ -1367,14 +1958,15 @@ pub fn reduce(model: Model, event: Event) Transition {
                 activation.workspace_id,
             );
         },
-        .initialize_native_topology => |topology| {
+        .initialize_native_topology => |initialization| {
             const workspace_transition = transition.model.workspace_transition;
-            transition.model.native_topology = topology;
+            transition.model.native_topology = initialization.topology;
             transition.model.pending_switch = null;
             transition.model.queued_switch = null;
             transition.model.observation_timer = null;
             transition.model.pending_native_window_moves.count = 0;
             transition.model.pending_native_workspace_move = null;
+            transition.model.pending_workspace_parks.count = 0;
             if (workspace_transition) |current| {
                 finalizeWorkspaceTransition(&transition, current, .topology_reinitialized);
             } else {
@@ -1382,8 +1974,15 @@ pub fn reduce(model: Model, event: Event) Transition {
                 transition.model.deferred_follow_focus = null;
             }
             syncNativeWorkspaceTopology(&transition);
+            if (initialization.focused_display_id) |display_id| {
+                if (transition.model.workspace_topology.findDisplay(display_id) != null) {
+                    transition.model.workspace_topology.focused_display_id = display_id;
+                }
+            }
             should_refresh_workspace_focus = true;
         },
+        .request_workspace_switch => |request| reduceWorkspaceSwitchRequest(&transition, request),
+        .request_virtual_workspace_move => |request| reduceVirtualWorkspaceMoveRequest(&transition, request),
         .request_native_switch => |request| reduceSwitchRequest(&transition, request),
         .native_space_changed => |at_ms| reduceSpaceChanged(&transition, at_ms),
         .observation_timer_fired => |timer| reduceObservationTimer(&transition, timer),
@@ -1411,8 +2010,108 @@ pub fn reduce(model: Model, event: Event) Transition {
         .native_workspace_move_rollback_result => |result| reduceNativeWorkspaceMoveRollbackResult(&transition, result),
         .window_focus_observed => |observation| reduceWindowFocusObserved(&transition, observation),
         .request_pending_focus => reducePendingFocusRequest(&transition),
-        .clear_pending_focus => transition.model.pending_focus.clear(),
         .follow_focus_observed => |observation| reduceFollowFocusObserved(&transition, observation),
+        .track_pending_role_window => |candidate| reducePendingRoleTracked(&transition, candidate),
+        .untrack_pending_role_window => |window_id| {
+            _ = transition.model.pending_role_windows.remove(window_id);
+        },
+        .pending_role_observed => |observation| reducePendingRoleObserved(&transition, observation),
+        .track_deferred_window_candidate => |candidate| reduceDeferredWindowTracked(&transition, candidate),
+        .untrack_deferred_window_candidate => |window_id| {
+            _ = transition.model.deferred_window_candidates.remove(window_id);
+        },
+        .deferred_window_observed => |observation| reduceDeferredWindowObserved(&transition, observation),
+        .deferred_window_promotion_failed => |window_id| reduceDeferredWindowPromotionFailed(&transition, window_id),
+        .untrack_window_candidates_for_process => |process_id| {
+            transition.model.pending_role_windows.removeProcess(process_id);
+            transition.model.deferred_window_candidates.removeProcess(process_id);
+        },
+        .track_app_launch_retry => |retry| reduceProcessRetryTracked(&transition.model.app_launch_retries, retry),
+        .untrack_app_launch_retry => |process_id| {
+            _ = transition.model.app_launch_retries.remove(process_id);
+        },
+        .app_launch_retry_timer_fired => |process_id| reduceAppLaunchRetryTimer(&transition, process_id),
+        .track_focus_retry => |retry| reduceProcessRetryTracked(&transition.model.focus_retries, retry),
+        .untrack_focus_retry => |process_id| {
+            _ = transition.model.focus_retries.remove(process_id);
+        },
+        .focus_retry_observed => |observation| reduceFocusRetryObserved(&transition, observation),
+        .workspace_reveal_observed => |observation| reduceWorkspaceRevealObserved(&transition, observation),
+        .workspace_park_timer_fired => |timer| reduceWorkspaceParkTimer(&transition, timer),
+        .clear_workspace_parks => transition.model.pending_workspace_parks.count = 0,
+        .display_changed => |change| {
+            transition.model.display_resettle_due_at_ms = change.resettle_at_ms;
+            const is_debounced = if (transition.model.last_display_change_at_ms) |previous|
+                change.at_ms < previous +| display_event_debounce_ms
+            else
+                false;
+            if (!is_debounced) {
+                transition.model.last_display_change_at_ms = change.at_ms;
+                transition.addEffect(.reconcile_displays);
+            }
+        },
+        .display_resettle_timer_fired => |at_ms| reduceDisplayResettleTimer(&transition, at_ms),
+        .configure_layout_interaction => |configuration| {
+            transition.model.bsp_split_mode = configuration.split_mode;
+            transition.model.bsp_insert_point = configuration.insert_point;
+        },
+        .toggle_split_mode => transition.model.bsp_split_mode = switch (transition.model.bsp_split_mode) {
+            .auto => .horizontal,
+            .horizontal => .vertical,
+            .vertical => .auto,
+        },
+        .set_insert_point => |insert_point| transition.model.bsp_insert_point = insert_point,
+        .focus_direction => |command| reduceFocusDirection(&transition, command),
+        .swap_direction => |command| reduceSwapDirection(&transition, command),
+        .set_window_mode => |command| reduceWindowModeCommand(&transition, command),
+        .toggle_window_fullscreen => |command| reduceFullscreenCommand(&transition, command),
+        .center_floating_window => |command| reduceCenterWindowCommand(&transition, command),
+        .window_frame_command_result => |result| reduceWindowFrameCommandResult(&transition, result),
+        .request_window_move => |request| reduceWindowMoveRequest(&transition, request),
+        .pointer_down => |candidate_window_id| reducePointerDown(&transition, candidate_window_id),
+        .pointer_dragged => reducePointerDragged(&transition),
+        .pointer_geometry_reconcile_requested => |window_id| {
+            if (transition.model.pointer_drag.active_window_id == window_id) {
+                transition.model.pointer_drag.should_reconcile_on_drop = true;
+            }
+        },
+        .drag_preview_observed => |observation| reduceDragPreviewObserved(&transition, observation),
+        .clear_drag_preview => clearDragPreview(&transition),
+        .pointer_up => reducePointerUp(&transition),
+        .remember_display_workspace => |entry| {
+            if (entry.active_workspace_id != 0) transition.model.display_memory.remember(entry);
+        },
+        .virtual_displays_observed => |observation| reduceVirtualDisplaysObserved(&transition, observation),
+        .request_retile_all_displays => {
+            transition.model.retile_request.all_displays = true;
+            transition.model.retile_request.display_count = 0;
+        },
+        .request_retile_display => |display_id| reduceRetileDisplayRequested(&transition.model, display_id),
+        .flush_retile_requests => {
+            const request = transition.model.retile_request;
+            if (request.all_displays or request.display_count > 0) {
+                transition.model.retile_request = .{};
+                transition.addEffect(.{ .retile_requested = request });
+            }
+        },
+        .request_cleanup_process => |process_id| reduceCleanupProcessRequested(&transition, process_id),
+        .request_offscreen_cleanup => transition.model.cleanup_request.should_clean_offscreen = true,
+        .clear_cleanup_requests => transition.model.cleanup_request = .{},
+        .flush_cleanup_requests => {
+            const request = transition.model.cleanup_request;
+            transition.model.cleanup_request = .{};
+            if (!transition.model.isWorkspaceTransitionActive() and
+                (request.process_count > 0 or request.should_clean_offscreen))
+            {
+                transition.addEffect(.{ .cleanup_requested = request });
+            }
+        },
+        .rebuild_layout => |rebuild| reduceLayoutRebuild(&transition, rebuild),
+        .layout_command => |command| {
+            if (applyLayoutEvent(&transition, command.event)) {
+                reduceRetileDisplayRequested(&transition.model, command.display_id);
+            }
+        },
         .geometry => |geometry_event| {
             const geometry_transition = geometry_mod.reduce(transition.model.geometry, geometry_event);
             transition.model.geometry = geometry_transition.state;
@@ -1426,6 +2125,53 @@ pub fn reduce(model: Model, event: Event) Transition {
     if (should_refresh_workspace_focus) refreshWorkspaceFocus(&transition.model);
     assertModel(&transition.model);
     return transition;
+}
+
+fn reduceWorkspaceInitialization(transition: *Transition, initialization: WorkspaceInitialization) void {
+    if (transition.model.windows.count != 0 or transition.model.spaces.space_count != 0) return;
+    if (initialization.display_count == 0 or initialization.workspace_count == 0) return;
+    if (initialization.display_count > initialization.workspace_count) return;
+
+    var primary_slot: ?usize = null;
+    for (initialization.display_ids[0..initialization.display_count], 0..) |display_id, slot| {
+        if (display_id == 0) return;
+        if (display_id == initialization.primary_display_id) primary_slot = slot;
+        for (initialization.display_ids[0..slot]) |prior| {
+            if (prior == display_id) return;
+        }
+    }
+    const primary_index = primary_slot orelse return;
+
+    var workspace_displays: [max_spaces_per_display]DisplayId = @splat(initialization.primary_display_id);
+    var topology: WorkspaceTopology = .{};
+    var extra_display_count: WorkspaceId = 0;
+    for (initialization.display_ids[0..initialization.display_count], 0..) |display_id, slot| {
+        const workspace_id: WorkspaceId = if (slot == primary_index)
+            1
+        else
+            initialization.workspace_count - extra_display_count;
+        topology.addDisplay(.{
+            .display_id = display_id,
+            .active_workspace_id = workspace_id,
+        });
+        if (slot == primary_index) continue;
+
+        workspace_displays[workspace_id - 1] = display_id;
+        extra_display_count += 1;
+    }
+    topology.focused_display_id = initialization.primary_display_id;
+
+    var catalog: SpaceCatalog = .{};
+    var workspace_id: WorkspaceId = 1;
+    while (workspace_id <= initialization.workspace_count) : (workspace_id += 1) {
+        catalog.add(.{
+            .key = .{ .virtual = workspace_id },
+            .workspace_id = workspace_id,
+            .display_id = workspace_displays[workspace_id - 1],
+        });
+    }
+    transition.model.spaces = catalog;
+    transition.model.workspace_topology = topology;
 }
 
 fn reduceWindowAdopted(transition: *Transition, adoption: WindowAdoption) void {
@@ -1481,11 +2227,17 @@ fn reduceWindowAdopted(transition: *Transition, adoption: WindowAdoption) void {
     std.debug.assert(transition.model.windows.put(adopted));
     transition.model.geometry.seedObserved(adopted.window_id, adopted.frame) catch unreachable;
 
-    const observation = adoption.tab_group orelse return;
-    const effect_count = transition.effect_count;
-    reduceWindowTabGroupObserved(transition, observation);
-    if (transition.effect_count == effect_count) return;
-    transition.model = original_model;
+    if (adoption.tab_group) |observation| {
+        const effect_count = transition.effect_count;
+        reduceWindowTabGroupObserved(transition, observation);
+        if (transition.effect_count != effect_count) {
+            transition.model = original_model;
+            return;
+        }
+    }
+
+    _ = transition.model.pending_role_windows.remove(adopted.window_id);
+    _ = transition.model.deferred_window_candidates.remove(adopted.window_id);
 }
 
 fn reduceWindowUpdated(transition: *Transition, update: WindowUpdate) void {
@@ -1538,6 +2290,8 @@ fn reduceWindowRemoved(transition: *Transition, window_id: WindowId) void {
     const owned_layout = window.tab_leader_window_id == window_id and
         transition.model.layout.contains(window.space_key, window_id);
 
+    removeWindowFromPointerState(transition, window_id);
+    _ = transition.model.pending_native_window_moves.remove(window_id);
     std.debug.assert(transition.model.windows.remove(window_id));
     transition.model.geometry.forget(window_id);
     if (!owned_layout) return;
@@ -1599,8 +2353,46 @@ fn reduceWindowIdReplaced(
 
     std.debug.assert(transition.model.windows.replaceId(replacement.old_window_id, replacement.new_window_id));
     transition.model.geometry.replaceWindowId(replacement.old_window_id, replacement.new_window_id);
+    if (transition.model.pending_native_window_moves.remove(replacement.old_window_id)) |pending| {
+        var updated = pending;
+        updated.window_id = replacement.new_window_id;
+        std.debug.assert(transition.model.pending_native_window_moves.put(updated));
+    }
+    replacePointerWindowId(&transition.model, replacement.old_window_id, replacement.new_window_id);
+    _ = transition.model.pending_role_windows.remove(replacement.new_window_id);
+    _ = transition.model.deferred_window_candidates.remove(replacement.new_window_id);
     for (&transition.model.workspace_focus) |*focus| {
         focus.replaceWindowId(replacement.old_window_id, replacement.new_window_id);
+    }
+}
+
+fn removeWindowFromPointerState(transition: *Transition, window_id: WindowId) void {
+    if (transition.model.pointer_drag.candidate_window_id == window_id) {
+        transition.model.pointer_drag.candidate_window_id = null;
+    }
+    if (transition.model.pointer_drag.active_window_id == window_id) {
+        transition.model.pointer_drag.active_window_id = null;
+        transition.model.pointer_drag.should_reconcile_on_drop = false;
+    }
+    if (transition.model.drag_preview.source_window_id == window_id or
+        transition.model.drag_preview.target_window_id == window_id)
+    {
+        clearDragPreview(transition);
+    }
+}
+
+fn replacePointerWindowId(model: *Model, old_window_id: WindowId, new_window_id: WindowId) void {
+    if (model.pointer_drag.candidate_window_id == old_window_id) {
+        model.pointer_drag.candidate_window_id = new_window_id;
+    }
+    if (model.pointer_drag.active_window_id == old_window_id) {
+        model.pointer_drag.active_window_id = new_window_id;
+    }
+    if (model.drag_preview.source_window_id == old_window_id) {
+        model.drag_preview.source_window_id = new_window_id;
+    }
+    if (model.drag_preview.target_window_id == old_window_id) {
+        model.drag_preview.target_window_id = new_window_id;
     }
 }
 
@@ -1779,6 +2571,187 @@ fn rejectWindowTabGroup(transition: *Transition, window_id: WindowId) void {
         .window_id = window_id,
         .reason = .invalid_tab_group,
     } });
+}
+
+fn reduceWorkspaceSwitchRequest(
+    transition: *Transition,
+    request: @FieldType(Event, "request_workspace_switch"),
+) void {
+    const target = transition.model.space(request.target.key) orelse return;
+    const active_workspace_id = transition.model.activeWorkspace(target.display_id) orelse return;
+    if (active_workspace_id == target.workspace_id) {
+        startWorkspaceTransition(
+            transition,
+            .switch_workspace,
+            target,
+            request.at_ms,
+            workspace_transition_settle_ms,
+            null,
+        );
+        transition.model.workspace_topology.focused_display_id = target.display_id;
+        clearDragPreview(transition);
+        transition.addEffect(.{ .workspace_switch_ready = .{ .target = target } });
+        return;
+    }
+
+    switch (target.key) {
+        .native => reduceSwitchRequest(transition, .{
+            .target = target,
+            .at_ms = request.at_ms,
+        }),
+        .virtual => {
+            const outgoing = transition.model.spaceForWorkspace(target.display_id, active_workspace_id) orelse return;
+            if (!transition.model.workspace_topology.setActiveWorkspace(target.display_id, target.workspace_id)) return;
+            transition.model.workspace_topology.focused_display_id = target.display_id;
+            startWorkspaceTransition(
+                transition,
+                .switch_workspace,
+                target,
+                request.at_ms,
+                workspace_transition_settle_ms,
+                null,
+            );
+            clearDragPreview(transition);
+            transition.addEffect(.{ .workspace_switch_ready = .{
+                .target = target,
+                .outgoing = outgoing,
+            } });
+        },
+    }
+}
+
+fn reduceVirtualWorkspaceMoveRequest(
+    transition: *Transition,
+    request: @FieldType(Event, "request_virtual_workspace_move"),
+) void {
+    if (request.source_display_id == request.target_display_id) return;
+    const moving_workspace_id = transition.model.activeWorkspace(request.source_display_id) orelse return;
+    const displaced_workspace_id = transition.model.activeWorkspace(request.target_display_id) orelse return;
+    const moving = transition.model.spaceForWorkspace(request.source_display_id, moving_workspace_id) orelse return;
+    const displaced = transition.model.spaceForWorkspace(request.target_display_id, displaced_workspace_id) orelse return;
+    if (moving.key != .virtual or displaced.key != .virtual) return;
+
+    var fallback = displaced;
+    for (transition.model.spaces.spaces[0..transition.model.spaces.space_count]) |space| {
+        if (space.workspace_id == moving.workspace_id) continue;
+        if (space.display_id != request.source_display_id) continue;
+        if (transition.model.activeWorkspace(space.display_id) == space.workspace_id) continue;
+        fallback = space;
+        break;
+    }
+
+    if (!transition.model.workspace_topology.setActiveWorkspace(request.target_display_id, moving.workspace_id)) return;
+    if (!transition.model.workspace_topology.setActiveWorkspace(request.source_display_id, fallback.workspace_id)) return;
+    if (!transition.model.spaces.setDisplay(moving.key, request.target_display_id)) return;
+    if (!transition.model.spaces.setDisplay(fallback.key, request.source_display_id)) return;
+    transition.model.workspace_topology.focused_display_id = request.target_display_id;
+    transition.model.pending_workspace_parks.count = 0;
+    pruneWindowCandidates(&transition.model.pending_role_windows, &transition.model.spaces);
+    pruneWindowCandidates(&transition.model.deferred_window_candidates, &transition.model.spaces);
+
+    const moved = transition.model.space(moving.key).?;
+    startWorkspaceTransition(
+        transition,
+        .move_workspace_to_display,
+        moved,
+        request.at_ms,
+        workspace_transition_settle_ms,
+        null,
+    );
+    clearDragPreview(transition);
+    transition.addEffect(.{ .virtual_workspace_move_ready = .{
+        .moving = moved,
+        .displaced = displaced,
+    } });
+}
+
+fn reduceVirtualDisplaysObserved(transition: *Transition, observation: VirtualDisplayObservation) void {
+    const workspace_count = transition.model.spaces.space_count;
+    if (observation.display_count == 0 or observation.display_count > workspace_count) return;
+    if (!displayObservationContains(&observation, observation.primary_display_id)) return;
+    if (!displayObservationContains(&observation, observation.focused_display_id)) return;
+
+    for (transition.model.spaces.spaces[0..workspace_count]) |space| {
+        if (space.key != .virtual) return;
+        if (space.workspace_id == 0 or space.workspace_id > workspace_count) return;
+    }
+
+    var catalog = transition.model.spaces;
+    var topology: WorkspaceTopology = .{};
+    var active_workspaces: [max_spaces_per_display + 1]bool = @splat(false);
+    for (observation.displays[0..observation.display_count]) |display| {
+        var workspace_id: WorkspaceId = 0;
+        if (display.uuid) |uuid| {
+            if (transition.model.display_memory.get(uuid)) |remembered| {
+                if (remembered.active_workspace_id <= workspace_count and
+                    !active_workspaces[remembered.active_workspace_id])
+                {
+                    workspace_id = remembered.active_workspace_id;
+                }
+            }
+        }
+        if (workspace_id == 0) {
+            workspace_id = firstUnclaimedWorkspace(active_workspaces[0 .. workspace_count + 1]) orelse return;
+        }
+
+        active_workspaces[workspace_id] = true;
+        topology.addDisplay(.{
+            .display_id = display.display_id,
+            .active_workspace_id = workspace_id,
+        });
+        const space = catalog.findLogicalWorkspace(workspace_id) orelse return;
+        std.debug.assert(catalog.setDisplay(space.key, display.display_id));
+    }
+    topology.focused_display_id = observation.focused_display_id;
+
+    for (catalog.spaces[0..catalog.space_count]) |space| {
+        if (active_workspaces[space.workspace_id]) continue;
+        const home_uuid = observation.workspace_home_uuids[space.workspace_id - 1];
+        const display_id = observedDisplayIdForUuid(&observation, home_uuid) orelse observation.primary_display_id;
+        std.debug.assert(catalog.setDisplay(space.key, display_id));
+    }
+
+    transition.model.spaces = catalog;
+    transition.model.workspace_topology = topology;
+    transition.model.pending_workspace_parks.count = 0;
+    pruneWindowCandidates(&transition.model.pending_role_windows, &catalog);
+    pruneWindowCandidates(&transition.model.deferred_window_candidates, &catalog);
+    refreshWorkspaceTransition(transition);
+    refreshPendingNativeWindowMoves(&transition.model);
+    refreshWorkspaceFocus(&transition.model);
+    for (observation.displays[0..observation.display_count]) |display| {
+        const uuid = display.uuid orelse continue;
+        const workspace_id = topology.activeWorkspace(display.display_id).?;
+        transition.model.display_memory.remember(.{
+            .uuid = uuid,
+            .active_workspace_id = workspace_id,
+        });
+    }
+    transition.addEffect(.virtual_displays_reconciled);
+}
+
+fn firstUnclaimedWorkspace(claimed: []const bool) ?WorkspaceId {
+    var workspace_id: WorkspaceId = 1;
+    while (workspace_id < claimed.len) : (workspace_id += 1) {
+        if (!claimed[workspace_id]) return workspace_id;
+    }
+    return null;
+}
+
+fn displayObservationContains(observation: *const VirtualDisplayObservation, display_id: DisplayId) bool {
+    for (observation.displays[0..observation.display_count]) |display| {
+        if (display.display_id == display_id) return true;
+    }
+    return false;
+}
+
+fn observedDisplayIdForUuid(observation: *const VirtualDisplayObservation, uuid: ?[16]u8) ?DisplayId {
+    const expected = uuid orelse return null;
+    for (observation.displays[0..observation.display_count]) |display| {
+        const actual = display.uuid orelse continue;
+        if (std.mem.eql(u8, &actual, &expected)) return display.display_id;
+    }
+    return null;
 }
 
 fn reduceSwitchRequest(
@@ -1993,7 +2966,9 @@ fn reduceNativeWindowMoveTracked(
     };
     if (!transition.model.pending_native_window_moves.put(pending)) {
         transition.addEffect(.{ .native_window_move_rejected = request });
+        return;
     }
+    transition.addEffect(.{ .move_native_window = pending });
 }
 
 fn reduceNativeWindowMoveObserved(
@@ -2037,9 +3012,29 @@ fn reduceNativeWindowMoveRollbackResult(
     if (pending.epoch != event.epoch) return;
 
     if (event.succeeded) {
-        _ = transition.model.pending_native_window_moves.remove(event.window_id);
-        transition.addEffect(.{ .native_window_move_rolled_back = pending });
-        return;
+        const current = transition.model.window(pending.window_id);
+        if (current == null or !current.?.space_key.eql(pending.target.key)) {
+            _ = transition.model.pending_native_window_moves.remove(event.window_id);
+            transition.addEffect(.{ .native_window_move_rolled_back = pending });
+            return;
+        }
+        reduceWindowSpaceAssigned(transition, .{
+            .window_id = pending.window_id,
+            .space_key = pending.source.key,
+            .layout = event.layout,
+        });
+        const restored = transition.model.window(pending.window_id) orelse return;
+        if (restored.space_key.eql(pending.source.key)) {
+            if (transition.model.focusedWorkspaceWindow(pending.source.workspace_id) == null) {
+                reduceWorkspaceFocusRecorded(transition, .{
+                    .workspace_id = pending.source.workspace_id,
+                    .window_id = pending.window_id,
+                });
+            }
+            _ = transition.model.pending_native_window_moves.remove(event.window_id);
+            transition.addEffect(.{ .native_window_move_rolled_back = pending });
+            return;
+        }
     }
     transition.addEffect(.{ .native_window_move_rollback_deferred = pending });
 }
@@ -2151,6 +3146,8 @@ fn reduceNativeWorkspaceMoveObserved(
     transition.model.windows.swapSpaceKeys(pending.source.key, pending.target.key);
     transition.model.pending_native_workspace_move = null;
     syncNativeWorkspaceTopology(transition);
+    const moved = transition.model.space(pending.target.key).?;
+    transition.model.workspace_topology.focused_display_id = moved.display_id;
     completeWorkspaceTransition(&transition.model, pending.epoch, .native_space_changed, event.at_ms);
     transition.addEffect(.{ .native_workspace_move_completed = pending });
 }
@@ -2243,6 +3240,682 @@ fn reducePendingFocusRequest(transition: *Transition) void {
     transition.addEffect(.{ .apply_pending_focus = pending });
 }
 
+fn reducePendingRoleTracked(transition: *Transition, candidate: WindowCandidate) void {
+    if (!windowCandidateIsValid(&transition.model, candidate) or candidate.attempts_remaining == 0) return;
+    if (transition.model.window(candidate.window_id) != null) {
+        _ = transition.model.pending_role_windows.remove(candidate.window_id);
+        return;
+    }
+    if (!transition.model.pending_role_windows.track(candidate, true)) {
+        @panic("pending role window capacity exceeded");
+    }
+}
+
+fn reducePendingRoleObserved(
+    transition: *Transition,
+    observation: @FieldType(Event, "pending_role_observed"),
+) void {
+    if (transition.model.window(observation.window_id) != null) {
+        _ = transition.model.pending_role_windows.remove(observation.window_id);
+        return;
+    }
+    const candidate = transition.model.pending_role_windows.getPtr(observation.window_id) orelse return;
+
+    switch (observation.readiness) {
+        .reject => _ = transition.model.pending_role_windows.remove(observation.window_id),
+        .ready => {
+            const ready = transition.model.pending_role_windows.remove(observation.window_id).?;
+            transition.addEffect(.{ .pending_role_ready = ready });
+        },
+        .pending => {
+            if (candidate.attempts_remaining > 0) {
+                candidate.attempts_remaining -= 1;
+                return;
+            }
+            const expired = transition.model.pending_role_windows.remove(observation.window_id).?;
+            transition.addEffect(.{ .pending_role_expired = expired });
+        },
+    }
+}
+
+fn reduceDeferredWindowTracked(transition: *Transition, candidate: WindowCandidate) void {
+    if (!windowCandidateIsValid(&transition.model, candidate) or candidate.attempts_remaining == 0) return;
+    if (transition.model.window(candidate.window_id) != null) {
+        _ = transition.model.deferred_window_candidates.remove(candidate.window_id);
+        return;
+    }
+    if (!transition.model.deferred_window_candidates.track(candidate, false)) {
+        @panic("deferred window candidate capacity exceeded");
+    }
+}
+
+fn reduceDeferredWindowObserved(
+    transition: *Transition,
+    observation: @FieldType(Event, "deferred_window_observed"),
+) void {
+    if (transition.model.window(observation.window_id) != null) {
+        _ = transition.model.deferred_window_candidates.remove(observation.window_id);
+        return;
+    }
+    const candidate = transition.model.deferred_window_candidates.getPtr(observation.window_id) orelse return;
+
+    switch (observation.readiness) {
+        .reject => _ = transition.model.deferred_window_candidates.remove(observation.window_id),
+        .pending => expireOrDecrementDeferredWindow(transition, candidate, .role_pending),
+        .ready => {
+            if (!observation.is_visible) {
+                expireOrDecrementDeferredWindow(transition, candidate, .off_screen);
+                return;
+            }
+            transition.addEffect(.{ .deferred_window_ready = candidate.* });
+        },
+    }
+}
+
+fn reduceDeferredWindowPromotionFailed(transition: *Transition, window_id: WindowId) void {
+    const candidate = transition.model.deferred_window_candidates.getPtr(window_id) orelse return;
+    expireOrDecrementDeferredWindow(transition, candidate, .unsettled_bounds);
+}
+
+fn expireOrDecrementDeferredWindow(
+    transition: *Transition,
+    candidate: *WindowCandidate,
+    reason: DeferredWindowExpiryReason,
+) void {
+    if (candidate.attempts_remaining > 0) {
+        candidate.attempts_remaining -= 1;
+        return;
+    }
+    const expired = transition.model.deferred_window_candidates.remove(candidate.window_id).?;
+    transition.addEffect(.{ .deferred_window_expired = .{
+        .candidate = expired,
+        .reason = reason,
+    } });
+}
+
+fn reduceProcessRetryTracked(retries: *ProcessRetries, retry: ProcessRetry) void {
+    if (retry.process_id <= 0 or retry.attempts_remaining == 0) return;
+    if (!retries.track(retry)) @panic("process retry capacity exceeded");
+}
+
+fn reduceAppLaunchRetryTimer(transition: *Transition, process_id: i32) void {
+    const retry = transition.model.app_launch_retries.getPtr(process_id) orelse return;
+    if (retry.attempts_remaining > 0) {
+        retry.attempts_remaining -= 1;
+        return;
+    }
+    _ = transition.model.app_launch_retries.remove(process_id);
+    transition.addEffect(.{ .app_launch_retry_ready = process_id });
+}
+
+fn reduceFocusRetryObserved(
+    transition: *Transition,
+    observation: @FieldType(Event, "focus_retry_observed"),
+) void {
+    const retry = transition.model.focus_retries.getPtr(observation.process_id) orelse return;
+    if (observation.focused_window_id != 0) {
+        _ = transition.model.focus_retries.remove(observation.process_id);
+        transition.addEffect(.{ .focus_retry_resolved = .{
+            .process_id = observation.process_id,
+            .window_id = observation.focused_window_id,
+        } });
+        return;
+    }
+    if (retry.attempts_remaining > 0) {
+        retry.attempts_remaining -= 1;
+        return;
+    }
+    _ = transition.model.focus_retries.remove(observation.process_id);
+    transition.addEffect(.{ .focus_retry_expired = observation.process_id });
+}
+
+fn reduceWorkspaceRevealObserved(
+    transition: *Transition,
+    observation: @FieldType(Event, "workspace_reveal_observed"),
+) void {
+    const outgoing = transition.model.space(observation.outgoing.key) orelse return;
+    const target = transition.model.space(observation.target.key) orelse return;
+    if (outgoing.key.eql(target.key) or outgoing.display_id != target.display_id) return;
+
+    const prior = transition.model.pending_workspace_parks.remove(target.display_id);
+    if (observation.is_revealed) {
+        transition.addEffect(.{ .park_workspace = .{ .outgoing = outgoing, .target = target } });
+        if (prior) |pending| {
+            if (!pending.outgoing.key.eql(outgoing.key) and
+                !pending.outgoing.key.eql(target.key))
+            {
+                const prior_outgoing = transition.model.space(pending.outgoing.key) orelse return;
+                transition.addEffect(.{ .park_workspace = .{ .outgoing = prior_outgoing, .target = target } });
+            }
+        }
+        return;
+    }
+
+    var cover = outgoing;
+    if (prior) |pending| {
+        if (!pending.outgoing.key.eql(target.key) and
+            !pending.outgoing.key.eql(outgoing.key))
+        {
+            transition.addEffect(.{ .park_workspace = .{ .outgoing = outgoing, .target = target } });
+            cover = transition.model.space(pending.outgoing.key) orelse outgoing;
+        }
+    }
+    if (!transition.model.pending_workspace_parks.put(.{
+        .outgoing = cover,
+        .target = target,
+        .deadline_at_ms = observation.deadline_at_ms,
+    })) @panic("pending workspace park capacity exceeded");
+}
+
+fn reduceWorkspaceParkTimer(
+    transition: *Transition,
+    timer: @FieldType(Event, "workspace_park_timer_fired"),
+) void {
+    const pending = transition.model.pending_workspace_parks.get(timer.display_id) orelse return;
+    const active_workspace_id = transition.model.activeWorkspace(timer.display_id) orelse return;
+    const active = transition.model.spaceForWorkspace(timer.display_id, active_workspace_id) orelse return;
+    if (!active.key.eql(pending.target.key)) {
+        _ = transition.model.pending_workspace_parks.remove(timer.display_id);
+        if (!pending.outgoing.key.eql(active.key)) {
+            const outgoing = transition.model.space(pending.outgoing.key) orelse return;
+            transition.addEffect(.{ .park_workspace = .{ .outgoing = outgoing, .target = active } });
+        }
+        return;
+    }
+    if (!timer.is_revealed and timer.at_ms < pending.deadline_at_ms) return;
+
+    _ = transition.model.pending_workspace_parks.remove(timer.display_id);
+    const outgoing = transition.model.space(pending.outgoing.key) orelse return;
+    const target = transition.model.space(pending.target.key) orelse return;
+    transition.addEffect(.{ .park_workspace = .{
+        .outgoing = outgoing,
+        .target = target,
+        .did_time_out = !timer.is_revealed,
+    } });
+}
+
+fn reduceDisplayResettleTimer(transition: *Transition, at_ms: TimestampMs) void {
+    const due_at_ms = transition.model.display_resettle_due_at_ms orelse return;
+    if (at_ms < due_at_ms) return;
+    transition.model.display_resettle_due_at_ms = null;
+    transition.addEffect(.display_resettle_due);
+}
+
+fn reducePointerDown(transition: *Transition, candidate_window_id: ?WindowId) void {
+    clearDragPreview(transition);
+    transition.model.pointer_drag = .{
+        .is_down = true,
+        .candidate_window_id = if (candidate_window_id) |window_id|
+            if (transition.model.window(window_id) != null) window_id else null
+        else
+            null,
+    };
+}
+
+fn reduceRetileDisplayRequested(model: *Model, display_id: DisplayId) void {
+    if (display_id == 0 or model.retile_request.all_displays) return;
+    for (model.retile_request.display_ids[0..model.retile_request.display_count]) |existing| {
+        if (existing == display_id) return;
+    }
+    if (model.retile_request.display_count == model.retile_request.display_ids.len) {
+        model.retile_request.all_displays = true;
+        model.retile_request.display_count = 0;
+        return;
+    }
+    model.retile_request.display_ids[model.retile_request.display_count] = display_id;
+    model.retile_request.display_count += 1;
+}
+
+fn reduceCleanupProcessRequested(transition: *Transition, process_id: i32) void {
+    if (process_id <= 0) return;
+    for (transition.model.cleanup_request.process_ids[0..transition.model.cleanup_request.process_count]) |existing| {
+        if (existing == process_id) return;
+    }
+    if (transition.model.cleanup_request.process_count == transition.model.cleanup_request.process_ids.len) {
+        transition.model.cleanup_request.should_clean_offscreen = true;
+        transition.addEffect(.{ .cleanup_request_overflow = process_id });
+        return;
+    }
+    transition.model.cleanup_request.process_ids[transition.model.cleanup_request.process_count] = process_id;
+    transition.model.cleanup_request.process_count += 1;
+}
+
+fn reduceLayoutRebuild(transition: *Transition, rebuild: LayoutRebuild) void {
+    if (rebuild.space_count > rebuild.spaces.len) return;
+    if (!std.math.isFinite(rebuild.inner_gap) or !std.math.isFinite(rebuild.split_ratio)) return;
+
+    const original_layout = transition.model.layout;
+    transition.model.layout = .{};
+    for (rebuild.spaces[0..rebuild.space_count]) |layout_space| {
+        const space = transition.model.space(layout_space.space_key) orelse {
+            transition.model.layout = original_layout;
+            return;
+        };
+        if (layout_space.root_frame) |frame| {
+            if (!frameIsFinite(frame) or frame.width <= 0 or frame.height <= 0) {
+                transition.model.layout = original_layout;
+                return;
+            }
+        }
+
+        for (transition.model.windows.items()) |window| {
+            if (!window.space_key.eql(space.key)) continue;
+            if (window.tab_leader_window_id != window.window_id) continue;
+            if (window.mode != .tiled) continue;
+
+            const anchor_window_id: ?WindowId = switch (rebuild.insert_point) {
+                .focused => blk: {
+                    const focused_window_id = transition.model.focusedWorkspaceWindow(space.workspace_id) orelse break :blk null;
+                    if (focused_window_id == window.window_id) break :blk null;
+                    break :blk focused_window_id;
+                },
+                .first => transition.model.layout.firstWid(space.key),
+                .last => transition.model.layout.lastWid(space.key),
+                .min_depth => null,
+            };
+            if (!applyLayoutEvent(transition, .{ .insert = .{
+                .space_key = space.key,
+                .kind = rebuild.kind,
+                .window_id = window.window_id,
+                .options = .{
+                    .split_mode = rebuild.split_mode,
+                    .child = rebuild.insert_child,
+                    .anchor_wid = anchor_window_id,
+                    .root_frame = layout_space.root_frame,
+                    .inner_gap = rebuild.inner_gap,
+                    .split_ratio = rebuild.split_ratio,
+                },
+            } })) {
+                transition.model.layout = original_layout;
+                return;
+            }
+        }
+        const focused_window_id = transition.model.focusedWorkspaceWindow(space.workspace_id) orelse continue;
+        if (!transition.model.layout.contains(space.key, focused_window_id)) continue;
+        _ = applyLayoutEvent(transition, .{ .set_active = .{
+            .space_key = space.key,
+            .window_id = focused_window_id,
+        } });
+    }
+}
+
+const ActionWindow = struct {
+    leader: ManagedWindow,
+    space: SpaceRef,
+};
+
+fn reduceFocusDirection(
+    transition: *Transition,
+    command: @FieldType(Event, "focus_direction"),
+) void {
+    const action = resolveActionWindow(&transition.model, command.window_id) orelse return;
+    const target_window_id = windowInDirection(&transition.model, action, command.direction) orelse
+        transition.model.layout.cycleFocus(
+            action.space.key,
+            action.leader.window_id,
+            command.direction == .right or command.direction == .down,
+        ) orelse return;
+    const target = transition.model.window(target_window_id) orelse return;
+    const leader = transition.model.window(target.tab_leader_window_id) orelse return;
+    if (!leader.space_key.eql(action.space.key)) return;
+    const active_window_id = transition.model.windowTabActive(leader.window_id);
+    const active = transition.model.window(active_window_id) orelse return;
+
+    reduceWorkspaceFocusRecorded(transition, .{
+        .workspace_id = action.space.workspace_id,
+        .window_id = leader.window_id,
+    });
+    _ = applyLayoutEvent(transition, .{ .set_active = .{
+        .space_key = action.space.key,
+        .window_id = leader.window_id,
+    } });
+    transition.addEffect(.{ .focus_window = .{
+        .window_id = active.window_id,
+        .process_id = active.process_id,
+    } });
+}
+
+fn reduceSwapDirection(
+    transition: *Transition,
+    command: @FieldType(Event, "swap_direction"),
+) void {
+    const action = resolveActionWindow(&transition.model, command.window_id) orelse return;
+    const target_window_id = windowInDirection(&transition.model, action, command.direction) orelse return;
+    if (!transition.model.layout.contains(action.space.key, action.leader.window_id)) return;
+    if (!transition.model.layout.contains(action.space.key, target_window_id)) return;
+    if (!applyLayoutEvent(transition, .{ .swap_window_ids = .{
+        .space_key = action.space.key,
+        .first_window_id = action.leader.window_id,
+        .second_window_id = target_window_id,
+    } })) return;
+
+    reduceRetileDisplayRequested(&transition.model, action.space.display_id);
+    transition.addEffect(.{ .windows_swapped = .{
+        .first_window_id = action.leader.window_id,
+        .second_window_id = target_window_id,
+        .direction = command.direction,
+    } });
+}
+
+fn reduceWindowModeCommand(
+    transition: *Transition,
+    command: @FieldType(Event, "set_window_mode"),
+) void {
+    const action = resolveActionWindow(&transition.model, command.window_id) orelse return;
+    if (action.leader.mode == command.mode) return;
+
+    var window = action.leader.snapshot();
+    window.mode = command.mode;
+    reduceWindowUpdated(transition, .{
+        .window = window,
+        .layout = command.layout,
+    });
+    const updated = transition.model.window(action.leader.window_id) orelse return;
+    if (updated.mode != command.mode) return;
+
+    reduceRetileDisplayRequested(&transition.model, action.space.display_id);
+    transition.addEffect(.{ .window_mode_changed = .{
+        .window_id = updated.window_id,
+        .previous = action.leader.mode,
+        .current = updated.mode,
+    } });
+}
+
+fn reduceFullscreenCommand(
+    transition: *Transition,
+    command: @FieldType(Event, "toggle_window_fullscreen"),
+) void {
+    const action = resolveActionWindow(&transition.model, command.window_id) orelse return;
+    const active_window_id = transition.model.windowTabActive(action.leader.window_id);
+    const active = transition.model.window(active_window_id) orelse return;
+
+    var leader = action.leader.snapshot();
+    leader.is_fullscreen = !leader.is_fullscreen;
+    const restore_frame: ?window_mod.Window.Frame = blk: {
+        if (leader.mode != .floating) break :blk null;
+        if (!leader.is_fullscreen) break :blk leader.float_frame;
+
+        const observed = command.observed_frame orelse leader.frame;
+        if (!frameIsFinite(observed) or observed.width <= 0 or observed.height <= 0) return;
+        leader.float_frame = observed;
+        break :blk null;
+    };
+    reduceWindowUpdated(transition, .{ .window = leader });
+
+    reduceRetileDisplayRequested(&transition.model, action.space.display_id);
+    transition.addEffect(.{ .fullscreen_changed = .{
+        .leader_window_id = action.leader.window_id,
+        .window_id = active.window_id,
+        .process_id = active.process_id,
+        .is_fullscreen = leader.is_fullscreen,
+        .mode = leader.mode,
+        .restore_frame = restore_frame,
+    } });
+}
+
+fn reduceCenterWindowCommand(
+    transition: *Transition,
+    command: @FieldType(Event, "center_floating_window"),
+) void {
+    const action = resolveActionWindow(&transition.model, command.window_id) orelse return;
+    if (action.leader.mode != .floating or action.leader.is_fullscreen) return;
+    if (!frameIsFinite(command.observed_frame) or !frameIsFinite(command.display_frame)) return;
+    if (command.observed_frame.width <= 0 or command.observed_frame.height <= 0) return;
+    if (command.display_frame.width <= 0 or command.display_frame.height <= 0) return;
+
+    const active_window_id = transition.model.windowTabActive(action.leader.window_id);
+    const active = transition.model.window(active_window_id) orelse return;
+    const target: window_mod.Window.Frame = .{
+        .x = command.display_frame.x + (command.display_frame.width - command.observed_frame.width) / 2.0,
+        .y = command.display_frame.y + (command.display_frame.height - command.observed_frame.height) / 2.0,
+        .width = command.observed_frame.width,
+        .height = command.observed_frame.height,
+    };
+    transition.addEffect(.{ .center_window = .{
+        .leader_window_id = action.leader.window_id,
+        .window_id = active.window_id,
+        .process_id = active.process_id,
+        .current_frame = active.frame,
+        .target_frame = target,
+    } });
+}
+
+fn reduceWindowFrameCommandResult(
+    transition: *Transition,
+    result: @FieldType(Event, "window_frame_command_result"),
+) void {
+    if (!result.succeeded) return;
+    if (!frameIsFinite(result.target_frame)) return;
+
+    var visible = transition.model.window(result.window_id) orelse return;
+    visible.frame = result.target_frame;
+    std.debug.assert(transition.model.windows.update(visible.snapshot()));
+
+    if (result.leader_window_id == result.window_id) {
+        if (!result.should_save_float_frame) return;
+        visible.float_frame = result.target_frame;
+        std.debug.assert(transition.model.windows.update(visible.snapshot()));
+        return;
+    }
+
+    var leader = transition.model.window(result.leader_window_id) orelse return;
+    if (leader.tab_leader_window_id != leader.window_id) return;
+    leader.frame = result.target_frame;
+    if (result.should_save_float_frame) leader.float_frame = result.target_frame;
+    std.debug.assert(transition.model.windows.update(leader.snapshot()));
+}
+
+fn reduceWindowMoveRequest(transition: *Transition, request: WindowMoveRequest) void {
+    const action = resolveActionWindow(&transition.model, request.window_id) orelse return;
+    const target = transition.model.space(request.target.key) orelse return;
+    if (action.space.key.eql(target.key)) return;
+    if (request.should_move_native and (action.space.key != .native or target.key != .native)) return;
+
+    reduceWindowSpaceAssigned(transition, .{
+        .window_id = action.leader.window_id,
+        .space_key = target.key,
+        .layout = request.layout,
+    });
+    const moved = transition.model.window(action.leader.window_id) orelse return;
+    if (!moved.space_key.eql(target.key)) return;
+
+    if (transition.model.focusedWorkspaceWindow(target.workspace_id) == null) {
+        reduceWorkspaceFocusRecorded(transition, .{
+            .workspace_id = target.workspace_id,
+            .window_id = moved.window_id,
+        });
+    }
+    transition.model.retile_request.all_displays = true;
+    transition.model.retile_request.display_count = 0;
+    if (request.should_move_native) {
+        reduceNativeWindowMoveTracked(transition, .{
+            .window_id = moved.window_id,
+            .source = action.space,
+            .target = target,
+        });
+    }
+
+    const active_window_id = transition.model.windowTabActive(moved.window_id);
+    const active = transition.model.window(active_window_id) orelse return;
+    transition.addEffect(.{ .window_moved = .{
+        .window_id = active.window_id,
+        .process_id = active.process_id,
+        .source = action.space,
+        .target = target,
+        .should_hide = !request.should_move_native and
+            transition.model.activeWorkspace(target.display_id) != target.workspace_id,
+        .should_follow_focus = request.should_follow_focus,
+    } });
+}
+
+fn resolveActionWindow(model: *const Model, window_id: WindowId) ?ActionWindow {
+    const window = model.window(window_id) orelse return null;
+    const leader = model.window(window.tab_leader_window_id) orelse return null;
+    const space = model.space(leader.space_key) orelse return null;
+    if (model.activeWorkspace(space.display_id) != space.workspace_id) return null;
+    return .{ .leader = leader, .space = space };
+}
+
+fn windowInDirection(model: *const Model, action: ActionWindow, direction: FocusDirection) ?WindowId {
+    const focused = action.leader.frame;
+    const focused_center_x = focused.x + focused.width / 2.0;
+    const focused_center_y = focused.y + focused.height / 2.0;
+    var best_window_id: ?WindowId = null;
+    var best_distance = std.math.inf(f64);
+
+    for (model.windows.items()) |window| {
+        if (!window.space_key.eql(action.space.key)) continue;
+        if (window.tab_leader_window_id != window.window_id) continue;
+        if (window.window_id == action.leader.window_id) continue;
+
+        const center_x = window.frame.x + window.frame.width / 2.0;
+        const center_y = window.frame.y + window.frame.height / 2.0;
+        const delta_x = center_x - focused_center_x;
+        const delta_y = center_y - focused_center_y;
+        const is_in_direction = switch (direction) {
+            .left => delta_x < 0,
+            .right => delta_x > 0,
+            .up => delta_y < 0,
+            .down => delta_y > 0,
+        };
+        if (!is_in_direction) continue;
+
+        const distance = @abs(delta_x) + @abs(delta_y);
+        if (distance >= best_distance) continue;
+        best_distance = distance;
+        best_window_id = window.window_id;
+    }
+    return best_window_id;
+}
+
+fn reducePointerDragged(transition: *Transition) void {
+    if (!transition.model.pointer_drag.is_down) return;
+    if (transition.model.pointer_drag.active_window_id != null) return;
+    transition.model.pointer_drag.active_window_id = transition.model.pointer_drag.candidate_window_id;
+}
+
+fn reduceDragPreviewObserved(
+    transition: *Transition,
+    observation: @FieldType(Event, "drag_preview_observed"),
+) void {
+    const source = transition.model.window(observation.source_window_id) orelse {
+        clearDragPreview(transition);
+        return;
+    };
+    if (source.mode != .tiled or source.is_fullscreen) {
+        clearDragPreview(transition);
+        return;
+    }
+
+    transition.model.drag_preview.source_window_id = source.window_id;
+    const target_window_id = observation.target_window_id orelse {
+        hideDragPreview(transition);
+        return;
+    };
+    const target_frame = observation.target_frame orelse {
+        hideDragPreview(transition);
+        return;
+    };
+    if (!frameIsFinite(target_frame) or target_frame.width <= 0 or target_frame.height <= 0) {
+        hideDragPreview(transition);
+        return;
+    }
+    const target = transition.model.window(target_window_id) orelse {
+        hideDragPreview(transition);
+        return;
+    };
+    if (target.mode != .tiled or target.is_fullscreen or !target.space_key.eql(source.space_key)) {
+        hideDragPreview(transition);
+        return;
+    }
+
+    const target_changed = transition.model.drag_preview.target_window_id != target_window_id;
+    transition.model.drag_preview.target_window_id = target_window_id;
+    if (transition.model.drag_preview.is_visible and !target_changed) return;
+    transition.model.drag_preview.is_visible = true;
+    transition.addEffect(.{ .show_drag_preview = target_frame });
+}
+
+fn reducePointerUp(transition: *Transition) void {
+    const pointer_drag = transition.model.pointer_drag;
+    const preview = transition.model.drag_preview;
+    transition.model.pointer_drag = .{};
+    clearDragPreview(transition);
+
+    const source_window_id = preview.source_window_id orelse {
+        if (pointer_drag.should_reconcile_on_drop) {
+            transition.addEffect(.{ .pointer_drag_completed = .{ .should_retile = true } });
+        }
+        return;
+    };
+    const target_window_id = preview.target_window_id orelse {
+        transition.addEffect(.{ .pointer_drag_completed = .{ .should_retile = true } });
+        return;
+    };
+    if (source_window_id == target_window_id) return;
+
+    const source = transition.model.window(source_window_id) orelse return;
+    const target = transition.model.window(target_window_id) orelse return;
+    if (source.mode != .tiled or target.mode != .tiled) return;
+    if (source.is_fullscreen or target.is_fullscreen) return;
+    if (!source.space_key.eql(target.space_key)) return;
+    if (!transition.model.layout.contains(source.space_key, source_window_id)) return;
+    if (!transition.model.layout.contains(source.space_key, target_window_id)) return;
+    if (!applyLayoutEvent(transition, .{ .swap_window_ids = .{
+        .space_key = source.space_key,
+        .first_window_id = source_window_id,
+        .second_window_id = target_window_id,
+    } })) return;
+    transition.addEffect(.{ .pointer_drag_completed = .{
+        .should_retile = true,
+        .swapped_window_ids = .{ .first = source_window_id, .second = target_window_id },
+    } });
+}
+
+fn clearDragPreview(transition: *Transition) void {
+    if (transition.model.drag_preview.is_visible) transition.addEffect(.hide_drag_preview);
+    transition.model.drag_preview = .{};
+}
+
+fn hideDragPreview(transition: *Transition) void {
+    transition.model.drag_preview.target_window_id = null;
+    if (!transition.model.drag_preview.is_visible) return;
+    transition.model.drag_preview.is_visible = false;
+    transition.addEffect(.hide_drag_preview);
+}
+
+fn windowCandidateIsValid(model: *const Model, candidate: WindowCandidate) bool {
+    return candidate.process_id > 0 and
+        candidate.window_id != 0 and
+        model.space(candidate.space_key) != null;
+}
+
+fn pruneWindowCandidates(candidates: *WindowCandidates, spaces: *const SpaceCatalog) void {
+    var index: usize = 0;
+    while (index < candidates.count) {
+        if (spaces.find(candidates.entries[index].space_key) != null) {
+            index += 1;
+            continue;
+        }
+        _ = candidates.remove(candidates.entries[index].window_id);
+    }
+}
+
+fn refreshPendingWorkspaceParks(parks: *PendingWorkspaceParks, spaces: *const SpaceCatalog) void {
+    var index: usize = 0;
+    while (index < parks.count) {
+        const outgoing = spaces.find(parks.entries[index].outgoing.key);
+        const target = spaces.find(parks.entries[index].target.key);
+        if (outgoing == null or target == null or outgoing.?.display_id != target.?.display_id) {
+            _ = parks.remove(parks.entries[index].target.display_id);
+            continue;
+        }
+        parks.entries[index].outgoing = outgoing.?;
+        parks.entries[index].target = target.?;
+        index += 1;
+    }
+}
+
 fn reduceFollowFocusObserved(
     transition: *Transition,
     event: FollowFocusObservation,
@@ -2267,7 +3940,10 @@ fn reduceFollowFocusObserved(
 
     const current = workspace_transition orelse {
         transition.model.deferred_follow_focus = null;
-        transition.addEffect(.{ .follow_focus_workspace = observation });
+        reduceWorkspaceSwitchRequest(transition, .{
+            .target = observation.target,
+            .at_ms = observation.at_ms,
+        });
         return;
     };
 
@@ -2299,6 +3975,7 @@ fn finishSwitch(
 
     if (failure == null) {
         transition.model.deferred_follow_focus = null;
+        transition.model.pending_focus.clear();
         completeWorkspaceTransition(
             &transition.model,
             pending.epoch,
@@ -2348,7 +4025,8 @@ fn startSwitch(
     };
     if (display.observed_space_id == nativeSpaceId(target).?) {
         if (should_focus_if_observed) {
-            transition.addEffect(.{ .focus_observed_space = target });
+            transition.model.workspace_topology.focused_display_id = target.display_id;
+            transition.addEffect(.{ .workspace_switch_ready = .{ .target = target } });
         } else {
             transition.addEffect(.{ .native_switch_completed = .{
                 .space = target,
@@ -2357,6 +4035,8 @@ fn startSwitch(
         }
         return;
     }
+
+    transition.model.workspace_topology.focused_display_id = target.display_id;
 
     const epoch = takeEpoch(&transition.model);
     const pending: PendingSwitch = .{
@@ -2669,7 +4349,89 @@ fn assertModel(model: *const Model) void {
         std.debug.assert(deferred.window_id != 0);
         std.debug.assert(deferred.transition_epoch == model.workspace_transition.?.epoch);
     }
+    assertWindowCandidates(model, &model.pending_role_windows);
+    assertWindowCandidates(model, &model.deferred_window_candidates);
+    assertProcessRetries(&model.app_launch_retries);
+    assertProcessRetries(&model.focus_retries);
+    std.debug.assert(model.pending_workspace_parks.count <= model.pending_workspace_parks.entries.len);
+    for (model.pending_workspace_parks.items(), 0..) |pending, index| {
+        pending.outgoing.assertValid();
+        pending.target.assertValid();
+        std.debug.assert(!pending.outgoing.key.eql(pending.target.key));
+        std.debug.assert(pending.outgoing.display_id == pending.target.display_id);
+        std.debug.assert(model.space(pending.outgoing.key).?.display_id == pending.outgoing.display_id);
+        std.debug.assert(model.space(pending.target.key).?.display_id == pending.target.display_id);
+        for (model.pending_workspace_parks.items()[0..index]) |prior| {
+            std.debug.assert(prior.target.display_id != pending.target.display_id);
+        }
+    }
+    if (!model.pointer_drag.is_down) {
+        std.debug.assert(model.pointer_drag.candidate_window_id == null);
+        std.debug.assert(model.pointer_drag.active_window_id == null);
+        std.debug.assert(!model.pointer_drag.should_reconcile_on_drop);
+    }
+    if (model.pointer_drag.candidate_window_id) |window_id| {
+        std.debug.assert(model.window(window_id) != null);
+    }
+    if (model.pointer_drag.active_window_id) |window_id| {
+        std.debug.assert(model.pointer_drag.is_down);
+        std.debug.assert(model.pointer_drag.candidate_window_id == window_id);
+    }
+    if (model.pointer_drag.should_reconcile_on_drop) {
+        std.debug.assert(model.pointer_drag.active_window_id != null);
+    }
+    if (model.drag_preview.source_window_id) |window_id| {
+        std.debug.assert(model.window(window_id) != null);
+    }
+    if (model.drag_preview.target_window_id) |window_id| {
+        std.debug.assert(model.window(window_id) != null);
+        std.debug.assert(model.drag_preview.source_window_id != null);
+    }
+    if (model.drag_preview.is_visible) std.debug.assert(model.drag_preview.target_window_id != null);
+    std.debug.assert(model.display_memory.count <= model.display_memory.entries.len);
+    for (model.display_memory.entries[0..model.display_memory.count], 0..) |entry, index| {
+        std.debug.assert(entry.active_workspace_id != 0);
+        for (model.display_memory.entries[0..index]) |prior| {
+            std.debug.assert(!std.mem.eql(u8, &prior.uuid, &entry.uuid));
+        }
+    }
+    std.debug.assert(model.retile_request.display_count <= model.retile_request.display_ids.len);
+    if (model.retile_request.all_displays) std.debug.assert(model.retile_request.display_count == 0);
+    for (model.retile_request.display_ids[0..model.retile_request.display_count], 0..) |display_id, index| {
+        std.debug.assert(display_id != 0);
+        for (model.retile_request.display_ids[0..index]) |prior| {
+            std.debug.assert(prior != display_id);
+        }
+    }
+    std.debug.assert(model.cleanup_request.process_count <= model.cleanup_request.process_ids.len);
+    for (model.cleanup_request.process_ids[0..model.cleanup_request.process_count], 0..) |process_id, index| {
+        std.debug.assert(process_id > 0);
+        for (model.cleanup_request.process_ids[0..index]) |prior| {
+            std.debug.assert(prior != process_id);
+        }
+    }
     std.debug.assert(crossDomainStateIsValid(model));
+}
+
+fn assertWindowCandidates(model: *const Model, candidates: *const WindowCandidates) void {
+    std.debug.assert(candidates.count <= candidates.entries.len);
+    for (candidates.items(), 0..) |candidate, index| {
+        std.debug.assert(windowCandidateIsValid(model, candidate));
+        std.debug.assert(model.window(candidate.window_id) == null);
+        for (candidates.items()[0..index]) |prior| {
+            std.debug.assert(prior.window_id != candidate.window_id);
+        }
+    }
+}
+
+fn assertProcessRetries(retries: *const ProcessRetries) void {
+    std.debug.assert(retries.count <= retries.entries.len);
+    for (retries.items(), 0..) |retry, index| {
+        std.debug.assert(retry.process_id > 0);
+        for (retries.items()[0..index]) |prior| {
+            std.debug.assert(prior.process_id != retry.process_id);
+        }
+    }
 }
 
 fn crossDomainStateIsValid(model: *const Model) bool {
@@ -2713,7 +4475,7 @@ fn testTopology(first_observed: NativeSpaceId, second_observed: ?NativeSpaceId) 
 }
 
 fn initializedModel(topology: NativeTopology) Model {
-    return reduce(.{}, .{ .initialize_native_topology = topology }).model;
+    return reduce(.{}, .{ .initialize_native_topology = .{ .topology = topology } }).model;
 }
 
 fn switchRequest(model: *const Model, display_id: DisplayId, workspace_id: WorkspaceId, at_ms: TimestampMs) Event {
@@ -2731,6 +4493,7 @@ fn followFocusObservation(model: *const Model, target_key: SpaceKey, is_target_v
         .source = .ax,
         .target = model.space(target_key).?,
         .is_target_visible = is_target_visible,
+        .at_ms = 100,
     } };
 }
 
@@ -2806,6 +4569,26 @@ test "workspace summaries preserve globally unique active workspaces" {
     try testing.expectEqual(@as(u32, 1), summaries[1].window_count);
     try testing.expect(summaries[1].is_active);
     try testing.expect(summaries[1].is_focused);
+}
+
+test "workspace initialization assigns one global workspace per display" {
+    const testing = std.testing;
+    var initialization: WorkspaceInitialization = .{
+        .workspace_count = 7,
+        .primary_display_id = 11,
+    };
+    try testing.expect(initialization.addDisplay(22));
+    try testing.expect(initialization.addDisplay(11));
+    try testing.expect(initialization.addDisplay(33));
+
+    const transition = reduce(.{}, .{ .initialize_workspaces = initialization });
+    try testing.expectEqual(@as(?WorkspaceId, 1), transition.model.activeWorkspace(11));
+    try testing.expectEqual(@as(?WorkspaceId, 7), transition.model.activeWorkspace(22));
+    try testing.expectEqual(@as(?WorkspaceId, 6), transition.model.activeWorkspace(33));
+    try testing.expectEqual(@as(?DisplayId, 11), transition.model.focusedDisplay());
+    try testing.expectEqual(@as(DisplayId, 11), transition.model.logicalWorkspace(2).?.display_id);
+    try testing.expectEqual(@as(DisplayId, 33), transition.model.logicalWorkspace(6).?.display_id);
+    try testing.expectEqual(@as(DisplayId, 22), transition.model.logicalWorkspace(7).?.display_id);
 }
 
 test "window catalog owns identity and Space membership" {
@@ -2939,6 +4722,48 @@ test "window lifecycle transitions update catalog geometry focus and layout atom
     try testing.expect(model.geometry.get(201) == null);
     try testing.expect(!model.layout.contains(second_space, 201));
     try testing.expectEqual(@as(?WindowId, null), model.focusedWorkspaceWindow(2));
+}
+
+test "layout rebuild replaces every Space atomically" {
+    const testing = std.testing;
+    const space_key: SpaceKey = .{ .virtual = 1 };
+    var catalog: SpaceCatalog = .{};
+    catalog.add(.{ .key = space_key, .workspace_id = 1, .display_id = 11 });
+    var model = reduce(.{}, .{ .replace_space_catalog = catalog }).model;
+
+    model = reduce(model, .{ .adopt_window = .{
+        .window_id = 101,
+        .process_id = 1001,
+        .space_key = space_key,
+        .layout = testLayoutInsertion(.bsp),
+    } }).model;
+    model = reduce(model, .{ .adopt_window = .{
+        .window_id = 102,
+        .process_id = 1002,
+        .space_key = space_key,
+        .layout = testLayoutInsertion(.bsp),
+    } }).model;
+
+    var rebuild: LayoutRebuild = .{
+        .kind = .monocle,
+        .split_mode = .horizontal,
+        .insert_child = .second,
+        .insert_point = .last,
+        .inner_gap = 8,
+        .split_ratio = 0.5,
+    };
+    try testing.expect(rebuild.addSpace(space_key, .{ .x = 0, .y = 0, .width = 1000, .height = 800 }));
+    var transition = reduce(model, .{ .rebuild_layout = rebuild });
+
+    try testing.expectEqual(tiling_mod.LayoutKind.monocle, transition.model.layout.layoutKind(space_key).?);
+    try testing.expect(transition.model.layout.contains(space_key, 101));
+    try testing.expect(transition.model.layout.contains(space_key, 102));
+
+    try testing.expect(rebuild.addSpace(.{ .virtual = 2 }, null));
+    transition = reduce(model, .{ .rebuild_layout = rebuild });
+    try testing.expectEqual(tiling_mod.LayoutKind.bsp, transition.model.layout.layoutKind(space_key).?);
+    try testing.expect(transition.model.layout.contains(space_key, 101));
+    try testing.expect(transition.model.layout.contains(space_key, 102));
 }
 
 test "layout rejection leaves window adoption unchanged" {
@@ -3836,10 +5661,10 @@ test "hidden focus without a transition requests a workspace switch" {
     const testing = std.testing;
     const model = initializedModel(testTopology(101, null));
     const transition = reduce(model, followFocusObservation(&model, .{ .native = 102 }, false));
-    const observation = transition.effects[0].follow_focus_workspace;
 
-    try testing.expectEqual(std.meta.Tag(Effect).follow_focus_workspace, std.meta.activeTag(transition.effects[0]));
-    try testing.expect(observation.target.key.eql(.{ .native = 102 }));
+    try testing.expect(transition.model.pending_switch.?.request.target.key.eql(.{ .native = 102 }));
+    try testing.expectEqual(std.meta.Tag(Effect).workspace_transition_started, std.meta.activeTag(transition.effects[0]));
+    try testing.expectEqual(std.meta.Tag(Effect).switch_native_space, std.meta.activeTag(transition.effects[1]));
     try testing.expect(!transition.model.hasDeferredFollowFocus());
 }
 
@@ -3997,4 +5822,366 @@ test "rapid switch requests keep only latest target" {
 
     try testing.expectEqual(@as(?WorkspaceId, 1), transition.model.desiredWorkspace(1));
     try testing.expectEqual(@as(?WorkspaceId, 1), if (transition.model.queued_switch) |queued| queued.target.workspace_id else null);
+}
+
+test "window discovery retries are reducer owned" {
+    const testing = std.testing;
+    var catalog: SpaceCatalog = .{};
+    catalog.add(.{ .key = .{ .virtual = 1 }, .workspace_id = 1, .display_id = 11 });
+    var model = reduce(.{}, .{ .replace_space_catalog = catalog }).model;
+    const candidate: WindowCandidate = .{
+        .process_id = 42,
+        .window_id = 100,
+        .space_key = .{ .virtual = 1 },
+        .attempts_remaining = 1,
+    };
+
+    model = reduce(model, .{ .track_pending_role_window = candidate }).model;
+    var transition = reduce(model, .{ .pending_role_observed = .{
+        .window_id = candidate.window_id,
+        .readiness = .pending,
+    } });
+    try testing.expectEqual(@as(u8, 0), transition.effect_count);
+    try testing.expectEqual(@as(u8, 0), transition.model.pending_role_windows.get(candidate.window_id).?.attempts_remaining);
+
+    transition = reduce(transition.model, .{ .pending_role_observed = .{
+        .window_id = candidate.window_id,
+        .readiness = .pending,
+    } });
+    try testing.expectEqual(@as(?WindowCandidate, null), transition.model.pending_role_windows.get(candidate.window_id));
+    try testing.expectEqual(std.meta.Tag(Effect).pending_role_expired, std.meta.activeTag(transition.effects[0]));
+
+    model = reduce(transition.model, .{ .track_deferred_window_candidate = candidate }).model;
+    transition = reduce(model, .{ .deferred_window_observed = .{
+        .window_id = candidate.window_id,
+        .readiness = .ready,
+        .is_visible = true,
+    } });
+    try testing.expect(transition.model.hasDeferredWindowCandidate(candidate.window_id));
+    try testing.expectEqual(std.meta.Tag(Effect).deferred_window_ready, std.meta.activeTag(transition.effects[0]));
+
+    transition = reduce(transition.model, .{ .deferred_window_promotion_failed = candidate.window_id });
+    try testing.expectEqual(@as(u8, 0), transition.model.deferred_window_candidates.get(candidate.window_id).?.attempts_remaining);
+    transition = reduce(transition.model, .{ .deferred_window_promotion_failed = candidate.window_id });
+    try testing.expect(!transition.model.hasDeferredWindowCandidate(candidate.window_id));
+    try testing.expectEqual(DeferredWindowExpiryReason.unsettled_bounds, transition.effects[0].deferred_window_expired.reason);
+}
+
+test "process retry outcomes are reducer owned" {
+    const testing = std.testing;
+    const retry: ProcessRetry = .{ .process_id = 42, .attempts_remaining = 1 };
+    var model = reduce(.{}, .{ .track_app_launch_retry = retry }).model;
+
+    var transition = reduce(model, .{ .app_launch_retry_timer_fired = retry.process_id });
+    try testing.expectEqual(@as(u8, 0), transition.effect_count);
+    transition = reduce(transition.model, .{ .app_launch_retry_timer_fired = retry.process_id });
+    try testing.expectEqual(@as(?ProcessRetry, null), transition.model.app_launch_retries.get(retry.process_id));
+    try testing.expectEqual(std.meta.Tag(Effect).app_launch_retry_ready, std.meta.activeTag(transition.effects[0]));
+
+    model = reduce(transition.model, .{ .track_focus_retry = retry }).model;
+    transition = reduce(model, .{ .focus_retry_observed = .{
+        .process_id = retry.process_id,
+        .focused_window_id = 100,
+    } });
+    try testing.expectEqual(@as(?ProcessRetry, null), transition.model.focus_retries.get(retry.process_id));
+    try testing.expectEqual(@as(WindowId, 100), transition.effects[0].focus_retry_resolved.window_id);
+}
+
+test "workspace park and display settle timers are reducer owned" {
+    const testing = std.testing;
+    var catalog: SpaceCatalog = .{};
+    catalog.add(.{ .key = .{ .virtual = 1 }, .workspace_id = 1, .display_id = 11 });
+    catalog.add(.{ .key = .{ .virtual = 2 }, .workspace_id = 2, .display_id = 11 });
+    var topology: WorkspaceTopology = .{};
+    topology.addDisplay(.{ .display_id = 11, .active_workspace_id = 2 });
+
+    var model = reduce(.{}, .{ .replace_space_catalog = catalog }).model;
+    model = reduce(model, .{ .replace_workspace_topology = topology }).model;
+    var transition = reduce(model, .{ .workspace_reveal_observed = .{
+        .outgoing = catalog.find(.{ .virtual = 1 }).?,
+        .target = catalog.find(.{ .virtual = 2 }).?,
+        .is_revealed = false,
+        .deadline_at_ms = 200,
+    } });
+    try testing.expect(transition.model.hasPendingWorkspaceParks());
+
+    transition = reduce(transition.model, .{ .workspace_park_timer_fired = .{
+        .display_id = 11,
+        .is_revealed = false,
+        .at_ms = 199,
+    } });
+    try testing.expectEqual(@as(u8, 0), transition.effect_count);
+    transition = reduce(transition.model, .{ .workspace_park_timer_fired = .{
+        .display_id = 11,
+        .is_revealed = false,
+        .at_ms = 200,
+    } });
+    try testing.expect(!transition.model.hasPendingWorkspaceParks());
+    try testing.expect(transition.effects[0].park_workspace.did_time_out);
+
+    model = reduce(transition.model, .{ .display_changed = .{
+        .at_ms = 100,
+        .resettle_at_ms = 500,
+    } }).model;
+    transition = reduce(model, .{ .display_resettle_timer_fired = 499 });
+    try testing.expect(transition.model.hasDisplayResettleScheduled());
+    transition = reduce(transition.model, .{ .display_resettle_timer_fired = 500 });
+    try testing.expect(!transition.model.hasDisplayResettleScheduled());
+    try testing.expectEqual(std.meta.Tag(Effect).display_resettle_due, std.meta.activeTag(transition.effects[0]));
+}
+
+test "workspace switch request commits virtual activation before its effect" {
+    const testing = std.testing;
+    var catalog: SpaceCatalog = .{};
+    catalog.add(.{ .key = .{ .virtual = 1 }, .workspace_id = 1, .display_id = 11 });
+    catalog.add(.{ .key = .{ .virtual = 2 }, .workspace_id = 2, .display_id = 11 });
+    var topology: WorkspaceTopology = .{};
+    topology.addDisplay(.{ .display_id = 11, .active_workspace_id = 1 });
+
+    var model = reduce(.{}, .{ .replace_space_catalog = catalog }).model;
+    model = reduce(model, .{ .replace_workspace_topology = topology }).model;
+    const transition = reduce(model, .{ .request_workspace_switch = .{
+        .target = catalog.find(.{ .virtual = 2 }).?,
+        .at_ms = 100,
+    } });
+
+    try testing.expectEqual(@as(?WorkspaceId, 2), transition.model.activeWorkspace(11));
+    try testing.expectEqual(@as(?DisplayId, 11), transition.model.focusedDisplay());
+    try testing.expect(transition.model.workspace_transition.?.target.key.eql(.{ .virtual = 2 }));
+    try testing.expectEqual(std.meta.Tag(Effect).workspace_switch_ready, std.meta.activeTag(transition.effects[1]));
+    try testing.expect(transition.effects[1].workspace_switch_ready.outgoing.?.key.eql(.{ .virtual = 1 }));
+}
+
+test "virtual workspace display move is one reducer transition" {
+    const testing = std.testing;
+    var catalog: SpaceCatalog = .{};
+    catalog.add(.{ .key = .{ .virtual = 1 }, .workspace_id = 1, .display_id = 11 });
+    catalog.add(.{ .key = .{ .virtual = 2 }, .workspace_id = 2, .display_id = 22 });
+    catalog.add(.{ .key = .{ .virtual = 3 }, .workspace_id = 3, .display_id = 11 });
+    var topology: WorkspaceTopology = .{};
+    topology.addDisplay(.{ .display_id = 11, .active_workspace_id = 1 });
+    topology.addDisplay(.{ .display_id = 22, .active_workspace_id = 2 });
+
+    var model = reduce(.{}, .{ .replace_space_catalog = catalog }).model;
+    model = reduce(model, .{ .replace_workspace_topology = topology }).model;
+    const transition = reduce(model, .{ .request_virtual_workspace_move = .{
+        .source_display_id = 11,
+        .target_display_id = 22,
+        .at_ms = 100,
+    } });
+
+    try testing.expectEqual(@as(?WorkspaceId, 3), transition.model.activeWorkspace(11));
+    try testing.expectEqual(@as(?WorkspaceId, 1), transition.model.activeWorkspace(22));
+    try testing.expectEqual(@as(DisplayId, 22), transition.model.space(.{ .virtual = 1 }).?.display_id);
+    try testing.expectEqual(@as(DisplayId, 11), transition.model.space(.{ .virtual = 3 }).?.display_id);
+    try testing.expectEqual(std.meta.Tag(Effect).virtual_workspace_move_ready, std.meta.activeTag(transition.effects[1]));
+}
+
+test "virtual display observation reconciles topology in one transition" {
+    const testing = std.testing;
+    const first_uuid: [16]u8 = @splat(1);
+    const second_uuid: [16]u8 = @splat(2);
+    var catalog: SpaceCatalog = .{};
+    catalog.add(.{ .key = .{ .virtual = 1 }, .workspace_id = 1, .display_id = 11 });
+    catalog.add(.{ .key = .{ .virtual = 2 }, .workspace_id = 2, .display_id = 22 });
+    catalog.add(.{ .key = .{ .virtual = 3 }, .workspace_id = 3, .display_id = 11 });
+    var topology: WorkspaceTopology = .{};
+    topology.addDisplay(.{ .display_id = 11, .active_workspace_id = 1 });
+    topology.addDisplay(.{ .display_id = 22, .active_workspace_id = 2 });
+
+    var model = reduce(.{}, .{ .replace_space_catalog = catalog }).model;
+    model = reduce(model, .{ .replace_workspace_topology = topology }).model;
+    model = reduce(model, .{ .remember_display_workspace = .{
+        .uuid = first_uuid,
+        .active_workspace_id = 1,
+    } }).model;
+    model = reduce(model, .{ .remember_display_workspace = .{
+        .uuid = second_uuid,
+        .active_workspace_id = 2,
+    } }).model;
+
+    var observation: VirtualDisplayObservation = .{
+        .primary_display_id = 111,
+        .focused_display_id = 222,
+    };
+    observation.workspace_home_uuids[0] = first_uuid;
+    observation.workspace_home_uuids[1] = second_uuid;
+    observation.workspace_home_uuids[2] = first_uuid;
+    try testing.expect(observation.addDisplay(.{ .display_id = 111, .uuid = first_uuid }));
+    try testing.expect(observation.addDisplay(.{ .display_id = 222, .uuid = second_uuid }));
+
+    const transition = reduce(model, .{ .virtual_displays_observed = observation });
+    try testing.expectEqual(@as(?WorkspaceId, 1), transition.model.activeWorkspace(111));
+    try testing.expectEqual(@as(?WorkspaceId, 2), transition.model.activeWorkspace(222));
+    try testing.expectEqual(@as(?DisplayId, 222), transition.model.focusedDisplay());
+    try testing.expectEqual(@as(DisplayId, 111), transition.model.logicalWorkspace(3).?.display_id);
+    try testing.expectEqual(std.meta.Tag(Effect).virtual_displays_reconciled, std.meta.activeTag(transition.effects[0]));
+}
+
+test "pointer drop swaps layout inside the reducer" {
+    const testing = std.testing;
+    var catalog: SpaceCatalog = .{};
+    catalog.add(.{ .key = .{ .virtual = 1 }, .workspace_id = 1, .display_id = 11 });
+    var model = reduce(.{}, .{ .replace_space_catalog = catalog }).model;
+    model = reduce(model, .{ .adopt_window = .{
+        .window_id = 100,
+        .process_id = 42,
+        .space_key = .{ .virtual = 1 },
+        .frame = .{ .x = 0, .y = 0, .width = 500, .height = 500 },
+        .layout = testLayoutInsertion(.bsp),
+    } }).model;
+    model = reduce(model, .{ .adopt_window = .{
+        .window_id = 200,
+        .process_id = 43,
+        .space_key = .{ .virtual = 1 },
+        .frame = .{ .x = 500, .y = 0, .width = 500, .height = 500 },
+        .layout = testLayoutInsertion(.bsp),
+    } }).model;
+
+    model = reduce(model, .{ .pointer_down = 100 }).model;
+    model = reduce(model, .pointer_dragged).model;
+    var transition = reduce(model, .{ .drag_preview_observed = .{
+        .source_window_id = 100,
+        .target_window_id = 200,
+        .target_frame = .{ .x = 500, .y = 0, .width = 500, .height = 500 },
+    } });
+    try testing.expectEqual(std.meta.Tag(Effect).show_drag_preview, std.meta.activeTag(transition.effects[0]));
+
+    transition = reduce(transition.model, .pointer_up);
+    try testing.expectEqual(@as(?WindowId, 200), transition.model.layout.firstWid(.{ .virtual = 1 }));
+    try testing.expect(!transition.model.pointer_drag.is_down);
+    try testing.expectEqual(std.meta.Tag(Effect).hide_drag_preview, std.meta.activeTag(transition.effects[0]));
+    try testing.expectEqual(@as(WindowId, 100), transition.effects[1].pointer_drag_completed.swapped_window_ids.?.first);
+}
+
+test "directional commands resolve focus and layout in the reducer" {
+    const testing = std.testing;
+    const space_key: SpaceKey = .{ .virtual = 1 };
+    var catalog: SpaceCatalog = .{};
+    catalog.add(.{ .key = space_key, .workspace_id = 1, .display_id = 11 });
+    var topology: WorkspaceTopology = .{};
+    topology.addDisplay(.{ .display_id = 11, .active_workspace_id = 1 });
+    var model = reduce(.{}, .{ .replace_space_catalog = catalog }).model;
+    model = reduce(model, .{ .replace_workspace_topology = topology }).model;
+    model = reduce(model, .{ .adopt_window = .{
+        .window_id = 100,
+        .process_id = 42,
+        .space_key = space_key,
+        .frame = .{ .x = 0, .y = 0, .width = 500, .height = 500 },
+        .layout = testLayoutInsertion(.bsp),
+    } }).model;
+    model = reduce(model, .{ .adopt_window = .{
+        .window_id = 200,
+        .process_id = 43,
+        .space_key = space_key,
+        .frame = .{ .x = 500, .y = 0, .width = 500, .height = 500 },
+        .layout = testLayoutInsertion(.bsp),
+    } }).model;
+
+    var transition = reduce(model, .{ .focus_direction = .{
+        .window_id = 100,
+        .direction = .right,
+    } });
+    try testing.expectEqual(@as(?WindowId, 200), transition.model.focusedWorkspaceWindow(1));
+    try testing.expectEqual(std.meta.Tag(Effect).focus_window, std.meta.activeTag(transition.effects[0]));
+    try testing.expectEqual(@as(WindowId, 200), transition.effects[0].focus_window.window_id);
+
+    transition = reduce(transition.model, .{ .swap_direction = .{
+        .window_id = 200,
+        .direction = .left,
+    } });
+    try testing.expectEqual(@as(?WindowId, 200), transition.model.layout.firstWid(space_key));
+    try testing.expectEqual(@as(u8, 1), transition.model.retile_request.display_count);
+    try testing.expectEqual(std.meta.Tag(Effect).windows_swapped, std.meta.activeTag(transition.effects[0]));
+}
+
+test "window presentation commands reduce intent before platform effects" {
+    const testing = std.testing;
+    const space_key: SpaceKey = .{ .virtual = 1 };
+    var catalog: SpaceCatalog = .{};
+    catalog.add(.{ .key = space_key, .workspace_id = 1, .display_id = 11 });
+    var topology: WorkspaceTopology = .{};
+    topology.addDisplay(.{ .display_id = 11, .active_workspace_id = 1 });
+    var model = reduce(.{}, .{ .replace_space_catalog = catalog }).model;
+    model = reduce(model, .{ .replace_workspace_topology = topology }).model;
+    model = reduce(model, .{ .adopt_window = .{
+        .window_id = 100,
+        .process_id = 42,
+        .space_key = space_key,
+        .frame = .{ .x = 10, .y = 20, .width = 400, .height = 300 },
+        .layout = testLayoutInsertion(.bsp),
+    } }).model;
+
+    var transition = reduce(model, .{ .set_window_mode = .{
+        .window_id = 100,
+        .mode = .floating,
+    } });
+    try testing.expectEqual(window_mod.WindowMode.floating, transition.model.window(100).?.mode);
+    try testing.expect(!transition.model.layout.contains(space_key, 100));
+    try testing.expectEqual(std.meta.Tag(Effect).window_mode_changed, std.meta.activeTag(transition.effects[0]));
+
+    transition = reduce(transition.model, .{ .toggle_window_fullscreen = .{
+        .window_id = 100,
+        .observed_frame = .{ .x = 30, .y = 40, .width = 500, .height = 350 },
+    } });
+    try testing.expect(transition.model.window(100).?.is_fullscreen);
+    try testing.expectEqual(@as(f64, 30), transition.model.window(100).?.float_frame.?.x);
+
+    transition = reduce(transition.model, .{ .toggle_window_fullscreen = .{
+        .window_id = 100,
+        .observed_frame = null,
+    } });
+    try testing.expect(!transition.model.window(100).?.is_fullscreen);
+    try testing.expectEqual(@as(f64, 30), transition.effects[0].fullscreen_changed.restore_frame.?.x);
+
+    transition = reduce(transition.model, .{ .center_floating_window = .{
+        .window_id = 100,
+        .observed_frame = .{ .x = 30, .y = 40, .width = 500, .height = 350 },
+        .display_frame = .{ .x = 0, .y = 0, .width = 1000, .height = 800 },
+    } });
+    const center = transition.effects[0].center_window;
+    try testing.expectEqual(@as(f64, 250), center.target_frame.x);
+    try testing.expectEqual(@as(f64, 225), center.target_frame.y);
+
+    transition = reduce(transition.model, .{ .window_frame_command_result = .{
+        .leader_window_id = 100,
+        .window_id = 100,
+        .target_frame = center.target_frame,
+        .should_save_float_frame = true,
+        .succeeded = true,
+    } });
+    try testing.expectEqual(@as(f64, 250), transition.model.window(100).?.frame.x);
+    try testing.expectEqual(@as(f64, 250), transition.model.window(100).?.float_frame.?.x);
+}
+
+test "window move command commits ownership layout and intent atomically" {
+    const testing = std.testing;
+    const source_key: SpaceKey = .{ .virtual = 1 };
+    const target_key: SpaceKey = .{ .virtual = 2 };
+    var catalog: SpaceCatalog = .{};
+    catalog.add(.{ .key = source_key, .workspace_id = 1, .display_id = 11 });
+    catalog.add(.{ .key = target_key, .workspace_id = 2, .display_id = 11 });
+    var topology: WorkspaceTopology = .{};
+    topology.addDisplay(.{ .display_id = 11, .active_workspace_id = 1 });
+    var model = reduce(.{}, .{ .replace_space_catalog = catalog }).model;
+    model = reduce(model, .{ .replace_workspace_topology = topology }).model;
+    model = reduce(model, .{ .adopt_window = .{
+        .window_id = 100,
+        .process_id = 42,
+        .space_key = source_key,
+        .layout = testLayoutInsertion(.bsp),
+    } }).model;
+
+    const transition = reduce(model, .{ .request_window_move = .{
+        .window_id = 100,
+        .target = catalog.find(target_key).?,
+        .layout = testLayoutInsertion(.bsp),
+        .should_move_native = false,
+    } });
+    try testing.expect(transition.model.window(100).?.space_key.eql(target_key));
+    try testing.expect(!transition.model.layout.contains(source_key, 100));
+    try testing.expect(transition.model.layout.contains(target_key, 100));
+    try testing.expectEqual(@as(?WindowId, 100), transition.model.focusedWorkspaceWindow(2));
+    try testing.expect(transition.model.retile_request.all_displays);
+    try testing.expect(transition.effects[0].window_moved.should_hide);
 }
