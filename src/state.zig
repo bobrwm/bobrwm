@@ -858,6 +858,51 @@ pub const ObservationTimer = struct {
     due_at_ms: TimestampMs,
 };
 
+pub const LayoutInsertion = struct {
+    kind: tiling_mod.LayoutKind,
+    options: tiling_mod.InsertOptions,
+};
+
+pub const WindowAdoption = struct {
+    window_id: WindowId,
+    process_id: i32,
+    space_key: SpaceKey,
+    frame: window_mod.Window.Frame = .{ .x = 0, .y = 0, .width = 0, .height = 0 },
+    is_fullscreen: bool = false,
+    mode: window_mod.WindowMode = .tiled,
+    float_frame: ?window_mod.Window.Frame = null,
+    layout: ?LayoutInsertion = null,
+    tab_group: ?WindowTabGroupObservation = null,
+
+    fn managedWindow(self: WindowAdoption) ManagedWindow {
+        return .{
+            .window_id = self.window_id,
+            .process_id = self.process_id,
+            .space_key = self.space_key,
+            .frame = self.frame,
+            .is_fullscreen = self.is_fullscreen,
+            .mode = self.mode,
+            .float_frame = self.float_frame,
+        };
+    }
+};
+
+pub const WindowUpdate = struct {
+    window: window_mod.Window,
+    layout: ?LayoutInsertion = null,
+};
+
+pub const WindowSpaceAssignment = struct {
+    window_id: WindowId,
+    space_key: SpaceKey,
+    layout: ?LayoutInsertion = null,
+};
+
+pub const WindowTabDetachment = struct {
+    window_id: WindowId,
+    layout: ?LayoutInsertion = null,
+};
+
 pub const Model = struct {
     spaces: SpaceCatalog = .{},
     windows: WindowCatalog = .{},
@@ -1085,19 +1130,16 @@ pub const Model = struct {
 
 pub const Event = union(enum) {
     replace_space_catalog: SpaceCatalog,
-    adopt_window: ManagedWindow,
-    update_window: window_mod.Window,
+    adopt_window: WindowAdoption,
+    update_window: WindowUpdate,
     remove_window: WindowId,
     replace_window_id: struct {
         old_window_id: WindowId,
         new_window_id: WindowId,
     },
-    assign_window_space: struct {
-        window_id: WindowId,
-        space_key: SpaceKey,
-    },
+    assign_window_space: WindowSpaceAssignment,
     observe_window_tab_group: WindowTabGroupObservation,
-    detach_window_tab: WindowId,
+    detach_window_tab: WindowTabDetachment,
     record_workspace_focus: struct {
         workspace_id: WorkspaceId,
         window_id: WindowId,
@@ -1197,6 +1239,7 @@ pub const WindowCatalogRejectionReason = enum {
     window_exists,
     window_missing,
     space_missing,
+    layout_missing,
 };
 
 pub const Effect = union(enum) {
@@ -1290,11 +1333,10 @@ pub fn reduce(model: Model, event: Event) Transition {
             refreshPendingNativeWindowMoves(&transition.model);
             should_refresh_workspace_focus = true;
         },
-        .adopt_window => |window| reduceWindowAdopted(&transition, window),
-        .update_window => |window| reduceWindowUpdated(&transition, window),
+        .adopt_window => |adoption| reduceWindowAdopted(&transition, adoption),
+        .update_window => |update| reduceWindowUpdated(&transition, update),
         .remove_window => |window_id| {
-            _ = transition.model.windows.remove(window_id);
-            transition.model.geometry.forget(window_id);
+            reduceWindowRemoved(&transition, window_id);
             should_refresh_workspace_focus = true;
         },
         .replace_window_id => |replacement| reduceWindowIdReplaced(&transition, replacement),
@@ -1306,8 +1348,8 @@ pub fn reduce(model: Model, event: Event) Transition {
             reduceWindowTabGroupObserved(&transition, observation);
             should_refresh_workspace_focus = true;
         },
-        .detach_window_tab => |window_id| {
-            reduceWindowTabDetached(&transition, window_id);
+        .detach_window_tab => |detachment| {
+            reduceWindowTabDetached(&transition, detachment);
             should_refresh_workspace_focus = true;
         },
         .record_workspace_focus => |focus| reduceWorkspaceFocusRecorded(&transition, focus),
@@ -1377,9 +1419,7 @@ pub fn reduce(model: Model, event: Event) Transition {
             if (geometry_transition.effect) |effect| transition.addEffect(.{ .geometry = effect });
         },
         .layout => |layout_event| {
-            const layout_transition = tiling_mod.reduce(transition.model.layout, layout_event);
-            transition.model.layout = layout_transition.model;
-            if (layout_transition.effect) |effect| transition.addEffect(.{ .layout = effect });
+            _ = applyLayoutEvent(&transition, layout_event);
         },
     }
 
@@ -1388,7 +1428,9 @@ pub fn reduce(model: Model, event: Event) Transition {
     return transition;
 }
 
-fn reduceWindowAdopted(transition: *Transition, window: ManagedWindow) void {
+fn reduceWindowAdopted(transition: *Transition, adoption: WindowAdoption) void {
+    const original_model = transition.model;
+    const window = adoption.managedWindow();
     if (window.window_id == 0 or window.process_id <= 0) {
         transition.addEffect(.{ .window_catalog_rejected = .{
             .window_id = window.window_id,
@@ -1410,25 +1452,115 @@ fn reduceWindowAdopted(transition: *Transition, window: ManagedWindow) void {
         } });
         return;
     }
+    if (transition.model.windows.count == transition.model.windows.entries.len) {
+        transition.addEffect(.{ .window_catalog_rejected = .{
+            .window_id = window.window_id,
+            .reason = .catalog_full,
+        } });
+        return;
+    }
+    if (adoption.layout) |layout| {
+        if (window.mode != .tiled) {
+            transition.addEffect(.{ .window_catalog_rejected = .{
+                .window_id = window.window_id,
+                .reason = .invalid_window,
+            } });
+            return;
+        }
+        if (!applyLayoutEvent(transition, .{ .insert = .{
+            .space_key = window.space_key,
+            .kind = layout.kind,
+            .window_id = window.window_id,
+            .options = layout.options,
+        } })) return;
+    }
+
     var adopted = window;
     adopted.tab_leader_window_id = adopted.window_id;
     adopted.is_suppressed = false;
-    if (transition.model.windows.put(adopted)) {
-        transition.model.geometry.seedObserved(adopted.window_id, adopted.frame) catch unreachable;
+    std.debug.assert(transition.model.windows.put(adopted));
+    transition.model.geometry.seedObserved(adopted.window_id, adopted.frame) catch unreachable;
+
+    const observation = adoption.tab_group orelse return;
+    const effect_count = transition.effect_count;
+    reduceWindowTabGroupObserved(transition, observation);
+    if (transition.effect_count == effect_count) return;
+    transition.model = original_model;
+}
+
+fn reduceWindowUpdated(transition: *Transition, update: WindowUpdate) void {
+    const window = update.window;
+    const previous = transition.model.window(window.wid) orelse {
+        transition.addEffect(.{ .window_catalog_rejected = .{
+            .window_id = window.wid,
+            .reason = .window_missing,
+        } });
+        return;
+    };
+    if (previous.process_id != window.pid) {
+        transition.addEffect(.{ .window_catalog_rejected = .{
+            .window_id = window.wid,
+            .reason = .invalid_window,
+        } });
         return;
     }
 
-    transition.addEffect(.{ .window_catalog_rejected = .{
-        .window_id = window.window_id,
-        .reason = .catalog_full,
-    } });
+    const is_layout_owner = previous.tab_leader_window_id == previous.window_id;
+    if (is_layout_owner and previous.mode != window.mode) {
+        if (window.mode == .tiled) {
+            const layout = update.layout orelse {
+                transition.addEffect(.{ .window_catalog_rejected = .{
+                    .window_id = window.wid,
+                    .reason = .layout_missing,
+                } });
+                return;
+            };
+            if (!applyLayoutEvent(transition, .{ .insert = .{
+                .space_key = previous.space_key,
+                .kind = layout.kind,
+                .window_id = window.wid,
+                .options = layout.options,
+            } })) return;
+        } else {
+            _ = applyLayoutEvent(transition, .{ .remove = .{
+                .space_key = previous.space_key,
+                .window_id = window.wid,
+            } });
+        }
+    }
+
+    std.debug.assert(transition.model.windows.update(window));
 }
 
-fn reduceWindowUpdated(transition: *Transition, window: window_mod.Window) void {
-    if (transition.model.windows.update(window)) return;
-    transition.addEffect(.{ .window_catalog_rejected = .{
-        .window_id = window.wid,
-        .reason = if (transition.model.window(window.wid) == null) .window_missing else .invalid_window,
+fn reduceWindowRemoved(transition: *Transition, window_id: WindowId) void {
+    const window = transition.model.window(window_id) orelse return;
+    const group = transition.model.windowTabGroup(window_id);
+    const owned_layout = window.tab_leader_window_id == window_id and
+        transition.model.layout.contains(window.space_key, window_id);
+
+    std.debug.assert(transition.model.windows.remove(window_id));
+    transition.model.geometry.forget(window_id);
+    if (!owned_layout) return;
+
+    const successor_window_id: ?WindowId = if (group) |snapshot| blk: {
+        for (snapshot.members()) |member_window_id| {
+            if (member_window_id == window_id) continue;
+            break :blk transition.model.windowTabLeader(member_window_id);
+        }
+        break :blk null;
+    } else null;
+    if (successor_window_id) |successor| {
+        _ = applyLayoutEvent(transition, .{ .replace_window_id = .{
+            .space_key = window.space_key,
+            .old_window_id = window_id,
+            .new_window_id = successor,
+        } });
+        return;
+    }
+
+    _ = applyLayoutEvent(transition, .{ .remove = .{
+        .space_key = window.space_key,
+        .window_id = window_id,
     } });
 }
 
@@ -1450,18 +1582,26 @@ fn reduceWindowIdReplaced(
         } });
         return;
     }
-    if (transition.model.windows.replaceId(replacement.old_window_id, replacement.new_window_id)) {
-        transition.model.geometry.replaceWindowId(replacement.old_window_id, replacement.new_window_id);
-        for (&transition.model.workspace_focus) |*focus| {
-            focus.replaceWindowId(replacement.old_window_id, replacement.new_window_id);
-        }
+    const previous = transition.model.window(replacement.old_window_id) orelse {
+        transition.addEffect(.{ .window_catalog_rejected = .{
+            .window_id = replacement.old_window_id,
+            .reason = .window_missing,
+        } });
         return;
+    };
+    if (transition.model.layout.contains(previous.space_key, replacement.old_window_id)) {
+        _ = applyLayoutEvent(transition, .{ .replace_window_id = .{
+            .space_key = previous.space_key,
+            .old_window_id = replacement.old_window_id,
+            .new_window_id = replacement.new_window_id,
+        } });
     }
 
-    transition.addEffect(.{ .window_catalog_rejected = .{
-        .window_id = replacement.old_window_id,
-        .reason = .window_missing,
-    } });
+    std.debug.assert(transition.model.windows.replaceId(replacement.old_window_id, replacement.new_window_id));
+    transition.model.geometry.replaceWindowId(replacement.old_window_id, replacement.new_window_id);
+    for (&transition.model.workspace_focus) |*focus| {
+        focus.replaceWindowId(replacement.old_window_id, replacement.new_window_id);
+    }
 }
 
 fn reduceWindowSpaceAssigned(
@@ -1475,12 +1615,44 @@ fn reduceWindowSpaceAssigned(
         } });
         return;
     }
-    if (transition.model.windows.assignSpace(assignment.window_id, assignment.space_key)) return;
+    const window = transition.model.window(assignment.window_id) orelse {
+        transition.addEffect(.{ .window_catalog_rejected = .{
+            .window_id = assignment.window_id,
+            .reason = .window_missing,
+        } });
+        return;
+    };
+    const leader = transition.model.window(window.tab_leader_window_id).?;
+    if (leader.space_key.eql(assignment.space_key)) return;
 
-    transition.addEffect(.{ .window_catalog_rejected = .{
-        .window_id = assignment.window_id,
-        .reason = .window_missing,
-    } });
+    if (transition.model.layout.contains(leader.space_key, leader.window_id)) {
+        const layout = assignment.layout orelse {
+            transition.addEffect(.{ .window_catalog_rejected = .{
+                .window_id = assignment.window_id,
+                .reason = .layout_missing,
+            } });
+            return;
+        };
+        if (!applyLayoutEvent(transition, .{ .move_window = .{
+            .source_key = leader.space_key,
+            .target_key = assignment.space_key,
+            .kind = layout.kind,
+            .window_id = leader.window_id,
+            .options = layout.options,
+        } })) return;
+    }
+
+    std.debug.assert(transition.model.windows.assignSpace(assignment.window_id, assignment.space_key));
+}
+
+fn applyLayoutEvent(transition: *Transition, event: tiling_mod.Event) bool {
+    const layout_transition = tiling_mod.reduce(transition.model.layout, event);
+    transition.model.layout = layout_transition.model;
+    if (layout_transition.effect) |effect| {
+        transition.addEffect(.{ .layout = effect });
+        return false;
+    }
+    return true;
 }
 
 fn reduceWindowTabGroupObserved(
@@ -1513,7 +1685,6 @@ fn reduceWindowTabGroupObserved(
             return;
         };
         if (member.process_id != leader.process_id or
-            !member.space_key.eql(leader.space_key) or
             (member.tab_leader_window_id != member.window_id and
                 member.tab_leader_window_id != observation.leader_window_id))
         {
@@ -1522,15 +1693,73 @@ fn reduceWindowTabGroupObserved(
         }
     }
 
+    for (observation.members()) |window_id| {
+        if (window_id == observation.leader_window_id) continue;
+        const member = transition.model.window(window_id).?;
+        if (!transition.model.layout.contains(member.space_key, window_id)) continue;
+        _ = applyLayoutEvent(transition, .{ .remove = .{
+            .space_key = member.space_key,
+            .window_id = window_id,
+        } });
+    }
+    for (observation.members()) |window_id| {
+        std.debug.assert(transition.model.windows.assignSpace(window_id, leader.space_key));
+    }
     transition.model.windows.observeTabGroup(observation);
 }
 
-fn reduceWindowTabDetached(transition: *Transition, window_id: WindowId) void {
-    if (transition.model.window(window_id) == null) {
-        rejectWindowTabGroup(transition, window_id);
+fn reduceWindowTabDetached(transition: *Transition, detachment: WindowTabDetachment) void {
+    const window = transition.model.window(detachment.window_id) orelse {
+        rejectWindowTabGroup(transition, detachment.window_id);
         return;
+    };
+    const group = transition.model.windowTabGroup(detachment.window_id) orelse return;
+    if (window.mode == .tiled and
+        transition.model.layout.contains(window.space_key, group.leader_window_id))
+    {
+        const layout = detachment.layout orelse {
+            transition.addEffect(.{ .window_catalog_rejected = .{
+                .window_id = detachment.window_id,
+                .reason = .layout_missing,
+            } });
+            return;
+        };
+
+        const original_layout = transition.model.layout;
+        const is_leader = group.leader_window_id == detachment.window_id;
+        const inserted_window_id = if (is_leader and group.member_count == 2)
+            firstOtherGroupMember(&group, detachment.window_id).?
+        else
+            detachment.window_id;
+        var options = layout.options;
+        if (is_leader and group.member_count > 2) {
+            const successor = firstOtherGroupMember(&group, detachment.window_id).?;
+            if (options.anchor_wid == detachment.window_id) options.anchor_wid = successor;
+            _ = applyLayoutEvent(transition, .{ .replace_window_id = .{
+                .space_key = window.space_key,
+                .old_window_id = detachment.window_id,
+                .new_window_id = successor,
+            } });
+        }
+        if (!applyLayoutEvent(transition, .{ .insert = .{
+            .space_key = window.space_key,
+            .kind = layout.kind,
+            .window_id = inserted_window_id,
+            .options = options,
+        } })) {
+            transition.model.layout = original_layout;
+            return;
+        }
     }
-    _ = transition.model.windows.detachTab(window_id);
+
+    std.debug.assert(transition.model.windows.detachTab(detachment.window_id));
+}
+
+fn firstOtherGroupMember(group: *const WindowTabGroupSnapshot, window_id: WindowId) ?WindowId {
+    for (group.members()) |member_window_id| {
+        if (member_window_id != window_id) return member_window_id;
+    }
+    return null;
 }
 
 fn reduceWorkspaceFocusRecorded(
@@ -2507,6 +2736,16 @@ fn trackNativeWindowMove(model: *const Model, window_id: WindowId, source_worksp
     } };
 }
 
+fn testLayoutInsertion(kind: tiling_mod.LayoutKind) LayoutInsertion {
+    return .{
+        .kind = kind,
+        .options = .{
+            .split_mode = .horizontal,
+            .child = .second,
+        },
+    };
+}
+
 test "workspace summaries preserve globally unique active workspaces" {
     const testing = std.testing;
     var catalog: SpaceCatalog = .{};
@@ -2578,7 +2817,7 @@ test "window catalog owns identity and Space membership" {
     var updated_window = initial_snapshot;
     updated_window.frame.x = 30;
     updated_window.is_fullscreen = true;
-    const updated = reduce(second.model, .{ .update_window = updated_window });
+    const updated = reduce(second.model, .{ .update_window = .{ .window = updated_window } });
     try testing.expectEqual(@as(f64, 30), updated.model.window(101).?.frame.x);
     try testing.expect(updated.model.window(101).?.is_fullscreen);
 
@@ -2603,6 +2842,190 @@ test "window catalog owns identity and Space membership" {
     try testing.expect(removed.model.window(202) == null);
     try testing.expect(removed.model.geometry.get(202) == null);
     try testing.expectEqual(@as(u16, 1), removed.model.windows.count);
+}
+
+test "window lifecycle transitions update catalog geometry focus and layout atomically" {
+    const testing = std.testing;
+    const first_space: SpaceKey = .{ .virtual = 1 };
+    const second_space: SpaceKey = .{ .virtual = 2 };
+    var catalog: SpaceCatalog = .{};
+    catalog.add(.{ .key = first_space, .workspace_id = 1, .display_id = 11 });
+    catalog.add(.{ .key = second_space, .workspace_id = 2, .display_id = 11 });
+    var model: Model = .{ .spaces = catalog };
+
+    model = reduce(model, .{ .adopt_window = .{
+        .window_id = 101,
+        .process_id = 1001,
+        .space_key = first_space,
+        .frame = .{ .x = 10, .y = 20, .width = 800, .height = 600 },
+        .layout = testLayoutInsertion(.bsp),
+    } }).model;
+    try testing.expect(model.window(101) != null);
+    try testing.expect(model.geometry.get(101) != null);
+    try testing.expect(model.layout.contains(first_space, 101));
+
+    var window = model.windowSnapshot(101).?;
+    window.mode = .floating;
+    model = reduce(model, .{ .update_window = .{ .window = window } }).model;
+    try testing.expectEqual(window_mod.WindowMode.floating, model.window(101).?.mode);
+    try testing.expect(!model.layout.contains(first_space, 101));
+
+    window.mode = .tiled;
+    model = reduce(model, .{ .update_window = .{
+        .window = window,
+        .layout = testLayoutInsertion(.bsp),
+    } }).model;
+    model = reduce(model, .{ .record_workspace_focus = .{
+        .workspace_id = 1,
+        .window_id = 101,
+    } }).model;
+    try testing.expectEqual(window_mod.WindowMode.tiled, model.window(101).?.mode);
+    try testing.expect(model.layout.contains(first_space, 101));
+
+    model = reduce(model, .{ .assign_window_space = .{
+        .window_id = 101,
+        .space_key = second_space,
+        .layout = testLayoutInsertion(.bsp),
+    } }).model;
+    try testing.expect(model.window(101).?.space_key.eql(second_space));
+    try testing.expect(!model.layout.contains(first_space, 101));
+    try testing.expect(model.layout.contains(second_space, 101));
+    try testing.expectEqual(@as(?WindowId, null), model.focusedWorkspaceWindow(1));
+
+    model = reduce(model, .{ .record_workspace_focus = .{
+        .workspace_id = 2,
+        .window_id = 101,
+    } }).model;
+    model = reduce(model, .{ .replace_window_id = .{
+        .old_window_id = 101,
+        .new_window_id = 201,
+    } }).model;
+    try testing.expect(model.window(101) == null);
+    try testing.expect(model.window(201) != null);
+    try testing.expect(model.geometry.get(101) == null);
+    try testing.expect(model.geometry.get(201) != null);
+    try testing.expect(!model.layout.contains(second_space, 101));
+    try testing.expect(model.layout.contains(second_space, 201));
+    try testing.expectEqual(@as(?WindowId, 201), model.focusedWorkspaceWindow(2));
+
+    model = reduce(model, .{ .remove_window = 201 }).model;
+    try testing.expect(model.window(201) == null);
+    try testing.expect(model.geometry.get(201) == null);
+    try testing.expect(!model.layout.contains(second_space, 201));
+    try testing.expectEqual(@as(?WindowId, null), model.focusedWorkspaceWindow(2));
+}
+
+test "layout rejection leaves window adoption unchanged" {
+    const testing = std.testing;
+    const space_key: SpaceKey = .{ .virtual = 1 };
+    var catalog: SpaceCatalog = .{};
+    catalog.add(.{ .key = space_key, .workspace_id = 1, .display_id = 11 });
+    var model: Model = .{ .spaces = catalog };
+
+    model = reduce(model, .{ .adopt_window = .{
+        .window_id = 101,
+        .process_id = 1001,
+        .space_key = space_key,
+        .layout = testLayoutInsertion(.bsp),
+    } }).model;
+    const rejected = reduce(model, .{ .adopt_window = .{
+        .window_id = 102,
+        .process_id = 1002,
+        .space_key = space_key,
+        .layout = testLayoutInsertion(.monocle),
+    } });
+
+    try testing.expectEqual(@as(u8, 1), rejected.effect_count);
+    try testing.expectEqual(std.meta.Tag(Effect).layout, std.meta.activeTag(rejected.effects[0]));
+    try testing.expect(rejected.model.window(102) == null);
+    try testing.expect(rejected.model.geometry.get(102) == null);
+    try testing.expect(rejected.model.layout.contains(space_key, 101));
+    try testing.expect(!rejected.model.layout.contains(space_key, 102));
+    try testing.expectEqual(@as(usize, 1), rejected.model.layout.windowCount(space_key));
+}
+
+test "tab transitions transfer layout ownership atomically" {
+    const testing = std.testing;
+    const space_key: SpaceKey = .{ .virtual = 1 };
+    var catalog: SpaceCatalog = .{};
+    catalog.add(.{ .key = space_key, .workspace_id = 1, .display_id = 11 });
+    var model: Model = .{ .spaces = catalog };
+
+    model = reduce(model, .{ .adopt_window = .{
+        .window_id = 101,
+        .process_id = 1001,
+        .space_key = space_key,
+        .layout = testLayoutInsertion(.bsp),
+    } }).model;
+    var group: WindowTabGroupObservation = .{
+        .leader_window_id = 101,
+        .active_window_id = 102,
+    };
+    try testing.expect(group.addMember(101));
+    try testing.expect(group.addMember(102));
+    model = reduce(model, .{ .adopt_window = .{
+        .window_id = 102,
+        .process_id = 1001,
+        .space_key = space_key,
+        .tab_group = group,
+    } }).model;
+
+    try testing.expectEqual(@as(usize, 1), model.layout.windowCount(space_key));
+    try testing.expect(model.layout.contains(space_key, 101));
+    try testing.expect(!model.layout.contains(space_key, 102));
+    try testing.expectEqual(@as(WindowId, 101), model.windowTabLeader(102));
+
+    model = reduce(model, .{ .detach_window_tab = .{
+        .window_id = 102,
+        .layout = testLayoutInsertion(.bsp),
+    } }).model;
+    try testing.expectEqual(@as(usize, 2), model.layout.windowCount(space_key));
+    try testing.expect(model.layout.contains(space_key, 101));
+    try testing.expect(model.layout.contains(space_key, 102));
+    try testing.expectEqual(@as(WindowId, 102), model.windowTabLeader(102));
+
+    model = reduce(model, .{ .observe_window_tab_group = group }).model;
+    model = reduce(model, .{ .remove_window = 101 }).model;
+    try testing.expectEqual(@as(usize, 1), model.layout.windowCount(space_key));
+    try testing.expect(!model.layout.contains(space_key, 101));
+    try testing.expect(model.layout.contains(space_key, 102));
+    try testing.expectEqual(@as(WindowId, 102), model.windowTabLeader(102));
+}
+
+test "tab grouping reconciles workspace and layout ownership atomically" {
+    const testing = std.testing;
+    const first_space: SpaceKey = .{ .virtual = 1 };
+    const second_space: SpaceKey = .{ .virtual = 2 };
+    var catalog: SpaceCatalog = .{};
+    catalog.add(.{ .key = first_space, .workspace_id = 1, .display_id = 11 });
+    catalog.add(.{ .key = second_space, .workspace_id = 2, .display_id = 11 });
+    var model: Model = .{ .spaces = catalog };
+    model = reduce(model, .{ .adopt_window = .{
+        .window_id = 101,
+        .process_id = 1001,
+        .space_key = first_space,
+        .layout = testLayoutInsertion(.bsp),
+    } }).model;
+    model = reduce(model, .{ .adopt_window = .{
+        .window_id = 102,
+        .process_id = 1001,
+        .space_key = second_space,
+        .layout = testLayoutInsertion(.bsp),
+    } }).model;
+
+    var group: WindowTabGroupObservation = .{
+        .leader_window_id = 101,
+        .active_window_id = 101,
+    };
+    try testing.expect(group.addMember(101));
+    try testing.expect(group.addMember(102));
+    model = reduce(model, .{ .observe_window_tab_group = group }).model;
+
+    try testing.expect(model.window(102).?.space_key.eql(first_space));
+    try testing.expectEqual(@as(WindowId, 101), model.windowTabLeader(102));
+    try testing.expect(model.layout.contains(first_space, 101));
+    try testing.expect(!model.layout.contains(second_space, 102));
+    try testing.expectEqual(@as(usize, 0), model.layout.windowCount(second_space));
 }
 
 test "workspace focus memory follows window lifecycle" {
@@ -2743,7 +3166,7 @@ test "window catalog owns tab identity and group Space assignment" {
     try testing.expect(model.window(102).?.is_suppressed);
     try testing.expect(!model.window(103).?.is_suppressed);
 
-    model = reduce(model, .{ .detach_window_tab = 102 }).model;
+    model = reduce(model, .{ .detach_window_tab = .{ .window_id = 102 } }).model;
     try testing.expectEqual(@as(WindowId, 102), model.windowTabLeader(102));
     try testing.expect(!model.window(102).?.is_suppressed);
     try testing.expectEqual(@as(WindowId, 101), model.windowTabLeader(103));
