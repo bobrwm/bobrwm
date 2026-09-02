@@ -71,7 +71,6 @@ final class MenuBarController: NSObject, NSMenuDelegate {
             item.rowState.isFocused = state?.is_focused ?? false
         }
 
-        // Only what is on screen: one chip per display, not the whole list.
         statusModel.chips = workspaces.compactMap { workspace in
             guard let state = states[workspace.id], state.is_active else { return nil }
             let hasName = !workspace.name.isEmpty && workspace.name != "\(workspace.id)"

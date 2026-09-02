@@ -2,6 +2,9 @@
 
 A tiling window manager for macOS, written in Zig.
 
+The state-engine design and its invariants are defined in
+[ARCHITECTURE.md](ARCHITECTURE.md).
+
 ## Installation
 
 ```
@@ -213,11 +216,16 @@ Native Mission Control spaces are available as an opt-in experimental backend:
 .native_spaces = true,
 ```
 
-This maps workspace 1 to the first ordinary native space, workspace 2 to the
-second, and so on, independently on each display. Create at least as many
-Mission Control spaces as configured bobrwm workspaces on every display where
-they will be used. Full-screen application spaces are ignored when assigning
-workspace numbers, but are crossed when switching. Switching uses the
+Each workspace is assigned to exactly one ordinary native Space across all
+displays. The currently visible Space on each display is assigned first, so
+two displays always expose distinct Bobrwm workspaces even when both native
+Spaces have the same local ordinal. Remaining assignments are preserved by
+native Space ID across topology observations. Configure at least as many
+ordinary Mission Control spaces in total as Bobrwm workspaces, with at least
+one on every managed display. Extra native Spaces remain unmanaged.
+
+Full-screen application spaces are ignored when assigning workspace numbers,
+but are crossed when switching. Switching uses the
 high-velocity synthetic Dock gesture pioneered by InstantSpaceSwitcher;
 on macOS 27 and later, Bobrwm also supplies the serialized IOHID payload now
 required by Dock. Window moves and topology queries use private, undocumented

@@ -272,6 +272,13 @@ pub const SkyLight = struct {
         return topology.workspaceForWindow(self, wid, display_id, workspace_count);
     }
 
+    /// Return the unique ordinary native Space containing a window.
+    pub fn nativeSpaceIdForWindow(self: *const SkyLight, wid: u32, display_id: u32) ?u64 {
+        var topology = self.nativeSpaceTopology() orelse return null;
+        defer topology.deinit();
+        return topology.spaceIdForWindow(self, wid, display_id);
+    }
+
     fn nativeSpaceSwitchPlan(self: *const SkyLight, display_id: u32, target_workspace_id: u8) ?NativeSpaceSwitchPlan {
         var topology = self.nativeSpaceTopology() orelse return null;
         defer topology.deinit();
@@ -337,6 +344,26 @@ pub const NativeSpaceTopology = struct {
         const display = self.managedDisplayInfo(display_id) orelse return null;
         const spaces = self.spacesForDisplay(display) orelse return null;
         return workspaceForWindowSpaces(window_spaces, spaces, workspace_count, self.keys.id, self.keys.space_type);
+    }
+
+    pub fn spaceIdForWindow(
+        self: *const NativeSpaceTopology,
+        sky: *const SkyLight,
+        wid: u32,
+        display_id: u32,
+    ) ?u64 {
+        const copy_window_spaces = sky.copySpacesForWindows orelse return null;
+        const number = c.CFNumberCreate(null, c.kCFNumberSInt32Type, &wid) orelse return null;
+        defer c.CFRelease(number);
+        var values = [_]?*const anyopaque{number};
+        const windows = c.CFArrayCreate(null, &values, 1, &c.kCFTypeArrayCallBacks) orelse return null;
+        defer c.CFRelease(windows);
+        const window_spaces = copy_window_spaces(sky.mainConnectionID(), 0x7, windows) orelse return null;
+        defer c.CFRelease(window_spaces);
+
+        const display = self.managedDisplayInfo(display_id) orelse return null;
+        const spaces = self.spacesForDisplay(display) orelse return null;
+        return spaceIdForWindowSpaces(window_spaces, spaces, self.keys.id, self.keys.space_type);
     }
 
     pub fn spaceIdAtWorkspace(self: *const NativeSpaceTopology, display_id: u32, workspace_id: u8) ?u64 {
@@ -558,6 +585,30 @@ fn workspaceForWindowSpaces(
         }
     }
     return matched_workspace_id;
+}
+
+fn spaceIdForWindowSpaces(
+    window_spaces: CFArrayRef,
+    display_spaces: CFArrayRef,
+    id_key: CFStringRef,
+    type_key: CFStringRef,
+) ?u64 {
+    var matched_space_id: ?u64 = null;
+    const count = c.CFArrayGetCount(@ptrCast(window_spaces));
+    for (0..@intCast(count)) |index| {
+        const space = c.CFArrayGetValueAtIndex(@ptrCast(window_spaces), @intCast(index)) orelse continue;
+        var sid: i64 = 0;
+        if (c.CFNumberGetValue(@ptrCast(space), c.kCFNumberSInt64Type, &sid) == 0 or sid <= 0) continue;
+
+        const space_id: u64 = @intCast(sid);
+        _ = workspaceForSpaceId(display_spaces, space_id, std.math.maxInt(u8), id_key, type_key) orelse continue;
+        if (matched_space_id) |matched| {
+            if (matched != space_id) return null;
+        } else {
+            matched_space_id = space_id;
+        }
+    }
+    return matched_space_id;
 }
 
 fn workspaceForSpaceId(

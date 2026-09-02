@@ -245,9 +245,9 @@ fn spaceForWindow(win: window_mod.Window) ?*workspace_mod.Space {
     return g_workspaces.get(win.space.key);
 }
 
-fn spaceForCommand(display_id: u32, workspace_id: u8) ?*workspace_mod.Space {
-    if (nativeSpacesEnabled()) return spaceForWorkspace(display_id, workspace_id);
-    return g_workspaces.get(.{ .virtual = workspace_id });
+fn spaceForCommand(_: u32, workspace_id: u8) ?*workspace_mod.Space {
+    const space_ref = g_state.logicalWorkspace(workspace_id) orelse return null;
+    return g_workspaces.get(space_ref.key);
 }
 
 fn applySpaceCatalog(catalog: state_mod.SpaceCatalog) void {
@@ -295,10 +295,7 @@ fn workspaceTraversalDirectionFromAction(action: u8) ?WorkspaceTraversalDirectio
 
 fn adjacentWorkspaceId(direction: WorkspaceTraversalDirection) ?u8 {
     const focused_display_id = focusedDisplayId();
-    const workspace_count = if (nativeSpacesEnabled())
-        g_state.native_topology.findDisplay(focused_display_id).?.space_count
-    else
-        g_workspaces.workspace_count;
+    const workspace_count = g_workspaces.workspace_count;
     std.debug.assert(workspace_count > 0);
     std.debug.assert(workspace_count <= workspace_mod.max_workspaces);
 
@@ -772,16 +769,8 @@ fn assertDisplayCoverage() void {
 }
 
 fn updateStatusBar() void {
-    var active_ids: [workspace_mod.max_displays]u8 = undefined;
-    for (0..g_display_count) |slot| {
-        active_ids[slot] = activeWorkspaceIdForDisplay(g_displays[slot].id);
-    }
-
-    statusbar.updateState(
-        presentationSpaces(),
-        active_ids[0..g_display_count],
-        activeWorkspaceIdForDisplay(focusedDisplayId()),
-    );
+    const summaries = g_state.workspaceSummaries(g_workspaces.workspace_count);
+    statusbar.updateState(summaries[0..g_workspaces.workspace_count]);
 }
 
 fn presentationSpaces() []workspace_mod.Space {
@@ -2211,7 +2200,7 @@ fn applyReloadedConfig(next: ConfigRuntime) void {
     // Preserve BSP topology and runtime split edits for ordinary config saves.
     // Only changing the layout algorithm requires reconstructing state.
     if (layout_changed) rebuildTilingStatesForConfig();
-    statusbar.updateWorkspaceMenu(presentationSpaces(), &g_config);
+    statusbar.updateWorkspaceMenu(g_workspaces.workspace_count, &g_config);
     updateStatusBar();
     retile();
     if (dim.enabled) pushDimSnapshot();
@@ -2699,7 +2688,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
 
     // Status bar (zig-objc) --
     statusbar.init(
-        presentationSpaces(),
+        g_workspaces.workspace_count,
         &g_config,
         .{
             .retile = statusBarRetile,
@@ -3584,6 +3573,7 @@ fn handleEvent(ev: *const event_mod.Event) void {
             reconcileDueGeometryObservations();
             processPendingWorkspaceParks();
             processPendingNativeWindowMoves();
+            processPendingNativeWorkspaceMove();
             if (processDueNativeStateObservation()) return;
             if (processDueDisplayResettle()) return;
             if (nativeSwitchPending()) return;
@@ -3897,6 +3887,7 @@ fn refreshRolePolling() void {
         g_app_launch_retries.count() > 0 or
         g_focus_retries.count() > 0 or
         g_state.hasPendingNativeWindowMoves() or
+        g_state.pendingNativeWorkspaceMove() != null or
         g_state.hasDeferredFollowFocus() or
         g_state.hasScheduledObservation() or
         g_state.isWorkspaceTransitionActive() or
@@ -3962,6 +3953,109 @@ fn processPendingNativeWindowMoves() void {
     }
 }
 
+fn executeNativeWorkspaceMove(pending: state_mod.PendingNativeWorkspaceMove) void {
+    const succeeded = moveNativeWorkspaceContents(pending, true);
+    dispatchStateEvent(.{ .native_workspace_move_started = .{
+        .epoch = pending.epoch,
+        .succeeded = succeeded,
+        .at_ms = nativeStateNowMs(),
+    } });
+}
+
+fn executeNativeWorkspaceMoveRollback(pending: state_mod.PendingNativeWorkspaceMove) void {
+    const succeeded = moveNativeWorkspaceContents(pending, false);
+    dispatchStateEvent(.{ .native_workspace_move_rollback_result = .{
+        .epoch = pending.epoch,
+        .succeeded = succeeded,
+    } });
+}
+
+fn moveNativeWorkspaceContents(pending: state_mod.PendingNativeWorkspaceMove, is_forward: bool) bool {
+    const source_ws = g_workspaces.get(pending.source.key) orelse return false;
+    const target_ws = g_workspaces.get(pending.target.key) orelse return false;
+    const source_target = if (is_forward) pending.target else pending.source;
+    const target_target = if (is_forward) pending.source else pending.target;
+
+    for (source_ws.windows.items) |wid| {
+        if (!moveTabGroupToNativeSpace(wid, source_target)) {
+            if (is_forward) _ = moveNativeWorkspaceContents(pending, false);
+            return false;
+        }
+    }
+    for (target_ws.windows.items) |wid| {
+        if (!moveTabGroupToNativeSpace(wid, target_target)) {
+            if (is_forward) _ = moveNativeWorkspaceContents(pending, false);
+            return false;
+        }
+    }
+    return true;
+}
+
+fn processPendingNativeWorkspaceMove() void {
+    const pending = g_state.pendingNativeWorkspaceMove() orelse return;
+    if (!pending.has_started or pending.is_rolling_back) return;
+
+    dispatchStateEvent(.{ .native_workspace_move_observed = .{
+        .epoch = pending.epoch,
+        .observation = if (nativeWorkspaceContentsConfirmed(pending)) .confirmed else .pending,
+        .at_ms = nativeStateNowMs(),
+    } });
+}
+
+fn nativeWorkspaceContentsConfirmed(pending: state_mod.PendingNativeWorkspaceMove) bool {
+    const source_ws = g_workspaces.get(pending.source.key) orelse return false;
+    const target_ws = g_workspaces.get(pending.target.key) orelse return false;
+
+    for (source_ws.windows.items) |wid| {
+        const move: state_mod.PendingNativeWindowMove = .{
+            .window_id = wid,
+            .source = pending.source,
+            .target = pending.target,
+            .epoch = pending.epoch,
+        };
+        if (nativeTabGroupMoveConfirmed(wid, move) != true) return false;
+    }
+    for (target_ws.windows.items) |wid| {
+        const move: state_mod.PendingNativeWindowMove = .{
+            .window_id = wid,
+            .source = pending.target,
+            .target = pending.source,
+            .epoch = pending.epoch,
+        };
+        if (nativeTabGroupMoveConfirmed(wid, move) != true) return false;
+    }
+    return true;
+}
+
+fn completeNativeWorkspaceMove(pending: state_mod.PendingNativeWorkspaceMove) void {
+    const source_index = g_workspaces.indexOf(pending.source.key) orelse return;
+    const target_index = g_workspaces.indexOf(pending.target.key) orelse return;
+    const moved_ref = g_state.space(pending.target.key) orelse return;
+    const displaced_ref = g_state.space(pending.source.key) orelse return;
+
+    g_workspaces.spaces[source_index].ref = moved_ref;
+    g_workspaces.spaces[target_index].ref = displaced_ref;
+    refreshLegacyWorkspaceWindows(&g_workspaces.spaces[source_index]);
+    refreshLegacyWorkspaceWindows(&g_workspaces.spaces[target_index]);
+
+    assertDisplayCoverage();
+    setFocusedDisplay(moved_ref.display_id);
+    retile();
+    updateStatusBar();
+    focusWorkspaceWindow(&g_workspaces.spaces[source_index]);
+}
+
+fn refreshLegacyWorkspaceWindows(space: *workspace_mod.Space) void {
+    for (space.windows.items) |wid| {
+        if (g_store.get(wid)) |window| {
+            var updated = window;
+            updated.space = space.ref;
+            g_store.putAssumeCapacity(updated);
+        }
+        updateTabGroupAssignment(wid, space.ref);
+    }
+}
+
 /// Full reconcile after a topology change: rebuild display/workspace state,
 /// pick up windows, retile, refresh the bar.
 fn reconcileDisplays() void {
@@ -3979,7 +4073,7 @@ fn captureNativeTopology() ?state_mod.NativeTopology {
     };
     defer snapshot.deinit();
 
-    var topology: state_mod.NativeTopology = .{};
+    var observation: state_mod.NativeTopologyObservation = .{};
     for (g_displays[0..g_display_count]) |display| {
         const observed_space_id = snapshot.currentSpaceId(display.id) orelse {
             log.warn("native topology: current Space unavailable display={d}", .{display.id});
@@ -3989,34 +4083,38 @@ fn captureNativeTopology() ?state_mod.NativeTopology {
             log.warn("native topology: ordinary Space count unavailable display={d}", .{display.id});
             return null;
         };
-        const managed_count = @min(available_count, g_workspaces.workspace_count);
-        if (managed_count == 0) {
+        const captured_count = @min(available_count, state_mod.max_spaces_per_display);
+        if (captured_count == 0) {
             log.warn("native topology: display has no ordinary Spaces display={d}", .{display.id});
             return null;
         }
-        if (managed_count < g_workspaces.workspace_count) {
-            log.debug("native topology: display={d} manages {d}/{d} configured workspaces", .{
-                display.id,
-                managed_count,
-                g_workspaces.workspace_count,
-            });
-        }
-        var display_topology = state_mod.DisplayTopology.init(display.id, observed_space_id);
 
-        var workspace_id: u8 = 1;
-        while (workspace_id <= managed_count) : (workspace_id += 1) {
-            const space_id = snapshot.spaceIdAtWorkspace(display.id, workspace_id) orelse {
-                log.warn("native topology: Space unavailable display={d} workspace={d}", .{ display.id, workspace_id });
+        var observed_display: state_mod.NativeDisplayObservation = .{
+            .display_id = display.id,
+            .observed_space_id = observed_space_id,
+            .space_count = captured_count,
+        };
+        var ordinal: u8 = 1;
+        while (ordinal <= captured_count) : (ordinal += 1) {
+            observed_display.space_ids[ordinal - 1] = snapshot.spaceIdAtWorkspace(display.id, ordinal) orelse {
+                log.warn("native topology: Space unavailable display={d} ordinal={d}", .{ display.id, ordinal });
                 return null;
             };
-            display_topology.addSpace(.{
-                .id = space_id,
-                .workspace_id = workspace_id,
-            });
         }
-        topology.addDisplay(display_topology);
+        if (std.mem.indexOfScalar(u64, observed_display.space_ids[0..captured_count], observed_space_id) == null) {
+            log.warn("native topology: observed Space outside managed range display={d} space={d}", .{ display.id, observed_space_id });
+            return null;
+        }
+        observation.addDisplay(observed_display);
     }
-    return topology;
+
+    return state_mod.mapNativeTopology(
+        observation,
+        &g_state.native_topology,
+        &g_state.workspace_topology,
+        &g_state.spaces,
+        g_workspaces.workspace_count,
+    );
 }
 
 fn dispatchStateEvent(event: state_mod.Event) void {
@@ -4065,6 +4163,18 @@ fn executeStateEffect(effect: state_mod.Effect) void {
         }),
         .native_window_move_rejected => |request| log.warn("native window move: tracking rejected wid={d} source={d} target={d}", .{
             request.window_id,
+            request.source.workspace_id,
+            request.target.workspace_id,
+        }),
+        .move_native_workspace_contents => |pending| executeNativeWorkspaceMove(pending),
+        .rollback_native_workspace_contents => |pending| executeNativeWorkspaceMoveRollback(pending),
+        .native_workspace_move_completed => |pending| completeNativeWorkspaceMove(pending),
+        .native_workspace_move_failed => |failure| log.warn("native workspace move failed source={d} target={d} rollback={}", .{
+            failure.move.source.workspace_id,
+            failure.move.target.workspace_id,
+            failure.rollback_succeeded,
+        }),
+        .native_workspace_move_rejected => |request| log.warn("native workspace move rejected source={d} target={d}", .{
             request.source.workspace_id,
             request.target.workspace_id,
         }),
@@ -4369,13 +4479,13 @@ fn reconcileNativeWindowAssignments(topology: *const skylight.NativeSpaceTopolog
         const visible_wid = g_tab_groups.resolveActive(win.wid);
         if (!on_screen.contains(visible_wid)) continue;
 
-        const workspace_id = topology.workspaceForWindow(sky, visible_wid, win.space.display_id, g_workspaces.workspace_count) orelse continue;
-        if (workspace_id == win.space.workspace_id) continue;
+        const space_id = topology.spaceIdForWindow(sky, visible_wid, win.space.display_id) orelse continue;
+        if (win.space.key.eql(.{ .native = space_id })) continue;
         if (repair_count == repairs.len) {
             log.warn("native workspace assignment repair truncated limit={d}", .{repairs.len});
             break;
         }
-        const target = g_state.spaceForWorkspace(win.space.display_id, workspace_id) orelse continue;
+        const target = g_state.space(.{ .native = space_id }) orelse continue;
         repairs[repair_count] = .{ .wid = win.wid, .target = target };
         repair_count += 1;
     }
@@ -6777,8 +6887,8 @@ fn resolveWorkspace(pid: i32, display_id: u32) *workspace_mod.Space {
 fn resolveWorkspaceForWindow(pid: i32, wid: u32, display_id: u32) *workspace_mod.Space {
     if (configuredWorkspace(pid, display_id)) |ws| return ws;
     if (nativeSpacesEnabled()) {
-        if (g_sky.?.nativeWorkspaceForWindow(wid, display_id, g_workspaces.workspace_count)) |workspace_id| {
-            if (spaceForWorkspace(display_id, workspace_id)) |ws| return ws;
+        if (g_sky.?.nativeSpaceIdForWindow(wid, display_id)) |space_id| {
+            if (g_workspaces.get(.{ .native = space_id })) |ws| return ws;
         }
     }
     const ws_id = activeWorkspaceIdForDisplay(display_id);
@@ -6937,9 +7047,16 @@ fn processPendingWorkspaceParks() void {
 
 fn switchWorkspace(target_id: u8) void {
     if (nativeSpacesEnabled()) {
-        const target_display = focusedDisplayId();
+        const target_ws = spaceForCommand(focusedDisplayId(), target_id) orelse return;
+        if (spaceVisible(target_ws.ref)) {
+            startWorkspaceTransition(.switch_workspace, target_ws.ref);
+            setFocusedDisplay(target_ws.ref.display_id);
+            updateStatusBar();
+            focusWorkspaceWindow(target_ws);
+            return;
+        }
         dispatchStateEvent(.{ .request_native_switch = .{
-            .target = (spaceForWorkspace(target_display, target_id) orelse return).ref,
+            .target = target_ws.ref,
             .at_ms = nativeStateNowMs(),
         } });
         return;
@@ -7278,12 +7395,24 @@ fn moveWindowToDisplay(target_display_slot: u8) void {
 }
 
 fn moveWorkspaceToDisplay(target_display_slot: usize) void {
-    if (nativeSpacesEnabled()) return;
     if (target_display_slot >= g_display_count) return;
 
     const source_display_id = focusedDisplayId();
     const target_display_id = g_displays[target_display_slot].id;
     if (source_display_id == target_display_id) return;
+
+    if (nativeSpacesEnabled()) {
+        const moving_workspace_id = activeWorkspaceIdForDisplay(source_display_id);
+        const displaced_workspace_id = activeWorkspaceIdForDisplay(target_display_id);
+        const source = spaceForWorkspace(source_display_id, moving_workspace_id) orelse return;
+        const target = spaceForWorkspace(target_display_id, displaced_workspace_id) orelse return;
+        dispatchStateEvent(.{ .request_native_workspace_move = .{
+            .source = source.ref,
+            .target = target.ref,
+            .at_ms = nativeStateNowMs(),
+        } });
+        return;
+    }
 
     const moving_ws_id = activeWorkspaceIdForDisplay(source_display_id);
     const displaced_ws_id = activeWorkspaceIdForDisplay(target_display_id);

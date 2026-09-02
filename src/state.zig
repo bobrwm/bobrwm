@@ -11,6 +11,7 @@ pub const max_pending_native_window_moves = 256;
 pub const native_switch_timeout_ms: u64 = 3200;
 pub const native_observation_delay_ms: u64 = 50;
 pub const native_window_move_attempts_max: u8 = 3;
+pub const native_workspace_move_timeout_ms: u64 = 3200;
 pub const workspace_transition_settle_ms: u64 = 400;
 
 pub const DisplayId = space_mod.DisplayId;
@@ -59,6 +60,14 @@ pub const DisplayWorkspace = struct {
     active_workspace_id: WorkspaceId,
 };
 
+/// Logical workspace state derived from its current placement.
+pub const WorkspaceSummary = struct {
+    workspace_id: WorkspaceId,
+    window_count: u32,
+    is_active: bool,
+    is_focused: bool,
+};
+
 pub const WorkspaceTopology = struct {
     displays: [max_displays]DisplayWorkspace = undefined,
     display_count: u8 = 0,
@@ -105,7 +114,7 @@ pub const SpaceCatalog = struct {
         space.assertValid();
         std.debug.assert(self.space_count < self.spaces.len);
         std.debug.assert(self.find(space.key) == null);
-        std.debug.assert(self.findWorkspace(space.display_id, space.workspace_id) == null);
+        std.debug.assert(self.findLogicalWorkspace(space.workspace_id) == null);
 
         self.spaces[self.space_count] = space;
         self.space_count += 1;
@@ -121,6 +130,13 @@ pub const SpaceCatalog = struct {
     pub fn findWorkspace(self: *const SpaceCatalog, display_id: DisplayId, workspace_id: WorkspaceId) ?SpaceRef {
         for (self.spaces[0..self.space_count]) |space| {
             if (space.display_id == display_id and space.workspace_id == workspace_id) return space;
+        }
+        return null;
+    }
+
+    pub fn findLogicalWorkspace(self: *const SpaceCatalog, workspace_id: WorkspaceId) ?SpaceRef {
+        for (self.spaces[0..self.space_count]) |space| {
+            if (space.workspace_id == workspace_id) return space;
         }
         return null;
     }
@@ -190,6 +206,9 @@ pub const NativeTopology = struct {
     pub fn addDisplay(self: *NativeTopology, topology: DisplayTopology) void {
         std.debug.assert(self.display_count < self.displays.len);
         std.debug.assert(self.findDisplay(topology.display_id) == null);
+        for (topology.spaces[0..topology.space_count]) |space| {
+            std.debug.assert(self.spaceForWorkspace(space.workspace_id) == null);
+        }
 
         self.displays[self.display_count] = topology;
         self.display_count += 1;
@@ -207,6 +226,43 @@ pub const NativeTopology = struct {
         return topology.workspaceForSpace(topology.observed_space_id);
     }
 
+    pub fn spaceForWorkspace(self: *const NativeTopology, workspace_id: WorkspaceId) ?SpaceRef {
+        for (self.displays[0..self.display_count]) |display| {
+            const space_id = display.spaceForWorkspace(workspace_id) orelse continue;
+            return .{
+                .key = .{ .native = space_id },
+                .workspace_id = workspace_id,
+                .display_id = display.display_id,
+            };
+        }
+        return null;
+    }
+
+    fn swapWorkspacePlacements(self: *NativeTopology, source_key: SpaceKey, target_key: SpaceKey) bool {
+        const source_id = switch (source_key) {
+            .native => |space_id| space_id,
+            .virtual => return false,
+        };
+        const target_id = switch (target_key) {
+            .native => |space_id| space_id,
+            .virtual => return false,
+        };
+        var source: ?*Space = null;
+        var target: ?*Space = null;
+        for (self.displays[0..self.display_count]) |*display| {
+            for (display.spaces[0..display.space_count]) |*space| {
+                if (space.id == source_id) source = space;
+                if (space.id == target_id) target = space;
+            }
+        }
+        if (source == null or target == null) return false;
+
+        const workspace_id = source.?.workspace_id;
+        source.?.workspace_id = target.?.workspace_id;
+        target.?.workspace_id = workspace_id;
+        return true;
+    }
+
     pub fn eql(self: *const NativeTopology, other: *const NativeTopology) bool {
         if (self.display_count != other.display_count) return false;
 
@@ -216,6 +272,130 @@ pub const NativeTopology = struct {
         return true;
     }
 };
+
+pub const NativeDisplayObservation = struct {
+    display_id: DisplayId,
+    observed_space_id: NativeSpaceId,
+    space_ids: [max_spaces_per_display]NativeSpaceId = @splat(0),
+    space_count: u8 = 0,
+};
+
+pub const NativeTopologyObservation = struct {
+    displays: [max_displays]NativeDisplayObservation = undefined,
+    display_count: u8 = 0,
+
+    pub fn addDisplay(self: *NativeTopologyObservation, display: NativeDisplayObservation) void {
+        std.debug.assert(self.display_count < self.displays.len);
+        self.displays[self.display_count] = display;
+        self.display_count += 1;
+    }
+};
+
+/// Assign global logical workspaces to an observed physical Space topology.
+pub fn mapNativeTopology(
+    observation: NativeTopologyObservation,
+    previous: *const NativeTopology,
+    workspace_topology: *const WorkspaceTopology,
+    catalog: *const SpaceCatalog,
+    workspace_count: u8,
+) ?NativeTopology {
+    if (workspace_count == 0 or observation.display_count > workspace_count) return null;
+
+    var assignments: [max_displays][max_spaces_per_display]WorkspaceId = @splat(@splat(0));
+    var claimed: [max_spaces_per_display + 1]bool = @splat(false);
+
+    for (observation.displays[0..observation.display_count], 0..) |display, display_index| {
+        const observed_index = std.mem.indexOfScalar(
+            NativeSpaceId,
+            display.space_ids[0..display.space_count],
+            display.observed_space_id,
+        ) orelse return null;
+        var workspace_id = workspaceForNativeSpace(previous, display.observed_space_id) orelse
+            workspace_topology.activeWorkspace(display.display_id) orelse 0;
+        if (workspace_id == 0 or workspace_id > workspace_count or claimed[workspace_id]) {
+            workspace_id = firstUnclaimedWorkspaceId(&claimed, workspace_count) orelse return null;
+        }
+        assignments[display_index][observed_index] = workspace_id;
+        claimed[workspace_id] = true;
+    }
+
+    for (observation.displays[0..observation.display_count], 0..) |display, display_index| {
+        for (display.space_ids[0..display.space_count], 0..) |space_id, space_index| {
+            if (assignments[display_index][space_index] != 0) continue;
+            const workspace_id = workspaceForNativeSpace(previous, space_id) orelse continue;
+            if (workspace_id > workspace_count or claimed[workspace_id]) continue;
+            assignments[display_index][space_index] = workspace_id;
+            claimed[workspace_id] = true;
+        }
+    }
+
+    for (observation.displays[0..observation.display_count], 0..) |display, display_index| {
+        for (assignments[display_index][0..display.space_count]) |*workspace_id| {
+            if (workspace_id.* != 0) continue;
+            workspace_id.* = firstUnclaimedWorkspaceOnDisplayId(
+                &claimed,
+                workspace_count,
+                catalog,
+                display.display_id,
+            ) orelse continue;
+            claimed[workspace_id.*] = true;
+        }
+    }
+
+    for (observation.displays[0..observation.display_count], 0..) |display, display_index| {
+        for (assignments[display_index][0..display.space_count]) |*workspace_id| {
+            if (workspace_id.* != 0) continue;
+            workspace_id.* = firstUnclaimedWorkspaceId(&claimed, workspace_count) orelse continue;
+            claimed[workspace_id.*] = true;
+        }
+    }
+
+    if (firstUnclaimedWorkspaceId(&claimed, workspace_count) != null) return null;
+
+    var topology: NativeTopology = .{};
+    for (observation.displays[0..observation.display_count], 0..) |display, display_index| {
+        var mapped = DisplayTopology.init(display.display_id, display.observed_space_id);
+        for (display.space_ids[0..display.space_count], assignments[display_index][0..display.space_count]) |space_id, workspace_id| {
+            if (workspace_id != 0) mapped.addSpace(.{ .id = space_id, .workspace_id = workspace_id });
+        }
+        topology.addDisplay(mapped);
+    }
+    return topology;
+}
+
+fn workspaceForNativeSpace(topology: *const NativeTopology, space_id: NativeSpaceId) ?WorkspaceId {
+    for (topology.displays[0..topology.display_count]) |display| {
+        const workspace_id = display.workspaceForSpace(space_id) orelse continue;
+        return workspace_id;
+    }
+    return null;
+}
+
+fn firstUnclaimedWorkspaceId(
+    claimed: *const [max_spaces_per_display + 1]bool,
+    workspace_count: u8,
+) ?WorkspaceId {
+    var workspace_id: WorkspaceId = 1;
+    while (workspace_id <= workspace_count) : (workspace_id += 1) {
+        if (!claimed[workspace_id]) return workspace_id;
+    }
+    return null;
+}
+
+fn firstUnclaimedWorkspaceOnDisplayId(
+    claimed: *const [max_spaces_per_display + 1]bool,
+    workspace_count: u8,
+    catalog: *const SpaceCatalog,
+    display_id: DisplayId,
+) ?WorkspaceId {
+    var workspace_id: WorkspaceId = 1;
+    while (workspace_id <= workspace_count) : (workspace_id += 1) {
+        if (claimed[workspace_id]) continue;
+        const space = catalog.findLogicalWorkspace(workspace_id) orelse continue;
+        if (space.display_id == display_id) return workspace_id;
+    }
+    return null;
+}
 
 pub const SwitchRequest = struct {
     target: SpaceRef,
@@ -309,6 +489,20 @@ pub const PendingNativeWindowMoves = struct {
         }
         return null;
     }
+};
+
+pub const PendingNativeWorkspaceMove = struct {
+    source: SpaceRef,
+    target: SpaceRef,
+    epoch: Epoch,
+    deadline_at_ms: TimestampMs,
+    has_started: bool = false,
+    is_rolling_back: bool = false,
+};
+
+pub const NativeWorkspaceMoveObservation = enum {
+    confirmed,
+    pending,
 };
 
 pub const NativeWindowMoveRequest = struct {
@@ -493,6 +687,16 @@ pub const WindowCatalog = struct {
         return true;
     }
 
+    fn swapSpaceKeys(self: *WindowCatalog, source_key: SpaceKey, target_key: SpaceKey) void {
+        for (self.entries[0..self.count]) |*entry| {
+            if (entry.space_key.eql(source_key)) {
+                entry.space_key = target_key;
+            } else if (entry.space_key.eql(target_key)) {
+                entry.space_key = source_key;
+            }
+        }
+    }
+
     fn replaceId(self: *WindowCatalog, old_window_id: WindowId, new_window_id: WindowId) bool {
         const index = self.findIndex(old_window_id) orelse return false;
         self.entries[index].window_id = new_window_id;
@@ -547,6 +751,7 @@ pub const Model = struct {
     observation_timer: ?ObservationTimer = null,
     workspace_transition: ?WorkspaceTransition = null,
     pending_native_window_moves: PendingNativeWindowMoves = .{},
+    pending_native_workspace_move: ?PendingNativeWorkspaceMove = null,
     pending_focus: PendingFocusQueue = .{},
     deferred_follow_focus: ?DeferredFollowFocus = null,
     next_epoch: Epoch = 1,
@@ -569,6 +774,10 @@ pub const Model = struct {
 
     pub fn pendingNativeWindowMove(self: *const Model, window_id: WindowId) ?PendingNativeWindowMove {
         return self.pending_native_window_moves.get(window_id);
+    }
+
+    pub fn pendingNativeWorkspaceMove(self: *const Model) ?PendingNativeWorkspaceMove {
+        return self.pending_native_workspace_move;
     }
 
     pub fn hasPendingFocus(self: *const Model) bool {
@@ -605,6 +814,10 @@ pub const Model = struct {
         return self.spaces.findWorkspace(display_id, workspace_id);
     }
 
+    pub fn logicalWorkspace(self: *const Model, workspace_id: WorkspaceId) ?SpaceRef {
+        return self.spaces.findLogicalWorkspace(workspace_id);
+    }
+
     pub fn space(self: *const Model, key: SpaceKey) ?SpaceRef {
         return self.spaces.find(key);
     }
@@ -621,6 +834,40 @@ pub const Model = struct {
             if (pending.request.target.display_id == display_id) return pending.request.target.workspace_id;
         }
         return self.activeWorkspace(display_id);
+    }
+
+    /// Project reducer state into one summary per configured workspace.
+    pub fn workspaceSummaries(self: *const Model, workspace_count: u8) [max_spaces_per_display]WorkspaceSummary {
+        std.debug.assert(workspace_count > 0 and workspace_count <= max_spaces_per_display);
+
+        var summaries: [max_spaces_per_display]WorkspaceSummary = undefined;
+        for (0..workspace_count) |index| {
+            summaries[index] = .{
+                .workspace_id = @intCast(index + 1),
+                .window_count = 0,
+                .is_active = false,
+                .is_focused = false,
+            };
+        }
+
+        for (self.windows.items()) |managed_window| {
+            if (managed_window.is_suppressed) continue;
+            const space_ref = self.space(managed_window.space_key) orelse continue;
+            std.debug.assert(space_ref.workspace_id <= workspace_count);
+            summaries[space_ref.workspace_id - 1].window_count += 1;
+        }
+
+        for (self.workspace_topology.displays[0..self.workspace_topology.display_count]) |display| {
+            std.debug.assert(display.active_workspace_id <= workspace_count);
+            const summary = &summaries[display.active_workspace_id - 1];
+            summary.is_active = true;
+            const is_focused_display = if (self.workspace_topology.focused_display_id) |focused_display_id|
+                display.display_id == focused_display_id
+            else
+                false;
+            summary.is_focused = summary.is_focused or is_focused_display;
+        }
+        return summaries;
     }
 };
 
@@ -693,6 +940,25 @@ pub const Event = union(enum) {
         epoch: Epoch,
         succeeded: bool,
     },
+    request_native_workspace_move: struct {
+        source: SpaceRef,
+        target: SpaceRef,
+        at_ms: TimestampMs,
+    },
+    native_workspace_move_started: struct {
+        epoch: Epoch,
+        succeeded: bool,
+        at_ms: TimestampMs,
+    },
+    native_workspace_move_observed: struct {
+        epoch: Epoch,
+        observation: NativeWorkspaceMoveObservation,
+        at_ms: TimestampMs,
+    },
+    native_workspace_move_rollback_result: struct {
+        epoch: Epoch,
+        succeeded: bool,
+    },
     window_focus_observed: WindowFocusObservation,
     request_pending_focus,
     clear_pending_focus,
@@ -746,6 +1012,17 @@ pub const Effect = union(enum) {
     native_window_move_rolled_back: PendingNativeWindowMove,
     native_window_move_rollback_deferred: PendingNativeWindowMove,
     native_window_move_rejected: NativeWindowMoveRequest,
+    move_native_workspace_contents: PendingNativeWorkspaceMove,
+    rollback_native_workspace_contents: PendingNativeWorkspaceMove,
+    native_workspace_move_completed: PendingNativeWorkspaceMove,
+    native_workspace_move_failed: struct {
+        move: PendingNativeWorkspaceMove,
+        rollback_succeeded: bool,
+    },
+    native_workspace_move_rejected: struct {
+        source: SpaceRef,
+        target: SpaceRef,
+    },
     apply_pending_focus: PendingFocus,
     window_focus_deferred: struct {
         observation: WindowFocusObservation,
@@ -819,6 +1096,7 @@ pub fn reduce(model: Model, event: Event) Transition {
             transition.model.queued_switch = null;
             transition.model.observation_timer = null;
             transition.model.pending_native_window_moves.count = 0;
+            transition.model.pending_native_workspace_move = null;
             if (workspace_transition) |current| {
                 finalizeWorkspaceTransition(&transition, current, .topology_reinitialized);
             } else {
@@ -842,6 +1120,10 @@ pub fn reduce(model: Model, event: Event) Transition {
         },
         .native_window_move_observed => |observation| reduceNativeWindowMoveObserved(&transition, observation),
         .native_window_move_rollback_result => |result| reduceNativeWindowMoveRollbackResult(&transition, result),
+        .request_native_workspace_move => |request| reduceNativeWorkspaceMoveRequest(&transition, request),
+        .native_workspace_move_started => |result| reduceNativeWorkspaceMoveStarted(&transition, result),
+        .native_workspace_move_observed => |observation| reduceNativeWorkspaceMoveObserved(&transition, observation),
+        .native_workspace_move_rollback_result => |result| reduceNativeWorkspaceMoveRollbackResult(&transition, result),
         .window_focus_observed => |observation| reduceWindowFocusObserved(&transition, observation),
         .request_pending_focus => reducePendingFocusRequest(&transition),
         .clear_pending_focus => transition.model.pending_focus.clear(),
@@ -1250,6 +1532,122 @@ fn reduceNativeWindowMoveRollbackResult(
     transition.addEffect(.{ .native_window_move_rollback_deferred = pending });
 }
 
+fn reduceNativeWorkspaceMoveRequest(
+    transition: *Transition,
+    request: @FieldType(Event, "request_native_workspace_move"),
+) void {
+    const source = transition.model.space(request.source.key) orelse {
+        transition.addEffect(.{ .native_workspace_move_rejected = .{
+            .source = request.source,
+            .target = request.target,
+        } });
+        return;
+    };
+    const target = transition.model.space(request.target.key) orelse {
+        transition.addEffect(.{ .native_workspace_move_rejected = .{
+            .source = request.source,
+            .target = request.target,
+        } });
+        return;
+    };
+    const is_invalid = transition.model.pending_native_workspace_move != null or
+        transition.model.pending_switch != null or
+        transition.model.pending_native_window_moves.count != 0 or
+        transition.model.workspace_transition != null or
+        nativeSpaceId(source) == null or
+        nativeSpaceId(target) == null or
+        source.key.eql(target.key) or
+        source.display_id == target.display_id;
+    if (is_invalid) {
+        transition.addEffect(.{ .native_workspace_move_rejected = .{
+            .source = source,
+            .target = target,
+        } });
+        return;
+    }
+
+    const epoch = takeEpoch(&transition.model);
+    const pending: PendingNativeWorkspaceMove = .{
+        .source = source,
+        .target = target,
+        .epoch = epoch,
+        .deadline_at_ms = request.at_ms +| native_workspace_move_timeout_ms,
+    };
+    transition.model.pending_native_workspace_move = pending;
+    startWorkspaceTransition(
+        transition,
+        .move_workspace_to_display,
+        target,
+        request.at_ms,
+        native_workspace_move_timeout_ms,
+        epoch,
+    );
+    transition.addEffect(.{ .move_native_workspace_contents = pending });
+}
+
+fn reduceNativeWorkspaceMoveStarted(
+    transition: *Transition,
+    result: @FieldType(Event, "native_workspace_move_started"),
+) void {
+    var pending = transition.model.pending_native_workspace_move orelse return;
+    if (pending.epoch != result.epoch) return;
+    if (!result.succeeded) {
+        transition.model.pending_native_workspace_move = null;
+        settleWorkspaceTransition(transition, pending.epoch, .native_switch_failed);
+        transition.addEffect(.{ .native_workspace_move_failed = .{
+            .move = pending,
+            .rollback_succeeded = true,
+        } });
+        return;
+    }
+
+    pending.has_started = true;
+    transition.model.pending_native_workspace_move = pending;
+}
+
+fn reduceNativeWorkspaceMoveObserved(
+    transition: *Transition,
+    event: @FieldType(Event, "native_workspace_move_observed"),
+) void {
+    var pending = transition.model.pending_native_workspace_move orelse return;
+    if (pending.epoch != event.epoch or !pending.has_started or pending.is_rolling_back) return;
+
+    if (event.observation == .pending) {
+        if (event.at_ms < pending.deadline_at_ms) return;
+        pending.is_rolling_back = true;
+        transition.model.pending_native_workspace_move = pending;
+        transition.addEffect(.{ .rollback_native_workspace_contents = pending });
+        return;
+    }
+
+    if (!transition.model.native_topology.swapWorkspacePlacements(pending.source.key, pending.target.key)) {
+        pending.is_rolling_back = true;
+        transition.model.pending_native_workspace_move = pending;
+        transition.addEffect(.{ .rollback_native_workspace_contents = pending });
+        return;
+    }
+    transition.model.windows.swapSpaceKeys(pending.source.key, pending.target.key);
+    transition.model.pending_native_workspace_move = null;
+    syncNativeWorkspaceTopology(transition);
+    completeWorkspaceTransition(&transition.model, pending.epoch, .native_space_changed, event.at_ms);
+    transition.addEffect(.{ .native_workspace_move_completed = pending });
+}
+
+fn reduceNativeWorkspaceMoveRollbackResult(
+    transition: *Transition,
+    result: @FieldType(Event, "native_workspace_move_rollback_result"),
+) void {
+    const pending = transition.model.pending_native_workspace_move orelse return;
+    if (pending.epoch != result.epoch or !pending.is_rolling_back) return;
+
+    transition.model.pending_native_workspace_move = null;
+    settleWorkspaceTransition(transition, pending.epoch, .native_switch_failed);
+    transition.addEffect(.{ .native_workspace_move_failed = .{
+        .move = pending,
+        .rollback_succeeded = result.succeeded,
+    } });
+}
+
 fn reduceWindowFocusObserved(
     transition: *Transition,
     event: WindowFocusObservation,
@@ -1614,6 +2012,7 @@ fn assertModel(model: *const Model) void {
         std.debug.assert(display.active_workspace_id != 0);
         for (model.workspace_topology.displays[0..index]) |prior| {
             std.debug.assert(prior.display_id != display.display_id);
+            std.debug.assert(prior.active_workspace_id != display.active_workspace_id);
         }
     }
     if (model.workspace_topology.focused_display_id) |display_id| {
@@ -1645,6 +2044,15 @@ fn assertModel(model: *const Model) void {
     if (model.queued_switch) |queued| {
         queued.target.assertValid();
         std.debug.assert(nativeSpaceId(queued.target) != null);
+    }
+    if (model.pending_native_workspace_move) |pending| {
+        std.debug.assert(pending.epoch != 0);
+        std.debug.assert(nativeSpaceId(pending.source) != null);
+        std.debug.assert(nativeSpaceId(pending.target) != null);
+        std.debug.assert(!pending.source.key.eql(pending.target.key));
+        std.debug.assert(pending.source.display_id != pending.target.display_id);
+        std.debug.assert(model.workspace_transition != null);
+        std.debug.assert(model.workspace_transition.?.epoch == pending.epoch);
     }
     if (model.workspace_transition) |workspace_transition| {
         std.debug.assert(workspace_transition.epoch != 0);
@@ -1699,9 +2107,9 @@ fn testTopology(first_observed: NativeSpaceId, second_observed: ?NativeSpaceId) 
 
     if (second_observed) |observed| {
         var second = DisplayTopology.init(2, observed);
-        second.addSpace(.{ .id = 201, .workspace_id = 1 });
-        second.addSpace(.{ .id = 202, .workspace_id = 2 });
-        second.addSpace(.{ .id = 203, .workspace_id = 3 });
+        second.addSpace(.{ .id = 201, .workspace_id = 4 });
+        second.addSpace(.{ .id = 202, .workspace_id = 5 });
+        second.addSpace(.{ .id = 203, .workspace_id = 6 });
         topology.addDisplay(second);
     }
     return topology;
@@ -1755,6 +2163,43 @@ fn trackNativeWindowMove(model: *const Model, window_id: WindowId, source_worksp
         .source = model.spaceForWorkspace(1, source_workspace_id).?,
         .target = model.spaceForWorkspace(1, target_workspace_id).?,
     } };
+}
+
+test "workspace summaries preserve globally unique active workspaces" {
+    const testing = std.testing;
+    var catalog: SpaceCatalog = .{};
+    catalog.add(.{ .key = .{ .native = 101 }, .workspace_id = 1, .display_id = 11 });
+    catalog.add(.{ .key = .{ .native = 201 }, .workspace_id = 2, .display_id = 22 });
+    catalog.add(.{ .key = .{ .native = 102 }, .workspace_id = 3, .display_id = 11 });
+
+    var topology: WorkspaceTopology = .{};
+    topology.addDisplay(.{ .display_id = 11, .active_workspace_id = 1 });
+    topology.addDisplay(.{ .display_id = 22, .active_workspace_id = 2 });
+    topology.focused_display_id = 22;
+
+    var model: Model = .{
+        .spaces = catalog,
+        .workspace_topology = topology,
+    };
+    model = reduce(model, .{ .adopt_window = .{
+        .window_id = 101,
+        .process_id = 1001,
+        .space_key = .{ .native = 101 },
+    } }).model;
+    model = reduce(model, .{ .adopt_window = .{
+        .window_id = 201,
+        .process_id = 2001,
+        .space_key = .{ .native = 201 },
+    } }).model;
+
+    const summaries = model.workspaceSummaries(3);
+
+    try testing.expectEqual(@as(u32, 1), summaries[0].window_count);
+    try testing.expect(summaries[0].is_active);
+    try testing.expect(!summaries[0].is_focused);
+    try testing.expectEqual(@as(u32, 1), summaries[1].window_count);
+    try testing.expect(summaries[1].is_active);
+    try testing.expect(summaries[1].is_focused);
 }
 
 test "window catalog owns identity and Space membership" {
@@ -2003,19 +2448,25 @@ test "intermediate Space becomes observed while request remains pending" {
     try testing.expect(transition.model.hasScheduledObservation());
 }
 
-test "native ordinal is scoped to display Space identity" {
+test "native workspace placement is globally unique across displays" {
     const testing = std.testing;
     const model = initializedModel(testTopology(102, 202));
     const first = model.spaceForWorkspace(1, 2).?;
-    const second = model.spaceForWorkspace(2, 2).?;
+    const second = model.spaceForWorkspace(2, 5).?;
 
     try testing.expectEqual(@as(?WorkspaceId, 2), model.observedWorkspace(1));
-    try testing.expectEqual(@as(?WorkspaceId, 2), model.observedWorkspace(2));
+    try testing.expectEqual(@as(?WorkspaceId, 5), model.observedWorkspace(2));
     try testing.expectEqual(@as(?NativeSpaceId, 102), model.native_topology.findDisplay(1).?.spaceForWorkspace(2));
-    try testing.expectEqual(@as(?NativeSpaceId, 202), model.native_topology.findDisplay(2).?.spaceForWorkspace(2));
+    try testing.expectEqual(@as(?NativeSpaceId, 202), model.native_topology.findDisplay(2).?.spaceForWorkspace(5));
     try testing.expect(first.key.eql(.{ .native = 102 }));
     try testing.expect(second.key.eql(.{ .native = 202 }));
     try testing.expect(!first.key.eql(second.key));
+
+    const summaries = model.workspaceSummaries(6);
+    try testing.expect(summaries[1].is_active);
+    try testing.expect(summaries[1].is_focused);
+    try testing.expect(summaries[4].is_active);
+    try testing.expect(!summaries[4].is_focused);
 }
 
 test "native topology preserves uneven per-display Space counts" {
@@ -2026,26 +2477,142 @@ test "native topology preserves uneven per-display Space counts" {
     primary.addSpace(.{ .id = 102, .workspace_id = 2 });
     topology.addDisplay(primary);
     var secondary = DisplayTopology.init(2, 201);
-    secondary.addSpace(.{ .id = 201, .workspace_id = 1 });
+    secondary.addSpace(.{ .id = 201, .workspace_id = 3 });
     topology.addDisplay(secondary);
 
     const model = initializedModel(topology);
 
     try testing.expectEqual(@as(u8, 3), model.spaces.space_count);
     try testing.expect(model.spaceForWorkspace(1, 2).?.key.eql(.{ .native = 102 }));
-    try testing.expect(model.spaceForWorkspace(2, 1).?.key.eql(.{ .native = 201 }));
+    try testing.expect(model.spaceForWorkspace(2, 3).?.key.eql(.{ .native = 201 }));
     try testing.expect(model.spaceForWorkspace(2, 2) == null);
+}
+
+test "native topology mapping assigns one global workspace per physical slot" {
+    const testing = std.testing;
+    var catalog: SpaceCatalog = .{};
+    catalog.add(.{ .key = .{ .virtual = 1 }, .workspace_id = 1, .display_id = 1 });
+    catalog.add(.{ .key = .{ .virtual = 2 }, .workspace_id = 2, .display_id = 1 });
+    catalog.add(.{ .key = .{ .virtual = 3 }, .workspace_id = 3, .display_id = 2 });
+    var workspace_topology: WorkspaceTopology = .{};
+    workspace_topology.addDisplay(.{ .display_id = 1, .active_workspace_id = 1 });
+    workspace_topology.addDisplay(.{ .display_id = 2, .active_workspace_id = 3 });
+
+    var observation: NativeTopologyObservation = .{};
+    var primary: NativeDisplayObservation = .{
+        .display_id = 1,
+        .observed_space_id = 102,
+        .space_count = 3,
+    };
+    primary.space_ids[0] = 101;
+    primary.space_ids[1] = 102;
+    primary.space_ids[2] = 103;
+    observation.addDisplay(primary);
+    var secondary: NativeDisplayObservation = .{
+        .display_id = 2,
+        .observed_space_id = 201,
+        .space_count = 1,
+    };
+    secondary.space_ids[0] = 201;
+    observation.addDisplay(secondary);
+
+    const previous: NativeTopology = .{};
+    const mapped = mapNativeTopology(observation, &previous, &workspace_topology, &catalog, 3).?;
+
+    try testing.expectEqual(@as(?WorkspaceId, 1), mapped.observedWorkspace(1));
+    try testing.expectEqual(@as(?WorkspaceId, 3), mapped.observedWorkspace(2));
+    try testing.expectEqual(@as(?NativeSpaceId, 101), mapped.findDisplay(1).?.spaceForWorkspace(2));
+    try testing.expect(mapped.findDisplay(1).?.workspaceForSpace(103) == null);
 }
 
 test "switch effect preserves target Space identity across displays" {
     const testing = std.testing;
     const model = initializedModel(testTopology(102, 201));
-    const transition = reduce(model, switchRequest(&model, 2, 2, 100));
+    const transition = reduce(model, switchRequest(&model, 2, 5, 100));
     const effect = transition.effects[1].switch_native_space;
 
     try testing.expect(effect.request.target.key.eql(.{ .native = 202 }));
     try testing.expectEqual(@as(DisplayId, 2), effect.request.target.display_id);
-    try testing.expectEqual(@as(WorkspaceId, 2), effect.request.target.workspace_id);
+    try testing.expectEqual(@as(WorkspaceId, 5), effect.request.target.workspace_id);
+}
+
+test "native workspace move commits placement and ownership atomically" {
+    const testing = std.testing;
+    var model = initializedModel(testTopology(101, 201));
+    model = reduce(model, .{ .adopt_window = .{
+        .window_id = 101,
+        .process_id = 1001,
+        .space_key = .{ .native = 101 },
+    } }).model;
+    model = reduce(model, .{ .adopt_window = .{
+        .window_id = 201,
+        .process_id = 2001,
+        .space_key = .{ .native = 201 },
+    } }).model;
+
+    var transition = reduce(model, .{ .request_native_workspace_move = .{
+        .source = model.space(.{ .native = 101 }).?,
+        .target = model.space(.{ .native = 201 }).?,
+        .at_ms = 100,
+    } });
+    try testing.expectEqual(@as(u8, 2), transition.effect_count);
+    try testing.expectEqual(std.meta.Tag(Effect).move_native_workspace_contents, std.meta.activeTag(transition.effects[1]));
+    const epoch = transition.model.pending_native_workspace_move.?.epoch;
+
+    transition = reduce(transition.model, .{ .native_workspace_move_started = .{
+        .epoch = epoch,
+        .succeeded = true,
+        .at_ms = 110,
+    } });
+    try testing.expect(transition.model.pending_native_workspace_move.?.has_started);
+
+    transition = reduce(transition.model, .{ .native_workspace_move_observed = .{
+        .epoch = epoch,
+        .observation = .confirmed,
+        .at_ms = 200,
+    } });
+
+    try testing.expect(transition.model.pending_native_workspace_move == null);
+    try testing.expectEqual(@as(?WorkspaceId, 4), transition.model.activeWorkspace(1));
+    try testing.expectEqual(@as(?WorkspaceId, 1), transition.model.activeWorkspace(2));
+    try testing.expectEqual(@as(WorkspaceId, 4), transition.model.space(.{ .native = 101 }).?.workspace_id);
+    try testing.expectEqual(@as(WorkspaceId, 1), transition.model.space(.{ .native = 201 }).?.workspace_id);
+    try testing.expect(transition.model.window(101).?.space_key.eql(.{ .native = 201 }));
+    try testing.expect(transition.model.window(201).?.space_key.eql(.{ .native = 101 }));
+    try testing.expectEqual(std.meta.Tag(Effect).native_workspace_move_completed, std.meta.activeTag(transition.effects[0]));
+}
+
+test "native workspace move timeout rolls physical contents back" {
+    const testing = std.testing;
+    const model = initializedModel(testTopology(101, 201));
+    var transition = reduce(model, .{ .request_native_workspace_move = .{
+        .source = model.space(.{ .native = 101 }).?,
+        .target = model.space(.{ .native = 201 }).?,
+        .at_ms = 100,
+    } });
+    const pending = transition.model.pending_native_workspace_move.?;
+    transition = reduce(transition.model, .{ .native_workspace_move_started = .{
+        .epoch = pending.epoch,
+        .succeeded = true,
+        .at_ms = 110,
+    } });
+    transition = reduce(transition.model, .{ .native_workspace_move_observed = .{
+        .epoch = pending.epoch,
+        .observation = .pending,
+        .at_ms = pending.deadline_at_ms,
+    } });
+
+    try testing.expect(transition.model.pending_native_workspace_move.?.is_rolling_back);
+    try testing.expectEqual(std.meta.Tag(Effect).rollback_native_workspace_contents, std.meta.activeTag(transition.effects[0]));
+
+    transition = reduce(transition.model, .{ .native_workspace_move_rollback_result = .{
+        .epoch = pending.epoch,
+        .succeeded = true,
+    } });
+    try testing.expect(transition.model.pending_native_workspace_move == null);
+    try testing.expectEqual(@as(WorkspaceId, 1), transition.model.space(.{ .native = 101 }).?.workspace_id);
+    try testing.expectEqual(@as(WorkspaceId, 4), transition.model.space(.{ .native = 201 }).?.workspace_id);
+    try testing.expectEqual(std.meta.Tag(Effect).native_workspace_move_failed, std.meta.activeTag(transition.effects[1]));
 }
 
 test "virtual catalog preserves identity when placement changes" {
