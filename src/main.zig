@@ -4105,7 +4105,7 @@ fn captureNativeTopology() ?state_mod.NativeTopology {
         };
         var ordinal: u8 = 1;
         while (ordinal <= captured_count) : (ordinal += 1) {
-            observed_display.space_ids[ordinal - 1] = snapshot.spaceIdAtWorkspace(display.id, ordinal) orelse {
+            observed_display.space_ids[ordinal - 1] = snapshot.ordinarySpaceIdAtOrdinal(display.id, ordinal) orelse {
                 log.warn("native topology: Space unavailable display={d} ordinal={d}", .{ display.id, ordinal });
                 return null;
             };
