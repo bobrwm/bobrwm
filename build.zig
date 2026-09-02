@@ -425,7 +425,7 @@ pub fn build(b: *std.Build) !void {
 
     const run_geometry_tests = b.addRunArtifact(geometry_tests);
 
-    // tabgroup.zig and tiling.zig are pure Zig (window.zig types only),
+    // Tab detection and tiling are pure Zig (window.zig types only),
     // so their test modules need no SDK or include wiring either.
     const tabgroup_test_mod = b.createModule(.{
         .root_source_file = b.path("src/tabgroup.zig"),

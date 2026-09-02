@@ -17,7 +17,7 @@ const bsp_mod = tiling.bsp_mod;
 const ipc = @import("ipc.zig");
 const ipc_transport = @import("ipc_transport.zig");
 const signal_transport = @import("signal_transport.zig");
-const tabgroup = @import("tabgroup.zig");
+const tab_detect = @import("tabgroup/detect.zig");
 const config_mod = @import("config.zig");
 const dim = @import("dim.zig");
 const statusbar = @import("statusbar.zig");
@@ -355,7 +355,7 @@ fn spaceVisible(space: state_mod.SpaceRef) bool {
 /// workspace and is not a suppressed tab member. Shared predicate so the
 /// borders and dimming snapshots stay in agreement about what is on screen.
 fn isVisibleManaged(win: *const window_mod.Window) bool {
-    if (g_tab_groups.isSuppressed(win.wid)) return false;
+    if (g_state.isWindowTabSuppressed(win.wid)) return false;
     const space = managedWindowSpace(win.wid) orelse return false;
     return spaceVisible(space);
 }
@@ -405,7 +405,7 @@ fn pushDimSnapshot() void {
         // Workspace focus records the tab-group leader, but the window on
         // screen (and in `entries`) is the group's active tab. Resolve so a
         // focused non-leader tab is exempted instead of dimmed.
-        focused[fn_count] = g_tab_groups.resolveActive(wid);
+        focused[fn_count] = g_state.windowTabActive(wid);
         fn_count += 1;
     }
 
@@ -452,7 +452,7 @@ fn focusedWindowIdForLoggedEvent(comptime event_name: []const u8, pid: i32) ?u32
 fn managedLeaderForFocusedWindow(pid: i32, focused_wid: u32) ?window_mod.Window {
     std.debug.assert(pid > 0);
     std.debug.assert(focused_wid != 0);
-    const leader_wid = g_tab_groups.resolveLeader(focused_wid);
+    const leader_wid = g_state.windowTabLeader(focused_wid);
     const leader = g_store.get(leader_wid) orelse return null;
     if (leader.pid != pid) return null;
     return leader;
@@ -647,7 +647,7 @@ fn applyDeferredFollowFocus(deferred: ?state_mod.DeferredFollowFocus) void {
 
     const focus = deferred orelse return;
 
-    const leader = g_store.get(g_tab_groups.resolveLeader(focus.window_id)) orelse return;
+    const leader = g_store.get(g_state.windowTabLeader(focus.window_id)) orelse return;
     if (leader.pid != focus.process_id) return;
     const space = managedWindowSpace(leader.wid) orelse return;
     if (spaceVisible(space)) return;
@@ -686,7 +686,7 @@ fn shouldRecordWorkspaceFocusForWindow(win: window_mod.Window) bool {
 fn syncFocusStateForWindowId(focused_wid: u32, source: FocusEventSource) bool {
     std.debug.assert(focused_wid != 0);
 
-    const leader = g_tab_groups.resolveLeader(focused_wid);
+    const leader = g_state.windowTabLeader(focused_wid);
     std.debug.assert(leader != 0);
 
     const win = g_store.get(leader) orelse return false;
@@ -1256,7 +1256,6 @@ var g_tiling_slots: [workspace_mod.max_spaces]TilingSlot = undefined;
 var g_displays: [workspace_mod.max_displays]DisplayInfo = undefined;
 var g_display_count: usize = 0;
 var g_bsp_split_mode: tiling.SplitMode = .auto;
-var g_tab_groups: tabgroup.TabGroupManager = undefined;
 var g_geometry: geometry_mod = undefined;
 var g_pending_role_windows: PendingRoleWindowMap = undefined;
 var g_deferred_window_candidates: DeferredWindowCandidateMap = undefined;
@@ -1292,8 +1291,8 @@ fn moveTabGroupToNativeSpace(wid: u32, target: state_mod.SpaceRef) bool {
         .virtual => return false,
     };
     const sky = &g_sky.?;
-    if (g_tab_groups.groupOf(wid)) |group| {
-        return sky.moveWindowsToNativeSpace(group.members.items, space_id);
+    if (g_state.windowTabGroup(wid)) |group| {
+        return sky.moveWindowsToNativeSpace(group.members(), space_id);
     }
     return sky.moveWindowToNativeSpace(wid, space_id);
 }
@@ -1301,7 +1300,7 @@ fn moveTabGroupToNativeSpace(wid: u32, target: state_mod.SpaceRef) bool {
 fn trackPendingNativeWindowMove(wid: u32, source: state_mod.SpaceRef, target: state_mod.SpaceRef) void {
     source.assertValid();
     target.assertValid();
-    const leader_wid = g_tab_groups.resolveLeader(wid);
+    const leader_wid = g_state.windowTabLeader(wid);
     dispatchStateEvent(.{ .track_native_window_move = .{
         .window_id = leader_wid,
         .source = source,
@@ -1324,9 +1323,9 @@ fn nativeTabGroupMoveConfirmed(wid: u32, pending: state_mod.PendingNativeWindowM
         .native => |value| value,
         .virtual => return null,
     };
-    if (g_tab_groups.groupOf(wid)) |group| {
+    if (g_state.windowTabGroup(wid)) |group| {
         var checked_count: usize = 0;
-        for (group.members.items) |member_wid| {
+        for (group.members()) |member_wid| {
             if (g_store.get(member_wid) == null) continue;
             checked_count += 1;
             if (!(sky.nativeWindowMoveConfirmed(member_wid, target_space_id, source_space_id) orelse return null)) return false;
@@ -2567,8 +2566,6 @@ pub fn main(init: std.process.Init.Minimal) !void {
     // Free per-workspace tiling states on exit. BSP allocates Split nodes and
     // leaf ArrayLists via g_allocator; without this, DebugAllocator reports leaks.
     defer destroyAllTilingStates();
-    g_tab_groups = tabgroup.TabGroupManager.init(g_allocator);
-    defer g_tab_groups.deinit();
     g_geometry = geometry_mod.init(g_allocator);
     defer g_geometry.deinit();
     g_geometry.ensureTotalCapacity(geometry_window_capacity) catch |err| {
@@ -3087,36 +3084,49 @@ fn replaceWindowIdentity(old_wid: u32, new_wid: u32) bool {
     return g_state.window(old_wid) == null and g_state.window(new_wid) != null;
 }
 
-fn syncWindowTabGroup(group_id: tabgroup.GroupId) bool {
-    const group = g_tab_groups.groups.getPtr(group_id) orelse return false;
-    var observation: state_mod.WindowTabGroupObservation = .{
-        .leader_window_id = group.leader_wid,
-        .active_window_id = group.active_wid,
-    };
-    for (group.members.items) |member_wid| {
-        if (observation.addMember(member_wid)) continue;
-        log.warn("tab group state rejected group={d} member={d}", .{ group_id, member_wid });
-        return false;
-    }
-
+fn observeWindowTabGroup(observation: state_mod.WindowTabGroupObservation) bool {
     dispatchStateEvent(.{ .observe_window_tab_group = observation });
-    for (group.members.items) |member_wid| {
+    for (observation.members()) |member_wid| {
         const member = g_state.window(member_wid) orelse return false;
-        if (member.tab_leader_window_id != group.leader_wid) return false;
-        if (member.is_suppressed != (member_wid != group.active_wid)) return false;
+        if (member.tab_leader_window_id != observation.leader_window_id) return false;
+        if (member.is_suppressed != (member_wid != observation.active_window_id)) return false;
     }
     return true;
 }
 
-fn dissolveWindowTabGroup(wid: u32) void {
-    if (g_state.window(wid) == null) return;
-    dispatchStateEvent(.{ .dissolve_window_tab_group = wid });
+fn attachWindowToTabGroup(sibling_window_id: u32, window_id: u32, active_window_id: u32) bool {
+    var observation: state_mod.WindowTabGroupObservation = .{
+        .leader_window_id = g_state.windowTabLeader(sibling_window_id),
+        .active_window_id = active_window_id,
+    };
+    if (g_state.windowTabGroup(sibling_window_id)) |group| {
+        for (group.members()) |member_window_id| {
+            if (!observation.addMember(member_window_id)) return false;
+        }
+    } else if (!observation.addMember(sibling_window_id)) {
+        return false;
+    }
+    if (!observation.addMember(window_id)) return false;
+    return observeWindowTabGroup(observation);
+}
+
+fn detachWindowTab(window_id: u32) bool {
+    if (g_state.window(window_id) == null) return false;
+    dispatchStateEvent(.{ .detach_window_tab = window_id });
+    const window = g_state.window(window_id) orelse return false;
+    return window.tab_leader_window_id == window_id and !window.is_suppressed;
 }
 
 fn setTabGroupActive(wid: u32) void {
-    g_tab_groups.setActive(wid);
-    const group = g_tab_groups.groupOf(wid) orelse return;
-    _ = syncWindowTabGroup(group.id);
+    const group = g_state.windowTabGroup(wid) orelse return;
+    var observation: state_mod.WindowTabGroupObservation = .{
+        .leader_window_id = group.leader_window_id,
+        .active_window_id = wid,
+    };
+    for (group.members()) |member_window_id| {
+        if (!observation.addMember(member_window_id)) return;
+    }
+    _ = observeWindowTabGroup(observation);
 }
 
 fn assignManagedWindowSpace(wid: u32, space: state_mod.SpaceRef) bool {
@@ -3150,7 +3160,7 @@ fn adoptWindow(ws: state_mod.SpaceRef, win: window_mod.Window) !void {
 
 fn setTilingActive(space_key: state_mod.SpaceKey, wid: u32) void {
     if (tilingStatePtr(space_key).*) |*st| {
-        const layout_wid = g_tab_groups.resolveLeader(wid);
+        const layout_wid = g_state.windowTabLeader(wid);
         st.setActive(layout_wid);
     }
 }
@@ -3161,8 +3171,8 @@ fn replaceManagedWindowId(old_wid: u32, new_wid: u32, frame: window_mod.Window.F
     std.debug.assert(frame.width > 0 and frame.height > 0);
     if (old_wid == new_wid) return false;
     if (g_store.get(new_wid) != null) return false;
-    if (g_tab_groups.groupOf(old_wid) != null) return false;
-    if (g_tab_groups.groupOf(new_wid) != null) return false;
+    if (g_state.windowTabGroup(old_wid) != null) return false;
+    if (g_state.windowTabGroup(new_wid) != null) return false;
 
     const old = g_store.get(old_wid) orelse return false;
     const space = managedWindowSpace(old.wid) orelse return false;
@@ -3685,7 +3695,7 @@ fn handleEvent(ev: *const event_mod.Event) void {
             // native-tab AX notifications carry the physical member wid,
             // while workspace and BSP state carry the group leader.
             const tab_dragged_out = checkTabDragOut(ev.pid, ev.wid);
-            const layout_wid = g_tab_groups.resolveLeader(ev.wid);
+            const layout_wid = g_state.windowTabLeader(ev.wid);
 
             if (updateDraggedWindowGeometry(ev.wid, observed)) {
                 retile();
@@ -3825,7 +3835,7 @@ fn toggleWindowFullscreen(wid: u32) void {
     var win = g_store.get(wid) orelse return;
     win.is_fullscreen = !win.is_fullscreen;
 
-    const visible_wid = g_tab_groups.resolveActive(wid);
+    const visible_wid = g_state.windowTabActive(wid);
     const restore_to: ?window_mod.Window.Frame = blk: {
         if (win.mode != .floating) break :blk null;
         if (!win.is_fullscreen) break :blk win.float_frame;
@@ -4477,9 +4487,9 @@ fn reconcileNativeWindowAssignments(topology: *const skylight.NativeSpaceTopolog
     var store_it = g_store.windows.iterator();
     while (store_it.next()) |entry| {
         const win = entry.value_ptr.*;
-        if (g_tab_groups.resolveLeader(win.wid) != win.wid) continue;
+        if (g_state.windowTabLeader(win.wid) != win.wid) continue;
         if (g_state.pendingNativeWindowMove(win.wid) != null) continue;
-        const visible_wid = g_tab_groups.resolveActive(win.wid);
+        const visible_wid = g_state.windowTabActive(win.wid);
         if (!on_screen.contains(visible_wid)) continue;
         const current_space = managedWindowSpace(win.wid) orelse continue;
 
@@ -5278,7 +5288,7 @@ const OnScreenWindows = struct {
     }
 };
 
-/// Snapshot the managed windows of `pid` that tabgroup.detect reasons about.
+/// Snapshot the managed windows of `pid` used for tab detection.
 ///
 /// Every OS query the heuristics need happens here, so the decisions themselves
 /// stay pure. `owns_workspace_slot` is the inverse of suppression: a group's
@@ -5286,7 +5296,7 @@ const OnScreenWindows = struct {
 fn tabCandidates(
     pid: i32,
     on_screen: *const OnScreenWindows,
-    out: []tabgroup.detect.Candidate,
+    out: []tab_detect.Candidate,
 ) BoundedSnapshotResult {
     std.debug.assert(pid > 0);
 
@@ -5307,7 +5317,7 @@ fn tabCandidates(
             .pid = win.pid,
             .live_frame = liveWindowFrame(win.wid),
             .is_visible_on_screen = on_visible_workspace and on_screen.contains(win.wid),
-            .owns_workspace_slot = !g_tab_groups.isSuppressed(win.wid),
+            .owns_workspace_slot = !g_state.isWindowTabSuppressed(win.wid),
         };
         count += 1;
     }
@@ -5318,7 +5328,7 @@ fn tabCandidates(
 fn appWindowSnapshot(
     pid: i32,
     on_screen: *const OnScreenWindows,
-    out: []tabgroup.detect.AppWindow,
+    out: []tab_detect.AppWindow,
 ) BoundedSnapshotResult {
     std.debug.assert(pid > 0);
 
@@ -5521,80 +5531,80 @@ fn addNewWindow(pid: i32, wid: u32) void {
 /// screen cannot have changed selection, so the AX work only happens on an actual
 /// switch. Only the active tab moves here; membership is decided elsewhere.
 fn refreshTabGroupActiveTabs() void {
-    if (g_tab_groups.groups.count() == 0) return;
-
     const on_screen = OnScreenWindows.snapshot();
     refreshTabGroupActiveTabsFromSnapshot(&on_screen);
 }
 
 fn refreshTabGroupActiveTabsFromSnapshot(on_screen: *const OnScreenWindows) void {
-    if (g_tab_groups.groups.count() == 0) return;
     if (on_screen.truncated) return;
 
-    const Move = struct { group_id: tabgroup.GroupId, selected: u32 };
-    var moves: std.ArrayList(Move) = .empty;
-    defer moves.deinit(g_allocator);
-    moves.ensureTotalCapacity(g_allocator, g_tab_groups.groups.count()) catch |err| {
-        log.err("tab refresh skipped: failed to allocate move snapshot: {}", .{err});
-        return;
-    };
+    var leader_window_ids: [state_mod.max_managed_windows]u32 = undefined;
+    const group_leaders = g_state.windowTabGroupLeaderIds(&leader_window_ids);
+    if (group_leaders.len == 0) return;
 
-    var it = g_tab_groups.groups.valueIterator();
-    while (it.next()) |group| {
-        const leader = g_store.get(group.leader_wid) orelse continue;
+    const Move = struct { leader_window_id: u32, active_window_id: u32, selected_window_id: u32 };
+    var moves: [state_mod.max_managed_windows]Move = undefined;
+    var move_count: usize = 0;
+    for (group_leaders) |leader_window_id| {
+        const group = g_state.windowTabGroup(leader_window_id) orelse continue;
+        const leader = g_store.get(group.leader_window_id) orelse continue;
         const leader_space = managedWindowSpace(leader.wid) orelse continue;
         // A parked group is off-screen on purpose and nothing acts on it until
         // its workspace is shown again.
         if (!spaceVisible(leader_space)) continue;
-        if (on_screen.contains(group.active_wid)) continue;
+        if (on_screen.contains(group.active_window_id)) continue;
 
-        var app_windows: [128]tabgroup.detect.AppWindow = undefined;
-        const app_snapshot = appWindowSnapshot(group.pid, on_screen, &app_windows);
+        var app_windows: [128]tab_detect.AppWindow = undefined;
+        const app_snapshot = appWindowSnapshot(group.process_id, on_screen, &app_windows);
         if (app_snapshot.truncated) {
-            log.warn("tab refresh skipped: AX window snapshot truncated pid={d} limit={d}", .{ group.pid, app_windows.len });
+            log.warn("tab refresh skipped: AX window snapshot truncated pid={d} limit={d}", .{ group.process_id, app_windows.len });
             continue;
         }
-        const selected = tabgroup.detect.selectedTabWindow(
+        const selected = tab_detect.selectedTabWindow(
             app_windows[0..app_snapshot.count],
-            group.canonical_frame,
+            leader.frame,
         ) orelse continue;
-        if (selected == group.active_wid) continue;
+        if (selected == group.active_window_id) continue;
 
-        moves.appendAssumeCapacity(.{ .group_id = group.id, .selected = selected });
+        moves[move_count] = .{
+            .leader_window_id = group.leader_window_id,
+            .active_window_id = group.active_window_id,
+            .selected_window_id = selected,
+        };
+        move_count += 1;
     }
 
-    // Applied after the walk: adopting a tab writes to the store and to the
-    // group's member list.
-    for (moves.items) |move| {
-        const group = g_tab_groups.groups.getPtr(move.group_id) orelse continue;
-        const leader = g_store.get(group.leader_wid) orelse continue;
+    for (moves[0..move_count]) |move| {
+        const group = g_state.windowTabGroup(move.leader_window_id) orelse continue;
+        const leader = g_store.get(group.leader_window_id) orelse continue;
 
         // The user can select a tab Bobrwm has never seen: background tabs are
         // absent from AXWindows, so they are only discovered as they surface.
-        if (g_store.get(move.selected) == null) {
+        if (g_store.get(move.selected_window_id) == null) {
             g_store.ensureUnusedCapacity(1) catch continue;
             const leader_space = managedWindowSpace(leader.wid) orelse continue;
             const discovered: window_mod.Window = .{
-                .wid = move.selected,
-                .pid = group.pid,
+                .wid = move.selected_window_id,
+                .pid = group.process_id,
                 .title = null,
-                .frame = group.canonical_frame,
+                .frame = leader.frame,
                 .is_minimized = false,
                 .mode = leader.mode,
             };
             if (!adoptWindowIdentity(discovered, leader_space.key)) continue;
-            g_tab_groups.addMember(move.group_id, move.selected) catch {
-                removeWindowIdentity(move.selected);
+            if (!attachWindowToTabGroup(group.leader_window_id, move.selected_window_id, move.selected_window_id)) {
+                removeWindowIdentity(move.selected_window_id);
                 continue;
-            };
+            }
             g_store.putAssumeCapacity(discovered);
-            seedObservedFrame(move.selected, group.canonical_frame);
+            seedObservedFrame(move.selected_window_id, leader.frame);
         }
 
-        log.debug("tab group {d} active tab {d} → {d} (tab bar)", .{
-            move.group_id, group.active_wid, move.selected,
+        if (g_state.windowTabLeader(move.selected_window_id) != group.leader_window_id) continue;
+        log.debug("tab group leader={d} active tab {d} → {d} (tab bar)", .{
+            group.leader_window_id, move.active_window_id, move.selected_window_id,
         });
-        setTabGroupActive(move.selected);
+        setTabGroupActive(move.selected_window_id);
     }
 }
 
@@ -5603,7 +5613,7 @@ fn refreshTabGroupActiveTabsFromSnapshot(on_screen: *const OnScreenWindows) void
 /// the group's slot. Returns true when a group absorbed it, meaning the caller
 /// must not manage it as its own window.
 ///
-/// Gathers the OS facts, asks tabgroup.detect to decide, applies the outcome.
+/// Gathers the OS facts, classifies them, and applies the outcome.
 fn tryFormTabGroupOnCreate(pid: i32, new_wid: u32) bool {
     const new_frame = liveWindowFrame(new_wid) orelse return false;
     log.debug("tab detect: new wid={d} bounds=({d:.0},{d:.0},{d:.0},{d:.0})", .{
@@ -5612,26 +5622,26 @@ fn tryFormTabGroupOnCreate(pid: i32, new_wid: u32) bool {
 
     const on_screen = OnScreenWindows.snapshot();
     if (on_screen.truncated) return false;
-    var candidates: [128]tabgroup.detect.Candidate = undefined;
+    var candidates: [128]tab_detect.Candidate = undefined;
     const candidate_snapshot = tabCandidates(pid, &on_screen, &candidates);
     if (candidate_snapshot.truncated) {
         log.warn("tab detect skipped: managed candidate snapshot truncated pid={d} limit={d}", .{ pid, candidates.len });
         return false;
     }
 
-    var app_windows: [128]tabgroup.detect.AppWindow = undefined;
+    var app_windows: [128]tab_detect.AppWindow = undefined;
     const app_snapshot = appWindowSnapshot(pid, &on_screen, &app_windows);
     if (app_snapshot.truncated) {
         log.warn("tab detect skipped: AX window snapshot truncated pid={d} limit={d}", .{ pid, app_windows.len });
         return false;
     }
-    const has_tab_group = tabgroup.detect.appHasTabGroup(app_windows[0..app_snapshot.count]);
+    const has_tab_group = tab_detect.appHasTabGroup(app_windows[0..app_snapshot.count]);
 
     // Collect before removal so the candidate snapshot stays valid.
     var stale_wids: [128]u32 = undefined;
-    const stale_count = tabgroup.detect.staleCandidates(pid, candidates[0..candidate_snapshot.count], &stale_wids);
+    const stale_count = tab_detect.staleCandidates(pid, candidates[0..candidate_snapshot.count], &stale_wids);
 
-    const formed = switch (tabgroup.detect.classifyNewWindow(pid, new_wid, new_frame, candidates[0..candidate_snapshot.count], has_tab_group)) {
+    const formed = switch (tab_detect.classifyNewWindow(pid, new_wid, new_frame, candidates[0..candidate_snapshot.count], has_tab_group)) {
         .standalone => blk: {
             log.debug("tab detect: wid={d} is standalone", .{new_wid});
             break :blk false;
@@ -5670,31 +5680,22 @@ fn joinTabGroup(pid: i32, sibling_wid: u32, new_wid: u32, new_frame: window_mod.
         .mode = sibling.mode,
     };
     if (!adoptWindowIdentity(member, ws.key)) return false;
-
-    if (g_tab_groups.groupOf(sibling_wid)) |g| {
-        g_tab_groups.addMember(g.id, new_wid) catch {
-            removeWindowIdentity(new_wid);
-            return false;
-        };
-    } else {
-        _ = g_tab_groups.createGroupWithMember(pid, sibling_wid, new_wid, sibling.frame) catch {
-            removeWindowIdentity(new_wid);
-            return false;
-        };
+    if (!attachWindowToTabGroup(sibling_wid, new_wid, new_wid)) {
+        removeWindowIdentity(new_wid);
+        return false;
     }
-
-    setTabGroupActive(new_wid);
 
     g_store.putAssumeCapacity(member);
     seedObservedFrame(new_wid, new_frame);
 
-    const leader = g_tab_groups.resolveLeader(sibling_wid);
+    const leader = g_state.windowTabLeader(sibling_wid);
+    const member_count = if (g_state.windowTabGroup(leader)) |group| group.member_count else 1;
     recordWorkspaceFocus(ws, leader);
     log.info("tab group formed pid={d} leader={d} active={d} members={d}", .{
         pid,
         leader,
         new_wid,
-        if (g_tab_groups.groupOf(leader)) |g| g.members.items.len else 1,
+        member_count,
     });
     return true;
 }
@@ -5702,6 +5703,8 @@ fn joinTabGroup(pid: i32, sibling_wid: u32, new_wid: u32, new_frame: window_mod.
 fn removeWindow(wid: u32) void {
     const win = g_store.get(wid) orelse return;
     const space = managedWindowSpace(win.wid) orelse return;
+    const tab_group = g_state.windowTabGroup(wid);
+    const was_group_leader = if (tab_group) |group| group.leader_window_id == wid else false;
     g_animator.cancel(wid);
     g_geometry.forget(wid);
     ax_mod.invalidateWindow(wid);
@@ -5711,21 +5714,13 @@ fn removeWindow(wid: u32) void {
     if (g_drag_preview.source_wid == wid or g_drag_preview.target_wid == wid) {
         clearDragPreview();
     }
-    // Clean up tab group membership first
-    const group_id_before: ?tabgroup.GroupId = if (g_tab_groups.groupOf(wid)) |g| g.id else null;
-    const was_group_leader = if (g_tab_groups.groupOf(wid)) |g| g.leader_wid == wid else false;
     removeWindowIdentity(wid);
-    const removal = g_tab_groups.removeMember(wid);
-
     g_store.remove(wid);
 
-    // removeMember guesses members[0] as the new active tab, but macOS
-    // selects the adjacent tab when the active one closes. Align with the
-    // app's actual focus so focus operations do not raise a background tab.
-    if (group_id_before) |gid| {
-        reconcileGroupActiveAfterRemoval(gid, win.pid);
-        _ = syncWindowTabGroup(gid);
-    }
+    const removal: WindowTabRemoval = if (tab_group) |group|
+        windowTabRemoval(&group, wid, was_group_leader)
+    else
+        .none;
 
     switch (removal) {
         // The removed window held the surviving tab group's layout slot.
@@ -5748,19 +5743,44 @@ fn removeWindow(wid: u32) void {
     _ = focusedWorkspaceWindow(space);
 }
 
+const WindowTabRemoval = union(enum) {
+    none,
+    leader_changed: u32,
+    dissolved_solo: u32,
+};
+
+fn windowTabRemoval(
+    previous_group: *const state_mod.WindowTabGroupSnapshot,
+    removed_window_id: u32,
+    was_group_leader: bool,
+) WindowTabRemoval {
+    var survivor_window_id: ?u32 = null;
+    for (previous_group.members()) |member_window_id| {
+        if (member_window_id == removed_window_id) continue;
+        survivor_window_id = member_window_id;
+        break;
+    }
+    const survivor = survivor_window_id orelse return .none;
+    if (previous_group.member_count == 2) return .{ .dissolved_solo = survivor };
+
+    reconcileGroupActiveAfterRemoval(survivor, previous_group.process_id);
+    if (!was_group_leader) return .none;
+    return .{ .leader_changed = g_state.windowTabLeader(survivor) };
+}
+
 /// Align a surviving tab group's active tab with the window the app actually
 /// focused after a member was removed. Best-effort: when the app has not yet
 /// focused the adjacent tab (or AX reports nothing), the members[0] guess
 /// stands until the next AXFocusedWindowChanged notification corrects it.
-fn reconcileGroupActiveAfterRemoval(group_id: tabgroup.GroupId, pid: i32) void {
-    std.debug.assert(group_id != 0);
+fn reconcileGroupActiveAfterRemoval(member_window_id: u32, pid: i32) void {
+    std.debug.assert(member_window_id != 0);
     std.debug.assert(pid > 0);
 
-    const g = g_tab_groups.groups.getPtr(group_id) orelse return;
+    const group = g_state.windowTabGroup(member_window_id) orelse return;
 
     const focused_wid = bw_ax_get_focused_window(pid);
     const app_focused: ?u32 = if (focused_wid == 0) null else focused_wid;
-    const active = tabgroup.detect.activeAfterRemoval(app_focused, g.members.items) orelse return;
+    const active = tab_detect.activeAfterRemoval(app_focused, group.members()) orelse return;
 
     setTabGroupActive(active);
 }
@@ -5932,7 +5952,7 @@ fn cleanupOffscreenManagedWindows() bool {
 
             // Tab-group members can be intentionally off-screen when a sibling
             // tab is active; treating them as ghosts causes layout churn.
-            if (g_tab_groups.groupOf(wid) != null) continue;
+            if (g_state.windowTabGroup(wid) != null) continue;
 
             // An on-screen window is healthy unless its app has stopped listing
             // it. A window whose native tab bar moved on still reports the
@@ -6018,12 +6038,12 @@ fn appListsWindow(pid: i32, wid: u32) bool {
 /// A window qualifies when its app's AXWindows list has dropped it (which is
 /// what a background tab looks like, and also what a destroyed ghost looks like)
 /// and an on-screen managed sibling occupies the same frame — the active tab.
-fn adoptWindowAsBackgroundTab(win: window_mod.Window) tabgroup.detect.OffscreenOutcomeKind {
+fn adoptWindowAsBackgroundTab(win: window_mod.Window) tab_detect.OffscreenOutcomeKind {
     const frame = liveWindowFrame(win.wid);
 
     const on_screen = OnScreenWindows.snapshot();
     if (on_screen.truncated) return .keep;
-    var app_windows: [128]tabgroup.detect.AppWindow = undefined;
+    var app_windows: [128]tab_detect.AppWindow = undefined;
     const app_snapshot = appWindowSnapshot(win.pid, &on_screen, &app_windows);
     if (app_snapshot.truncated) {
         log.warn("background-tab adoption skipped: AX window snapshot truncated pid={d} limit={d}", .{ win.pid, app_windows.len });
@@ -6036,15 +6056,15 @@ fn adoptWindowAsBackgroundTab(win: window_mod.Window) tabgroup.detect.OffscreenO
         break :blk false;
     };
 
-    var candidates: [128]tabgroup.detect.Candidate = undefined;
+    var candidates: [128]tab_detect.Candidate = undefined;
     const candidate_snapshot = tabCandidates(win.pid, &on_screen, &candidates);
     if (candidate_snapshot.truncated) {
         log.warn("background-tab adoption skipped: candidate snapshot truncated pid={d} limit={d}", .{ win.pid, candidates.len });
         return .keep;
     }
 
-    const has_tab_group = tabgroup.detect.appHasTabGroup(app_windows[0..app_snapshot.count]);
-    const sibling_wid = switch (tabgroup.detect.classifyOffscreenManaged(
+    const has_tab_group = tab_detect.appHasTabGroup(app_windows[0..app_snapshot.count]);
+    const sibling_wid = switch (tab_detect.classifyOffscreenManaged(
         win.wid,
         win.pid,
         frame,
@@ -6065,20 +6085,12 @@ fn adoptWindowAsBackgroundTab(win: window_mod.Window) tabgroup.detect.OffscreenO
     const sibling_space = managedWindowSpace(sibling.wid) orelse return .reap;
     if (!assignManagedWindowSpace(win.wid, sibling_space)) return .reap;
 
-    if (g_tab_groups.groupOf(sibling_wid)) |group| {
-        g_tab_groups.addMember(group.id, win.wid) catch {
-            _ = assignManagedWindowSpace(win.wid, source_space);
-            return .reap;
-        };
-    } else {
-        _ = g_tab_groups.createGroupWithMember(win.pid, sibling_wid, win.wid, sibling.frame) catch {
-            _ = assignManagedWindowSpace(win.wid, source_space);
-            return .reap;
-        };
+    if (!attachWindowToTabGroup(sibling_wid, win.wid, sibling_wid)) {
+        _ = assignManagedWindowSpace(win.wid, source_space);
+        return .reap;
     }
-    setTabGroupActive(sibling_wid);
 
-    // Members live only in the store; drop the standalone layout slot.
+    // Tab members do not own layout slots.
     removeFromTiling(source_space.key, win.wid);
 
     var updated = win;
@@ -6086,7 +6098,7 @@ fn adoptWindowAsBackgroundTab(win: window_mod.Window) tabgroup.detect.OffscreenO
     g_store.put(updated) catch {};
 
     log.info("cleanup: adopted wid={d} as background tab, leader={d} pid={d}", .{
-        win.wid, g_tab_groups.resolveLeader(sibling_wid), win.pid,
+        win.wid, g_state.windowTabLeader(sibling_wid), win.pid,
     });
     return .adopt;
 }
@@ -6096,7 +6108,7 @@ fn adoptWindowAsBackgroundTab(win: window_mod.Window) tabgroup.detect.OffscreenO
 /// Returns true when display ownership changed and callers should retile.
 fn updateDraggedWindowGeometry(dragged_wid: u32, frame: window_mod.Window.Frame) bool {
     if (g_pointer_drag_wid != dragged_wid) return false;
-    const leader_wid = g_tab_groups.resolveLeader(dragged_wid);
+    const leader_wid = g_state.windowTabLeader(dragged_wid);
     const leader = g_store.get(leader_wid) orelse return false;
     const leader_space = managedWindowSpace(leader.wid) orelse return false;
     const next_display_id = displayIdForFrame(frame);
@@ -6148,7 +6160,6 @@ fn adoptDraggedFrame(
             g_store.putAssumeCapacity(updated);
         }
     }
-    g_tab_groups.updateFrame(leader_wid, frame);
 }
 
 /// Apply ownership policy to geometry changed without an active pointer drag.
@@ -6341,7 +6352,7 @@ fn parkHiddenWorkspaceWindows() void {
             // window of a group is its active tab — which may not be the
             // leader. Park the active tab; suppressed members are already
             // off-screen behind it.
-            const visible_wid = g_tab_groups.resolveActive(wid);
+            const visible_wid = g_state.windowTabActive(wid);
             const win = g_store.get(visible_wid) orelse continue;
 
             if (ctx.isParked(win.frame)) continue;
@@ -6491,7 +6502,7 @@ fn restoreFloatingWindows(ws: state_mod.SpaceRef, display: shim.bw_frame, conten
         // but the window park moved off-screen is the group's active tab.
         // Reading the leader's bounds here would leave a group whose active
         // tab is not its leader parked forever.
-        const wid = g_tab_groups.resolveActive(leader_wid);
+        const wid = g_state.windowTabActive(leader_wid);
         var win = g_store.get(wid) orelse continue;
 
         // Mirrors the tiled fullscreen path in retileDisplay: gate on the
@@ -6546,11 +6557,10 @@ fn restoreFloatingWindows(ws: state_mod.SpaceRef, display: shim.bw_frame, conten
 /// one the caller just wrote — are skipped. No-op when wid does not lead a
 /// group.
 fn applyFrameToTabGroup(leader_wid: u32, frame: window_mod.Window.Frame) void {
-    const g = g_tab_groups.groupOfMut(leader_wid) orelse return;
-    if (g.leader_wid != leader_wid) return;
+    const group = g_state.windowTabGroup(leader_wid) orelse return;
+    if (group.leader_window_id != leader_wid) return;
 
-    g.canonical_frame = frame;
-    for (g.members.items) |member_wid| {
+    for (group.members()) |member_wid| {
         const member = g_store.get(member_wid) orelse continue;
         if (framesEqual(member.frame, frame) and !g_geometry.needsRepair(member_wid, frame, nanoTimestamp())) continue;
 
@@ -6612,7 +6622,7 @@ fn retileDisplay(display_id: u32) void {
         // addressed to it reaches nothing. Place the tab that is showing, as
         // restoreFloatingWindows does; applyFrameToTabGroup carries the frame
         // to the rest of the group afterwards.
-        const visible_wid = g_tab_groups.resolveActive(entry.wid);
+        const visible_wid = g_state.windowTabActive(entry.wid);
         var visible = g_store.get(visible_wid) orelse continue;
 
         // Fullscreen windows fill the outer-gap-inset frame, skipping BSP splits and inner gaps
@@ -6712,14 +6722,14 @@ fn reconcileFocusedWindow(pid: i32, focused_wid: u32) void {
     }
 
     const in_store = g_store.get(focused_wid) != null;
-    const suppressed = g_tab_groups.isSuppressed(focused_wid);
-    const in_group = g_tab_groups.groupOf(focused_wid) != null;
+    const suppressed = g_state.isWindowTabSuppressed(focused_wid);
+    const in_group = g_state.windowTabGroup(focused_wid) != null;
     log.debug("reconcile: wid={d} in_store={} suppressed={} in_group={}", .{
         focused_wid, in_store, suppressed, in_group,
     });
 
     if (syncFocusStateForWindowId(focused_wid, .ax)) {
-        const leader = g_tab_groups.resolveLeader(focused_wid);
+        const leader = g_state.windowTabLeader(focused_wid);
         if (suppressed) {
             log.info("reconcile case 2: tab switch, active={d} leader={d}", .{ focused_wid, leader });
         } else {
@@ -6745,21 +6755,20 @@ fn reconcileFocusedWindow(pid: i32, focused_wid: u32) void {
 /// When a suppressed tab's bounds diverge from its group's canonical frame,
 /// promote it to a standalone tiled window.
 fn checkTabDragOut(_: i32, wid: u32) bool {
-    const g = g_tab_groups.groupOfMut(wid) orelse return false;
-    if (g.active_wid == wid) return false; // only check suppressed members
-    const group_id = g.id;
-    const was_leader = g.leader_wid == wid;
+    const group = g_state.windowTabGroup(wid) orelse return false;
+    if (group.active_window_id == wid) return false;
+    const was_leader = group.leader_window_id == wid;
+    const leader = g_store.get(group.leader_window_id) orelse return false;
 
     const frame = liveWindowFrame(wid) orelse return false;
-    switch (tabgroup.detect.classifyMember(frame, g.canonical_frame, isVisibleOnScreen(wid))) {
+    switch (tab_detect.classifyMember(frame, leader.frame, isVisibleOnScreen(wid))) {
         .keep => return false,
         .promote_to_standalone => {},
     }
 
     log.info("tab drag-out detected: wid={d} promoted to standalone", .{wid});
-    const removal = g_tab_groups.removeMember(wid);
-    dissolveWindowTabGroup(wid);
-    _ = syncWindowTabGroup(group_id);
+    if (!detachWindowTab(wid)) return false;
+    const removal = windowTabRemoval(&group, wid, was_leader);
 
     // Update the stored frame before restoring standalone layout slots.
     if (g_store.get(wid)) |win| {
@@ -6854,7 +6863,7 @@ fn workspaceRevealSettled(ws: state_mod.SpaceRef) bool {
 
     const snapshot = workspaceWindows(ws);
     for (snapshot.items()) |leader_wid| {
-        const visible_wid = g_tab_groups.resolveActive(leader_wid);
+        const visible_wid = g_state.windowTabActive(leader_wid);
         const win = g_store.get(visible_wid) orelse return false;
         if (win.is_minimized) continue;
         const window_space = managedWindowSpace(visible_wid) orelse return false;
@@ -7082,20 +7091,20 @@ fn parkOutgoingWorkspace(ws: state_mod.SpaceRef, target: state_mod.SpaceRef) voi
     var hidden_count: usize = 0;
     const snapshot = workspaceWindows(ws);
     for (snapshot.items()) |wid| {
-        const visible_wid = g_tab_groups.resolveActive(wid);
+        const visible_wid = g_state.windowTabActive(wid);
         const hide_wid = if (g_store.get(visible_wid) != null) visible_wid else wid;
         const win = g_store.get(hide_wid) orelse continue;
         const window_space = managedWindowSpace(hide_wid) orelse continue;
         if (!window_space.key.eql(ws.key)) continue;
 
-        if (g_tab_groups.groupOf(wid)) |group| {
+        if (g_state.windowTabGroup(wid)) |group| {
             log.debug("workspace switch hiding window workspace={d} layout_wid={d} hide_wid={d} group_leader={d} group_active={d} members={d}", .{
                 ws.workspace_id,
                 wid,
                 hide_wid,
-                group.leader_wid,
-                group.active_wid,
-                group.members.items.len,
+                group.leader_window_id,
+                group.active_window_id,
+                group.member_count,
             });
         } else {
             log.debug("workspace switch hiding window workspace={d} layout_wid={d} hide_wid={d} group=none", .{
@@ -7144,16 +7153,16 @@ fn focusWorkspaceWindow(ws: state_mod.SpaceRef) void {
         }
     }
     if (focus_wid) |fwid| {
-        const actual_wid = g_tab_groups.resolveActive(fwid);
+        const actual_wid = g_state.windowTabActive(fwid);
         if (g_store.get(actual_wid)) |win| {
-            if (g_tab_groups.groupOf(fwid)) |group| {
+            if (g_state.windowTabGroup(fwid)) |group| {
                 log.debug("workspace focus target workspace={d} focused_wid={d} actual_wid={d} group_leader={d} group_active={d} members={d}", .{
                     ws.workspace_id,
                     fwid,
                     actual_wid,
-                    group.leader_wid,
-                    group.active_wid,
-                    group.members.items.len,
+                    group.leader_window_id,
+                    group.active_window_id,
+                    group.member_count,
                 });
             } else {
                 log.debug("workspace focus target workspace={d} focused_wid={d} actual_wid={d} group=none", .{
@@ -7224,7 +7233,7 @@ fn moveWindowToWorkspace(target_id: u8) void {
 
     // If target is not visible on the window's new display, hide it.
     if (!nativeSpacesEnabled() and !spaceVisible(target_ws)) {
-        const visible_wid = g_tab_groups.resolveActive(wid);
+        const visible_wid = g_state.windowTabActive(wid);
         if (g_store.get(visible_wid)) |visible_window| {
             hideWindow(visible_window.pid, visible_wid);
         }
@@ -7319,7 +7328,7 @@ fn moveWorkspaceToDisplay(target_display_slot: usize) void {
     const hctx = HideCtx.init(target_display_id);
     const displaced_windows = workspaceWindows(displaced_ws);
     for (displaced_windows.items()) |wid| {
-        const visible_wid = g_tab_groups.resolveActive(wid);
+        const visible_wid = g_state.windowTabActive(wid);
         const hide_wid = if (g_store.get(visible_wid) != null) visible_wid else wid;
         if (g_store.get(hide_wid)) |win| {
             const window_space = managedWindowSpace(hide_wid) orelse continue;
@@ -7443,7 +7452,7 @@ fn focusDirection(dir: FocusDir) void {
 
     if (best_wid) |wid| {
         // If target is a tab group leader, focus the active tab instead
-        const actual_wid = g_tab_groups.resolveActive(wid);
+        const actual_wid = g_state.windowTabActive(wid);
         if (g_store.get(actual_wid)) |win| {
             _ = bw_ax_focus_window(win.pid, actual_wid);
             recordWorkspaceFocus(ctx.workspace, wid);
