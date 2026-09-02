@@ -278,19 +278,14 @@ fn activeWorkspace() *workspace_mod.Space {
 }
 
 fn focusedWorkspaceWindow(space: *const workspace_mod.Space) ?u32 {
-    const focused_wid = g_state.focusedWorkspaceWindow(space.ref.workspace_id);
-    std.debug.assert(focused_wid == space.focused_wid);
-    return focused_wid;
+    return g_state.focusedWorkspaceWindow(space.ref.workspace_id);
 }
 
-fn recordWorkspaceFocus(space: *workspace_mod.Space, wid: u32) void {
+fn recordWorkspaceFocus(space: *const workspace_mod.Space, wid: u32) void {
     dispatchStateEvent(.{ .record_workspace_focus = .{
         .workspace_id = space.ref.workspace_id,
         .window_id = wid,
     } });
-    const focused_wid = g_state.focusedWorkspaceWindow(space.ref.workspace_id) orelse return;
-    space.recordFocus(focused_wid);
-    std.debug.assert(focused_wid == space.focused_wid);
 }
 
 fn nativeStateNowMs() state_mod.TimestampMs {
