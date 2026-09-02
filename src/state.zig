@@ -2,6 +2,7 @@
 
 const std = @import("std");
 const space_mod = @import("space.zig");
+const window_mod = @import("window.zig");
 
 pub const max_displays = 8;
 pub const max_managed_windows = 1024;
@@ -22,7 +23,7 @@ pub const SpaceKey = space_mod.Key;
 pub const SpaceRef = space_mod.Ref;
 pub const Epoch = u64;
 pub const TimestampMs = u64;
-pub const WindowId = u32;
+pub const WindowId = window_mod.WindowId;
 
 pub const FocusEventSource = enum {
     keyboard,
@@ -632,6 +633,22 @@ pub const ManagedWindow = struct {
     space_key: SpaceKey,
     tab_leader_window_id: WindowId = 0,
     is_suppressed: bool = false,
+    frame: window_mod.Window.Frame = .{ .x = 0, .y = 0, .width = 0, .height = 0 },
+    is_fullscreen: bool = false,
+    mode: window_mod.WindowMode = .tiled,
+    float_frame: ?window_mod.Window.Frame = null,
+
+    /// Project reducer state into the value consumed by platform adapters.
+    pub fn snapshot(self: ManagedWindow) window_mod.Window {
+        return .{
+            .wid = self.window_id,
+            .pid = self.process_id,
+            .frame = self.frame,
+            .is_fullscreen = self.is_fullscreen,
+            .mode = self.mode,
+            .float_frame = self.float_frame,
+        };
+    }
 };
 
 pub const WindowTabGroupObservation = struct {
@@ -773,6 +790,17 @@ pub const WindowCatalog = struct {
         return true;
     }
 
+    fn update(self: *WindowCatalog, window: window_mod.Window) bool {
+        const index = self.findIndex(window.wid) orelse return false;
+        const entry = &self.entries[index];
+        if (entry.process_id != window.pid) return false;
+        entry.frame = window.frame;
+        entry.is_fullscreen = window.is_fullscreen;
+        entry.mode = window.mode;
+        entry.float_frame = window.float_frame;
+        return true;
+    }
+
     fn swapSpaceKeys(self: *WindowCatalog, source_key: SpaceKey, target_key: SpaceKey) void {
         for (self.entries[0..self.count]) |*entry| {
             if (entry.space_key.eql(source_key)) {
@@ -906,6 +934,12 @@ pub const Model = struct {
 
     pub fn window(self: *const Model, window_id: WindowId) ?ManagedWindow {
         return self.windows.get(window_id);
+    }
+
+    /// Return an immutable value snapshot for platform and layout code.
+    pub fn windowSnapshot(self: *const Model, window_id: WindowId) ?window_mod.Window {
+        const managed_window = self.window(window_id) orelse return null;
+        return managed_window.snapshot();
     }
 
     /// Resolve a managed window to the leader that owns its layout slot.
@@ -1042,6 +1076,7 @@ pub const Model = struct {
 pub const Event = union(enum) {
     replace_space_catalog: SpaceCatalog,
     adopt_window: ManagedWindow,
+    update_window: window_mod.Window,
     remove_window: WindowId,
     replace_window_id: struct {
         old_window_id: WindowId,
@@ -1242,6 +1277,7 @@ pub fn reduce(model: Model, event: Event) Transition {
             should_refresh_workspace_focus = true;
         },
         .adopt_window => |window| reduceWindowAdopted(&transition, window),
+        .update_window => |window| reduceWindowUpdated(&transition, window),
         .remove_window => |window_id| {
             _ = transition.model.windows.remove(window_id);
             should_refresh_workspace_focus = true;
@@ -1357,6 +1393,14 @@ fn reduceWindowAdopted(transition: *Transition, window: ManagedWindow) void {
     transition.addEffect(.{ .window_catalog_rejected = .{
         .window_id = window.window_id,
         .reason = .catalog_full,
+    } });
+}
+
+fn reduceWindowUpdated(transition: *Transition, window: window_mod.Window) void {
+    if (transition.model.windows.update(window)) return;
+    transition.addEffect(.{ .window_catalog_rejected = .{
+        .window_id = window.wid,
+        .reason = if (transition.model.window(window.wid) == null) .window_missing else .invalid_window,
     } });
 }
 
@@ -2226,6 +2270,8 @@ fn assertModel(model: *const Model) void {
         std.debug.assert(window.window_id != 0);
         std.debug.assert(window.process_id > 0);
         std.debug.assert(window.tab_leader_window_id != 0);
+        std.debug.assert(frameIsFinite(window.frame));
+        if (window.float_frame) |frame| std.debug.assert(frameIsFinite(frame));
         for (model.windows.items()[0..index]) |prior| {
             std.debug.assert(prior.window_id != window.window_id);
         }
@@ -2356,6 +2402,13 @@ fn assertModel(model: *const Model) void {
     }
 }
 
+fn frameIsFinite(frame: window_mod.Window.Frame) bool {
+    return std.math.isFinite(frame.x) and
+        std.math.isFinite(frame.y) and
+        std.math.isFinite(frame.width) and
+        std.math.isFinite(frame.height);
+}
+
 fn testTopology(first_observed: NativeSpaceId, second_observed: ?NativeSpaceId) NativeTopology {
     var topology: NativeTopology = .{};
     var first = DisplayTopology.init(1, first_observed);
@@ -2471,6 +2524,9 @@ test "window catalog owns identity and Space membership" {
         .window_id = 101,
         .process_id = 1001,
         .space_key = .{ .virtual = 1 },
+        .frame = .{ .x = 10, .y = 20, .width = 800, .height = 600 },
+        .mode = .floating,
+        .float_frame = .{ .x = 10, .y = 20, .width = 800, .height = 600 },
     } });
     const second = reduce(first.model, .{ .adopt_window = .{
         .window_id = 102,
@@ -2481,8 +2537,18 @@ test "window catalog owns identity and Space membership" {
     try testing.expect(model.window(101) == null);
     try testing.expectEqual(@as(u16, 2), second.model.windows.countInSpace(.{ .virtual = 1 }));
     try testing.expectEqual(@as(i32, 1001), second.model.window(101).?.process_id);
+    const initial_snapshot = second.model.windowSnapshot(101).?;
+    try testing.expectEqual(window_mod.WindowMode.floating, initial_snapshot.mode);
+    try testing.expectEqual(@as(f64, 800), initial_snapshot.frame.width);
 
-    const assigned = reduce(second.model, .{ .assign_window_space = .{
+    var updated_window = initial_snapshot;
+    updated_window.frame.x = 30;
+    updated_window.is_fullscreen = true;
+    const updated = reduce(second.model, .{ .update_window = updated_window });
+    try testing.expectEqual(@as(f64, 30), updated.model.window(101).?.frame.x);
+    try testing.expect(updated.model.window(101).?.is_fullscreen);
+
+    const assigned = reduce(updated.model, .{ .assign_window_space = .{
         .window_id = 101,
         .space_key = .{ .virtual = 2 },
     } });
