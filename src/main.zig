@@ -670,7 +670,7 @@ fn syncFocusStateForWindowId(focused_wid: u32, source: FocusEventSource) bool {
 
     // Window ID is the canonical identity. PID-only notifications are resolved
     // before this point so same-process windows do not overwrite each other.
-    g_tab_groups.setActive(focused_wid);
+    setTabGroupActive(focused_wid);
     observeWindowFocus(win, source, null);
     if (shouldRecordWorkspaceFocusForWindow(win)) {
         if (spaceForWindow(win)) |ws| {
@@ -3067,6 +3067,38 @@ fn replaceWindowIdentity(old_wid: u32, new_wid: u32) bool {
     return g_state.window(old_wid) == null and g_state.window(new_wid) != null;
 }
 
+fn syncWindowTabGroup(group_id: tabgroup.GroupId) bool {
+    const group = g_tab_groups.groups.getPtr(group_id) orelse return false;
+    var observation: state_mod.WindowTabGroupObservation = .{
+        .leader_window_id = group.leader_wid,
+        .active_window_id = group.active_wid,
+    };
+    for (group.members.items) |member_wid| {
+        if (observation.addMember(member_wid)) continue;
+        log.warn("tab group state rejected group={d} member={d}", .{ group_id, member_wid });
+        return false;
+    }
+
+    dispatchStateEvent(.{ .observe_window_tab_group = observation });
+    for (group.members.items) |member_wid| {
+        const member = g_state.window(member_wid) orelse return false;
+        if (member.tab_leader_window_id != group.leader_wid) return false;
+        if (member.is_suppressed != (member_wid != group.active_wid)) return false;
+    }
+    return true;
+}
+
+fn dissolveWindowTabGroup(wid: u32) void {
+    if (g_state.window(wid) == null) return;
+    dispatchStateEvent(.{ .dissolve_window_tab_group = wid });
+}
+
+fn setTabGroupActive(wid: u32) void {
+    g_tab_groups.setActive(wid);
+    const group = g_tab_groups.groupOf(wid) orelse return;
+    _ = syncWindowTabGroup(group.id);
+}
+
 fn assignManagedWindowSpace(wid: u32, space: state_mod.SpaceRef) bool {
     var win = g_store.get(wid) orelse return false;
     const managed = g_state.window(wid) orelse return false;
@@ -5421,7 +5453,7 @@ fn refreshTabGroupActiveTabsFromSnapshot(on_screen: *const OnScreenWindows) void
         log.debug("tab group {d} active tab {d} → {d} (tab bar)", .{
             move.group_id, group.active_wid, move.selected,
         });
-        g_tab_groups.setActive(move.selected);
+        setTabGroupActive(move.selected);
     }
 }
 
@@ -5512,7 +5544,7 @@ fn joinTabGroup(pid: i32, sibling_wid: u32, new_wid: u32, new_frame: window_mod.
         };
     }
 
-    g_tab_groups.setActive(new_wid);
+    setTabGroupActive(new_wid);
 
     g_store.putAssumeCapacity(member);
     seedObservedFrame(new_wid, new_frame);
@@ -5541,9 +5573,9 @@ fn removeWindow(wid: u32) void {
     }
     // Clean up tab group membership first
     const group_id_before: ?tabgroup.GroupId = if (g_tab_groups.groupOf(wid)) |g| g.id else null;
+    removeWindowIdentity(wid);
     const removal = g_tab_groups.removeMember(wid);
 
-    removeWindowIdentity(wid);
     g_store.remove(wid);
 
     // removeMember guesses members[0] as the new active tab, but macOS
@@ -5551,6 +5583,7 @@ fn removeWindow(wid: u32) void {
     // app's actual focus so focus operations do not raise a background tab.
     if (group_id_before) |gid| {
         reconcileGroupActiveAfterRemoval(gid, win.pid);
+        _ = syncWindowTabGroup(gid);
     }
 
     switch (removal) {
@@ -5606,7 +5639,7 @@ fn reconcileGroupActiveAfterRemoval(group_id: tabgroup.GroupId, pid: i32) void {
     const app_focused: ?u32 = if (focused_wid == 0) null else focused_wid;
     const active = tabgroup.detect.activeAfterRemoval(app_focused, g.members.items) orelse return;
 
-    g_tab_groups.setActive(active);
+    setTabGroupActive(active);
 }
 
 /// Hand a removed tab-group leader's workspace and layout slot to the new
@@ -5918,13 +5951,20 @@ fn adoptWindowAsBackgroundTab(win: window_mod.Window) tabgroup.detect.OffscreenO
     };
 
     const sibling = g_store.get(sibling_wid) orelse return .reap;
+    if (!assignManagedWindowSpace(win.wid, sibling.space)) return .reap;
 
     if (g_tab_groups.groupOf(sibling_wid)) |group| {
-        g_tab_groups.addMember(group.id, win.wid) catch return .reap;
+        g_tab_groups.addMember(group.id, win.wid) catch {
+            _ = assignManagedWindowSpace(win.wid, win.space);
+            return .reap;
+        };
     } else {
-        _ = g_tab_groups.createGroupWithMember(win.pid, sibling_wid, win.wid, sibling.frame) catch return .reap;
+        _ = g_tab_groups.createGroupWithMember(win.pid, sibling_wid, win.wid, sibling.frame) catch {
+            _ = assignManagedWindowSpace(win.wid, win.space);
+            return .reap;
+        };
     }
-    g_tab_groups.setActive(sibling_wid);
+    setTabGroupActive(sibling_wid);
 
     // Members live only in the store; drop the standalone workspace/layout slot.
     if (spaceForWindow(win)) |ws| {
@@ -5934,7 +5974,6 @@ fn adoptWindowAsBackgroundTab(win: window_mod.Window) tabgroup.detect.OffscreenO
 
     var updated = win;
     if (frame) |f| updated.frame = f;
-    if (!assignManagedWindowSpace(win.wid, sibling.space)) return .reap;
     updated.space = sibling.space;
     g_store.put(updated) catch {};
 
@@ -6612,6 +6651,7 @@ fn reconcileFocusedWindow(pid: i32, focused_wid: u32) void {
 fn checkTabDragOut(_: i32, wid: u32) bool {
     const g = g_tab_groups.groupOfMut(wid) orelse return false;
     if (g.active_wid == wid) return false; // only check suppressed members
+    const group_id = g.id;
 
     const frame = liveWindowFrame(wid) orelse return false;
     switch (tabgroup.detect.classifyMember(frame, g.canonical_frame, isVisibleOnScreen(wid))) {
@@ -6621,6 +6661,8 @@ fn checkTabDragOut(_: i32, wid: u32) bool {
 
     log.info("tab drag-out detected: wid={d} promoted to standalone", .{wid});
     const removal = g_tab_groups.removeMember(wid);
+    dissolveWindowTabGroup(wid);
+    _ = syncWindowTabGroup(group_id);
 
     // Update stored frame and add to workspace + layout
     if (g_store.get(wid)) |win| {

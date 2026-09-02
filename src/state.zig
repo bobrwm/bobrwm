@@ -394,6 +394,37 @@ pub const ManagedWindow = struct {
     window_id: WindowId,
     process_id: i32,
     space_key: SpaceKey,
+    tab_leader_window_id: WindowId = 0,
+    is_suppressed: bool = false,
+};
+
+pub const WindowTabGroupObservation = struct {
+    leader_window_id: WindowId,
+    active_window_id: WindowId,
+    member_window_ids: [max_managed_windows]WindowId = undefined,
+    member_count: u16 = 0,
+
+    pub fn addMember(self: *WindowTabGroupObservation, window_id: WindowId) bool {
+        if (window_id == 0 or self.member_count == self.member_window_ids.len) return false;
+        for (self.members()) |existing| {
+            if (existing == window_id) return false;
+        }
+
+        self.member_window_ids[self.member_count] = window_id;
+        self.member_count += 1;
+        return true;
+    }
+
+    pub fn members(self: *const WindowTabGroupObservation) []const WindowId {
+        return self.member_window_ids[0..self.member_count];
+    }
+
+    fn contains(self: *const WindowTabGroupObservation, window_id: WindowId) bool {
+        for (self.members()) |member_window_id| {
+            if (member_window_id == window_id) return true;
+        }
+        return false;
+    }
 };
 
 pub const WindowCatalog = struct {
@@ -427,21 +458,70 @@ pub const WindowCatalog = struct {
 
     fn remove(self: *WindowCatalog, window_id: WindowId) bool {
         const index = self.findIndex(window_id) orelse return false;
+        const removed = self.entries[index];
         self.count -= 1;
         self.entries[index] = self.entries[self.count];
+
+        if (removed.tab_leader_window_id == removed.window_id) {
+            self.dissolveTabGroupByLeader(removed.window_id);
+            return true;
+        }
+
+        var group_count: u16 = 0;
+        var active_count: u16 = 0;
+        var first_member_index: ?usize = null;
+        for (self.items(), 0..) |entry, entry_index| {
+            if (entry.tab_leader_window_id != removed.tab_leader_window_id) continue;
+            group_count += 1;
+            if (!entry.is_suppressed) active_count += 1;
+            if (first_member_index == null) first_member_index = entry_index;
+        }
+        if (group_count < 2) {
+            self.dissolveTabGroupByLeader(removed.tab_leader_window_id);
+        } else if (active_count == 0) {
+            self.entries[first_member_index.?].is_suppressed = false;
+        }
         return true;
     }
 
     fn assignSpace(self: *WindowCatalog, window_id: WindowId, space_key: SpaceKey) bool {
         const index = self.findIndex(window_id) orelse return false;
-        self.entries[index].space_key = space_key;
+        const leader_window_id = self.entries[index].tab_leader_window_id;
+        for (self.entries[0..self.count]) |*entry| {
+            if (entry.tab_leader_window_id == leader_window_id) entry.space_key = space_key;
+        }
         return true;
     }
 
     fn replaceId(self: *WindowCatalog, old_window_id: WindowId, new_window_id: WindowId) bool {
         const index = self.findIndex(old_window_id) orelse return false;
         self.entries[index].window_id = new_window_id;
+        for (self.entries[0..self.count]) |*entry| {
+            if (entry.tab_leader_window_id == old_window_id) entry.tab_leader_window_id = new_window_id;
+        }
         return true;
+    }
+
+    fn observeTabGroup(self: *WindowCatalog, observation: WindowTabGroupObservation) void {
+        self.dissolveTabGroupByLeader(observation.leader_window_id);
+        for (observation.members()) |window_id| {
+            const index = self.findIndex(window_id).?;
+            self.entries[index].tab_leader_window_id = observation.leader_window_id;
+            self.entries[index].is_suppressed = window_id != observation.active_window_id;
+        }
+    }
+
+    fn dissolveTabGroup(self: *WindowCatalog, window_id: WindowId) void {
+        const window = self.get(window_id) orelse return;
+        self.dissolveTabGroupByLeader(window.tab_leader_window_id);
+    }
+
+    fn dissolveTabGroupByLeader(self: *WindowCatalog, leader_window_id: WindowId) void {
+        for (self.entries[0..self.count]) |*entry| {
+            if (entry.tab_leader_window_id != leader_window_id) continue;
+            entry.tab_leader_window_id = entry.window_id;
+            entry.is_suppressed = false;
+        }
     }
 
     fn findIndex(self: *const WindowCatalog, window_id: WindowId) ?usize {
@@ -556,6 +636,8 @@ pub const Event = union(enum) {
         window_id: WindowId,
         space_key: SpaceKey,
     },
+    observe_window_tab_group: WindowTabGroupObservation,
+    dissolve_window_tab_group: WindowId,
     replace_workspace_topology: WorkspaceTopology,
     focus_display: DisplayId,
     activate_workspace: struct {
@@ -625,6 +707,7 @@ pub const SwitchFailureReason = enum {
 
 pub const WindowCatalogRejectionReason = enum {
     catalog_full,
+    invalid_tab_group,
     invalid_window,
     window_exists,
     window_missing,
@@ -713,6 +796,8 @@ pub fn reduce(model: Model, event: Event) Transition {
         },
         .replace_window_id => |replacement| reduceWindowIdReplaced(&transition, replacement),
         .assign_window_space => |assignment| reduceWindowSpaceAssigned(&transition, assignment),
+        .observe_window_tab_group => |observation| reduceWindowTabGroupObserved(&transition, observation),
+        .dissolve_window_tab_group => |window_id| reduceWindowTabGroupDissolved(&transition, window_id),
         .replace_workspace_topology => |topology| {
             transition.model.workspace_topology = topology;
         },
@@ -789,7 +874,10 @@ fn reduceWindowAdopted(transition: *Transition, window: ManagedWindow) void {
         } });
         return;
     }
-    if (transition.model.windows.put(window)) return;
+    var adopted = window;
+    adopted.tab_leader_window_id = adopted.window_id;
+    adopted.is_suppressed = false;
+    if (transition.model.windows.put(adopted)) return;
 
     transition.addEffect(.{ .window_catalog_rejected = .{
         .window_id = window.window_id,
@@ -839,6 +927,63 @@ fn reduceWindowSpaceAssigned(
     transition.addEffect(.{ .window_catalog_rejected = .{
         .window_id = assignment.window_id,
         .reason = .window_missing,
+    } });
+}
+
+fn reduceWindowTabGroupObserved(
+    transition: *Transition,
+    observation: WindowTabGroupObservation,
+) void {
+    if (observation.member_count > observation.member_window_ids.len) {
+        rejectWindowTabGroup(transition, observation.leader_window_id);
+        return;
+    }
+    const leader = transition.model.window(observation.leader_window_id) orelse {
+        rejectWindowTabGroup(transition, observation.leader_window_id);
+        return;
+    };
+    if (observation.member_count < 2 or
+        !observation.contains(observation.leader_window_id) or
+        !observation.contains(observation.active_window_id))
+    {
+        rejectWindowTabGroup(transition, observation.leader_window_id);
+        return;
+    }
+    for (observation.members(), 0..) |window_id, index| {
+        for (observation.members()[0..index]) |prior_window_id| {
+            if (prior_window_id != window_id) continue;
+            rejectWindowTabGroup(transition, window_id);
+            return;
+        }
+        const member = transition.model.window(window_id) orelse {
+            rejectWindowTabGroup(transition, window_id);
+            return;
+        };
+        if (member.process_id != leader.process_id or
+            !member.space_key.eql(leader.space_key) or
+            (member.tab_leader_window_id != member.window_id and
+                member.tab_leader_window_id != observation.leader_window_id))
+        {
+            rejectWindowTabGroup(transition, window_id);
+            return;
+        }
+    }
+
+    transition.model.windows.observeTabGroup(observation);
+}
+
+fn reduceWindowTabGroupDissolved(transition: *Transition, window_id: WindowId) void {
+    if (transition.model.window(window_id) == null) {
+        rejectWindowTabGroup(transition, window_id);
+        return;
+    }
+    transition.model.windows.dissolveTabGroup(window_id);
+}
+
+fn rejectWindowTabGroup(transition: *Transition, window_id: WindowId) void {
+    transition.addEffect(.{ .window_catalog_rejected = .{
+        .window_id = window_id,
+        .reason = .invalid_tab_group,
     } });
 }
 
@@ -1442,9 +1587,26 @@ fn assertModel(model: *const Model) void {
     for (model.windows.items(), 0..) |window, index| {
         std.debug.assert(window.window_id != 0);
         std.debug.assert(window.process_id > 0);
+        std.debug.assert(window.tab_leader_window_id != 0);
         for (model.windows.items()[0..index]) |prior| {
             std.debug.assert(prior.window_id != window.window_id);
         }
+
+        const leader = model.window(window.tab_leader_window_id).?;
+        std.debug.assert(leader.process_id == window.process_id);
+        std.debug.assert(leader.space_key.eql(window.space_key));
+        std.debug.assert(leader.tab_leader_window_id == leader.window_id);
+        if (window.tab_leader_window_id != window.window_id) continue;
+
+        var member_count: u16 = 0;
+        var active_count: u16 = 0;
+        for (model.windows.items()) |member| {
+            if (member.tab_leader_window_id != window.window_id) continue;
+            member_count += 1;
+            if (!member.is_suppressed) active_count += 1;
+        }
+        std.debug.assert(member_count > 0);
+        std.debug.assert(active_count == 1);
     }
     std.debug.assert(model.workspace_topology.display_count <= model.workspace_topology.displays.len);
     for (model.workspace_topology.displays[0..model.workspace_topology.display_count], 0..) |display, index| {
@@ -1687,6 +1849,80 @@ test "window catalog rejects invalid lifecycle events" {
         WindowCatalogRejectionReason.window_exists,
         duplicate.effects[0].window_catalog_rejected.reason,
     );
+}
+
+test "window catalog owns tab identity and group Space assignment" {
+    const testing = std.testing;
+    var catalog: SpaceCatalog = .{};
+    catalog.add(.{ .key = .{ .virtual = 1 }, .workspace_id = 1, .display_id = 11 });
+    catalog.add(.{ .key = .{ .virtual = 2 }, .workspace_id = 2, .display_id = 11 });
+    var model: Model = .{ .spaces = catalog };
+    for ([_]WindowId{ 101, 102, 103 }) |window_id| {
+        model = reduce(model, .{ .adopt_window = .{
+            .window_id = window_id,
+            .process_id = 1001,
+            .space_key = .{ .virtual = 1 },
+        } }).model;
+    }
+
+    var group: WindowTabGroupObservation = .{
+        .leader_window_id = 101,
+        .active_window_id = 102,
+    };
+    try testing.expect(group.addMember(101));
+    try testing.expect(group.addMember(102));
+    try testing.expect(group.addMember(103));
+    model = reduce(model, .{ .observe_window_tab_group = group }).model;
+
+    try testing.expectEqual(@as(WindowId, 101), model.window(103).?.tab_leader_window_id);
+    try testing.expect(model.window(101).?.is_suppressed);
+    try testing.expect(!model.window(102).?.is_suppressed);
+    try testing.expect(model.window(103).?.is_suppressed);
+
+    model = reduce(model, .{ .assign_window_space = .{
+        .window_id = 103,
+        .space_key = .{ .virtual = 2 },
+    } }).model;
+    try testing.expectEqual(@as(u16, 3), model.windows.countInSpace(.{ .virtual = 2 }));
+
+    group.active_window_id = 103;
+    model = reduce(model, .{ .observe_window_tab_group = group }).model;
+    try testing.expect(model.window(102).?.is_suppressed);
+    try testing.expect(!model.window(103).?.is_suppressed);
+
+    model = reduce(model, .{ .dissolve_window_tab_group = 102 }).model;
+    for ([_]WindowId{ 101, 102, 103 }) |window_id| {
+        const window = model.window(window_id).?;
+        try testing.expectEqual(window_id, window.tab_leader_window_id);
+        try testing.expect(!window.is_suppressed);
+    }
+}
+
+test "removing a tab leader leaves valid standalone identities" {
+    const testing = std.testing;
+    var catalog: SpaceCatalog = .{};
+    catalog.add(.{ .key = .{ .virtual = 1 }, .workspace_id = 1, .display_id = 11 });
+    var model: Model = .{ .spaces = catalog };
+    for ([_]WindowId{ 101, 102 }) |window_id| {
+        model = reduce(model, .{ .adopt_window = .{
+            .window_id = window_id,
+            .process_id = 1001,
+            .space_key = .{ .virtual = 1 },
+        } }).model;
+    }
+    var group: WindowTabGroupObservation = .{
+        .leader_window_id = 101,
+        .active_window_id = 102,
+    };
+    try testing.expect(group.addMember(101));
+    try testing.expect(group.addMember(102));
+    model = reduce(model, .{ .observe_window_tab_group = group }).model;
+
+    model = reduce(model, .{ .remove_window = 101 }).model;
+
+    const survivor = model.window(102).?;
+    try testing.expectEqual(@as(WindowId, 102), survivor.tab_leader_window_id);
+    try testing.expect(!survivor.is_suppressed);
 }
 
 test "switch request preserves observed Space until confirmation" {
