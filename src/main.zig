@@ -787,22 +787,6 @@ fn updateStatusBar() void {
     statusbar.updateState(summaries[0..g_workspaces.workspace_count]);
 }
 
-fn presentationSpaces() []workspace_mod.Space {
-    if (!nativeSpacesEnabled()) return g_workspaces.spaces[0..g_workspaces.space_count];
-
-    const display_id = focusedDisplayId();
-    var start: ?usize = null;
-    for (g_workspaces.spaces[0..g_workspaces.space_count], 0..) |space, index| {
-        if (space.ref.display_id == display_id) {
-            if (start == null) start = index;
-            continue;
-        }
-        if (start) |first| return g_workspaces.spaces[first..index];
-    }
-    const first = start orelse unreachable;
-    return g_workspaces.spaces[first..g_workspaces.space_count];
-}
-
 fn clearTilingStates() void {
     for (0..workspace_mod.max_spaces) |ws_idx| {
         g_tiling_states[ws_idx] = null;
@@ -7906,48 +7890,66 @@ fn ipcQueryWorkspaces(fd: posix.socket_t, format: ipc.IpcCommand.QueryFormat) vo
     const w = &out.writer;
 
     switch (format) {
-        .text => for (presentationSpaces()) |*ws| {
-            const focused: u32 = focusedWorkspaceWindow(ws) orelse 0;
-            w.print("{d} {s} {d} {d}\n", .{
-                ws.ref.workspace_id,
-                if (spaceVisible(ws.ref)) "visible" else "hidden",
-                focused,
-                ws.windows.items.len,
-            }) catch break;
-        },
-        .json => {
-            var json: std.json.Stringify = .{ .writer = w };
-            json.beginArray() catch {};
-            for (presentationSpaces()) |*ws| {
-                json.beginObject() catch break;
-                json.objectField("workspace_id") catch break;
-                json.write(ws.ref.workspace_id) catch break;
-                json.objectField("visible") catch break;
-                json.write(spaceVisible(ws.ref)) catch break;
-                json.objectField("focused_window") catch break;
-                json.write(focusedWorkspaceWindow(ws)) catch break;
-                json.objectField("windows") catch break;
-                json.beginArray() catch break;
-                for (ws.windows.items) |wid| {
-                    const win = g_store.get(wid) orelse continue;
-                    var id_buf: [256]u8 = undefined;
-                    const id_len = if (osutil.appBundleId(win.pid, &id_buf)) |id| id.len else 0;
-                    const bundle_id: []const u8 = if (id_len > 0) id_buf[0..id_len] else "(unknown)";
-
-                    writeWindowJson(&json, win, bundle_id) catch break;
-                }
-                json.endArray() catch break;
-                json.endObject() catch break;
-            }
-            json.endArray() catch {};
-            w.writeByte('\n') catch {};
-        },
+        .text => writeWorkspaceText(w),
+        .json => writeWorkspaceJson(w),
     }
 
     const payload = out.written();
     ipc.writeResponse(fd, payload);
     const elapsed_ms = @divTrunc(nanoTimestamp() - started_ns, std.time.ns_per_ms);
     log.debug("[trace] query workspaces rows={} bytes={} elapsed_ms={}", .{ g_workspaces.workspace_count, payload.len, elapsed_ms });
+}
+
+fn writeWorkspaceText(writer: *std.Io.Writer) void {
+    var workspace_id: u8 = 1;
+    while (workspace_id <= g_workspaces.workspace_count) : (workspace_id += 1) {
+        const space = g_state.logicalWorkspace(workspace_id) orelse unreachable;
+        var window_ids: [state_mod.max_managed_windows]u32 = undefined;
+        const windows = g_state.workspaceWindowIds(space.key, &window_ids);
+        writer.print("{d} {s} {d} {d}\n", .{
+            workspace_id,
+            if (spaceVisible(space)) "visible" else "hidden",
+            g_state.focusedWorkspaceWindow(workspace_id) orelse 0,
+            windows.len,
+        }) catch return;
+    }
+}
+
+fn writeWorkspaceJson(writer: *std.Io.Writer) void {
+    var json: std.json.Stringify = .{ .writer = writer };
+    json.beginArray() catch return;
+
+    var workspace_id: u8 = 1;
+    while (workspace_id <= g_workspaces.workspace_count) : (workspace_id += 1) {
+        const space = g_state.logicalWorkspace(workspace_id) orelse unreachable;
+        writeWorkspaceJsonEntry(&json, space) catch break;
+    }
+    json.endArray() catch {};
+    writer.writeByte('\n') catch {};
+}
+
+fn writeWorkspaceJsonEntry(json: *std.json.Stringify, space: state_mod.SpaceRef) std.Io.Writer.Error!void {
+    try json.beginObject();
+    try json.objectField("workspace_id");
+    try json.write(space.workspace_id);
+    try json.objectField("visible");
+    try json.write(spaceVisible(space));
+    try json.objectField("focused_window");
+    try json.write(g_state.focusedWorkspaceWindow(space.workspace_id));
+    try json.objectField("windows");
+    try json.beginArray();
+
+    var window_ids: [state_mod.max_managed_windows]u32 = undefined;
+    for (g_state.workspaceWindowIds(space.key, &window_ids)) |wid| {
+        var win = g_store.get(wid) orelse continue;
+        win.space = space;
+        var id_buf: [256]u8 = undefined;
+        const id_len = if (osutil.appBundleId(win.pid, &id_buf)) |id| id.len else 0;
+        const bundle_id: []const u8 = if (id_len > 0) id_buf[0..id_len] else "(unknown)";
+        try writeWindowJson(json, win, bundle_id);
+    }
+    try json.endArray();
+    try json.endObject();
 }
 
 fn ipcQueryDisplays(fd: posix.socket_t, format: ipc.IpcCommand.QueryFormat) void {
