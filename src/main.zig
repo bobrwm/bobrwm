@@ -4108,6 +4108,7 @@ fn completeNativeSwitch(space: state_mod.SpaceRef, epoch: state_mod.Epoch) void 
     if (g_state.space(space.key) == null) return;
 
     _ = discoverWindowsAfterNativeSpaceSwitch();
+    stabilizeEmptyNativeWorkspace(space);
     clearDragPreview();
     requestRetileDisplay(space.display_id);
     if (!g_event_drain_active) flushRetileRequests();
@@ -4119,6 +4120,29 @@ fn completeNativeSwitch(space: state_mod.SpaceRef, epoch: state_mod.Epoch) void 
         space.workspace_id,
         space.display_id,
         elapsed_ms,
+    });
+}
+
+/// Keep an empty native Space from snapping back to the outgoing app's Space.
+/// macOS otherwise leaves that app frontmost and may reactivate its last
+/// focused window once the synthetic Dock gesture settles.
+fn stabilizeEmptyNativeWorkspace(space: state_mod.SpaceRef) void {
+    const windows = workspaceWindows(space);
+    if (windows.count != 0) return;
+    for (g_state.pending_role_windows.items()) |candidate| {
+        if (candidate.space_key.eql(space.key)) return;
+    }
+    for (g_state.deferred_window_candidates.items()) |candidate| {
+        if (candidate.space_key.eql(space.key)) return;
+    }
+
+    const NSApplication = objc.getClass("NSApplication") orelse return;
+    const app = NSApplication.msgSend(objc.Object, "sharedApplication", .{});
+    if (app.value == null) return;
+    app.msgSend(void, "activateIgnoringOtherApps:", .{true});
+    log.debug("native workspace activated self for empty target workspace={d} display={d}", .{
+        space.workspace_id,
+        space.display_id,
     });
 }
 
