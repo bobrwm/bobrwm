@@ -1,6 +1,5 @@
 const std = @import("std");
 const Window = @import("window.zig");
-const space_mod = @import("space.zig");
 
 pub const max_workspaces = 10;
 pub const max_displays = 8;
@@ -17,47 +16,6 @@ pub fn frameCoversTarget(actual: Window.Window.Frame, target: Window.Window.Fram
         actual.x + actual.width >= target.x + target.width - tolerance and
         actual.y + actual.height >= target.y + target.height - tolerance;
 }
-
-pub const Space = struct {
-    ref: space_mod.Ref,
-
-    pub fn init(ref: space_mod.Ref) Space {
-        ref.assertValid();
-        return .{ .ref = ref };
-    }
-};
-
-pub const WorkspaceManager = struct {
-    spaces: [max_spaces]Space,
-    space_count: u8,
-
-    pub fn init() WorkspaceManager {
-        return .{
-            .spaces = undefined,
-            .space_count = 0,
-        };
-    }
-
-    pub fn configure(self: *WorkspaceManager, refs: []const space_mod.Ref) void {
-        std.debug.assert(refs.len <= self.spaces.len);
-        self.space_count = @intCast(refs.len);
-        for (refs, 0..) |ref, index| {
-            self.spaces[index] = Space.init(ref);
-        }
-    }
-
-    pub fn get(self: *WorkspaceManager, key: space_mod.Key) ?*Space {
-        const index = self.indexOf(key) orelse return null;
-        return &self.spaces[index];
-    }
-
-    pub fn indexOf(self: *const WorkspaceManager, key: space_mod.Key) ?usize {
-        for (self.spaces[0..self.space_count], 0..) |space, index| {
-            if (space.ref.key.eql(key)) return index;
-        }
-        return null;
-    }
-};
 
 test "physical reveal accepts exact and clamped-larger frames only" {
     const t = std.testing;
