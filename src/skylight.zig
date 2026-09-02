@@ -345,6 +345,12 @@ pub const NativeSpaceTopology = struct {
         return spaceAtIndex(spaces, workspace_id, self.keys.id, self.keys.space_type);
     }
 
+    pub fn ordinarySpaceCount(self: *const NativeSpaceTopology, display_id: u32) ?u8 {
+        const display = self.managedDisplayInfo(display_id) orelse return null;
+        const spaces = self.spacesForDisplay(display) orelse return null;
+        return countOrdinarySpaces(spaces, self.keys.space_type);
+    }
+
     fn switchPlan(self: *const NativeSpaceTopology, display_id: u32, target_workspace_id: u8) ?NativeSpaceSwitchPlan {
         const display = self.managedDisplayInfo(display_id) orelse return null;
         const current_space: CFDictionaryRef = @ptrCast(c.CFDictionaryGetValue(@ptrCast(display), self.keys.current_space) orelse return null);
@@ -515,6 +521,19 @@ fn spaceAtIndex(spaces: CFArrayRef, workspace_id: u8, id_key: CFStringRef, type_
         return @intCast(sid);
     }
     return null;
+}
+
+fn countOrdinarySpaces(spaces: CFArrayRef, type_key: CFStringRef) ?u8 {
+    var ordinary_count: u8 = 0;
+    const count = c.CFArrayGetCount(@ptrCast(spaces));
+    for (0..@intCast(count)) |index| {
+        const space: CFDictionaryRef = @ptrCast(c.CFArrayGetValueAtIndex(@ptrCast(spaces), @intCast(index)) orelse continue);
+        const type_ref = c.CFDictionaryGetValue(@ptrCast(space), type_key) orelse continue;
+        var space_type: i32 = -1;
+        if (c.CFNumberGetValue(@ptrCast(type_ref), c.kCFNumberSInt32Type, &space_type) == 0 or space_type != 0) continue;
+        ordinary_count = std.math.add(u8, ordinary_count, 1) catch return null;
+    }
+    return ordinary_count;
 }
 
 fn workspaceForWindowSpaces(

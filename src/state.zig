@@ -2018,6 +2018,25 @@ test "native ordinal is scoped to display Space identity" {
     try testing.expect(!first.key.eql(second.key));
 }
 
+test "native topology preserves uneven per-display Space counts" {
+    const testing = std.testing;
+    var topology: NativeTopology = .{};
+    var primary = DisplayTopology.init(1, 102);
+    primary.addSpace(.{ .id = 101, .workspace_id = 1 });
+    primary.addSpace(.{ .id = 102, .workspace_id = 2 });
+    topology.addDisplay(primary);
+    var secondary = DisplayTopology.init(2, 201);
+    secondary.addSpace(.{ .id = 201, .workspace_id = 1 });
+    topology.addDisplay(secondary);
+
+    const model = initializedModel(topology);
+
+    try testing.expectEqual(@as(u8, 3), model.spaces.space_count);
+    try testing.expect(model.spaceForWorkspace(1, 2).?.key.eql(.{ .native = 102 }));
+    try testing.expect(model.spaceForWorkspace(2, 1).?.key.eql(.{ .native = 201 }));
+    try testing.expect(model.spaceForWorkspace(2, 2) == null);
+}
+
 test "switch effect preserves target Space identity across displays" {
     const testing = std.testing;
     const model = initializedModel(testTopology(102, 201));

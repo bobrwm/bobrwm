@@ -294,19 +294,23 @@ fn workspaceTraversalDirectionFromAction(action: u8) ?WorkspaceTraversalDirectio
 }
 
 fn adjacentWorkspaceId(direction: WorkspaceTraversalDirection) ?u8 {
-    std.debug.assert(g_workspaces.workspace_count > 0);
-    std.debug.assert(g_workspaces.workspace_count <= workspace_mod.max_workspaces);
-
     const focused_display_id = focusedDisplayId();
+    const workspace_count = if (nativeSpacesEnabled())
+        g_state.native_topology.findDisplay(focused_display_id).?.space_count
+    else
+        g_workspaces.workspace_count;
+    std.debug.assert(workspace_count > 0);
+    std.debug.assert(workspace_count <= workspace_mod.max_workspaces);
+
     const base_id = if (nativeSpacesEnabled())
         g_state.desiredWorkspace(focused_display_id) orelse activeWorkspaceIdForDisplay(focused_display_id)
     else
         activeWorkspace().ref.workspace_id;
-    std.debug.assert(base_id > 0 and base_id <= g_workspaces.workspace_count);
+    std.debug.assert(base_id > 0 and base_id <= workspace_count);
 
     return switch (direction) {
         .previous => if (base_id > 1) base_id - 1 else null,
-        .next => if (base_id < g_workspaces.workspace_count) base_id + 1 else null,
+        .next => if (base_id < workspace_count) base_id + 1 else null,
     };
 }
 
@@ -784,13 +788,16 @@ fn presentationSpaces() []workspace_mod.Space {
     if (!nativeSpacesEnabled()) return g_workspaces.spaces[0..g_workspaces.space_count];
 
     const display_id = focusedDisplayId();
+    var start: ?usize = null;
     for (g_workspaces.spaces[0..g_workspaces.space_count], 0..) |space, index| {
-        if (space.ref.display_id != display_id) continue;
-        const end = index + g_workspaces.workspace_count;
-        std.debug.assert(end <= g_workspaces.space_count);
-        return g_workspaces.spaces[index..end];
+        if (space.ref.display_id == display_id) {
+            if (start == null) start = index;
+            continue;
+        }
+        if (start) |first| return g_workspaces.spaces[first..index];
     }
-    unreachable;
+    const first = start orelse unreachable;
+    return g_workspaces.spaces[first..g_workspaces.space_count];
 }
 
 fn clearTilingStates() void {
@@ -3966,17 +3973,42 @@ fn reconcileDisplays() void {
 
 fn captureNativeTopology() ?state_mod.NativeTopology {
     const sky = &g_sky.?;
-    var snapshot = sky.nativeSpaceTopology() orelse return null;
+    var snapshot = sky.nativeSpaceTopology() orelse {
+        log.warn("native topology: WindowServer snapshot unavailable", .{});
+        return null;
+    };
     defer snapshot.deinit();
 
     var topology: state_mod.NativeTopology = .{};
     for (g_displays[0..g_display_count]) |display| {
-        const observed_space_id = snapshot.currentSpaceId(display.id) orelse return null;
+        const observed_space_id = snapshot.currentSpaceId(display.id) orelse {
+            log.warn("native topology: current Space unavailable display={d}", .{display.id});
+            return null;
+        };
+        const available_count = snapshot.ordinarySpaceCount(display.id) orelse {
+            log.warn("native topology: ordinary Space count unavailable display={d}", .{display.id});
+            return null;
+        };
+        const managed_count = @min(available_count, g_workspaces.workspace_count);
+        if (managed_count == 0) {
+            log.warn("native topology: display has no ordinary Spaces display={d}", .{display.id});
+            return null;
+        }
+        if (managed_count < g_workspaces.workspace_count) {
+            log.debug("native topology: display={d} manages {d}/{d} configured workspaces", .{
+                display.id,
+                managed_count,
+                g_workspaces.workspace_count,
+            });
+        }
         var display_topology = state_mod.DisplayTopology.init(display.id, observed_space_id);
 
         var workspace_id: u8 = 1;
-        while (workspace_id <= g_workspaces.workspace_count) : (workspace_id += 1) {
-            const space_id = snapshot.spaceIdAtWorkspace(display.id, workspace_id) orelse return null;
+        while (workspace_id <= managed_count) : (workspace_id += 1) {
+            const space_id = snapshot.spaceIdAtWorkspace(display.id, workspace_id) orelse {
+                log.warn("native topology: Space unavailable display={d} workspace={d}", .{ display.id, workspace_id });
+                return null;
+            };
             display_topology.addSpace(.{
                 .id = space_id,
                 .workspace_id = workspace_id,
