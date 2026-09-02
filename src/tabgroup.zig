@@ -147,7 +147,7 @@ pub const TabGroupManager = struct {
     }
 
     /// Outcome of removing a window from its tab group. The leader is the
-    /// group's only member registered in workspace window lists and the BSP
+    /// group's only member projected into workspace membership and the BSP
     /// layout, so callers must act on leadership changes or the surviving
     /// tabs become invisible to tiling.
     pub const RemoveResult = union(enum) {
@@ -155,8 +155,8 @@ pub const TabGroupManager = struct {
         /// group, or the group dissolved with no member left.
         none,
         /// The removed wid led a group that survives; payload is the new
-        /// leader. Callers must hand the old leader's workspace/layout slot
-        /// to the new leader.
+        /// leader. Callers must hand the old leader's layout slot to the new
+        /// leader.
         leader_changed: WindowId,
         /// The group dissolved leaving a single member; callers should
         /// restore it as a standalone window.

@@ -250,13 +250,29 @@ fn spaceForCommand(_: u32, workspace_id: u8) ?*workspace_mod.Space {
     return g_workspaces.get(space_ref.key);
 }
 
+const WorkspaceWindowSnapshot = struct {
+    window_ids: [state_mod.max_managed_windows]u32 = undefined,
+    count: usize = 0,
+
+    fn items(self: *const WorkspaceWindowSnapshot) []const u32 {
+        return self.window_ids[0..self.count];
+    }
+};
+
+fn workspaceWindows(space: *const workspace_mod.Space) WorkspaceWindowSnapshot {
+    var snapshot: WorkspaceWindowSnapshot = .{};
+    snapshot.count = g_state.workspaceWindowIds(space.ref.key, &snapshot.window_ids).len;
+    return snapshot;
+}
+
 fn applySpaceCatalog(catalog: state_mod.SpaceCatalog) void {
     dispatchStateEvent(.{ .replace_space_catalog = catalog });
 
     for (catalog.spaces[0..catalog.space_count]) |space_ref| {
         const space = g_workspaces.get(space_ref.key) orelse continue;
         space.ref = space_ref;
-        for (space.windows.items) |wid| {
+        const windows = workspaceWindows(space);
+        for (windows.items()) |wid| {
             if (!assignManagedWindowSpace(wid, space_ref)) continue;
             updateTabGroupAssignment(wid, space_ref);
         }
@@ -2158,9 +2174,10 @@ fn rolePollTimerTick(context: ?*anyopaque) callconv(.c) void {
 fn rebuildTilingStatesForConfig() void {
     destroyAllTilingStates();
     for (g_workspaces.spaces[0..g_workspaces.space_count]) |*ws| {
-        for (ws.windows.items) |wid| {
+        const windows = workspaceWindows(ws);
+        for (windows.items()) |wid| {
             const win = g_store.get(wid) orelse continue;
-            // Workspace lists contain only tab-group leaders; a leader may be
+            // Reducer membership projects only tab-group leaders; a leader may be
             // "suppressed" while another native tab is active but still owns
             // the group's one layout slot.
             if (win.mode != .tiled) continue;
@@ -2541,8 +2558,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     g_store = window_mod.WindowStore.init(g_allocator);
     defer g_store.deinit();
     const ws_count = config_mod.workspaceCount(&g_config);
-    g_workspaces = workspace_mod.WorkspaceManager.init(g_allocator, ws_count);
-    defer g_workspaces.deinit();
+    g_workspaces = workspace_mod.WorkspaceManager.init(ws_count);
     clearTilingStates();
     // Free per-workspace tiling states on exit. BSP allocates Split nodes and
     // leaf ArrayLists via g_allocator; without this, DebugAllocator reports leaks.
@@ -3106,14 +3122,10 @@ fn assignManagedWindowSpace(wid: u32, space: state_mod.SpaceRef) bool {
     return true;
 }
 
-/// Reserve every allocating container before committing a managed window.
-/// Layout insertion happens before the no-fail store/workspace append, so an
-/// allocation failure cannot leave a window present in only part of the model.
 fn adoptWindow(ws: *workspace_mod.Space, win: window_mod.Window) !void {
     std.debug.assert(g_store.get(win.wid) == null);
     std.debug.assert(win.space.key.eql(ws.ref.key));
     try g_store.ensureUnusedCapacity(1);
-    try ws.ensureUnusedWindowCapacity(1);
     if (win.mode == .tiled) try tryInsertIntoTiling(ws.ref.key, win.wid);
     if (!adoptWindowIdentity(win)) {
         if (win.mode == .tiled) removeFromTiling(ws.ref.key, win.wid);
@@ -3121,7 +3133,6 @@ fn adoptWindow(ws: *workspace_mod.Space, win: window_mod.Window) !void {
     }
 
     g_store.putAssumeCapacity(win);
-    ws.addWindowAssumeCapacity(win.wid);
     seedObservedFrame(win.wid, win.frame);
 }
 
@@ -3143,24 +3154,17 @@ fn replaceManagedWindowId(old_wid: u32, new_wid: u32, frame: window_mod.Window.F
 
     const old = g_store.get(old_wid) orelse return false;
     g_store.ensureUnusedCapacity(1) catch return false;
-    const ws = spaceForWindow(old) orelse return false;
     const sp = tilingStatePtr(old.space.key);
     var replaced_in_layout = false;
     if (sp.*) |*st| {
         replaced_in_layout = st.replaceWid(old_wid, new_wid);
     }
 
-    const replaced_in_workspace = ws.replaceWindow(old_wid, new_wid);
-    if (!replaced_in_workspace or (old.mode == .tiled and !replaced_in_layout)) {
-        if (replaced_in_workspace) _ = ws.replaceWindow(new_wid, old_wid);
-        if (replaced_in_layout) {
-            if (sp.*) |*st| _ = st.replaceWid(new_wid, old_wid);
-        }
-        log.warn("window id replacement failed old={d} new={d} workspace={d} in_workspace={} in_layout={}", .{
+    if (old.mode == .tiled and !replaced_in_layout) {
+        log.warn("window id replacement failed old={d} new={d} workspace={d} in_layout={}", .{
             old_wid,
             new_wid,
             old.space.workspace_id,
-            replaced_in_workspace,
             replaced_in_layout,
         });
         return false;
@@ -3170,7 +3174,6 @@ fn replaceManagedWindowId(old_wid: u32, new_wid: u32, frame: window_mod.Window.F
     updated.wid = new_wid;
     updated.frame = frame;
     if (!replaceWindowIdentity(old_wid, new_wid)) {
-        _ = ws.replaceWindow(new_wid, old_wid);
         if (replaced_in_layout) {
             if (sp.*) |*st| _ = st.replaceWid(new_wid, old_wid);
         }
@@ -3897,7 +3900,6 @@ fn rollbackNativeWindowMove(wid: u32, pending: state_mod.PendingNativeWindowMove
 
     const source_ws = g_workspaces.get(pending.source.key) orelse return false;
     const target_ws = g_workspaces.get(pending.target.key) orelse return false;
-    source_ws.ensureUnusedWindowCapacity(1) catch return false;
     if (win.mode == .tiled) {
         tryInsertIntoTiling(source_ws.ref.key, wid) catch |err| {
             log.err("native window move: rollback layout failed wid={d}: {}", .{ wid, err });
@@ -3913,8 +3915,6 @@ fn rollbackNativeWindowMove(wid: u32, pending: state_mod.PendingNativeWindowMove
         return false;
     }
 
-    source_ws.addWindowAssumeCapacity(wid);
-    target_ws.removeWindow(wid);
     removeFromTiling(target_ws.ref.key, wid);
     if (focusedWorkspaceWindow(source_ws) == null) recordWorkspaceFocus(source_ws, wid);
 
@@ -4032,8 +4032,8 @@ fn completeNativeWorkspaceMove(pending: state_mod.PendingNativeWorkspaceMove) vo
 
     g_workspaces.spaces[source_index].ref = moved_ref;
     g_workspaces.spaces[target_index].ref = displaced_ref;
-    refreshLegacyWorkspaceWindows(&g_workspaces.spaces[source_index]);
-    refreshLegacyWorkspaceWindows(&g_workspaces.spaces[target_index]);
+    refreshWorkspaceWindowMetadata(&g_workspaces.spaces[source_index]);
+    refreshWorkspaceWindowMetadata(&g_workspaces.spaces[target_index]);
 
     assertDisplayCoverage();
     setFocusedDisplay(moved_ref.display_id);
@@ -4042,13 +4042,9 @@ fn completeNativeWorkspaceMove(pending: state_mod.PendingNativeWorkspaceMove) vo
     focusWorkspaceWindow(&g_workspaces.spaces[source_index]);
 }
 
-fn refreshLegacyWorkspaceWindows(space: *workspace_mod.Space) void {
-    var window_ids: [state_mod.max_managed_windows]u32 = undefined;
-    const workspace_windows = g_state.workspaceWindowIds(space.ref.key, &window_ids);
-    std.debug.assert(workspace_windows.len == space.windows.items.len);
-
-    for (workspace_windows) |wid| {
-        std.debug.assert(legacyWorkspaceContainsWindow(space, wid));
+fn refreshWorkspaceWindowMetadata(space: *workspace_mod.Space) void {
+    const windows = workspaceWindows(space);
+    for (windows.items()) |wid| {
         if (g_store.get(wid)) |window| {
             var updated = window;
             updated.space = space.ref;
@@ -4056,13 +4052,6 @@ fn refreshLegacyWorkspaceWindows(space: *workspace_mod.Space) void {
         }
         updateTabGroupAssignment(wid, space.ref);
     }
-}
-
-fn legacyWorkspaceContainsWindow(space: *const workspace_mod.Space, wid: u32) bool {
-    for (space.windows.items) |candidate| {
-        if (candidate == wid) return true;
-    }
-    return false;
 }
 
 /// Full reconcile after a topology change: rebuild display/workspace state,
@@ -4413,7 +4402,8 @@ fn focusObservedNativeSpace(space: state_mod.SpaceRef) void {
 fn completeNativeSwitch(space: state_mod.SpaceRef, epoch: state_mod.Epoch) void {
     const started_ns = nanoTimestamp();
     const workspace = g_workspaces.get(space.key) orelse return;
-    for (workspace.windows.items) |wid| {
+    const windows = workspaceWindows(workspace);
+    for (windows.items()) |wid| {
         if (!assignManagedWindowSpace(wid, workspace.ref)) continue;
         updateTabGroupAssignment(wid, workspace.ref);
     }
@@ -4510,7 +4500,6 @@ fn reassignManagedWindowToNativeWorkspace(wid: u32, target: state_mod.SpaceRef) 
 
     const source_ws = spaceForWindow(win) orelse return;
     const target_ws = g_workspaces.get(target.key) orelse return;
-    target_ws.ensureUnusedWindowCapacity(1) catch return;
     if (win.mode == .tiled) {
         tryInsertIntoTiling(target_ws.ref.key, wid) catch |err| {
             log.warn("native workspace assignment layout repair failed wid={d} workspace={d}: {}", .{ wid, target.workspace_id, err });
@@ -4523,8 +4512,6 @@ fn reassignManagedWindowToNativeWorkspace(wid: u32, target: state_mod.SpaceRef) 
     }
 
     const source_workspace_id = win.space.workspace_id;
-    target_ws.addWindowAssumeCapacity(wid);
-    source_ws.removeWindow(wid);
     removeFromTiling(source_ws.ref.key, wid);
     if (focusedWorkspaceWindow(target_ws) == null) recordWorkspaceFocus(target_ws, wid);
 
@@ -5216,8 +5203,9 @@ fn discoverWindowsImpl(should_refresh_tabs: bool) usize {
 
     // Ensure a focused window is set on the active workspace
     const active_ws = activeWorkspace();
-    if (focusedWorkspaceWindow(active_ws) == null and active_ws.windows.items.len > 0) {
-        recordWorkspaceFocus(active_ws, active_ws.windows.items[0]);
+    const active_windows = workspaceWindows(active_ws);
+    if (focusedWorkspaceWindow(active_ws) == null and active_windows.items().len > 0) {
+        recordWorkspaceFocus(active_ws, active_windows.items()[0]);
     }
 
     const completed_ns = nanoTimestamp();
@@ -5637,8 +5625,7 @@ fn tryFormTabGroupOnCreate(pid: i32, new_wid: u32) bool {
     }
     const has_tab_group = tabgroup.detect.appHasTabGroup(app_windows[0..app_snapshot.count]);
 
-    // Collected before any removal: removeWindow mutates the workspace window
-    // lists that the snapshot describes.
+    // Collect before removal so the candidate snapshot stays valid.
     var stale_wids: [128]u32 = undefined;
     const stale_count = tabgroup.detect.staleCandidates(pid, candidates[0..candidate_snapshot.count], &stale_wids);
 
@@ -5724,6 +5711,7 @@ fn removeWindow(wid: u32) void {
     }
     // Clean up tab group membership first
     const group_id_before: ?tabgroup.GroupId = if (g_tab_groups.groupOf(wid)) |g| g.id else null;
+    const was_group_leader = if (g_tab_groups.groupOf(wid)) |g| g.leader_wid == wid else false;
     removeWindowIdentity(wid);
     const removal = g_tab_groups.removeMember(wid);
 
@@ -5738,39 +5726,19 @@ fn removeWindow(wid: u32) void {
     }
 
     switch (removal) {
-        // The removed window led a surviving tab group. It is the group's
-        // only representative in workspace/layout state, so hand its slot to
-        // the new leader instead of deleting it; otherwise the remaining tabs
-        // become invisible to tiling and directional focus.
+        // The removed window held the surviving tab group's layout slot.
         .leader_changed => |new_leader| {
             transferLeaderSlot(win.space.key, wid, new_leader);
         },
         .none => {
-            if (spaceForWindow(win)) |ws| {
-                ws.removeWindow(wid);
-            }
             removeFromTiling(win.space.key, wid);
         },
-        // The group dissolved — restore the solo survivor to workspace and layout.
+        // The group dissolved — restore the solo survivor to the layout.
         .dissolved_solo => |solo_wid| {
-            if (spaceForWindow(win)) |ws| {
-                ws.removeWindow(wid);
-            }
             removeFromTiling(win.space.key, wid);
-
-            if (spaceForWindow(win)) |ws| {
-                var in_ws = false;
-                for (ws.windows.items) |w| {
-                    if (w == solo_wid) {
-                        in_ws = true;
-                        break;
-                    }
-                }
-                if (!in_ws) {
-                    log.info("removeWindow: restoring tab survivor wid={d} to workspace", .{solo_wid});
-                    ws.addWindow(solo_wid) catch {};
-                    if (windowIsTiled(solo_wid)) insertIntoTiling(win.space.key, solo_wid);
-                }
+            if (was_group_leader and windowIsTiled(solo_wid)) {
+                log.info("removeWindow: restoring tab survivor wid={d} to layout", .{solo_wid});
+                insertIntoTiling(win.space.key, solo_wid);
             }
         },
     }
@@ -5795,20 +5763,10 @@ fn reconcileGroupActiveAfterRemoval(group_id: tabgroup.GroupId, pid: i32) void {
     setTabGroupActive(active);
 }
 
-/// Hand a removed tab-group leader's workspace and layout slot to the new
-/// leader, preserving the window's position in both. Falls back to plain
-/// insertion when the old leader was not present (state drift).
+/// Hand a removed tab-group leader's layout slot to the new leader.
 fn transferLeaderSlot(space_key: state_mod.SpaceKey, old_leader: u32, new_leader: u32) void {
     std.debug.assert(old_leader != 0 and new_leader != 0);
     std.debug.assert(old_leader != new_leader);
-
-    var replaced_in_workspace = false;
-    if (g_workspaces.get(space_key)) |ws| {
-        replaced_in_workspace = ws.replaceWindow(old_leader, new_leader);
-        if (!replaced_in_workspace) {
-            ws.addWindow(new_leader) catch {};
-        }
-    }
 
     var replaced_in_layout = false;
     const sp = tilingStatePtr(space_key);
@@ -5822,15 +5780,11 @@ fn transferLeaderSlot(space_key: state_mod.SpaceKey, old_leader: u32, new_leader
         insertIntoTiling(space_key, new_leader);
     }
 
-    if (replaced_in_workspace and (replaced_in_layout or !wants_layout)) {
-        log.info("leader succession: wid={d} slot handed to wid={d} ws={d}", .{
-            old_leader, new_leader, if (g_workspaces.get(space_key)) |ws| ws.ref.workspace_id else 0,
-        });
-    } else {
-        log.warn("leader succession fallback: old={d} new={d} ws={d} in_workspace={} in_layout={}", .{
-            old_leader, new_leader, if (g_workspaces.get(space_key)) |ws| ws.ref.workspace_id else 0, replaced_in_workspace, replaced_in_layout,
-        });
+    if (replaced_in_layout or !wants_layout) {
+        log.info("leader succession: wid={d} slot handed to wid={d}", .{ old_leader, new_leader });
+        return;
     }
+    log.warn("leader succession fallback: old={d} new={d} in_layout={}", .{ old_leader, new_leader, replaced_in_layout });
 }
 
 fn removeAppWindows(pid: i32) void {
@@ -5914,7 +5868,8 @@ fn cleanupWorkspaceWindowsForPid(pid: i32) bool {
         // so skip hidden workspaces to avoid false positives.
         if (!spaceVisible(ws.ref)) continue;
 
-        for (ws.windows.items) |wid| {
+        const windows = workspaceWindows(ws);
+        for (windows.items()) |wid| {
             const win = g_store.get(wid) orelse continue;
             if (win.pid != pid) continue;
 
@@ -5969,7 +5924,8 @@ fn cleanupOffscreenManagedWindows() bool {
         // Windows on hidden workspaces are intentionally parked off-screen.
         if (!spaceVisible(ws.ref)) continue;
 
-        for (ws.windows.items) |wid| {
+        const windows = workspaceWindows(ws);
+        for (windows.items()) |wid| {
             const win = g_store.get(wid) orelse continue;
 
             // Tab-group members can be intentionally off-screen when a sibling
@@ -5998,8 +5954,7 @@ fn cleanupOffscreenManagedWindows() bool {
         log.warn("cleanup: offscreen batch truncated queued={d}", .{suspect_count});
     }
 
-    // Mutations deferred to here — removeWindow/adoption modify workspace
-    // window lists, which must not happen while iterating them above.
+    // Mutations are deferred so the snapshots above stay valid.
     var mutated = false;
     for (suspects[0..suspect_count]) |suspect| {
         const win = g_store.get(suspect.wid) orelse continue;
@@ -6119,10 +6074,7 @@ fn adoptWindowAsBackgroundTab(win: window_mod.Window) tabgroup.detect.OffscreenO
     }
     setTabGroupActive(sibling_wid);
 
-    // Members live only in the store; drop the standalone workspace/layout slot.
-    if (spaceForWindow(win)) |ws| {
-        ws.removeWindow(win.wid);
-    }
+    // Members live only in the store; drop the standalone layout slot.
     removeFromTiling(win.space.key, win.wid);
 
     var updated = win;
@@ -6137,7 +6089,7 @@ fn adoptWindowAsBackgroundTab(win: window_mod.Window) tabgroup.detect.OffscreenO
 }
 
 /// Adopt geometry from the exact window claimed by a real pointer drag while
-/// mutating workspace/layout ownership through its native-tab group leader.
+/// mutating ownership and layout through its native-tab group leader.
 /// Returns true when display ownership changed and callers should retile.
 fn updateDraggedWindowGeometry(dragged_wid: u32, frame: window_mod.Window.Frame) bool {
     if (g_pointer_drag_wid != dragged_wid) return false;
@@ -6361,7 +6313,7 @@ fn reconcileDisplayChange() void {
 /// Park every window of every hidden workspace so a topology change never
 /// leaves windows at coordinates that no longer map to a live display.
 ///
-/// Walks workspace membership lists rather than gating on raw CG on-screen
+/// Walks reducer workspace membership rather than gating on raw CG on-screen
 /// state: parked windows keep peek pixels visible, so CG counts them as
 /// on-screen, while genuinely stranded windows can be fully off-screen — CG
 /// presence distinguishes exactly the wrong ones. Windows already at their
@@ -6378,8 +6330,9 @@ fn parkHiddenWorkspaceWindows() void {
         if (spaceVisible(ws.ref)) continue;
 
         const ctx = HideCtx.init(home);
-        for (ws.windows.items) |wid| {
-            // Workspace lists hold tab-group leaders, but the on-screen
+        const snapshot = workspaceWindows(ws);
+        for (snapshot.items()) |wid| {
+            // Reducer membership holds tab-group leaders, but the on-screen
             // window of a group is its active tab — which may not be the
             // leader. Park the active tab; suppressed members are already
             // off-screen behind it.
@@ -6525,7 +6478,8 @@ fn restoreFloatingWindows(ws: *workspace_mod.Space, display: shim.bw_frame, cont
     const sky = g_sky orelse return;
     const conn = sky.mainConnectionID();
 
-    for (ws.windows.items) |leader_wid| {
+    const snapshot = workspaceWindows(ws);
+    for (snapshot.items()) |leader_wid| {
         const leader = g_store.get(leader_wid) orelse continue;
         if (leader.mode != .floating) continue;
         if (!leader.space.key.eql(ws.ref.key)) {
@@ -6716,7 +6670,8 @@ fn retileAllDisplays() void {
 
 fn observeDiscoveredApps() void {
     for (g_workspaces.spaces[0..g_workspaces.space_count]) |*ws| {
-        for (ws.windows.items) |wid| {
+        const snapshot = workspaceWindows(ws);
+        for (snapshot.items()) |wid| {
             if (g_store.get(wid)) |win| {
                 ax_observer.observeApp(win.pid);
             }
@@ -6731,7 +6686,8 @@ fn restoreAllWindows() void {
     dim.resetAll();
 
     for (g_workspaces.spaces[0..g_workspaces.space_count]) |*ws| {
-        for (ws.windows.items) |wid| {
+        const snapshot = workspaceWindows(ws);
+        for (snapshot.items()) |wid| {
             if (g_store.get(wid)) |win| {
                 if (spaceVisible(win.space)) continue;
                 const display_slot = displayIndexById(win.space.display_id) orelse continue;
@@ -6805,6 +6761,7 @@ fn checkTabDragOut(_: i32, wid: u32) bool {
     const g = g_tab_groups.groupOfMut(wid) orelse return false;
     if (g.active_wid == wid) return false; // only check suppressed members
     const group_id = g.id;
+    const was_leader = g.leader_wid == wid;
 
     const frame = liveWindowFrame(wid) orelse return false;
     switch (tabgroup.detect.classifyMember(frame, g.canonical_frame, isVisibleOnScreen(wid))) {
@@ -6817,7 +6774,7 @@ fn checkTabDragOut(_: i32, wid: u32) bool {
     dissolveWindowTabGroup(wid);
     _ = syncWindowTabGroup(group_id);
 
-    // Update stored frame and add to workspace + layout
+    // Update the stored frame before restoring standalone layout slots.
     if (g_store.get(wid)) |win| {
         var updated = win;
         updated.frame = frame;
@@ -6827,47 +6784,27 @@ fn checkTabDragOut(_: i32, wid: u32) bool {
     const win = g_store.get(wid) orelse return false;
     const ws = spaceForWindow(win) orelse return false;
 
-    // If the dragged-out tab led the group, its existing workspace/layout
-    // slot belongs to the surviving group — hand it to the new leader before
-    // re-adding wid as a standalone window.
+    // If the dragged-out tab led a surviving group, hand its layout slot to
+    // the new leader before inserting wid as a standalone window.
     switch (removal) {
         .leader_changed => |new_leader| transferLeaderSlot(win.space.key, wid, new_leader),
         .none, .dissolved_solo => {},
     }
 
-    // The wid may still occupy a workspace/layout slot when it was the
-    // group's leader and the group dissolved; avoid inserting a duplicate.
-    var wid_in_ws = false;
-    for (ws.windows.items) |w| {
-        if (w == wid) {
-            wid_in_ws = true;
-            break;
-        }
-    }
-    if (!wid_in_ws) {
-        ws.addWindow(wid) catch return false;
-        insertIntoTiling(win.space.key, wid);
-    }
-    recordWorkspaceFocus(ws, wid);
-
-    // If the group dissolved, verify the survivor is still managed
     switch (removal) {
+        .none, .leader_changed => {
+            if (windowIsTiled(wid)) insertIntoTiling(win.space.key, wid);
+        },
         .dissolved_solo => |solo_wid| {
-            var in_ws = false;
-            for (ws.windows.items) |w| {
-                if (w == solo_wid) {
-                    in_ws = true;
-                    break;
-                }
-            }
-            if (!in_ws) {
-                log.info("drag-out: restoring survivor wid={d} to workspace", .{solo_wid});
-                ws.addWindow(solo_wid) catch {};
-                insertIntoTiling(win.space.key, solo_wid);
+            if (was_leader) {
+                log.info("drag-out: restoring survivor wid={d} to layout", .{solo_wid});
+                if (windowIsTiled(solo_wid)) insertIntoTiling(win.space.key, solo_wid);
+            } else if (windowIsTiled(wid)) {
+                insertIntoTiling(win.space.key, wid);
             }
         },
-        .none, .leader_changed => {},
     }
+    recordWorkspaceFocus(ws, wid);
 
     return true;
 }
@@ -6928,7 +6865,8 @@ fn workspaceRevealSettled(ws: *const workspace_mod.Space) bool {
     const on_screen = OnScreenWindows.snapshot();
     if (on_screen.truncated) return false;
 
-    for (ws.windows.items) |leader_wid| {
+    const snapshot = workspaceWindows(ws);
+    for (snapshot.items()) |leader_wid| {
         const visible_wid = g_tab_groups.resolveActive(leader_wid);
         const win = g_store.get(visible_wid) orelse return false;
         if (win.is_minimized) continue;
@@ -7078,10 +7016,11 @@ fn switchWorkspace(target_id: u8) void {
     // If target is already visible on some display, just focus there.
     if (spaceVisible(target_ws.ref)) {
         const target_display = target_ws.ref.display_id;
+        const target_windows = workspaceWindows(target_ws);
         log.debug("workspace switch target already visible workspace={d} display={d} windows={d}", .{
             target_id,
             target_display,
-            target_ws.windows.items.len,
+            target_windows.count,
         });
         startWorkspaceTransition(.switch_workspace, target_ws.ref);
         setFocusedDisplay(target_display);
@@ -7097,12 +7036,14 @@ fn switchWorkspace(target_id: u8) void {
     if (target_id == current_id) return;
 
     const old_ws = spaceForWorkspace(target_display, current_id) orelse return;
+    const old_windows = workspaceWindows(old_ws);
+    const target_windows = workspaceWindows(target_ws);
     log.debug("workspace switch preparing current_workspace={d} target_workspace={d} display={d} current_windows={d} target_windows={d}", .{
         current_id,
         target_id,
         target_display,
-        old_ws.windows.items.len,
-        target_ws.windows.items.len,
+        old_windows.count,
+        target_windows.count,
     });
 
     // Activate target; old workspace keeps its display_id (just hidden).
@@ -7110,14 +7051,14 @@ fn switchWorkspace(target_id: u8) void {
         .display_id = target_display,
         .workspace_id = target_id,
     } });
-    for (target_ws.windows.items) |wid| {
+    for (target_windows.items()) |wid| {
         if (!assignManagedWindowSpace(wid, target_ws.ref)) continue;
         updateTabGroupAssignment(wid, target_ws.ref);
     }
     log.debug("workspace switch activated target workspace={d} display={d} windows={d}", .{
         target_id,
         target_display,
-        target_ws.windows.items.len,
+        target_windows.count,
     });
 
     assertDisplayCoverage();
@@ -7155,7 +7096,8 @@ fn parkOutgoingWorkspace(ws: *workspace_mod.Space, target: state_mod.SpaceRef) v
     const hctx = HideCtx.init(display_id);
 
     var hidden_count: usize = 0;
-    for (ws.windows.items) |wid| {
+    const snapshot = workspaceWindows(ws);
+    for (snapshot.items()) |wid| {
         const visible_wid = g_tab_groups.resolveActive(wid);
         const hide_wid = if (g_store.get(visible_wid) != null) visible_wid else wid;
         const win = g_store.get(hide_wid) orelse continue;
@@ -7209,7 +7151,8 @@ fn focusWorkspaceWindow(ws: *workspace_mod.Space) void {
         if (g_store.get(fwid) == null) focus_wid = null;
     }
     if (focus_wid == null) {
-        for (ws.windows.items) |wid| {
+        const snapshot = workspaceWindows(ws);
+        for (snapshot.items()) |wid| {
             if (g_store.get(wid) == null) continue;
             focus_wid = wid;
             break;
@@ -7281,9 +7224,7 @@ fn moveWindowToWorkspace(target_id: u8) void {
     log.debug("move workspace target wid={d} pid={d} source={d} target={d}", .{ wid, updated.pid, ws.ref.workspace_id, target_id });
 
     const target_ws = spaceForCommand(updated.space.display_id, target_id) orelse return;
-    // Prepare the destination completely before removing the source slot.
-    // After these fallible steps, the move commits without allocation.
-    target_ws.ensureUnusedWindowCapacity(1) catch return;
+    // Prepare the destination layout before removing the source slot.
     if (updated.mode == .tiled) {
         tryInsertIntoTiling(target_ws.ref.key, wid) catch |err| {
             log.err("failed to move wid={d} to workspace {d}: {}", .{ wid, target_id, err });
@@ -7300,9 +7241,6 @@ fn moveWindowToWorkspace(target_id: u8) void {
         if (updated.mode == .tiled) removeFromTiling(target_ws.ref.key, wid);
         return;
     }
-    target_ws.addWindowAssumeCapacity(wid);
-
-    ws.removeWindow(wid);
     removeFromTiling(ws.ref.key, wid);
     if (focusedWorkspaceWindow(target_ws) == null) {
         recordWorkspaceFocus(target_ws, wid);
@@ -7346,31 +7284,19 @@ fn reassignManagedWindowToDisplay(wid: u32, target_display_id: u32) bool {
     const source_ws = spaceForWindow(win) orelse return false;
     const target_ws = spaceForWorkspace(target_display_id, target_workspace_id) orelse return false;
     if (!source_ws.ref.key.eql(target_ws.ref.key)) {
-        for (target_ws.windows.items) |existing_wid| {
-            if (existing_wid == wid) {
-                log.warn("refusing display move for wid={d}: already in target workspace {d}", .{ wid, target_workspace_id });
-                return false;
-            }
-        }
-
-        target_ws.ensureUnusedWindowCapacity(1) catch return false;
         if (win.mode == .tiled) {
             tryInsertIntoTiling(target_ws.ref.key, wid) catch |err| {
                 log.err("failed to move wid={d} to display {d}: {}", .{ wid, target_display_id, err });
                 return false;
             };
         }
-        target_ws.addWindowAssumeCapacity(wid);
-
         if (!assignManagedWindowSpace(wid, target_ws.ref)) {
             if (win.mode == .tiled) removeFromTiling(target_ws.ref.key, wid);
-            target_ws.removeWindow(wid);
             return false;
         }
         updateTabGroupAssignment(wid, target_ws.ref);
 
         removeFromTiling(source_ws.ref.key, wid);
-        source_ws.removeWindow(wid);
         recordWorkspaceFocus(target_ws, wid);
 
         win.space = target_ws.ref;
@@ -7432,7 +7358,8 @@ fn moveWorkspaceToDisplay(target_display_slot: usize) void {
 
     // Hide displaced workspace's windows on target display
     const hctx = HideCtx.init(target_display_id);
-    for (displaced_ws.windows.items) |wid| {
+    const displaced_windows = workspaceWindows(displaced_ws);
+    for (displaced_windows.items()) |wid| {
         const visible_wid = g_tab_groups.resolveActive(wid);
         const hide_wid = if (g_store.get(visible_wid) != null) visible_wid else wid;
         if (g_store.get(hide_wid)) |win| {
@@ -7506,7 +7433,8 @@ fn windowInDirection(ws: *const workspace_mod.Space, focused: *const window_mod.
     var best_wid: ?u32 = null;
     var best_dist: f64 = std.math.inf(f64);
 
-    for (ws.windows.items) |wid| {
+    const snapshot = workspaceWindows(ws);
+    for (snapshot.items()) |wid| {
         if (wid == focused.wid) continue;
         const win = g_store.get(wid) orelse continue;
         if (!win.space.key.eql(focused.space.key)) continue;
@@ -7786,9 +7714,10 @@ fn ipcQueryWindows(fd: posix.socket_t, format: ipc.IpcCommand.QueryFormat) void 
     defer out.deinit();
     const w = &out.writer;
     var written: usize = 0;
+    const snapshot = workspaceWindows(ws);
 
     switch (format) {
-        .text => for (ws.windows.items) |wid| {
+        .text => for (snapshot.items()) |wid| {
             if (g_store.get(wid)) |win| {
                 var id_buf: [256]u8 = undefined;
                 const id_len = if (osutil.appBundleId(win.pid, &id_buf)) |id| id.len else 0;
@@ -7804,7 +7733,7 @@ fn ipcQueryWindows(fd: posix.socket_t, format: ipc.IpcCommand.QueryFormat) void 
         .json => {
             var json: std.json.Stringify = .{ .writer = w };
             json.beginArray() catch {};
-            for (ws.windows.items) |wid| {
+            for (snapshot.items()) |wid| {
                 if (g_store.get(wid)) |win| {
                     var id_buf: [256]u8 = undefined;
                     const id_len = if (osutil.appBundleId(win.pid, &id_buf)) |id| id.len else 0;
@@ -7839,7 +7768,8 @@ fn ipcQueryApps(fd: posix.socket_t, format: ipc.IpcCommand.QueryFormat) void {
     if (format == .json) json.beginArray() catch {};
 
     for (g_workspaces.spaces[0..g_workspaces.space_count]) |*ws| {
-        for (ws.windows.items) |wid| {
+        const snapshot = workspaceWindows(ws);
+        for (snapshot.items()) |wid| {
             if (g_store.get(wid)) |win| {
                 // Deduplicate by PID
                 if (std.mem.findScalar(i32, seen_pids[0..seen_count], win.pid) != null) continue;
