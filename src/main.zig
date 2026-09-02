@@ -2803,15 +2803,12 @@ fn reconcileDueGeometryObservations() void {
                         continue;
                     }
                     if (reconcileDivergedGeometryIntent(wid, intent)) {
-                        dispatchStateEvent(.{ .geometry = .{ .forget = wid } });
+                        forgetGeometryIfUnmanaged(wid);
                         continue;
                     }
                 }
             }
-            // No physical window exists after the ownership interval. Drop
-            // the sample state; cleanup/tab reconciliation owns any remaining
-            // managed entry and a later write will create fresh provenance.
-            dispatchStateEvent(.{ .geometry = .{ .forget = wid } });
+            forgetGeometryIfUnmanaged(wid);
             continue;
         };
         dispatchStateEvent(.{ .geometry = .{ .settle = .{
@@ -2961,13 +2958,6 @@ fn openConfigFile() void {
     if (!workspace.msgSend(bool, "openURL:", .{url})) {
         log.warn("failed to open config file at {s}", .{path});
     }
-}
-
-fn swapTilingStates(first_key: state_mod.SpaceKey, second_key: state_mod.SpaceKey) void {
-    dispatchStateEvent(.{ .layout = .{ .swap_layouts = .{
-        .first_key = first_key,
-        .second_key = second_key,
-    } } });
 }
 
 fn tryInsertIntoTiling(space_key: state_mod.SpaceKey, wid: u32) !void {
@@ -3901,8 +3891,6 @@ fn nativeWorkspaceContentsConfirmed(pending: state_mod.PendingNativeWorkspaceMov
 fn completeNativeWorkspaceMove(pending: state_mod.PendingNativeWorkspaceMove) void {
     const moved_ref = g_state.space(pending.target.key) orelse return;
     _ = g_state.space(pending.source.key) orelse return;
-
-    swapTilingStates(pending.source.key, pending.target.key);
 
     assertDisplayCoverage();
     setFocusedDisplay(moved_ref.display_id);

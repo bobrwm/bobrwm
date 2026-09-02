@@ -269,6 +269,16 @@ pub fn entryAtPoint(
     return self.bspEntryAtPoint(root, frame, inner_gap, point_x, point_y, excluded_window_id);
 }
 
+/// Return the number of unique window identities owned by all layouts.
+pub fn totalWindowCount(self: *const Self) usize {
+    var total: usize = 0;
+    for (self.layouts[0..self.layout_count]) |slot| {
+        const state = slot.state orelse continue;
+        total += state.window_count;
+    }
+    return total;
+}
+
 pub fn assertValid(self: *const Self) void {
     std.debug.assert(self.layout_count <= self.layouts.len);
     std.debug.assert(self.node_count <= self.nodes.len);

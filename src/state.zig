@@ -2138,6 +2138,16 @@ fn reduceNativeWorkspaceMoveObserved(
         transition.addEffect(.{ .rollback_native_workspace_contents = pending });
         return;
     }
+    if (!applyLayoutEvent(transition, .{ .swap_layouts = .{
+        .first_key = pending.source.key,
+        .second_key = pending.target.key,
+    } })) {
+        _ = transition.model.native_topology.swapWorkspacePlacements(pending.source.key, pending.target.key);
+        pending.is_rolling_back = true;
+        transition.model.pending_native_workspace_move = pending;
+        transition.addEffect(.{ .rollback_native_workspace_contents = pending });
+        return;
+    }
     transition.model.windows.swapSpaceKeys(pending.source.key, pending.target.key);
     transition.model.pending_native_workspace_move = null;
     syncNativeWorkspaceTopology(transition);
@@ -2659,6 +2669,22 @@ fn assertModel(model: *const Model) void {
         std.debug.assert(deferred.window_id != 0);
         std.debug.assert(deferred.transition_epoch == model.workspace_transition.?.epoch);
     }
+    std.debug.assert(crossDomainStateIsValid(model));
+}
+
+fn crossDomainStateIsValid(model: *const Model) bool {
+    if (model.geometry.windowCount() != model.windows.count) return false;
+
+    var layout_window_count: usize = 0;
+    for (model.windows.items()) |window| {
+        if (model.space(window.space_key) == null) return false;
+        if (model.geometry.get(window.window_id) == null) return false;
+        if (!model.layout.contains(window.space_key, window.window_id)) continue;
+        if (window.tab_leader_window_id != window.window_id) return false;
+        if (window.mode != .tiled) return false;
+        layout_window_count += 1;
+    }
+    return layout_window_count == model.layout.totalWindowCount();
 }
 
 fn frameIsFinite(frame: window_mod.Window.Frame) bool {
@@ -2942,6 +2968,67 @@ test "layout rejection leaves window adoption unchanged" {
     try testing.expect(rejected.model.layout.contains(space_key, 101));
     try testing.expect(!rejected.model.layout.contains(space_key, 102));
     try testing.expectEqual(@as(usize, 1), rejected.model.layout.windowCount(space_key));
+}
+
+test "cross-domain validation rejects ownership divergence" {
+    const testing = std.testing;
+    const first_space: SpaceKey = .{ .virtual = 1 };
+    const second_space: SpaceKey = .{ .virtual = 2 };
+    var catalog: SpaceCatalog = .{};
+    catalog.add(.{ .key = first_space, .workspace_id = 1, .display_id = 11 });
+    catalog.add(.{ .key = second_space, .workspace_id = 2, .display_id = 11 });
+    var model: Model = .{ .spaces = catalog };
+    model = reduce(model, .{ .adopt_window = .{
+        .window_id = 101,
+        .process_id = 1001,
+        .space_key = first_space,
+        .layout = testLayoutInsertion(.bsp),
+    } }).model;
+    model = reduce(model, .{ .adopt_window = .{
+        .window_id = 102,
+        .process_id = 1001,
+        .space_key = first_space,
+        .layout = testLayoutInsertion(.bsp),
+    } }).model;
+    try testing.expect(crossDomainStateIsValid(&model));
+
+    var invalid = model;
+    invalid.geometry.forget(101);
+    try testing.expect(!crossDomainStateIsValid(&invalid));
+
+    invalid = model;
+    try invalid.geometry.seedObserved(999, .{ .x = 0, .y = 0, .width = 1, .height = 1 });
+    try testing.expect(!crossDomainStateIsValid(&invalid));
+
+    invalid = model;
+    invalid.windows.entries[0].space_key = second_space;
+    try testing.expect(!crossDomainStateIsValid(&invalid));
+
+    invalid = model;
+    invalid.windows.entries[0].space_key = .{ .virtual = 99 };
+    try testing.expect(!crossDomainStateIsValid(&invalid));
+
+    invalid = model;
+    invalid.windows.entries[0].mode = .floating;
+    try testing.expect(!crossDomainStateIsValid(&invalid));
+
+    var group: WindowTabGroupObservation = .{
+        .leader_window_id = 101,
+        .active_window_id = 102,
+    };
+    try testing.expect(group.addMember(101));
+    try testing.expect(group.addMember(102));
+    model = reduce(model, .{ .observe_window_tab_group = group }).model;
+    try testing.expect(crossDomainStateIsValid(&model));
+
+    invalid = model;
+    invalid.layout = tiling_mod.reduce(invalid.layout, .{ .insert = .{
+        .space_key = first_space,
+        .kind = .bsp,
+        .window_id = 102,
+        .options = testLayoutInsertion(.bsp).options,
+    } }).model;
+    try testing.expect(!crossDomainStateIsValid(&invalid));
 }
 
 test "tab transitions transfer layout ownership atomically" {
@@ -3402,11 +3489,13 @@ test "native workspace move commits placement and ownership atomically" {
         .window_id = 101,
         .process_id = 1001,
         .space_key = .{ .native = 101 },
+        .layout = testLayoutInsertion(.bsp),
     } }).model;
     model = reduce(model, .{ .adopt_window = .{
         .window_id = 201,
         .process_id = 2001,
         .space_key = .{ .native = 201 },
+        .layout = testLayoutInsertion(.bsp),
     } }).model;
     model = reduce(model, .{ .record_workspace_focus = .{
         .workspace_id = 1,
@@ -3446,6 +3535,8 @@ test "native workspace move commits placement and ownership atomically" {
     try testing.expectEqual(@as(WorkspaceId, 1), transition.model.space(.{ .native = 201 }).?.workspace_id);
     try testing.expect(transition.model.window(101).?.space_key.eql(.{ .native = 201 }));
     try testing.expect(transition.model.window(201).?.space_key.eql(.{ .native = 101 }));
+    try testing.expect(transition.model.layout.contains(.{ .native = 201 }, 101));
+    try testing.expect(transition.model.layout.contains(.{ .native = 101 }, 201));
     try testing.expectEqual(@as(?WindowId, 101), transition.model.focusedWorkspaceWindow(1));
     try testing.expectEqual(@as(?WindowId, 201), transition.model.focusedWorkspaceWindow(4));
     try testing.expectEqual(std.meta.Tag(Effect).native_workspace_move_completed, std.meta.activeTag(transition.effects[0]));

@@ -455,6 +455,11 @@ pub fn get(self: *const Self, wid: WindowId) ?Entry {
     return self.entries[index].value;
 }
 
+/// Return the number of tracked window identities.
+pub fn windowCount(self: *const Self) usize {
+    return self.entry_count;
+}
+
 pub fn forget(self: *Self, wid: WindowId) void {
     const index = self.findIndex(wid) orelse return;
     self.entry_count -= 1;
