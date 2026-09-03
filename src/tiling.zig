@@ -900,8 +900,8 @@ fn rejectionEffect(space_key: SpaceKey, window_id: ?WindowId, err: anyerror) Eff
 }
 
 const testing = std.testing;
-const first_space: SpaceKey = .{ .virtual = 1 };
-const second_space: SpaceKey = .{ .virtual = 2 };
+const first_space: SpaceKey = .{ .id = 1 };
+const second_space: SpaceKey = .{ .id = 2 };
 const test_frame: Frame = .{ .x = 0, .y = 0, .width = 1000, .height = 800 };
 
 fn insertEvent(space_key: SpaceKey, kind: LayoutKind, window_id: WindowId) Event {

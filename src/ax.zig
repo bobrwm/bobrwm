@@ -583,8 +583,8 @@ fn writeFrame(
     return size_err;
 }
 
-/// Move a window without touching its size. Off-screen parking and pure-move
-/// retiles use this instead of setWindowFrame: writing AXSize when only the
+/// Move a window without touching its size. Pure-move retiles use this instead
+/// of setWindowFrame: writing AXSize when only the
 /// position changes triggers a visible resize flash and a reflow storm in
 /// size-sensitive apps.
 pub fn setWindowPosition(pid: i32, wid: u32, x: f64, y: f64) bool {

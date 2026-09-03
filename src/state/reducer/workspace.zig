@@ -7,13 +7,11 @@ const pointer_reducer = @import("pointer.zig");
 const window_reducer = @import("window.zig");
 const tiling_mod = @import("../../tiling.zig");
 
-const max_spaces_per_display = model_mod.max_spaces_per_display;
 const native_switch_timeout_ms = model_mod.native_switch_timeout_ms;
 const native_observation_delay_ms = model_mod.native_observation_delay_ms;
 const native_workspace_move_timeout_ms = model_mod.native_workspace_move_timeout_ms;
 const workspace_transition_settle_ms = model_mod.workspace_transition_settle_ms;
 const DisplayId = model_mod.DisplayId;
-const NativeSpaceId = model_mod.NativeSpaceId;
 const WorkspaceId = model_mod.WorkspaceId;
 const SpaceKey = model_mod.SpaceKey;
 const SpaceRef = model_mod.SpaceRef;
@@ -41,63 +39,12 @@ const WindowMoveRequest = model_mod.WindowMoveRequest;
 const PendingFocus = model_mod.PendingFocus;
 const WindowCandidate = model_mod.WindowCandidate;
 const WindowCandidates = model_mod.WindowCandidates;
-const PendingWorkspacePark = model_mod.PendingWorkspacePark;
-const PendingWorkspaceParks = model_mod.PendingWorkspaceParks;
-const WorkspaceInitialization = model_mod.WorkspaceInitialization;
-const VirtualDisplayObservation = model_mod.VirtualDisplayObservation;
 const ObservationTimer = model_mod.ObservationTimer;
 const Model = model_mod.Model;
 const Event = model_mod.Event;
 const SwitchFailureReason = model_mod.SwitchFailureReason;
 const Effect = model_mod.Effect;
 const Transition = model_mod.Transition;
-
-pub fn reduceWorkspaceInitialization(transition: *Transition, initialization: WorkspaceInitialization) void {
-    if (transition.model.windows.count != 0 or transition.model.spaces.space_count != 0) return;
-    if (initialization.display_count == 0 or initialization.workspace_count == 0) return;
-    if (initialization.display_count > initialization.workspace_count) return;
-
-    var primary_slot: ?usize = null;
-    for (initialization.display_ids[0..initialization.display_count], 0..) |display_id, slot| {
-        if (display_id == 0) return;
-        if (display_id == initialization.primary_display_id) primary_slot = slot;
-        for (initialization.display_ids[0..slot]) |prior| {
-            if (prior == display_id) return;
-        }
-    }
-    const primary_index = primary_slot orelse return;
-
-    var workspace_displays: [max_spaces_per_display]DisplayId = @splat(initialization.primary_display_id);
-    var topology: WorkspaceTopology = .{};
-    var extra_display_count: WorkspaceId = 0;
-    for (initialization.display_ids[0..initialization.display_count], 0..) |display_id, slot| {
-        const workspace_id: WorkspaceId = if (slot == primary_index)
-            1
-        else
-            initialization.workspace_count - extra_display_count;
-        topology.addDisplay(.{
-            .display_id = display_id,
-            .active_workspace_id = workspace_id,
-        });
-        if (slot == primary_index) continue;
-
-        workspace_displays[workspace_id - 1] = display_id;
-        extra_display_count += 1;
-    }
-    topology.focused_display_id = initialization.primary_display_id;
-
-    var catalog: SpaceCatalog = .{};
-    var workspace_id: WorkspaceId = 1;
-    while (workspace_id <= initialization.workspace_count) : (workspace_id += 1) {
-        catalog.add(.{
-            .key = .{ .virtual = workspace_id },
-            .workspace_id = workspace_id,
-            .display_id = workspace_displays[workspace_id - 1],
-        });
-    }
-    transition.model.spaces = catalog;
-    transition.model.workspace_topology = topology;
-}
 
 pub fn reduceWorkspaceSwitchRequest(
     transition: *Transition,
@@ -120,164 +67,10 @@ pub fn reduceWorkspaceSwitchRequest(
         return;
     }
 
-    switch (target.key) {
-        .native => reduceSwitchRequest(transition, .{
-            .target = target,
-            .at_ms = request.at_ms,
-        }),
-        .virtual => {
-            const outgoing = transition.model.spaceForWorkspace(target.display_id, active_workspace_id) orelse return;
-            if (!transition.model.workspace_topology.setActiveWorkspace(target.display_id, target.workspace_id)) return;
-            transition.model.workspace_topology.focused_display_id = target.display_id;
-            startWorkspaceTransition(
-                transition,
-                .switch_workspace,
-                target,
-                request.at_ms,
-                workspace_transition_settle_ms,
-                null,
-            );
-            pointer_reducer.clearDragPreview(transition);
-            transition.addEffect(.{ .workspace_switch_ready = .{
-                .target = target,
-                .outgoing = outgoing,
-            } });
-        },
-    }
-}
-
-pub fn reduceVirtualWorkspaceMoveRequest(
-    transition: *Transition,
-    request: @FieldType(Event, "request_virtual_workspace_move"),
-) void {
-    if (request.source_display_id == request.target_display_id) return;
-    const moving_workspace_id = transition.model.activeWorkspace(request.source_display_id) orelse return;
-    const displaced_workspace_id = transition.model.activeWorkspace(request.target_display_id) orelse return;
-    const moving = transition.model.spaceForWorkspace(request.source_display_id, moving_workspace_id) orelse return;
-    const displaced = transition.model.spaceForWorkspace(request.target_display_id, displaced_workspace_id) orelse return;
-    if (moving.key != .virtual or displaced.key != .virtual) return;
-
-    var fallback = displaced;
-    for (transition.model.spaces.spaces[0..transition.model.spaces.space_count]) |space| {
-        if (space.workspace_id == moving.workspace_id) continue;
-        if (space.display_id != request.source_display_id) continue;
-        if (transition.model.activeWorkspace(space.display_id) == space.workspace_id) continue;
-        fallback = space;
-        break;
-    }
-
-    if (!transition.model.workspace_topology.setActiveWorkspace(request.target_display_id, moving.workspace_id)) return;
-    if (!transition.model.workspace_topology.setActiveWorkspace(request.source_display_id, fallback.workspace_id)) return;
-    if (!transition.model.spaces.setDisplay(moving.key, request.target_display_id)) return;
-    if (!transition.model.spaces.setDisplay(fallback.key, request.source_display_id)) return;
-    transition.model.workspace_topology.focused_display_id = request.target_display_id;
-    transition.model.pending_workspace_parks.count = 0;
-    pruneWindowCandidates(&transition.model.pending_role_windows, &transition.model.spaces);
-    pruneWindowCandidates(&transition.model.deferred_window_candidates, &transition.model.spaces);
-
-    const moved = transition.model.space(moving.key).?;
-    startWorkspaceTransition(
-        transition,
-        .move_workspace_to_display,
-        moved,
-        request.at_ms,
-        workspace_transition_settle_ms,
-        null,
-    );
-    pointer_reducer.clearDragPreview(transition);
-    transition.addEffect(.{ .virtual_workspace_move_ready = .{
-        .moving = moved,
-        .displaced = displaced,
-    } });
-}
-
-pub fn reduceVirtualDisplaysObserved(transition: *Transition, observation: VirtualDisplayObservation) void {
-    const workspace_count = transition.model.spaces.space_count;
-    if (observation.display_count == 0 or observation.display_count > workspace_count) return;
-    if (!displayObservationContains(&observation, observation.primary_display_id)) return;
-    if (!displayObservationContains(&observation, observation.focused_display_id)) return;
-
-    for (transition.model.spaces.spaces[0..workspace_count]) |space| {
-        if (space.key != .virtual) return;
-        if (space.workspace_id == 0 or space.workspace_id > workspace_count) return;
-    }
-
-    var catalog = transition.model.spaces;
-    var topology: WorkspaceTopology = .{};
-    var active_workspaces: [max_spaces_per_display + 1]bool = @splat(false);
-    for (observation.displays[0..observation.display_count]) |display| {
-        var workspace_id: WorkspaceId = 0;
-        if (display.uuid) |uuid| {
-            if (transition.model.display_memory.get(uuid)) |remembered| {
-                if (remembered.active_workspace_id <= workspace_count and
-                    !active_workspaces[remembered.active_workspace_id])
-                {
-                    workspace_id = remembered.active_workspace_id;
-                }
-            }
-        }
-        if (workspace_id == 0) {
-            workspace_id = firstUnclaimedWorkspace(active_workspaces[0 .. workspace_count + 1]) orelse return;
-        }
-
-        active_workspaces[workspace_id] = true;
-        topology.addDisplay(.{
-            .display_id = display.display_id,
-            .active_workspace_id = workspace_id,
-        });
-        const space = catalog.findLogicalWorkspace(workspace_id) orelse return;
-        std.debug.assert(catalog.setDisplay(space.key, display.display_id));
-    }
-    topology.focused_display_id = observation.focused_display_id;
-
-    for (catalog.spaces[0..catalog.space_count]) |space| {
-        if (active_workspaces[space.workspace_id]) continue;
-        const home_uuid = observation.workspace_home_uuids[space.workspace_id - 1];
-        const display_id = observedDisplayIdForUuid(&observation, home_uuid) orelse observation.primary_display_id;
-        std.debug.assert(catalog.setDisplay(space.key, display_id));
-    }
-
-    transition.model.spaces = catalog;
-    transition.model.workspace_topology = topology;
-    transition.model.pending_workspace_parks.count = 0;
-    pruneWindowCandidates(&transition.model.pending_role_windows, &catalog);
-    pruneWindowCandidates(&transition.model.deferred_window_candidates, &catalog);
-    refreshWorkspaceTransition(transition);
-    refreshPendingNativeWindowMoves(&transition.model);
-    refreshWorkspaceFocus(&transition.model);
-    for (observation.displays[0..observation.display_count]) |display| {
-        const uuid = display.uuid orelse continue;
-        const workspace_id = topology.activeWorkspace(display.display_id).?;
-        transition.model.display_memory.remember(.{
-            .uuid = uuid,
-            .active_workspace_id = workspace_id,
-        });
-    }
-    transition.addEffect(.virtual_displays_reconciled);
-}
-
-pub fn firstUnclaimedWorkspace(claimed: []const bool) ?WorkspaceId {
-    var workspace_id: WorkspaceId = 1;
-    while (workspace_id < claimed.len) : (workspace_id += 1) {
-        if (!claimed[workspace_id]) return workspace_id;
-    }
-    return null;
-}
-
-pub fn displayObservationContains(observation: *const VirtualDisplayObservation, display_id: DisplayId) bool {
-    for (observation.displays[0..observation.display_count]) |display| {
-        if (display.display_id == display_id) return true;
-    }
-    return false;
-}
-
-pub fn observedDisplayIdForUuid(observation: *const VirtualDisplayObservation, uuid: ?[16]u8) ?DisplayId {
-    const expected = uuid orelse return null;
-    for (observation.displays[0..observation.display_count]) |display| {
-        const actual = display.uuid orelse continue;
-        if (std.mem.eql(u8, &actual, &expected)) return display.display_id;
-    }
-    return null;
+    reduceSwitchRequest(transition, .{
+        .target = target,
+        .at_ms = request.at_ms,
+    });
 }
 
 pub fn reduceSwitchRequest(
@@ -289,10 +82,6 @@ pub fn reduceSwitchRequest(
         return;
     };
     if (target.display_id != event.target.display_id or target.workspace_id != event.target.workspace_id) {
-        transition.addEffect(.{ .native_switch_rejected = event.target });
-        return;
-    }
-    if (nativeSpaceId(target) == null) {
         transition.addEffect(.{ .native_switch_rejected = event.target });
         return;
     }
@@ -349,7 +138,7 @@ pub fn reduceTopologyObserved(
 
     const display = event.topology.findDisplay(pending.request.target.display_id);
     const actual_space_id = if (display) |value| value.observed_space_id else null;
-    if (actual_space_id == nativeSpaceId(pending.request.target)) {
+    if (actual_space_id == pending.request.target.key.id) {
         finishSwitch(transition, pending, event.at_ms, null);
         return;
     }
@@ -361,7 +150,7 @@ pub fn reduceTopologyObserved(
 
     finishSwitch(transition, pending, event.at_ms, .{
         .reason = .unexpected_space,
-        .actual = if (actual_space_id) |space_id| transition.model.space(.{ .native = space_id }) else null,
+        .actual = if (actual_space_id) |space_id| transition.model.space(.{ .id = space_id }) else null,
     });
 }
 
@@ -372,7 +161,7 @@ pub fn syncNativeWorkspaceTopology(transition: *Transition) void {
     for (transition.model.native_topology.displays[0..transition.model.native_topology.display_count]) |display| {
         for (display.spaces[0..display.space_count]) |space| {
             catalog.add(.{
-                .key = .{ .native = space.id },
+                .key = .{ .id = space.id },
                 .workspace_id = space.workspace_id,
                 .display_id = display.display_id,
             });
@@ -422,7 +211,7 @@ pub fn reduceSwitchEffectFailed(
     const actual_space_id = if (display) |value| value.observed_space_id else null;
     finishSwitch(transition, pending, event.at_ms, .{
         .reason = .effect_failed,
-        .actual = if (actual_space_id) |space_id| transition.model.space(.{ .native = space_id }) else null,
+        .actual = if (actual_space_id) |space_id| transition.model.space(.{ .id = space_id }) else null,
     });
 }
 
@@ -479,7 +268,7 @@ pub fn reduceNativeWindowMoveTracked(
         transition.addEffect(.{ .native_window_move_rejected = request });
         return;
     };
-    if (nativeSpaceId(source) == null or nativeSpaceId(target) == null or source.key.eql(target.key)) {
+    if (source.key.eql(target.key)) {
         transition.addEffect(.{ .native_window_move_rejected = request });
         return;
     }
@@ -588,8 +377,6 @@ pub fn reduceNativeWorkspaceMoveRequest(
         transition.model.pending_switch != null or
         transition.model.pending_native_window_moves.count != 0 or
         transition.model.workspace_transition != null or
-        nativeSpaceId(source) == null or
-        nativeSpaceId(target) == null or
         source.key.eql(target.key) or
         source.display_id == target.display_id;
     if (is_invalid) {
@@ -767,71 +554,6 @@ pub fn reducePendingFocusRequest(transition: *Transition) void {
     transition.addEffect(.{ .apply_pending_focus = pending });
 }
 
-pub fn reduceWorkspaceRevealObserved(
-    transition: *Transition,
-    observation: @FieldType(Event, "workspace_reveal_observed"),
-) void {
-    const outgoing = transition.model.space(observation.outgoing.key) orelse return;
-    const target = transition.model.space(observation.target.key) orelse return;
-    if (outgoing.key.eql(target.key) or outgoing.display_id != target.display_id) return;
-
-    const prior = transition.model.pending_workspace_parks.remove(target.display_id);
-    if (observation.is_revealed) {
-        transition.addEffect(.{ .park_workspace = .{ .outgoing = outgoing, .target = target } });
-        if (prior) |pending| {
-            if (!pending.outgoing.key.eql(outgoing.key) and
-                !pending.outgoing.key.eql(target.key))
-            {
-                const prior_outgoing = transition.model.space(pending.outgoing.key) orelse return;
-                transition.addEffect(.{ .park_workspace = .{ .outgoing = prior_outgoing, .target = target } });
-            }
-        }
-        return;
-    }
-
-    var cover = outgoing;
-    if (prior) |pending| {
-        if (!pending.outgoing.key.eql(target.key) and
-            !pending.outgoing.key.eql(outgoing.key))
-        {
-            transition.addEffect(.{ .park_workspace = .{ .outgoing = outgoing, .target = target } });
-            cover = transition.model.space(pending.outgoing.key) orelse outgoing;
-        }
-    }
-    if (!transition.model.pending_workspace_parks.put(.{
-        .outgoing = cover,
-        .target = target,
-        .deadline_at_ms = observation.deadline_at_ms,
-    })) @panic("pending workspace park capacity exceeded");
-}
-
-pub fn reduceWorkspaceParkTimer(
-    transition: *Transition,
-    timer: @FieldType(Event, "workspace_park_timer_fired"),
-) void {
-    const pending = transition.model.pending_workspace_parks.get(timer.display_id) orelse return;
-    const active_workspace_id = transition.model.activeWorkspace(timer.display_id) orelse return;
-    const active = transition.model.spaceForWorkspace(timer.display_id, active_workspace_id) orelse return;
-    if (!active.key.eql(pending.target.key)) {
-        _ = transition.model.pending_workspace_parks.remove(timer.display_id);
-        if (!pending.outgoing.key.eql(active.key)) {
-            const outgoing = transition.model.space(pending.outgoing.key) orelse return;
-            transition.addEffect(.{ .park_workspace = .{ .outgoing = outgoing, .target = active } });
-        }
-        return;
-    }
-    if (!timer.is_revealed and timer.at_ms < pending.deadline_at_ms) return;
-
-    _ = transition.model.pending_workspace_parks.remove(timer.display_id);
-    const outgoing = transition.model.space(pending.outgoing.key) orelse return;
-    const target = transition.model.space(pending.target.key) orelse return;
-    transition.addEffect(.{ .park_workspace = .{
-        .outgoing = outgoing,
-        .target = target,
-        .did_time_out = !timer.is_revealed,
-    } });
-}
-
 pub fn reduceDisplayResettleTimer(transition: *Transition, at_ms: TimestampMs) void {
     const due_at_ms = transition.model.display_resettle_due_at_ms orelse return;
     if (at_ms < due_at_ms) return;
@@ -867,21 +589,6 @@ pub fn pruneWindowCandidates(candidates: *WindowCandidates, spaces: *const Space
             continue;
         }
         _ = candidates.remove(candidates.entries[index].window_id);
-    }
-}
-
-pub fn refreshPendingWorkspaceParks(parks: *PendingWorkspaceParks, spaces: *const SpaceCatalog) void {
-    var index: usize = 0;
-    while (index < parks.count) {
-        const outgoing = spaces.find(parks.entries[index].outgoing.key);
-        const target = spaces.find(parks.entries[index].target.key);
-        if (outgoing == null or target == null or outgoing.?.display_id != target.?.display_id) {
-            _ = parks.remove(parks.entries[index].target.display_id);
-            continue;
-        }
-        parks.entries[index].outgoing = outgoing.?;
-        parks.entries[index].target = target.?;
-        index += 1;
     }
 }
 
@@ -992,7 +699,7 @@ pub fn startSwitch(
         transition.addEffect(.{ .native_switch_rejected = target });
         return;
     };
-    if (display.observed_space_id == nativeSpaceId(target).?) {
+    if (display.observed_space_id == target.key.id) {
         if (should_focus_if_observed) {
             transition.model.workspace_topology.focused_display_id = target.display_id;
             transition.addEffect(.{ .workspace_switch_ready = .{ .target = target } });
@@ -1133,13 +840,6 @@ pub fn takeEpoch(model: *Model) Epoch {
 
 pub fn sameRequest(left: SwitchRequest, right: SwitchRequest) bool {
     return left.target.key.eql(right.target.key);
-}
-
-pub fn nativeSpaceId(space: SpaceRef) ?NativeSpaceId {
-    return switch (space.key) {
-        .native => |space_id| space_id,
-        .virtual => null,
-    };
 }
 
 pub fn refreshWorkspaceFocus(model: *Model) void {

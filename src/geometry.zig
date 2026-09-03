@@ -25,12 +25,10 @@ pub const default_resample_delay_ns: i128 = 75 * std.time.ns_per_ms;
 
 pub const IntentSource = enum {
     layout,
-    workspace_park,
     floating_restore,
     user_command,
     animation,
     tab_sync,
-    exit_restore,
 };
 
 pub const Position = struct {
@@ -614,11 +612,11 @@ test "seeding physical state does not arm reconciliation" {
 test "position intent matches without requiring a known size" {
     var coordinator = Self.initWithSettleInterval(100);
 
-    _ = try coordinator.recordPositionAccepted(10, 1507, 977, .workspace_park, 1_000);
-    const parked: Frame = .{ .x = 1507, .y = 977, .width = 750, .height = 941 };
+    _ = try coordinator.recordPositionAccepted(10, 1507, 977, .layout, 1_000);
+    const observed: Frame = .{ .x = 1507, .y = 977, .width = 750, .height = 941 };
     try testing.expectEqual(
         ObservationOwner.manager,
-        try coordinator.observe(10, parked, 1_500, null),
+        try coordinator.observe(10, observed, 1_500, null),
     );
 }
 

@@ -187,8 +187,6 @@ pub fn reduceWindowMoveRequest(transition: *Transition, request: WindowMoveReque
     const action = resolveActionWindow(&transition.model, request.window_id) orelse return;
     const target = transition.model.space(request.target.key) orelse return;
     if (action.space.key.eql(target.key)) return;
-    if (request.should_move_native and (action.space.key != .native or target.key != .native)) return;
-
     window_reducer.reduceWindowSpaceAssigned(transition, .{
         .window_id = action.leader.window_id,
         .space_key = target.key,
@@ -218,11 +216,8 @@ pub fn reduceWindowMoveRequest(transition: *Transition, request: WindowMoveReque
     const active = transition.model.window(active_window_id) orelse return;
     transition.addEffect(.{ .window_moved = .{
         .window_id = active.window_id,
-        .process_id = active.process_id,
         .source = action.space,
         .target = target,
-        .should_hide = !request.should_move_native and
-            transition.model.activeWorkspace(target.display_id) != target.workspace_id,
         .should_follow_focus = request.should_follow_focus,
     } });
 }

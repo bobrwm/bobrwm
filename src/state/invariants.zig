@@ -5,19 +5,11 @@ const model_mod = @import("model.zig");
 const window_mod = @import("../window.zig");
 
 const Model = model_mod.Model;
-const NativeSpaceId = model_mod.NativeSpaceId;
 const ProcessRetries = model_mod.ProcessRetries;
 const SpaceRef = model_mod.SpaceRef;
 const WindowCandidate = model_mod.WindowCandidate;
 const WindowCandidates = model_mod.WindowCandidates;
 const WorkspaceId = model_mod.WorkspaceId;
-
-fn nativeSpaceId(space: SpaceRef) ?NativeSpaceId {
-    return switch (space.key) {
-        .native => |space_id| space_id,
-        .virtual => null,
-    };
-}
 
 fn windowCandidateIsValid(model: *const Model, candidate: WindowCandidate) bool {
     return candidate.process_id > 0 and
@@ -111,20 +103,32 @@ pub fn assertModel(model: *const Model) void {
             }
         }
     }
+    if (model.native_topology.display_count > 0) {
+        var physical_space_count: u8 = 0;
+        for (model.native_topology.displays[0..model.native_topology.display_count]) |display| {
+            for (display.spaces[0..display.space_count]) |space| {
+                const space_ref = model.space(.{ .id = space.id }).?;
+                std.debug.assert(space_ref.workspace_id == space.workspace_id);
+                std.debug.assert(space_ref.display_id == display.display_id);
+                physical_space_count += 1;
+            }
+        }
+        std.debug.assert(model.spaces.space_count == physical_space_count);
+    }
     if (model.pending_switch) |pending| {
         std.debug.assert(pending.epoch != 0);
         pending.request.target.assertValid();
-        std.debug.assert(nativeSpaceId(pending.request.target) != null);
+        std.debug.assert(pending.request.target.key.id != 0);
         if (model.observation_timer) |timer| std.debug.assert(timer.epoch == pending.epoch);
     }
     if (model.queued_switch) |queued| {
         queued.target.assertValid();
-        std.debug.assert(nativeSpaceId(queued.target) != null);
+        std.debug.assert(queued.target.key.id != 0);
     }
     if (model.pending_native_workspace_move) |pending| {
         std.debug.assert(pending.epoch != 0);
-        std.debug.assert(nativeSpaceId(pending.source) != null);
-        std.debug.assert(nativeSpaceId(pending.target) != null);
+        std.debug.assert(pending.source.key.id != 0);
+        std.debug.assert(pending.target.key.id != 0);
         std.debug.assert(!pending.source.key.eql(pending.target.key));
         std.debug.assert(pending.source.display_id != pending.target.display_id);
         std.debug.assert(model.workspace_transition != null);
@@ -143,8 +147,8 @@ pub fn assertModel(model: *const Model) void {
         std.debug.assert(pending.window_id != 0);
         std.debug.assert(pending.epoch != 0);
         std.debug.assert(pending.attempts_remaining > 0);
-        std.debug.assert(nativeSpaceId(pending.source) != null);
-        std.debug.assert(nativeSpaceId(pending.target) != null);
+        std.debug.assert(pending.source.key.id != 0);
+        std.debug.assert(pending.target.key.id != 0);
         std.debug.assert(!pending.source.key.eql(pending.target.key));
         std.debug.assert(model.space(pending.source.key) != null);
         std.debug.assert(model.space(pending.target.key) != null);
@@ -175,18 +179,6 @@ pub fn assertModel(model: *const Model) void {
     assertWindowCandidates(model, &model.deferred_window_candidates);
     assertProcessRetries(&model.app_launch_retries);
     assertProcessRetries(&model.focus_retries);
-    std.debug.assert(model.pending_workspace_parks.count <= model.pending_workspace_parks.entries.len);
-    for (model.pending_workspace_parks.items(), 0..) |pending, index| {
-        pending.outgoing.assertValid();
-        pending.target.assertValid();
-        std.debug.assert(!pending.outgoing.key.eql(pending.target.key));
-        std.debug.assert(pending.outgoing.display_id == pending.target.display_id);
-        std.debug.assert(model.space(pending.outgoing.key).?.display_id == pending.outgoing.display_id);
-        std.debug.assert(model.space(pending.target.key).?.display_id == pending.target.display_id);
-        for (model.pending_workspace_parks.items()[0..index]) |prior| {
-            std.debug.assert(prior.target.display_id != pending.target.display_id);
-        }
-    }
     if (!model.pointer_drag.is_down) {
         std.debug.assert(model.pointer_drag.candidate_window_id == null);
         std.debug.assert(model.pointer_drag.active_window_id == null);
@@ -210,13 +202,6 @@ pub fn assertModel(model: *const Model) void {
         std.debug.assert(model.drag_preview.source_window_id != null);
     }
     if (model.drag_preview.is_visible) std.debug.assert(model.drag_preview.target_window_id != null);
-    std.debug.assert(model.display_memory.count <= model.display_memory.entries.len);
-    for (model.display_memory.entries[0..model.display_memory.count], 0..) |entry, index| {
-        std.debug.assert(entry.active_workspace_id != 0);
-        for (model.display_memory.entries[0..index]) |prior| {
-            std.debug.assert(!std.mem.eql(u8, &prior.uuid, &entry.uuid));
-        }
-    }
     std.debug.assert(model.retile_request.display_count <= model.retile_request.display_ids.len);
     if (model.retile_request.all_displays) std.debug.assert(model.retile_request.display_count == 0);
     for (model.retile_request.display_ids[0..model.retile_request.display_count], 0..) |display_id, index| {

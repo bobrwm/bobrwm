@@ -89,15 +89,6 @@ pub const SpaceCatalog = struct {
         }
         return null;
     }
-
-    pub fn setDisplay(self: *SpaceCatalog, key: SpaceKey, display_id: DisplayId) bool {
-        for (self.spaces[0..self.space_count]) |*space| {
-            if (!space.key.eql(key)) continue;
-            space.display_id = display_id;
-            return true;
-        }
-        return false;
-    }
 };
 
 pub const Space = struct {
@@ -188,7 +179,7 @@ pub const NativeTopology = struct {
         for (self.displays[0..self.display_count]) |display| {
             const space_id = display.spaceForWorkspace(workspace_id) orelse continue;
             return .{
-                .key = .{ .native = space_id },
+                .key = .{ .id = space_id },
                 .workspace_id = workspace_id,
                 .display_id = display.display_id,
             };
@@ -197,20 +188,12 @@ pub const NativeTopology = struct {
     }
 
     pub fn swapWorkspacePlacements(self: *NativeTopology, source_key: SpaceKey, target_key: SpaceKey) bool {
-        const source_id = switch (source_key) {
-            .native => |space_id| space_id,
-            .virtual => return false,
-        };
-        const target_id = switch (target_key) {
-            .native => |space_id| space_id,
-            .virtual => return false,
-        };
         var source: ?*Space = null;
         var target: ?*Space = null;
         for (self.displays[0..self.display_count]) |*display| {
             for (display.spaces[0..display.space_count]) |*space| {
-                if (space.id == source_id) source = space;
-                if (space.id == target_id) target = space;
+                if (space.id == source_key.id) source = space;
+                if (space.id == target_key.id) target = space;
             }
         }
         if (source == null or target == null) return false;
@@ -261,12 +244,15 @@ pub fn mapNativeTopology(
     workspace_topology: *const WorkspaceTopology,
     catalog: *const SpaceCatalog,
     workspace_count: u8,
+    primary_display_id: DisplayId,
 ) ?NativeTopology {
     if (workspace_count == 0 or observation.display_count > workspace_count) return null;
+    if (!observationContainsDisplay(&observation, primary_display_id)) return null;
     if (preserveStableNativeTopology(&observation, previous, workspace_count)) |topology| return topology;
 
     var assignments: [max_displays][max_spaces_per_display]WorkspaceId = @splat(@splat(0));
     var claimed: [max_spaces_per_display + 1]bool = @splat(false);
+    const is_initial = previous.display_count == 0 and catalog.space_count == 0;
 
     for (observation.displays[0..observation.display_count], 0..) |display, display_index| {
         const observed_index = std.mem.indexOfScalar(
@@ -275,7 +261,11 @@ pub fn mapNativeTopology(
             display.observed_space_id,
         ) orelse return null;
         var workspace_id = workspaceForNativeSpace(previous, display.observed_space_id) orelse
-            workspace_topology.activeWorkspace(display.display_id) orelse 0;
+            workspace_topology.activeWorkspace(display.display_id) orelse
+            if (is_initial)
+                initialWorkspaceForDisplay(&observation, display.display_id, primary_display_id, workspace_count) orelse 0
+            else
+                0;
         if (workspace_id == 0 or workspace_id > workspace_count or claimed[workspace_id]) {
             workspace_id = firstUnclaimedWorkspaceId(&claimed, workspace_count) orelse return null;
         }
@@ -296,12 +286,21 @@ pub fn mapNativeTopology(
     for (observation.displays[0..observation.display_count], 0..) |display, display_index| {
         for (assignments[display_index][0..display.space_count]) |*workspace_id| {
             if (workspace_id.* != 0) continue;
-            workspace_id.* = firstUnclaimedWorkspaceOnDisplayId(
-                &claimed,
-                workspace_count,
-                catalog,
-                display.display_id,
-            ) orelse continue;
+            workspace_id.* = if (is_initial)
+                firstUnclaimedWorkspaceOnInitialDisplay(
+                    &claimed,
+                    workspace_count,
+                    &observation,
+                    display.display_id,
+                    primary_display_id,
+                ) orelse continue
+            else
+                firstUnclaimedWorkspaceOnDisplayId(
+                    &claimed,
+                    workspace_count,
+                    catalog,
+                    display.display_id,
+                ) orelse continue;
             claimed[workspace_id.*] = true;
         }
     }
@@ -325,6 +324,56 @@ pub fn mapNativeTopology(
         topology.addDisplay(mapped);
     }
     return topology;
+}
+
+fn observationContainsDisplay(observation: *const NativeTopologyObservation, display_id: DisplayId) bool {
+    for (observation.displays[0..observation.display_count]) |display| {
+        if (display.display_id == display_id) return true;
+    }
+    return false;
+}
+
+fn initialWorkspaceForDisplay(
+    observation: *const NativeTopologyObservation,
+    display_id: DisplayId,
+    primary_display_id: DisplayId,
+    workspace_count: WorkspaceId,
+) ?WorkspaceId {
+    if (display_id == primary_display_id) return 1;
+
+    var external_index: WorkspaceId = 0;
+    for (observation.displays[0..observation.display_count]) |display| {
+        if (display.display_id == primary_display_id) continue;
+        if (display.display_id == display_id) return workspace_count - external_index;
+        external_index += 1;
+    }
+    return null;
+}
+
+fn firstUnclaimedWorkspaceOnInitialDisplay(
+    claimed: *const [max_spaces_per_display + 1]bool,
+    workspace_count: WorkspaceId,
+    observation: *const NativeTopologyObservation,
+    display_id: DisplayId,
+    primary_display_id: DisplayId,
+) ?WorkspaceId {
+    var workspace_id: WorkspaceId = 1;
+    while (workspace_id <= workspace_count) : (workspace_id += 1) {
+        if (claimed[workspace_id]) continue;
+        for (observation.displays[0..observation.display_count]) |display| {
+            const active_workspace_id = initialWorkspaceForDisplay(
+                observation,
+                display.display_id,
+                primary_display_id,
+                workspace_count,
+            ) orelse continue;
+            if (active_workspace_id != workspace_id) continue;
+            if (display.display_id == display_id) return workspace_id;
+            break;
+        }
+        if (display_id == primary_display_id) return workspace_id;
+    }
+    return null;
 }
 
 fn preserveStableNativeTopology(

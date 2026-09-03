@@ -18,7 +18,6 @@ pub const max_managed_windows = model_mod.max_managed_windows;
 pub const max_pending_focus_entries = model_mod.max_pending_focus_entries;
 pub const max_pending_window_candidates = model_mod.max_pending_window_candidates;
 pub const max_process_retries = model_mod.max_process_retries;
-pub const max_display_memory_entries = model_mod.max_display_memory_entries;
 pub const max_cleanup_processes = model_mod.max_cleanup_processes;
 pub const max_spaces_per_display = model_mod.max_spaces_per_display;
 pub const max_workspace_focus_history = model_mod.max_workspace_focus_history;
@@ -72,9 +71,7 @@ pub const NativeWorkspaceMoveObservation = model_mod.NativeWorkspaceMoveObservat
 pub const NativeWindowMoveRequest = model_mod.NativeWindowMoveRequest;
 pub const NativeWindowMoveObservation = model_mod.NativeWindowMoveObservation;
 pub const DeferredWindowExpiryReason = model_mod.DeferredWindowExpiryReason;
-pub const WorkspaceParkEffect = model_mod.WorkspaceParkEffect;
 pub const WorkspaceSwitchEffect = model_mod.WorkspaceSwitchEffect;
-pub const VirtualWorkspaceMoveEffect = model_mod.VirtualWorkspaceMoveEffect;
 pub const FocusWindowEffect = model_mod.FocusWindowEffect;
 pub const WindowSwapEffect = model_mod.WindowSwapEffect;
 pub const WindowModeEffect = model_mod.WindowModeEffect;
@@ -89,16 +86,9 @@ pub const WindowCandidate = model_mod.WindowCandidate;
 pub const WindowCandidates = model_mod.WindowCandidates;
 pub const ProcessRetry = model_mod.ProcessRetry;
 pub const ProcessRetries = model_mod.ProcessRetries;
-pub const PendingWorkspacePark = model_mod.PendingWorkspacePark;
-pub const PendingWorkspaceParks = model_mod.PendingWorkspaceParks;
 pub const PointerDragState = model_mod.PointerDragState;
 pub const DragPreviewState = model_mod.DragPreviewState;
 pub const PointerDragCompletion = model_mod.PointerDragCompletion;
-pub const DisplayMemoryEntry = model_mod.DisplayMemoryEntry;
-pub const DisplayIdentity = model_mod.DisplayIdentity;
-pub const WorkspaceInitialization = model_mod.WorkspaceInitialization;
-pub const VirtualDisplayObservation = model_mod.VirtualDisplayObservation;
-pub const DisplayMemory = model_mod.DisplayMemory;
 pub const RetileRequest = model_mod.RetileRequest;
 pub const CleanupRequest = model_mod.CleanupRequest;
 pub const LayoutSpaceFrame = model_mod.LayoutSpaceFrame;
@@ -122,12 +112,10 @@ pub fn reduce(model: Model, event: Event) Transition {
     var should_refresh_workspace_focus = false;
 
     switch (event) {
-        .initialize_workspaces => |initialization| workspace_reducer.reduceWorkspaceInitialization(&transition, initialization),
         .replace_space_catalog => |catalog| {
             transition.model.spaces = catalog;
             workspace_reducer.pruneWindowCandidates(&transition.model.pending_role_windows, &catalog);
             workspace_reducer.pruneWindowCandidates(&transition.model.deferred_window_candidates, &catalog);
-            workspace_reducer.refreshPendingWorkspaceParks(&transition.model.pending_workspace_parks, &catalog);
             workspace_reducer.refreshWorkspaceTransition(&transition);
             workspace_reducer.refreshPendingNativeWindowMoves(&transition.model);
             should_refresh_workspace_focus = true;
@@ -174,7 +162,6 @@ pub fn reduce(model: Model, event: Event) Transition {
             transition.model.observation_timer = null;
             transition.model.pending_native_window_moves.count = 0;
             transition.model.pending_native_workspace_move = null;
-            transition.model.pending_workspace_parks.count = 0;
             if (workspace_transition) |current| {
                 workspace_reducer.finalizeWorkspaceTransition(&transition, current, .topology_reinitialized);
             } else {
@@ -190,7 +177,6 @@ pub fn reduce(model: Model, event: Event) Transition {
             should_refresh_workspace_focus = true;
         },
         .request_workspace_switch => |request| workspace_reducer.reduceWorkspaceSwitchRequest(&transition, request),
-        .request_virtual_workspace_move => |request| workspace_reducer.reduceVirtualWorkspaceMoveRequest(&transition, request),
         .request_native_switch => |request| workspace_reducer.reduceSwitchRequest(&transition, request),
         .native_space_changed => |at_ms| workspace_reducer.reduceSpaceChanged(&transition, at_ms),
         .observation_timer_fired => |timer| workspace_reducer.reduceObservationTimer(&transition, timer),
@@ -244,9 +230,6 @@ pub fn reduce(model: Model, event: Event) Transition {
             _ = transition.model.focus_retries.remove(process_id);
         },
         .focus_retry_observed => |observation| discovery_reducer.reduceFocusRetryObserved(&transition, observation),
-        .workspace_reveal_observed => |observation| workspace_reducer.reduceWorkspaceRevealObserved(&transition, observation),
-        .workspace_park_timer_fired => |timer| workspace_reducer.reduceWorkspaceParkTimer(&transition, timer),
-        .clear_workspace_parks => transition.model.pending_workspace_parks.count = 0,
         .display_changed => |change| {
             transition.model.display_resettle_due_at_ms = change.resettle_at_ms;
             const is_debounced = if (transition.model.last_display_change_at_ms) |previous|
@@ -286,10 +269,6 @@ pub fn reduce(model: Model, event: Event) Transition {
         .drag_preview_observed => |observation| pointer_reducer.reduceDragPreviewObserved(&transition, observation),
         .clear_drag_preview => pointer_reducer.clearDragPreview(&transition),
         .pointer_up => pointer_reducer.reducePointerUp(&transition),
-        .remember_display_workspace => |entry| {
-            if (entry.active_workspace_id != 0) transition.model.display_memory.remember(entry);
-        },
-        .virtual_displays_observed => |observation| workspace_reducer.reduceVirtualDisplaysObserved(&transition, observation),
         .request_retile_all_displays => {
             transition.model.retile_request.all_displays = true;
             transition.model.retile_request.display_count = 0;
@@ -431,9 +410,9 @@ fn testLayoutInsertion(kind: tiling_mod.LayoutKind) LayoutInsertion {
 test "workspace summaries preserve globally unique active workspaces" {
     const testing = std.testing;
     var catalog: SpaceCatalog = .{};
-    catalog.add(.{ .key = .{ .native = 101 }, .workspace_id = 1, .display_id = 11 });
-    catalog.add(.{ .key = .{ .native = 201 }, .workspace_id = 2, .display_id = 22 });
-    catalog.add(.{ .key = .{ .native = 102 }, .workspace_id = 3, .display_id = 11 });
+    catalog.add(.{ .key = .{ .id = 101 }, .workspace_id = 1, .display_id = 11 });
+    catalog.add(.{ .key = .{ .id = 201 }, .workspace_id = 2, .display_id = 22 });
+    catalog.add(.{ .key = .{ .id = 102 }, .workspace_id = 3, .display_id = 11 });
 
     var topology: WorkspaceTopology = .{};
     topology.addDisplay(.{ .display_id = 11, .active_workspace_id = 1 });
@@ -447,12 +426,12 @@ test "workspace summaries preserve globally unique active workspaces" {
     model = reduce(model, .{ .adopt_window = .{
         .window_id = 101,
         .process_id = 1001,
-        .space_key = .{ .native = 101 },
+        .space_key = .{ .id = 101 },
     } }).model;
     model = reduce(model, .{ .adopt_window = .{
         .window_id = 201,
         .process_id = 2001,
-        .space_key = .{ .native = 201 },
+        .space_key = .{ .id = 201 },
     } }).model;
     const summaries = model.workspaceSummaries(3);
 
@@ -464,37 +443,17 @@ test "workspace summaries preserve globally unique active workspaces" {
     try testing.expect(summaries[1].is_focused);
 }
 
-test "workspace initialization assigns one global workspace per display" {
-    const testing = std.testing;
-    var initialization: WorkspaceInitialization = .{
-        .workspace_count = 7,
-        .primary_display_id = 11,
-    };
-    try testing.expect(initialization.addDisplay(22));
-    try testing.expect(initialization.addDisplay(11));
-    try testing.expect(initialization.addDisplay(33));
-
-    const transition = reduce(.{}, .{ .initialize_workspaces = initialization });
-    try testing.expectEqual(@as(?WorkspaceId, 1), transition.model.activeWorkspace(11));
-    try testing.expectEqual(@as(?WorkspaceId, 7), transition.model.activeWorkspace(22));
-    try testing.expectEqual(@as(?WorkspaceId, 6), transition.model.activeWorkspace(33));
-    try testing.expectEqual(@as(?DisplayId, 11), transition.model.focusedDisplay());
-    try testing.expectEqual(@as(DisplayId, 11), transition.model.logicalWorkspace(2).?.display_id);
-    try testing.expectEqual(@as(DisplayId, 33), transition.model.logicalWorkspace(6).?.display_id);
-    try testing.expectEqual(@as(DisplayId, 22), transition.model.logicalWorkspace(7).?.display_id);
-}
-
 test "window catalog owns identity and Space membership" {
     const testing = std.testing;
     var catalog: SpaceCatalog = .{};
-    catalog.add(.{ .key = .{ .virtual = 1 }, .workspace_id = 1, .display_id = 11 });
-    catalog.add(.{ .key = .{ .virtual = 2 }, .workspace_id = 2, .display_id = 11 });
+    catalog.add(.{ .key = .{ .id = 1 }, .workspace_id = 1, .display_id = 11 });
+    catalog.add(.{ .key = .{ .id = 2 }, .workspace_id = 2, .display_id = 11 });
     const model: Model = .{ .spaces = catalog };
 
     const first = reduce(model, .{ .adopt_window = .{
         .window_id = 101,
         .process_id = 1001,
-        .space_key = .{ .virtual = 1 },
+        .space_key = .{ .id = 1 },
         .frame = .{ .x = 10, .y = 20, .width = 800, .height = 600 },
         .mode = .floating,
         .float_frame = .{ .x = 10, .y = 20, .width = 800, .height = 600 },
@@ -502,11 +461,11 @@ test "window catalog owns identity and Space membership" {
     const second = reduce(first.model, .{ .adopt_window = .{
         .window_id = 102,
         .process_id = 1002,
-        .space_key = .{ .virtual = 1 },
+        .space_key = .{ .id = 1 },
     } });
 
     try testing.expect(model.window(101) == null);
-    try testing.expectEqual(@as(u16, 2), second.model.windows.countInSpace(.{ .virtual = 1 }));
+    try testing.expectEqual(@as(u16, 2), second.model.windows.countInSpace(.{ .id = 1 }));
     try testing.expectEqual(@as(i32, 1001), second.model.window(101).?.process_id);
     const initial_snapshot = second.model.windowSnapshot(101).?;
     try testing.expectEqual(window_mod.WindowMode.floating, initial_snapshot.mode);
@@ -525,11 +484,11 @@ test "window catalog owns identity and Space membership" {
 
     const assigned = reduce(updated.model, .{ .assign_window_space = .{
         .window_id = 101,
-        .space_key = .{ .virtual = 2 },
+        .space_key = .{ .id = 2 },
     } });
-    try testing.expectEqual(@as(u16, 1), assigned.model.windows.countInSpace(.{ .virtual = 1 }));
-    try testing.expectEqual(@as(u16, 1), assigned.model.windows.countInSpace(.{ .virtual = 2 }));
-    try testing.expect(assigned.model.window(101).?.space_key.eql(.{ .virtual = 2 }));
+    try testing.expectEqual(@as(u16, 1), assigned.model.windows.countInSpace(.{ .id = 1 }));
+    try testing.expectEqual(@as(u16, 1), assigned.model.windows.countInSpace(.{ .id = 2 }));
+    try testing.expect(assigned.model.window(101).?.space_key.eql(.{ .id = 2 }));
 
     const replaced = reduce(assigned.model, .{ .replace_window_id = .{
         .old_window_id = 102,
@@ -548,8 +507,8 @@ test "window catalog owns identity and Space membership" {
 
 test "window lifecycle transitions update catalog geometry focus and layout atomically" {
     const testing = std.testing;
-    const first_space: SpaceKey = .{ .virtual = 1 };
-    const second_space: SpaceKey = .{ .virtual = 2 };
+    const first_space: SpaceKey = .{ .id = 1 };
+    const second_space: SpaceKey = .{ .id = 2 };
     var catalog: SpaceCatalog = .{};
     catalog.add(.{ .key = first_space, .workspace_id = 1, .display_id = 11 });
     catalog.add(.{ .key = second_space, .workspace_id = 2, .display_id = 11 });
@@ -619,7 +578,7 @@ test "window lifecycle transitions update catalog geometry focus and layout atom
 
 test "layout rebuild replaces every Space atomically" {
     const testing = std.testing;
-    const space_key: SpaceKey = .{ .virtual = 1 };
+    const space_key: SpaceKey = .{ .id = 1 };
     var catalog: SpaceCatalog = .{};
     catalog.add(.{ .key = space_key, .workspace_id = 1, .display_id = 11 });
     var model = reduce(.{}, .{ .replace_space_catalog = catalog }).model;
@@ -652,7 +611,7 @@ test "layout rebuild replaces every Space atomically" {
     try testing.expect(transition.model.layout.contains(space_key, 101));
     try testing.expect(transition.model.layout.contains(space_key, 102));
 
-    try testing.expect(rebuild.addSpace(.{ .virtual = 2 }, null));
+    try testing.expect(rebuild.addSpace(.{ .id = 2 }, null));
     transition = reduce(model, .{ .rebuild_layout = rebuild });
     try testing.expectEqual(tiling_mod.LayoutKind.bsp, transition.model.layout.layoutKind(space_key).?);
     try testing.expect(transition.model.layout.contains(space_key, 101));
@@ -661,7 +620,7 @@ test "layout rebuild replaces every Space atomically" {
 
 test "layout rejection leaves window adoption unchanged" {
     const testing = std.testing;
-    const space_key: SpaceKey = .{ .virtual = 1 };
+    const space_key: SpaceKey = .{ .id = 1 };
     var catalog: SpaceCatalog = .{};
     catalog.add(.{ .key = space_key, .workspace_id = 1, .display_id = 11 });
     var model: Model = .{ .spaces = catalog };
@@ -690,8 +649,8 @@ test "layout rejection leaves window adoption unchanged" {
 
 test "cross-domain validation rejects ownership divergence" {
     const testing = std.testing;
-    const first_space: SpaceKey = .{ .virtual = 1 };
-    const second_space: SpaceKey = .{ .virtual = 2 };
+    const first_space: SpaceKey = .{ .id = 1 };
+    const second_space: SpaceKey = .{ .id = 2 };
     var catalog: SpaceCatalog = .{};
     catalog.add(.{ .key = first_space, .workspace_id = 1, .display_id = 11 });
     catalog.add(.{ .key = second_space, .workspace_id = 2, .display_id = 11 });
@@ -723,7 +682,7 @@ test "cross-domain validation rejects ownership divergence" {
     try testing.expect(!invariants.crossDomainStateIsValid(&invalid));
 
     invalid = model;
-    invalid.windows.entries[0].space_key = .{ .virtual = 99 };
+    invalid.windows.entries[0].space_key = .{ .id = 99 };
     try testing.expect(!invariants.crossDomainStateIsValid(&invalid));
 
     invalid = model;
@@ -751,7 +710,7 @@ test "cross-domain validation rejects ownership divergence" {
 
 test "tab transitions transfer layout ownership atomically" {
     const testing = std.testing;
-    const space_key: SpaceKey = .{ .virtual = 1 };
+    const space_key: SpaceKey = .{ .id = 1 };
     var catalog: SpaceCatalog = .{};
     catalog.add(.{ .key = space_key, .workspace_id = 1, .display_id = 11 });
     var model: Model = .{ .spaces = catalog };
@@ -799,8 +758,8 @@ test "tab transitions transfer layout ownership atomically" {
 
 test "tab grouping reconciles workspace and layout ownership atomically" {
     const testing = std.testing;
-    const first_space: SpaceKey = .{ .virtual = 1 };
-    const second_space: SpaceKey = .{ .virtual = 2 };
+    const first_space: SpaceKey = .{ .id = 1 };
+    const second_space: SpaceKey = .{ .id = 2 };
     var catalog: SpaceCatalog = .{};
     catalog.add(.{ .key = first_space, .workspace_id = 1, .display_id = 11 });
     catalog.add(.{ .key = second_space, .workspace_id = 2, .display_id = 11 });
@@ -836,15 +795,15 @@ test "tab grouping reconciles workspace and layout ownership atomically" {
 test "workspace focus memory follows window lifecycle" {
     const testing = std.testing;
     var catalog: SpaceCatalog = .{};
-    catalog.add(.{ .key = .{ .virtual = 1 }, .workspace_id = 1, .display_id = 11 });
-    catalog.add(.{ .key = .{ .virtual = 2 }, .workspace_id = 2, .display_id = 11 });
+    catalog.add(.{ .key = .{ .id = 1 }, .workspace_id = 1, .display_id = 11 });
+    catalog.add(.{ .key = .{ .id = 2 }, .workspace_id = 2, .display_id = 11 });
     var model: Model = .{ .spaces = catalog };
 
     for ([_]WindowId{ 101, 102 }) |window_id| {
         model = reduce(model, .{ .adopt_window = .{
             .window_id = window_id,
             .process_id = 1001,
-            .space_key = .{ .virtual = 1 },
+            .space_key = .{ .id = 1 },
         } }).model;
         model = reduce(model, .{ .record_workspace_focus = .{
             .workspace_id = 1,
@@ -863,7 +822,7 @@ test "workspace focus memory follows window lifecycle" {
 
     model = reduce(model, .{ .assign_window_space = .{
         .window_id = 201,
-        .space_key = .{ .virtual = 2 },
+        .space_key = .{ .id = 2 },
     } }).model;
     try testing.expectEqual(@as(?WindowId, null), model.focusedWorkspaceWindow(1));
     try testing.expectEqual(@as(?WindowId, null), model.focusedWorkspaceWindow(2));
@@ -878,13 +837,13 @@ test "workspace focus memory follows window lifecycle" {
 test "window catalog rejects invalid lifecycle events" {
     const testing = std.testing;
     var catalog: SpaceCatalog = .{};
-    catalog.add(.{ .key = .{ .virtual = 1 }, .workspace_id = 1, .display_id = 11 });
+    catalog.add(.{ .key = .{ .id = 1 }, .workspace_id = 1, .display_id = 11 });
     const model: Model = .{ .spaces = catalog };
 
     const invalid = reduce(model, .{ .adopt_window = .{
         .window_id = 0,
         .process_id = 1001,
-        .space_key = .{ .virtual = 1 },
+        .space_key = .{ .id = 1 },
     } });
     try testing.expectEqual(@as(u8, 1), invalid.effect_count);
     try testing.expectEqual(
@@ -895,7 +854,7 @@ test "window catalog rejects invalid lifecycle events" {
     const missing_space = reduce(model, .{ .adopt_window = .{
         .window_id = 101,
         .process_id = 1001,
-        .space_key = .{ .virtual = 2 },
+        .space_key = .{ .id = 2 },
     } });
     try testing.expectEqual(
         WindowCatalogRejectionReason.space_missing,
@@ -904,7 +863,7 @@ test "window catalog rejects invalid lifecycle events" {
 
     const missing_window = reduce(model, .{ .assign_window_space = .{
         .window_id = 101,
-        .space_key = .{ .virtual = 1 },
+        .space_key = .{ .id = 1 },
     } });
     try testing.expectEqual(
         WindowCatalogRejectionReason.window_missing,
@@ -914,12 +873,12 @@ test "window catalog rejects invalid lifecycle events" {
     const adopted = reduce(model, .{ .adopt_window = .{
         .window_id = 101,
         .process_id = 1001,
-        .space_key = .{ .virtual = 1 },
+        .space_key = .{ .id = 1 },
     } });
     const duplicate = reduce(adopted.model, .{ .adopt_window = .{
         .window_id = 101,
         .process_id = 1001,
-        .space_key = .{ .virtual = 1 },
+        .space_key = .{ .id = 1 },
     } });
     try testing.expectEqual(
         WindowCatalogRejectionReason.window_exists,
@@ -930,14 +889,14 @@ test "window catalog rejects invalid lifecycle events" {
 test "window catalog owns tab identity and group Space assignment" {
     const testing = std.testing;
     var catalog: SpaceCatalog = .{};
-    catalog.add(.{ .key = .{ .virtual = 1 }, .workspace_id = 1, .display_id = 11 });
-    catalog.add(.{ .key = .{ .virtual = 2 }, .workspace_id = 2, .display_id = 11 });
+    catalog.add(.{ .key = .{ .id = 1 }, .workspace_id = 1, .display_id = 11 });
+    catalog.add(.{ .key = .{ .id = 2 }, .workspace_id = 2, .display_id = 11 });
     var model: Model = .{ .spaces = catalog };
     for ([_]WindowId{ 101, 102, 103 }) |window_id| {
         model = reduce(model, .{ .adopt_window = .{
             .window_id = window_id,
             .process_id = 1001,
-            .space_key = .{ .virtual = 1 },
+            .space_key = .{ .id = 1 },
         } }).model;
     }
 
@@ -957,12 +916,12 @@ test "window catalog owns tab identity and group Space assignment" {
 
     model = reduce(model, .{ .assign_window_space = .{
         .window_id = 103,
-        .space_key = .{ .virtual = 2 },
+        .space_key = .{ .id = 2 },
     } }).model;
-    try testing.expectEqual(@as(u16, 3), model.windows.countInSpace(.{ .virtual = 2 }));
+    try testing.expectEqual(@as(u16, 3), model.windows.countInSpace(.{ .id = 2 }));
 
     var window_ids: [max_managed_windows]WindowId = undefined;
-    const workspace_windows = model.workspaceWindowIds(.{ .virtual = 2 }, &window_ids);
+    const workspace_windows = model.workspaceWindowIds(.{ .id = 2 }, &window_ids);
     try testing.expectEqual(@as(usize, 1), workspace_windows.len);
     try testing.expectEqual(@as(WindowId, 101), workspace_windows[0]);
 
@@ -981,13 +940,13 @@ test "window catalog owns tab identity and group Space assignment" {
 test "removing a tab leader leaves valid standalone identities" {
     const testing = std.testing;
     var catalog: SpaceCatalog = .{};
-    catalog.add(.{ .key = .{ .virtual = 1 }, .workspace_id = 1, .display_id = 11 });
+    catalog.add(.{ .key = .{ .id = 1 }, .workspace_id = 1, .display_id = 11 });
     var model: Model = .{ .spaces = catalog };
     for ([_]WindowId{ 101, 102 }) |window_id| {
         model = reduce(model, .{ .adopt_window = .{
             .window_id = window_id,
             .process_id = 1001,
-            .space_key = .{ .virtual = 1 },
+            .space_key = .{ .id = 1 },
         } }).model;
     }
     var group: WindowTabGroupObservation = .{
@@ -1008,13 +967,13 @@ test "removing a tab leader leaves valid standalone identities" {
 test "removing a tab leader preserves a surviving group" {
     const testing = std.testing;
     var catalog: SpaceCatalog = .{};
-    catalog.add(.{ .key = .{ .virtual = 1 }, .workspace_id = 1, .display_id = 11 });
+    catalog.add(.{ .key = .{ .id = 1 }, .workspace_id = 1, .display_id = 11 });
     var model: Model = .{ .spaces = catalog };
     for ([_]WindowId{ 101, 102, 103 }) |window_id| {
         model = reduce(model, .{ .adopt_window = .{
             .window_id = window_id,
             .process_id = 1001,
-            .space_key = .{ .virtual = 1 },
+            .space_key = .{ .id = 1 },
         } }).model;
     }
     var group: WindowTabGroupObservation = .{
@@ -1122,8 +1081,8 @@ test "native workspace placement is globally unique across displays" {
     try testing.expectEqual(@as(?WorkspaceId, 5), model.observedWorkspace(2));
     try testing.expectEqual(@as(?NativeSpaceId, 102), model.native_topology.findDisplay(1).?.spaceForWorkspace(2));
     try testing.expectEqual(@as(?NativeSpaceId, 202), model.native_topology.findDisplay(2).?.spaceForWorkspace(5));
-    try testing.expect(first.key.eql(.{ .native = 102 }));
-    try testing.expect(second.key.eql(.{ .native = 202 }));
+    try testing.expect(first.key.eql(.{ .id = 102 }));
+    try testing.expect(second.key.eql(.{ .id = 202 }));
     try testing.expect(!first.key.eql(second.key));
 
     const summaries = model.workspaceSummaries(6);
@@ -1147,17 +1106,17 @@ test "native topology preserves uneven per-display Space counts" {
     const model = initializedModel(topology);
 
     try testing.expectEqual(@as(u8, 3), model.spaces.space_count);
-    try testing.expect(model.spaceForWorkspace(1, 2).?.key.eql(.{ .native = 102 }));
-    try testing.expect(model.spaceForWorkspace(2, 3).?.key.eql(.{ .native = 201 }));
+    try testing.expect(model.spaceForWorkspace(1, 2).?.key.eql(.{ .id = 102 }));
+    try testing.expect(model.spaceForWorkspace(2, 3).?.key.eql(.{ .id = 201 }));
     try testing.expect(model.spaceForWorkspace(2, 2) == null);
 }
 
 test "native topology mapping assigns one global workspace per physical slot" {
     const testing = std.testing;
     var catalog: SpaceCatalog = .{};
-    catalog.add(.{ .key = .{ .virtual = 1 }, .workspace_id = 1, .display_id = 1 });
-    catalog.add(.{ .key = .{ .virtual = 2 }, .workspace_id = 2, .display_id = 1 });
-    catalog.add(.{ .key = .{ .virtual = 3 }, .workspace_id = 3, .display_id = 2 });
+    catalog.add(.{ .key = .{ .id = 1 }, .workspace_id = 1, .display_id = 1 });
+    catalog.add(.{ .key = .{ .id = 2 }, .workspace_id = 2, .display_id = 1 });
+    catalog.add(.{ .key = .{ .id = 3 }, .workspace_id = 3, .display_id = 2 });
     var workspace_topology: WorkspaceTopology = .{};
     workspace_topology.addDisplay(.{ .display_id = 1, .active_workspace_id = 1 });
     workspace_topology.addDisplay(.{ .display_id = 2, .active_workspace_id = 3 });
@@ -1181,7 +1140,7 @@ test "native topology mapping assigns one global workspace per physical slot" {
     observation.addDisplay(secondary);
 
     const previous: NativeTopology = .{};
-    const mapped = mapNativeTopology(observation, &previous, &workspace_topology, &catalog, 3).?;
+    const mapped = mapNativeTopology(observation, &previous, &workspace_topology, &catalog, 3, 1).?;
 
     try testing.expectEqual(@as(?WorkspaceId, 1), mapped.observedWorkspace(1));
     try testing.expectEqual(@as(?WorkspaceId, 3), mapped.observedWorkspace(2));
@@ -1201,9 +1160,9 @@ test "native topology mapping ignores an activated extra Space" {
     previous.addDisplay(secondary);
 
     var catalog: SpaceCatalog = .{};
-    catalog.add(.{ .key = .{ .native = 101 }, .workspace_id = 1, .display_id = 1 });
-    catalog.add(.{ .key = .{ .native = 102 }, .workspace_id = 2, .display_id = 1 });
-    catalog.add(.{ .key = .{ .native = 201 }, .workspace_id = 3, .display_id = 2 });
+    catalog.add(.{ .key = .{ .id = 101 }, .workspace_id = 1, .display_id = 1 });
+    catalog.add(.{ .key = .{ .id = 102 }, .workspace_id = 2, .display_id = 1 });
+    catalog.add(.{ .key = .{ .id = 201 }, .workspace_id = 3, .display_id = 2 });
     var workspace_topology: WorkspaceTopology = .{};
     workspace_topology.addDisplay(.{ .display_id = 1, .active_workspace_id = 2 });
     workspace_topology.addDisplay(.{ .display_id = 2, .active_workspace_id = 3 });
@@ -1226,10 +1185,51 @@ test "native topology mapping ignores an activated extra Space" {
     observed_secondary.space_ids[0] = 201;
     observation.addDisplay(observed_secondary);
 
-    const mapped = mapNativeTopology(observation, &previous, &workspace_topology, &catalog, 3).?;
+    const mapped = mapNativeTopology(observation, &previous, &workspace_topology, &catalog, 3, 1).?;
 
     try testing.expect(mapped.eql(&previous));
     try testing.expect(mapped.findDisplay(1).?.workspaceForSpace(103) == null);
+}
+
+test "initial topology mapping binds logical workspaces to physical Spaces" {
+    const testing = std.testing;
+    var observation: NativeTopologyObservation = .{};
+    var secondary: NativeDisplayObservation = .{
+        .display_id = 22,
+        .observed_space_id = 201,
+        .space_count = 2,
+    };
+    secondary.space_ids[0] = 201;
+    secondary.space_ids[1] = 202;
+    observation.addDisplay(secondary);
+
+    var primary: NativeDisplayObservation = .{
+        .display_id = 11,
+        .observed_space_id = 102,
+        .space_count = 3,
+    };
+    primary.space_ids[0] = 101;
+    primary.space_ids[1] = 102;
+    primary.space_ids[2] = 103;
+    observation.addDisplay(primary);
+
+    const previous: NativeTopology = .{};
+    const workspace_topology: WorkspaceTopology = .{};
+    const catalog: SpaceCatalog = .{};
+    const mapped = mapNativeTopology(
+        observation,
+        &previous,
+        &workspace_topology,
+        &catalog,
+        4,
+        11,
+    ).?;
+
+    try testing.expectEqual(@as(?WorkspaceId, 1), mapped.observedWorkspace(11));
+    try testing.expectEqual(@as(?WorkspaceId, 4), mapped.observedWorkspace(22));
+    try testing.expectEqual(@as(?NativeSpaceId, 102), mapped.findDisplay(11).?.spaceForWorkspace(1));
+    try testing.expectEqual(@as(?NativeSpaceId, 201), mapped.findDisplay(22).?.spaceForWorkspace(4));
+    try testing.expect(mapped.findDisplay(22).?.workspaceForSpace(202) == null);
 }
 
 test "switch effect preserves target Space identity across displays" {
@@ -1238,7 +1238,7 @@ test "switch effect preserves target Space identity across displays" {
     const transition = reduce(model, switchRequest(&model, 2, 5, 100));
     const effect = transition.effects[1].switch_native_space;
 
-    try testing.expect(effect.request.target.key.eql(.{ .native = 202 }));
+    try testing.expect(effect.request.target.key.eql(.{ .id = 202 }));
     try testing.expectEqual(@as(DisplayId, 2), effect.request.target.display_id);
     try testing.expectEqual(@as(WorkspaceId, 5), effect.request.target.workspace_id);
 }
@@ -1249,13 +1249,13 @@ test "native workspace move commits placement and ownership atomically" {
     model = reduce(model, .{ .adopt_window = .{
         .window_id = 101,
         .process_id = 1001,
-        .space_key = .{ .native = 101 },
+        .space_key = .{ .id = 101 },
         .layout = testLayoutInsertion(.bsp),
     } }).model;
     model = reduce(model, .{ .adopt_window = .{
         .window_id = 201,
         .process_id = 2001,
-        .space_key = .{ .native = 201 },
+        .space_key = .{ .id = 201 },
         .layout = testLayoutInsertion(.bsp),
     } }).model;
     model = reduce(model, .{ .record_workspace_focus = .{
@@ -1268,8 +1268,8 @@ test "native workspace move commits placement and ownership atomically" {
     } }).model;
 
     var transition = reduce(model, .{ .request_native_workspace_move = .{
-        .source = model.space(.{ .native = 101 }).?,
-        .target = model.space(.{ .native = 201 }).?,
+        .source = model.space(.{ .id = 101 }).?,
+        .target = model.space(.{ .id = 201 }).?,
         .at_ms = 100,
     } });
     try testing.expectEqual(@as(u8, 2), transition.effect_count);
@@ -1292,12 +1292,12 @@ test "native workspace move commits placement and ownership atomically" {
     try testing.expect(transition.model.pending_native_workspace_move == null);
     try testing.expectEqual(@as(?WorkspaceId, 4), transition.model.activeWorkspace(1));
     try testing.expectEqual(@as(?WorkspaceId, 1), transition.model.activeWorkspace(2));
-    try testing.expectEqual(@as(WorkspaceId, 4), transition.model.space(.{ .native = 101 }).?.workspace_id);
-    try testing.expectEqual(@as(WorkspaceId, 1), transition.model.space(.{ .native = 201 }).?.workspace_id);
-    try testing.expect(transition.model.window(101).?.space_key.eql(.{ .native = 201 }));
-    try testing.expect(transition.model.window(201).?.space_key.eql(.{ .native = 101 }));
-    try testing.expect(transition.model.layout.contains(.{ .native = 201 }, 101));
-    try testing.expect(transition.model.layout.contains(.{ .native = 101 }, 201));
+    try testing.expectEqual(@as(WorkspaceId, 4), transition.model.space(.{ .id = 101 }).?.workspace_id);
+    try testing.expectEqual(@as(WorkspaceId, 1), transition.model.space(.{ .id = 201 }).?.workspace_id);
+    try testing.expect(transition.model.window(101).?.space_key.eql(.{ .id = 201 }));
+    try testing.expect(transition.model.window(201).?.space_key.eql(.{ .id = 101 }));
+    try testing.expect(transition.model.layout.contains(.{ .id = 201 }, 101));
+    try testing.expect(transition.model.layout.contains(.{ .id = 101 }, 201));
     try testing.expectEqual(@as(?WindowId, 101), transition.model.focusedWorkspaceWindow(1));
     try testing.expectEqual(@as(?WindowId, 201), transition.model.focusedWorkspaceWindow(4));
     try testing.expectEqual(std.meta.Tag(Effect).native_workspace_move_completed, std.meta.activeTag(transition.effects[0]));
@@ -1307,8 +1307,8 @@ test "native workspace move timeout rolls physical contents back" {
     const testing = std.testing;
     const model = initializedModel(testTopology(101, 201));
     var transition = reduce(model, .{ .request_native_workspace_move = .{
-        .source = model.space(.{ .native = 101 }).?,
-        .target = model.space(.{ .native = 201 }).?,
+        .source = model.space(.{ .id = 101 }).?,
+        .target = model.space(.{ .id = 201 }).?,
         .at_ms = 100,
     } });
     const pending = transition.model.pending_native_workspace_move.?;
@@ -1331,27 +1331,27 @@ test "native workspace move timeout rolls physical contents back" {
         .succeeded = true,
     } });
     try testing.expect(transition.model.pending_native_workspace_move == null);
-    try testing.expectEqual(@as(WorkspaceId, 1), transition.model.space(.{ .native = 101 }).?.workspace_id);
-    try testing.expectEqual(@as(WorkspaceId, 4), transition.model.space(.{ .native = 201 }).?.workspace_id);
+    try testing.expectEqual(@as(WorkspaceId, 1), transition.model.space(.{ .id = 101 }).?.workspace_id);
+    try testing.expectEqual(@as(WorkspaceId, 4), transition.model.space(.{ .id = 201 }).?.workspace_id);
     try testing.expectEqual(std.meta.Tag(Effect).native_workspace_move_failed, std.meta.activeTag(transition.effects[1]));
 }
 
-test "virtual catalog preserves identity when placement changes" {
+test "Space catalog preserves physical identity when placement changes" {
     const testing = std.testing;
     var catalog: SpaceCatalog = .{};
-    catalog.add(.{ .key = .{ .virtual = 1 }, .workspace_id = 1, .display_id = 11 });
-    catalog.add(.{ .key = .{ .virtual = 2 }, .workspace_id = 2, .display_id = 22 });
+    catalog.add(.{ .key = .{ .id = 1 }, .workspace_id = 1, .display_id = 11 });
+    catalog.add(.{ .key = .{ .id = 2 }, .workspace_id = 2, .display_id = 22 });
 
     var model = reduce(.{}, .{ .replace_space_catalog = catalog }).model;
     catalog.spaces[1].display_id = 11;
     model = reduce(model, .{ .replace_space_catalog = catalog }).model;
 
-    const moved = model.space(.{ .virtual = 2 }).?;
+    const moved = model.space(.{ .id = 2 }).?;
     try testing.expectEqual(@as(DisplayId, 11), moved.display_id);
-    try testing.expect(moved.key.eql(.{ .virtual = 2 }));
+    try testing.expect(moved.key.eql(.{ .id = 2 }));
 }
 
-test "virtual workspace and focused display are reducer owned" {
+test "workspace and focused display are reducer owned" {
     const testing = std.testing;
     var topology: WorkspaceTopology = .{};
     topology.addDisplay(.{ .display_id = 11, .active_workspace_id = 1 });
@@ -1370,22 +1370,22 @@ test "virtual workspace and focused display are reducer owned" {
     try testing.expectEqual(@as(u8, 0), transition.effect_count);
 }
 
-test "virtual workspace transition settles from explicit focus and time events" {
+test "workspace transition settles from explicit focus and time events" {
     const testing = std.testing;
     var catalog: SpaceCatalog = .{};
-    catalog.add(.{ .key = .{ .virtual = 1 }, .workspace_id = 1, .display_id = 11 });
-    catalog.add(.{ .key = .{ .virtual = 2 }, .workspace_id = 2, .display_id = 11 });
+    catalog.add(.{ .key = .{ .id = 1 }, .workspace_id = 1, .display_id = 11 });
+    catalog.add(.{ .key = .{ .id = 2 }, .workspace_id = 2, .display_id = 11 });
 
     var model = reduce(.{}, .{ .replace_space_catalog = catalog }).model;
     var transition = reduce(model, .{ .start_workspace_transition = .{
         .kind = .switch_workspace,
-        .target = model.space(.{ .virtual = 2 }).?,
+        .target = model.space(.{ .id = 2 }).?,
         .at_ms = 100,
     } });
     model = transition.model;
     const epoch = model.workspace_transition.?.epoch;
 
-    try testing.expect(model.workspace_transition.?.target.key.eql(.{ .virtual = 2 }));
+    try testing.expect(model.workspace_transition.?.target.key.eql(.{ .id = 2 }));
     try testing.expectEqual(@as(TimestampMs, 500), model.workspace_transition.?.deadline_at_ms);
     try testing.expectEqual(std.meta.Tag(Effect).workspace_transition_started, std.meta.activeTag(transition.effects[0]));
 
@@ -1414,23 +1414,23 @@ test "virtual workspace transition settles from explicit focus and time events" 
     try testing.expectEqual(WorkspaceTransitionSettlementReason.completed, transition.effects[0].workspace_transition_settled.reason);
 }
 
-test "virtual display move transition follows stable Space identity" {
+test "display move transition follows stable Space identity" {
     const testing = std.testing;
     var catalog: SpaceCatalog = .{};
-    catalog.add(.{ .key = .{ .virtual = 1 }, .workspace_id = 1, .display_id = 11 });
-    catalog.add(.{ .key = .{ .virtual = 2 }, .workspace_id = 2, .display_id = 22 });
+    catalog.add(.{ .key = .{ .id = 1 }, .workspace_id = 1, .display_id = 11 });
+    catalog.add(.{ .key = .{ .id = 2 }, .workspace_id = 2, .display_id = 22 });
 
     var model = reduce(.{}, .{ .replace_space_catalog = catalog }).model;
     model = reduce(model, .{ .start_workspace_transition = .{
         .kind = .move_workspace_to_display,
-        .target = model.space(.{ .virtual = 2 }).?,
+        .target = model.space(.{ .id = 2 }).?,
         .at_ms = 100,
     } }).model;
 
     catalog.spaces[1].display_id = 11;
     model = reduce(model, .{ .replace_space_catalog = catalog }).model;
 
-    try testing.expect(model.workspace_transition.?.target.key.eql(.{ .virtual = 2 }));
+    try testing.expect(model.workspace_transition.?.target.key.eql(.{ .id = 2 }));
     try testing.expectEqual(@as(DisplayId, 11), model.workspace_transition.?.target.display_id);
     try testing.expectEqual(WorkspaceTransitionKind.move_workspace_to_display, model.workspace_transition.?.kind);
 }
@@ -1438,20 +1438,20 @@ test "virtual display move transition follows stable Space identity" {
 test "stale workspace transition timer cannot settle newer intent" {
     const testing = std.testing;
     var catalog: SpaceCatalog = .{};
-    catalog.add(.{ .key = .{ .virtual = 1 }, .workspace_id = 1, .display_id = 11 });
-    catalog.add(.{ .key = .{ .virtual = 2 }, .workspace_id = 2, .display_id = 11 });
+    catalog.add(.{ .key = .{ .id = 1 }, .workspace_id = 1, .display_id = 11 });
+    catalog.add(.{ .key = .{ .id = 2 }, .workspace_id = 2, .display_id = 11 });
 
     var model = reduce(.{}, .{ .replace_space_catalog = catalog }).model;
     model = reduce(model, .{ .start_workspace_transition = .{
         .kind = .switch_workspace,
-        .target = model.space(.{ .virtual = 1 }).?,
+        .target = model.space(.{ .id = 1 }).?,
         .at_ms = 100,
     } }).model;
     const stale_epoch = model.workspace_transition.?.epoch;
 
     model = reduce(model, .{ .start_workspace_transition = .{
         .kind = .switch_workspace,
-        .target = model.space(.{ .virtual = 2 }).?,
+        .target = model.space(.{ .id = 2 }).?,
         .at_ms = 200,
     } }).model;
     const current_epoch = model.workspace_transition.?.epoch;
@@ -1462,7 +1462,7 @@ test "stale workspace transition timer cannot settle newer intent" {
     } });
 
     try testing.expectEqual(current_epoch, transition.model.workspace_transition.?.epoch);
-    try testing.expect(transition.model.workspace_transition.?.target.key.eql(.{ .virtual = 2 }));
+    try testing.expect(transition.model.workspace_transition.?.target.key.eql(.{ .id = 2 }));
     try testing.expectEqual(@as(u8, 0), transition.effect_count);
 }
 
@@ -1472,9 +1472,9 @@ test "pending focus queue replaces by window and applies newest intent" {
     model = reduce(model, switchRequest(&model, 1, 2, 100)).model;
     const epoch = model.workspace_transition.?.epoch;
 
-    model = reduce(model, windowFocusObservation(&model, 10, 41, .ax, .{ .native = 102 }, false, null)).model;
-    model = reduce(model, windowFocusObservation(&model, 20, 42, .drag, .{ .native = 101 }, false, null)).model;
-    model = reduce(model, windowFocusObservation(&model, 10, 41, .drag, .{ .native = 102 }, false, null)).model;
+    model = reduce(model, windowFocusObservation(&model, 10, 41, .ax, .{ .id = 102 }, false, null)).model;
+    model = reduce(model, windowFocusObservation(&model, 20, 42, .drag, .{ .id = 101 }, false, null)).model;
+    model = reduce(model, windowFocusObservation(&model, 10, 41, .drag, .{ .id = 102 }, false, null)).model;
 
     try testing.expectEqual(@as(u8, 2), model.pendingFocusCount());
     var transition = reduce(model, .request_pending_focus);
@@ -1486,7 +1486,7 @@ test "pending focus queue replaces by window and applies newest intent" {
 
     transition = reduce(
         transition.model,
-        windowFocusObservation(&transition.model, 10, 41, .drag, .{ .native = 102 }, true, epoch),
+        windowFocusObservation(&transition.model, 10, 41, .drag, .{ .id = 102 }, true, epoch),
     );
     try testing.expect(!transition.model.hasPendingFocus());
     try testing.expectEqual(std.meta.Tag(Effect).window_focus_accepted, std.meta.activeTag(transition.effects[0]));
@@ -1495,29 +1495,29 @@ test "pending focus queue replaces by window and applies newest intent" {
 test "new workspace transition rejects stale pending focus observation" {
     const testing = std.testing;
     var catalog: SpaceCatalog = .{};
-    catalog.add(.{ .key = .{ .virtual = 1 }, .workspace_id = 1, .display_id = 11 });
-    catalog.add(.{ .key = .{ .virtual = 2 }, .workspace_id = 2, .display_id = 11 });
+    catalog.add(.{ .key = .{ .id = 1 }, .workspace_id = 1, .display_id = 11 });
+    catalog.add(.{ .key = .{ .id = 2 }, .workspace_id = 2, .display_id = 11 });
 
     var model = reduce(.{}, .{ .replace_space_catalog = catalog }).model;
     model = reduce(model, .{ .start_workspace_transition = .{
         .kind = .switch_workspace,
-        .target = model.space(.{ .virtual = 1 }).?,
+        .target = model.space(.{ .id = 1 }).?,
         .at_ms = 100,
     } }).model;
-    model = reduce(model, windowFocusObservation(&model, 10, 41, .ax, .{ .virtual = 1 }, false, null)).model;
+    model = reduce(model, windowFocusObservation(&model, 10, 41, .ax, .{ .id = 1 }, false, null)).model;
     const stale_epoch = model.workspace_transition.?.epoch;
 
     model = reduce(model, .{ .start_workspace_transition = .{
         .kind = .switch_workspace,
-        .target = model.space(.{ .virtual = 2 }).?,
+        .target = model.space(.{ .id = 2 }).?,
         .at_ms = 200,
     } }).model;
-    model = reduce(model, windowFocusObservation(&model, 20, 42, .ax, .{ .virtual = 2 }, false, null)).model;
+    model = reduce(model, windowFocusObservation(&model, 20, 42, .ax, .{ .id = 2 }, false, null)).model;
 
     const current_epoch = model.workspace_transition.?.epoch;
     const transition = reduce(
         model,
-        windowFocusObservation(&model, 10, 41, .ax, .{ .virtual = 1 }, true, stale_epoch),
+        windowFocusObservation(&model, 10, 41, .ax, .{ .id = 1 }, true, stale_epoch),
     );
 
     try testing.expectEqual(current_epoch, transition.model.workspace_transition.?.epoch);
@@ -1527,20 +1527,20 @@ test "new workspace transition rejects stale pending focus observation" {
 test "keyboard focus accepts a visible non-target and clears pending focus" {
     const testing = std.testing;
     var catalog: SpaceCatalog = .{};
-    catalog.add(.{ .key = .{ .virtual = 1 }, .workspace_id = 1, .display_id = 11 });
-    catalog.add(.{ .key = .{ .virtual = 2 }, .workspace_id = 2, .display_id = 11 });
+    catalog.add(.{ .key = .{ .id = 1 }, .workspace_id = 1, .display_id = 11 });
+    catalog.add(.{ .key = .{ .id = 2 }, .workspace_id = 2, .display_id = 11 });
 
     var model = reduce(.{}, .{ .replace_space_catalog = catalog }).model;
     model = reduce(model, .{ .start_workspace_transition = .{
         .kind = .switch_workspace,
-        .target = model.space(.{ .virtual = 2 }).?,
+        .target = model.space(.{ .id = 2 }).?,
         .at_ms = 100,
     } }).model;
-    model = reduce(model, windowFocusObservation(&model, 10, 41, .ax, .{ .virtual = 1 }, false, null)).model;
+    model = reduce(model, windowFocusObservation(&model, 10, 41, .ax, .{ .id = 1 }, false, null)).model;
 
     const transition = reduce(
         model,
-        windowFocusObservation(&model, 10, 41, .keyboard, .{ .virtual = 1 }, true, null),
+        windowFocusObservation(&model, 10, 41, .keyboard, .{ .id = 1 }, true, null),
     );
 
     try testing.expect(!transition.model.hasPendingFocus());
@@ -1551,24 +1551,24 @@ test "keyboard focus accepts a visible non-target and clears pending focus" {
 test "deferred follow focus leaves the model with transition settlement" {
     const testing = std.testing;
     var catalog: SpaceCatalog = .{};
-    catalog.add(.{ .key = .{ .virtual = 1 }, .workspace_id = 1, .display_id = 11 });
-    catalog.add(.{ .key = .{ .virtual = 2 }, .workspace_id = 2, .display_id = 11 });
+    catalog.add(.{ .key = .{ .id = 1 }, .workspace_id = 1, .display_id = 11 });
+    catalog.add(.{ .key = .{ .id = 2 }, .workspace_id = 2, .display_id = 11 });
 
     var model = reduce(.{}, .{ .replace_space_catalog = catalog }).model;
     model = reduce(model, .{ .start_workspace_transition = .{
         .kind = .switch_workspace,
-        .target = model.space(.{ .virtual = 2 }).?,
+        .target = model.space(.{ .id = 2 }).?,
         .at_ms = 100,
     } }).model;
     const epoch = model.workspace_transition.?.epoch;
 
-    var transition = reduce(model, followFocusObservation(&model, .{ .virtual = 1 }, false));
+    var transition = reduce(model, followFocusObservation(&model, .{ .id = 1 }, false));
     model = transition.model;
     try testing.expect(model.hasDeferredFollowFocus());
     try testing.expectEqual(epoch, model.deferred_follow_focus.?.transition_epoch);
     try testing.expectEqual(std.meta.Tag(Effect).follow_focus_deferred, std.meta.activeTag(transition.effects[0]));
 
-    transition = reduce(model, followFocusObservation(&model, .{ .virtual = 2 }, true));
+    transition = reduce(model, followFocusObservation(&model, .{ .id = 2 }, true));
     model = transition.model;
     try testing.expect(model.hasDeferredFollowFocus());
     try testing.expectEqual(@as(u8, 0), transition.effect_count);
@@ -1587,7 +1587,7 @@ test "native switch ignores follow focus until Space observation" {
     const testing = std.testing;
     var model = initializedModel(testTopology(101, null));
     model = reduce(model, switchRequest(&model, 1, 2, 100)).model;
-    const transition = reduce(model, followFocusObservation(&model, .{ .native = 101 }, false));
+    const transition = reduce(model, followFocusObservation(&model, .{ .id = 101 }, false));
 
     try testing.expect(!transition.model.hasDeferredFollowFocus());
     try testing.expectEqual(std.meta.Tag(Effect).follow_focus_ignored_during_native_switch, std.meta.activeTag(transition.effects[0]));
@@ -1596,9 +1596,9 @@ test "native switch ignores follow focus until Space observation" {
 test "hidden focus without a transition requests a workspace switch" {
     const testing = std.testing;
     const model = initializedModel(testTopology(101, null));
-    const transition = reduce(model, followFocusObservation(&model, .{ .native = 102 }, false));
+    const transition = reduce(model, followFocusObservation(&model, .{ .id = 102 }, false));
 
-    try testing.expect(transition.model.pending_switch.?.request.target.key.eql(.{ .native = 102 }));
+    try testing.expect(transition.model.pending_switch.?.request.target.key.eql(.{ .id = 102 }));
     try testing.expectEqual(std.meta.Tag(Effect).workspace_transition_started, std.meta.activeTag(transition.effects[0]));
     try testing.expectEqual(std.meta.Tag(Effect).switch_native_space, std.meta.activeTag(transition.effects[1]));
     try testing.expect(!transition.model.hasDeferredFollowFocus());
@@ -1719,7 +1719,7 @@ test "pending native window move follows Space identity across ordinal changes" 
     } });
     const pending = transition.model.pendingNativeWindowMove(42).?;
 
-    try testing.expect(pending.target.key.eql(.{ .native = 102 }));
+    try testing.expect(pending.target.key.eql(.{ .id = 102 }));
     try testing.expectEqual(@as(WorkspaceId, 3), pending.target.workspace_id);
 }
 
@@ -1763,12 +1763,12 @@ test "rapid switch requests keep only latest target" {
 test "window discovery retries are reducer owned" {
     const testing = std.testing;
     var catalog: SpaceCatalog = .{};
-    catalog.add(.{ .key = .{ .virtual = 1 }, .workspace_id = 1, .display_id = 11 });
+    catalog.add(.{ .key = .{ .id = 1 }, .workspace_id = 1, .display_id = 11 });
     var model = reduce(.{}, .{ .replace_space_catalog = catalog }).model;
     const candidate: WindowCandidate = .{
         .process_id = 42,
         .window_id = 100,
-        .space_key = .{ .virtual = 1 },
+        .space_key = .{ .id = 1 },
         .attempts_remaining = 1,
     };
 
@@ -1823,153 +1823,35 @@ test "process retry outcomes are reducer owned" {
     try testing.expectEqual(@as(WindowId, 100), transition.effects[0].focus_retry_resolved.window_id);
 }
 
-test "workspace park and display settle timers are reducer owned" {
+test "display settle timer is reducer owned" {
     const testing = std.testing;
-    var catalog: SpaceCatalog = .{};
-    catalog.add(.{ .key = .{ .virtual = 1 }, .workspace_id = 1, .display_id = 11 });
-    catalog.add(.{ .key = .{ .virtual = 2 }, .workspace_id = 2, .display_id = 11 });
-    var topology: WorkspaceTopology = .{};
-    topology.addDisplay(.{ .display_id = 11, .active_workspace_id = 2 });
-
-    var model = reduce(.{}, .{ .replace_space_catalog = catalog }).model;
-    model = reduce(model, .{ .replace_workspace_topology = topology }).model;
-    var transition = reduce(model, .{ .workspace_reveal_observed = .{
-        .outgoing = catalog.find(.{ .virtual = 1 }).?,
-        .target = catalog.find(.{ .virtual = 2 }).?,
-        .is_revealed = false,
-        .deadline_at_ms = 200,
-    } });
-    try testing.expect(transition.model.hasPendingWorkspaceParks());
-
-    transition = reduce(transition.model, .{ .workspace_park_timer_fired = .{
-        .display_id = 11,
-        .is_revealed = false,
-        .at_ms = 199,
-    } });
-    try testing.expectEqual(@as(u8, 0), transition.effect_count);
-    transition = reduce(transition.model, .{ .workspace_park_timer_fired = .{
-        .display_id = 11,
-        .is_revealed = false,
-        .at_ms = 200,
-    } });
-    try testing.expect(!transition.model.hasPendingWorkspaceParks());
-    try testing.expect(transition.effects[0].park_workspace.did_time_out);
-
-    model = reduce(transition.model, .{ .display_changed = .{
+    const model = reduce(.{}, .{ .display_changed = .{
         .at_ms = 100,
         .resettle_at_ms = 500,
     } }).model;
-    transition = reduce(model, .{ .display_resettle_timer_fired = 499 });
+    var transition = reduce(model, .{ .display_resettle_timer_fired = 499 });
     try testing.expect(transition.model.hasDisplayResettleScheduled());
     transition = reduce(transition.model, .{ .display_resettle_timer_fired = 500 });
     try testing.expect(!transition.model.hasDisplayResettleScheduled());
     try testing.expectEqual(std.meta.Tag(Effect).display_resettle_due, std.meta.activeTag(transition.effects[0]));
 }
 
-test "workspace switch request commits virtual activation before its effect" {
-    const testing = std.testing;
-    var catalog: SpaceCatalog = .{};
-    catalog.add(.{ .key = .{ .virtual = 1 }, .workspace_id = 1, .display_id = 11 });
-    catalog.add(.{ .key = .{ .virtual = 2 }, .workspace_id = 2, .display_id = 11 });
-    var topology: WorkspaceTopology = .{};
-    topology.addDisplay(.{ .display_id = 11, .active_workspace_id = 1 });
-
-    var model = reduce(.{}, .{ .replace_space_catalog = catalog }).model;
-    model = reduce(model, .{ .replace_workspace_topology = topology }).model;
-    const transition = reduce(model, .{ .request_workspace_switch = .{
-        .target = catalog.find(.{ .virtual = 2 }).?,
-        .at_ms = 100,
-    } });
-
-    try testing.expectEqual(@as(?WorkspaceId, 2), transition.model.activeWorkspace(11));
-    try testing.expectEqual(@as(?DisplayId, 11), transition.model.focusedDisplay());
-    try testing.expect(transition.model.workspace_transition.?.target.key.eql(.{ .virtual = 2 }));
-    try testing.expectEqual(std.meta.Tag(Effect).workspace_switch_ready, std.meta.activeTag(transition.effects[1]));
-    try testing.expect(transition.effects[1].workspace_switch_ready.outgoing.?.key.eql(.{ .virtual = 1 }));
-}
-
-test "virtual workspace display move is one reducer transition" {
-    const testing = std.testing;
-    var catalog: SpaceCatalog = .{};
-    catalog.add(.{ .key = .{ .virtual = 1 }, .workspace_id = 1, .display_id = 11 });
-    catalog.add(.{ .key = .{ .virtual = 2 }, .workspace_id = 2, .display_id = 22 });
-    catalog.add(.{ .key = .{ .virtual = 3 }, .workspace_id = 3, .display_id = 11 });
-    var topology: WorkspaceTopology = .{};
-    topology.addDisplay(.{ .display_id = 11, .active_workspace_id = 1 });
-    topology.addDisplay(.{ .display_id = 22, .active_workspace_id = 2 });
-
-    var model = reduce(.{}, .{ .replace_space_catalog = catalog }).model;
-    model = reduce(model, .{ .replace_workspace_topology = topology }).model;
-    const transition = reduce(model, .{ .request_virtual_workspace_move = .{
-        .source_display_id = 11,
-        .target_display_id = 22,
-        .at_ms = 100,
-    } });
-
-    try testing.expectEqual(@as(?WorkspaceId, 3), transition.model.activeWorkspace(11));
-    try testing.expectEqual(@as(?WorkspaceId, 1), transition.model.activeWorkspace(22));
-    try testing.expectEqual(@as(DisplayId, 22), transition.model.space(.{ .virtual = 1 }).?.display_id);
-    try testing.expectEqual(@as(DisplayId, 11), transition.model.space(.{ .virtual = 3 }).?.display_id);
-    try testing.expectEqual(std.meta.Tag(Effect).virtual_workspace_move_ready, std.meta.activeTag(transition.effects[1]));
-}
-
-test "virtual display observation reconciles topology in one transition" {
-    const testing = std.testing;
-    const first_uuid: [16]u8 = @splat(1);
-    const second_uuid: [16]u8 = @splat(2);
-    var catalog: SpaceCatalog = .{};
-    catalog.add(.{ .key = .{ .virtual = 1 }, .workspace_id = 1, .display_id = 11 });
-    catalog.add(.{ .key = .{ .virtual = 2 }, .workspace_id = 2, .display_id = 22 });
-    catalog.add(.{ .key = .{ .virtual = 3 }, .workspace_id = 3, .display_id = 11 });
-    var topology: WorkspaceTopology = .{};
-    topology.addDisplay(.{ .display_id = 11, .active_workspace_id = 1 });
-    topology.addDisplay(.{ .display_id = 22, .active_workspace_id = 2 });
-
-    var model = reduce(.{}, .{ .replace_space_catalog = catalog }).model;
-    model = reduce(model, .{ .replace_workspace_topology = topology }).model;
-    model = reduce(model, .{ .remember_display_workspace = .{
-        .uuid = first_uuid,
-        .active_workspace_id = 1,
-    } }).model;
-    model = reduce(model, .{ .remember_display_workspace = .{
-        .uuid = second_uuid,
-        .active_workspace_id = 2,
-    } }).model;
-
-    var observation: VirtualDisplayObservation = .{
-        .primary_display_id = 111,
-        .focused_display_id = 222,
-    };
-    observation.workspace_home_uuids[0] = first_uuid;
-    observation.workspace_home_uuids[1] = second_uuid;
-    observation.workspace_home_uuids[2] = first_uuid;
-    try testing.expect(observation.addDisplay(.{ .display_id = 111, .uuid = first_uuid }));
-    try testing.expect(observation.addDisplay(.{ .display_id = 222, .uuid = second_uuid }));
-
-    const transition = reduce(model, .{ .virtual_displays_observed = observation });
-    try testing.expectEqual(@as(?WorkspaceId, 1), transition.model.activeWorkspace(111));
-    try testing.expectEqual(@as(?WorkspaceId, 2), transition.model.activeWorkspace(222));
-    try testing.expectEqual(@as(?DisplayId, 222), transition.model.focusedDisplay());
-    try testing.expectEqual(@as(DisplayId, 111), transition.model.logicalWorkspace(3).?.display_id);
-    try testing.expectEqual(std.meta.Tag(Effect).virtual_displays_reconciled, std.meta.activeTag(transition.effects[0]));
-}
-
 test "pointer drop swaps layout inside the reducer" {
     const testing = std.testing;
     var catalog: SpaceCatalog = .{};
-    catalog.add(.{ .key = .{ .virtual = 1 }, .workspace_id = 1, .display_id = 11 });
+    catalog.add(.{ .key = .{ .id = 1 }, .workspace_id = 1, .display_id = 11 });
     var model = reduce(.{}, .{ .replace_space_catalog = catalog }).model;
     model = reduce(model, .{ .adopt_window = .{
         .window_id = 100,
         .process_id = 42,
-        .space_key = .{ .virtual = 1 },
+        .space_key = .{ .id = 1 },
         .frame = .{ .x = 0, .y = 0, .width = 500, .height = 500 },
         .layout = testLayoutInsertion(.bsp),
     } }).model;
     model = reduce(model, .{ .adopt_window = .{
         .window_id = 200,
         .process_id = 43,
-        .space_key = .{ .virtual = 1 },
+        .space_key = .{ .id = 1 },
         .frame = .{ .x = 500, .y = 0, .width = 500, .height = 500 },
         .layout = testLayoutInsertion(.bsp),
     } }).model;
@@ -1984,7 +1866,7 @@ test "pointer drop swaps layout inside the reducer" {
     try testing.expectEqual(std.meta.Tag(Effect).show_drag_preview, std.meta.activeTag(transition.effects[0]));
 
     transition = reduce(transition.model, .pointer_up);
-    try testing.expectEqual(@as(?WindowId, 200), transition.model.layout.firstWid(.{ .virtual = 1 }));
+    try testing.expectEqual(@as(?WindowId, 200), transition.model.layout.firstWid(.{ .id = 1 }));
     try testing.expect(!transition.model.pointer_drag.is_down);
     try testing.expectEqual(std.meta.Tag(Effect).hide_drag_preview, std.meta.activeTag(transition.effects[0]));
     try testing.expectEqual(@as(WindowId, 100), transition.effects[1].pointer_drag_completed.swapped_window_ids.?.first);
@@ -1992,7 +1874,7 @@ test "pointer drop swaps layout inside the reducer" {
 
 test "directional commands resolve focus and layout in the reducer" {
     const testing = std.testing;
-    const space_key: SpaceKey = .{ .virtual = 1 };
+    const space_key: SpaceKey = .{ .id = 1 };
     var catalog: SpaceCatalog = .{};
     catalog.add(.{ .key = space_key, .workspace_id = 1, .display_id = 11 });
     var topology: WorkspaceTopology = .{};
@@ -2033,7 +1915,7 @@ test "directional commands resolve focus and layout in the reducer" {
 
 test "window presentation commands reduce intent before platform effects" {
     const testing = std.testing;
-    const space_key: SpaceKey = .{ .virtual = 1 };
+    const space_key: SpaceKey = .{ .id = 1 };
     var catalog: SpaceCatalog = .{};
     catalog.add(.{ .key = space_key, .workspace_id = 1, .display_id = 11 });
     var topology: WorkspaceTopology = .{};
@@ -2092,8 +1974,8 @@ test "window presentation commands reduce intent before platform effects" {
 
 test "window move command commits ownership layout and intent atomically" {
     const testing = std.testing;
-    const source_key: SpaceKey = .{ .virtual = 1 };
-    const target_key: SpaceKey = .{ .virtual = 2 };
+    const source_key: SpaceKey = .{ .id = 1 };
+    const target_key: SpaceKey = .{ .id = 2 };
     var catalog: SpaceCatalog = .{};
     catalog.add(.{ .key = source_key, .workspace_id = 1, .display_id = 11 });
     catalog.add(.{ .key = target_key, .workspace_id = 2, .display_id = 11 });
@@ -2124,5 +2006,5 @@ test "window move command commits ownership layout and intent atomically" {
     try testing.expectEqual(@as(?WindowId, null), transition.model.focusedWorkspaceWindow(1));
     try testing.expectEqual(@as(?WindowId, 100), transition.model.focusedWorkspaceWindow(2));
     try testing.expect(transition.model.retile_request.all_displays);
-    try testing.expect(transition.effects[0].window_moved.should_hide);
+    try testing.expectEqual(std.meta.Tag(Effect).window_moved, std.meta.activeTag(transition.effects[0]));
 }

@@ -62,10 +62,6 @@ const EventQueue = spsc_queue.Queue(event_mod.Event, 1024);
 const state_effect_queue_capacity = 64;
 const StateEffectQueue = spsc_queue.Queue(state_mod.Effect, state_effect_queue_capacity);
 
-// Hidden-window position (bottom-right corner, barely visible)
-
-/// Pixels visible in the corner when a window is hidden off-screen.
-const hide_peek: f64 = 5;
 /// Poll cadence for windows that are waiting on role readiness or visibility.
 const role_poll_interval_ms: u64 = 100;
 /// Keep one slow app AX server from monopolizing the main event drain.
@@ -86,13 +82,6 @@ const focus_retry_attempts_max: u8 = 10;
 /// an intermediate topology, so a reconcile this long after the final event
 /// converges on the settled arrangement.
 const display_settle_delay_ms: u64 = 250;
-/// A successful AX write can precede the corresponding WindowServer move.
-/// Keep the outgoing workspace covering the display while polling for the
-/// incoming physical frames; the deferred path handles slower applications.
-const workspace_reveal_poll_interval_us: u32 = 500;
-const workspace_reveal_wait_max_us: u32 = 50_000;
-const workspace_reveal_deferred_timeout_ms: u64 = 1000;
-
 const DisplayInfo = struct {
     id: u32,
     /// Stable per-display identity (CGDisplayCreateUUIDFromDisplayID) used to
@@ -108,8 +97,6 @@ const DropTarget = struct {
     wid: u32,
     frame: window_mod.Window.Frame,
 };
-
-const HideCorner = enum { bottom_right, bottom_left };
 
 const WindowRoleState = state_mod.WindowReadiness;
 
@@ -243,7 +230,7 @@ fn nativeStateNowMs() state_mod.TimestampMs {
 }
 
 fn nativeSwitchPending() bool {
-    return nativeSpacesEnabled() and g_state.isNativeSwitchPending();
+    return g_state.isNativeSwitchPending();
 }
 
 fn workspaceTraversalDirectionFromAction(action: u8) ?WorkspaceTraversalDirection {
@@ -258,10 +245,7 @@ fn adjacentWorkspaceId(direction: WorkspaceTraversalDirection) ?u8 {
     std.debug.assert(workspace_count > 0);
     std.debug.assert(workspace_count <= workspace_mod.max_workspaces);
 
-    const base_id = if (nativeSpacesEnabled())
-        g_state.desiredWorkspace(focused_display_id) orelse activeWorkspaceIdForDisplay(focused_display_id)
-    else
-        activeWorkspace().workspace_id;
+    const base_id = g_state.desiredWorkspace(focused_display_id) orelse activeWorkspaceIdForDisplay(focused_display_id);
     std.debug.assert(base_id > 0 and base_id <= workspace_count);
 
     return switch (direction) {
@@ -542,7 +526,7 @@ fn observeWindowFocus(win: window_mod.Window, source: FocusEventSource, pending_
 /// event named; `win` is its group leader, which owns the workspace slot.
 ///
 /// Hidden focus is deferred through the entire transition, including the
-/// settle tail: late AX focus from the workspace just parked can otherwise
+/// settle tail: late AX focus from the Space just left can otherwise
 /// reverse an accepted switch and create a two-workspace feedback loop. The
 /// deferred replay validates the frontmost app once synthetic events settle,
 /// preserving a genuine fast Cmd+Tab without following stale AX fallout.
@@ -706,8 +690,6 @@ fn assertDisplayCoverage() void {
     for (0..g_display_count) |slot| {
         const ws_id = activeWorkspaceIdForDisplay(g_displays[slot].id);
         std.debug.assert(spaceForWorkspace(g_displays[slot].id, ws_id) != null);
-        if (nativeSpacesEnabled()) continue;
-
         for (0..g_display_count) |other| {
             if (other == slot) continue;
             std.debug.assert(activeWorkspaceIdForDisplay(g_displays[other].id) != ws_id);
@@ -731,17 +713,6 @@ fn displayUuidBytes(display_id: u32) ?[16]u8 {
     defer c.CFRelease(@ptrCast(uuid_ref));
     const bytes: [16]u8 = @bitCast(c.CFUUIDGetUUIDBytes(uuid_ref));
     return bytes;
-}
-
-/// Record each present display's active workspace, keyed by UUID.
-fn rememberDisplayWorkspaces() void {
-    for (g_displays[0..g_display_count]) |display| {
-        const uuid = display.uuid orelse continue;
-        dispatchStateEvent(.{ .remember_display_workspace = .{
-            .uuid = uuid,
-            .active_workspace_id = activeWorkspaceIdForDisplay(display.id),
-        } });
-    }
 }
 
 fn refreshDisplays() void {
@@ -911,187 +882,7 @@ fn seedObservedFrame(wid: u32, frame: window_mod.Window.Frame) void {
     } } });
 }
 
-/// Pick the bottom corner that does not border an adjacent monitor.
-/// Falls back to bottom-right on single-monitor setups.
-fn hideCorner(display_id: u32) HideCorner {
-    const slot = displayIndexById(display_id) orelse return .bottom_right;
-    const display = g_displays[slot].visible;
-    const display_right = display.x + display.w;
-
-    for (g_displays[0..g_display_count], 0..) |other, other_slot| {
-        if (other_slot == slot) continue;
-        if (@abs(other.visible.x - display_right) < 5) return .bottom_left;
-    }
-    return .bottom_right;
-}
-
-/// Precomputed hide parameters (display frame + corner), so callers that
-/// hide many windows in a loop only query NSScreen once.
-const HideCtx = struct {
-    display: shim.bw_frame,
-    corner: HideCorner,
-
-    fn init(display_id: u32) HideCtx {
-        const slot = displayIndexById(display_id) orelse return .{
-            .display = g_displays[0].visible,
-            .corner = .bottom_right,
-        };
-        return .{
-            .display = g_displays[slot].visible,
-            .corner = hideCorner(display_id),
-        };
-    }
-
-    /// Off-screen park position for a window of the given stored width.
-    /// bottom_left parks the window off the left edge, which needs its width;
-    /// without a usable width it falls back to bottom_right, which does not.
-    fn parkPosition(self: HideCtx, width: f64) struct { x: f64, y: f64 } {
-        std.debug.assert(width >= 0);
-        const corner: HideCorner = if (width > 1) self.corner else .bottom_right;
-        return .{
-            .x = switch (corner) {
-                .bottom_right => self.display.x + self.display.w - hide_peek,
-                .bottom_left => self.display.x - width + hide_peek,
-            },
-            .y = self.display.y + self.display.h - hide_peek,
-        };
-    }
-
-    /// Whether an accepted frame already sits at its park position. Park
-    /// positions are only recorded for AX writes the app accepted, so this is
-    /// a reliable "already hidden" signal and the write can be skipped —
-    /// worth doing because the skipped write is synchronous IPC into an app
-    /// that may be slow or hung.
-    fn isParked(self: HideCtx, frame: window_mod.Window.Frame) bool {
-        const park = self.parkPosition(frame.width);
-        const tol = window_mod.Window.Frame.tolerance;
-        return @abs(frame.x - park.x) <= tol and @abs(frame.y - park.y) <= tol;
-    }
-
-    /// Move a single window off-screen by POSITION only — never resizing it.
-    /// Resizing on hide causes a visible flash and a reflow storm in
-    /// size-sensitive apps; the parked size is irrelevant and retile restores
-    /// the real frame on re-activation. Updates the stored position so
-    /// retileDisplay detects the move and re-places the window when its
-    /// workspace becomes visible again. The size is never written.
-    fn hide(self: HideCtx, pid: i32, wid: u32) void {
-        self.captureFloatFrame(wid);
-
-        const width: f64 = if (managedWindow(wid)) |win| blk: {
-            if (self.isParked(win.frame)) return;
-            break :blk win.frame.width;
-        } else 0;
-        const park = self.parkPosition(width);
-        const pos_x = park.x;
-        const pos_y = park.y;
-
-        const ok = setWindowPositionTracked(pid, wid, pos_x, pos_y, .workspace_park);
-        log.debug("hide window wid={d} pid={d} ok={} x={d:.0} y={d:.0}", .{ wid, pid, ok, pos_x, pos_y });
-        if (!ok and !self.hideFocusedFallback(pid, wid, pos_x, pos_y)) {
-            log.warn("hide failed wid={d} pid={d}", .{ wid, pid });
-        }
-
-        // Record the park position only when this window's own AX write was
-        // accepted. The focused-window fallback updates the replacement id's
-        // metadata itself, and recording a failed park would make the stored
-        // frame claim the window is off-screen while it is still visible —
-        // parkHiddenWorkspaceWindows compares accepted frames and would never
-        // retry it.
-        if (ok) {
-            if (managedWindow(wid)) |win| {
-                var updated = win;
-                updated.frame.x = pos_x;
-                updated.frame.y = pos_y;
-                _ = updateManagedWindow(updated);
-            }
-        }
-    }
-
-    /// Snapshot a floating window's live on-screen frame before it is parked in
-    /// the corner. retileDisplay only restores tiled windows from BSP, so a
-    /// floating window would otherwise stay parked when its workspace is shown.
-    /// Reads WindowServer bounds directly so capture uses physical geometry.
-    /// Skips capture when the window is already
-    /// off-screen (center outside the display) so a re-hide cannot overwrite the
-    /// remembered position with the parked corner.
-    fn captureFloatFrame(self: HideCtx, wid: u32) void {
-        var win = managedWindow(wid) orelse return;
-        if (win.mode != .floating) return;
-        // A fullscreen window's bounds are Bobrwm's own placement, not a user
-        // one. Capturing them would overwrite the pre-fullscreen frame that
-        // toggling fullscreen off has to restore.
-        if (win.is_fullscreen) return;
-
-        const sky = g_sky orelse return;
-        var rect: skylight.CGRect = undefined;
-        if (sky.getWindowBounds(sky.mainConnectionID(), wid, &rect) != 0) return;
-
-        const center_x = rect.origin.x + rect.size.width / 2.0;
-        const center_y = rect.origin.y + rect.size.height / 2.0;
-        const on_x = center_x >= self.display.x and center_x <= self.display.x + self.display.w;
-        const on_y = center_y >= self.display.y and center_y <= self.display.y + self.display.h;
-        if (!on_x or !on_y) return;
-
-        win.float_frame = .{
-            .x = rect.origin.x,
-            .y = rect.origin.y,
-            .width = rect.size.width,
-            .height = rect.size.height,
-        };
-        _ = updateManagedWindow(win);
-    }
-
-    /// Ghostty can replace the active native-tab window ID before Bobrwm has
-    /// reconciled focus. If moving the stored ID fails, move the app's current
-    /// focused AX window to the same off-screen position so it cannot leak onto
-    /// the newly activated empty workspace, then reconcile the ID swap.
-    fn hideFocusedFallback(self: HideCtx, pid: i32, failed_wid: u32, x: f64, y: f64) bool {
-        _ = self;
-        std.debug.assert(pid > 0);
-        std.debug.assert(failed_wid > 0);
-
-        const focused_wid = focusedWindowIdForPid(pid) orelse return false;
-        if (focused_wid == failed_wid) return false;
-
-        const ok = setWindowPositionTracked(pid, focused_wid, x, y, .workspace_park);
-        log.debug("hide fallback focused window failed_wid={d} focused_wid={d} pid={d} ok={} x={d:.0} y={d:.0}", .{
-            failed_wid,
-            focused_wid,
-            pid,
-            ok,
-            x,
-            y,
-        });
-        if (!ok) return false;
-
-        // Record the ID swap at the parked position using the failed window's
-        // stored size. replaceManagedWindowId needs a non-degenerate frame, so
-        // clamp a degenerate stored size (not yet tiled, or discovered
-        // mid-construction) to 1x1 metadata instead of bailing: the focused
-        // window has already been moved off-screen, and skipping the swap
-        // here would leave the stale id managed and the moved window
-        // untracked. Retile restores the real frame on re-activation.
-        const stored = managedWindow(failed_wid) orelse return false;
-        const replacement_frame: window_mod.Window.Frame = .{
-            .x = x,
-            .y = y,
-            .width = @max(stored.frame.width, 1),
-            .height = @max(stored.frame.height, 1),
-        };
-        return replaceManagedWindowId(failed_wid, focused_wid, replacement_frame);
-    }
-};
-
-/// Convenience wrapper for single-window hides outside of loops.
-fn hideWindow(pid: i32, wid: u32) void {
-    const display_id = if (managedWindowSpace(wid)) |space| space.display_id else focusedDisplayId();
-    g_animator.finish(wid);
-    (HideCtx.init(display_id)).hide(pid, wid);
-}
-
-/// Workspace-aware on-screen check. Windows on hidden workspaces are parked
-/// in a screen corner with a few peek pixels visible — CG considers them
-/// "on screen" but they should not be treated as such.
+/// Workspace-aware on-screen check.
 fn isVisibleOnScreen(wid: u32) bool {
     if (managedWindow(wid)) |win| {
         const space = managedWindowSpace(win.wid) orelse return false;
@@ -1129,10 +920,6 @@ var g_config_path: ?[:0]const u8 = null;
 var g_mouse_down_location: c.CGPoint = .{ .x = 0, .y = 0 };
 var g_mouse_drag_event_emitted = false;
 
-fn nativeSpacesEnabled() bool {
-    return g_config.native_spaces and g_sky != null and g_sky.?.supportsNativeSpaces();
-}
-
 fn workspaceCount() u8 {
     const count = config_mod.workspaceCount(&g_config);
     std.debug.assert(count > 0 and count <= workspace_mod.max_workspaces);
@@ -1140,11 +927,7 @@ fn workspaceCount() u8 {
 }
 
 fn moveTabGroupToNativeSpace(wid: u32, target: state_mod.SpaceRef) bool {
-    if (!nativeSpacesEnabled()) return false;
-    const space_id = switch (target.key) {
-        .native => |value| value,
-        .virtual => return false,
-    };
+    const space_id = target.key.id;
     const sky = &g_sky.?;
     if (g_state.windowTabGroup(wid)) |group| {
         return sky.moveWindowsToNativeSpace(group.members(), space_id);
@@ -1165,14 +948,8 @@ fn requestNativeWindowMove(wid: u32, source: state_mod.SpaceRef, target: state_m
 
 fn nativeTabGroupMoveConfirmed(wid: u32, pending: state_mod.PendingNativeWindowMove) ?bool {
     const sky = &g_sky.?;
-    const target_space_id = switch (pending.target.key) {
-        .native => |value| value,
-        .virtual => return null,
-    };
-    const source_space_id = switch (pending.source.key) {
-        .native => |value| value,
-        .virtual => return null,
-    };
+    const target_space_id = pending.target.key.id;
+    const source_space_id = pending.source.key.id;
     if (g_state.windowTabGroup(wid)) |group| {
         var checked_count: usize = 0;
         for (group.members()) |member_wid| {
@@ -2006,12 +1783,6 @@ fn reloadConfig() bool {
         notifyConfigReloadFailed();
         return false;
     }
-    if (next.config.native_spaces != g_config.native_spaces) {
-        log.err("config reload cannot change native_spaces; restart to apply it", .{});
-        next.deinit();
-        notifyConfigReloadFailed();
-        return false;
-    }
     applyReloadedConfig(next);
     return true;
 }
@@ -2104,14 +1875,13 @@ fn hotkeyTapCallback(
 }
 
 fn setupHotkeyEventTap() void {
-    var mask: c.CGEventMask =
+    const mask: c.CGEventMask =
         (@as(c.CGEventMask, 1) << @intCast(c.kCGEventKeyDown)) |
         (@as(c.CGEventMask, 1) << @intCast(c.kCGEventLeftMouseDown)) |
         (@as(c.CGEventMask, 1) << @intCast(c.kCGEventLeftMouseDragged)) |
-        (@as(c.CGEventMask, 1) << @intCast(c.kCGEventLeftMouseUp));
-    if (g_config.native_spaces) {
-        mask |= (@as(c.CGEventMask, 1) << 29) | (@as(c.CGEventMask, 1) << 30);
-    }
+        (@as(c.CGEventMask, 1) << @intCast(c.kCGEventLeftMouseUp)) |
+        (@as(c.CGEventMask, 1) << 29) |
+        (@as(c.CGEventMask, 1) << 30);
 
     g_tap_port = cg_extra.CGEventTapCreate(
         c.kCGSessionEventTap,
@@ -2301,10 +2071,10 @@ pub fn main(init: std.process.Init.Minimal) !void {
         axPrompt();
     }
 
-    // -- SkyLight (optional) --
+    // -- SkyLight --
     g_sky = skylight.SkyLight.init();
-    if (g_config.native_spaces and (g_sky == null or !g_sky.?.supportsNativeSpaces())) {
-        log.err("native_spaces requested but required SkyLight symbols are unavailable", .{});
+    if (g_sky == null or !g_sky.?.supportsNativeSpaces()) {
+        log.err("required native Space APIs are unavailable", .{});
         return error.NativeSpacesUnavailable;
     }
 
@@ -2316,42 +2086,30 @@ pub fn main(init: std.process.Init.Minimal) !void {
     refreshDisplays();
 
     const primary_id = primaryDisplayId();
-    var initialization: state_mod.WorkspaceInitialization = .{
-        .workspace_count = workspaceCount(),
-        .primary_display_id = primary_id,
-    };
-    for (g_displays[0..g_display_count]) |display| {
-        if (!initialization.addDisplay(display.id)) return error.InvalidDisplayTopology;
-    }
-    dispatchStateEvent(.{ .initialize_workspaces = initialization });
-    if (g_state.spaces.space_count != workspaceCount()) return error.InvalidDisplayTopology;
-
     // Start from WindowServer's truth. Assuming space 1 here would immediately
     // tile windows from whichever native space happened to be visible into the
     // wrong internal workspace after a relaunch.
-    if (nativeSpacesEnabled()) {
-        const topology = captureNativeTopology() orelse {
-            log.err("could not capture configured native Space topology", .{});
-            return error.NativeSpaceMappingUnavailable;
-        };
-        for (topology.displays[0..topology.display_count]) |display| {
-            if (display.workspaceForSpace(display.observed_space_id) != null) continue;
-            log.err("current native Space {d} is not a configured ordinary workspace on display {d}", .{
-                display.observed_space_id,
-                display.display_id,
-            });
-            return error.NativeSpaceMappingUnavailable;
-        }
-        dispatchStateEvent(.{ .initialize_native_topology = .{
-            .topology = topology,
-            .focused_display_id = primary_id,
-        } });
+    const topology = captureNativeTopology() orelse {
+        log.err("could not map configured workspaces to Mission Control Spaces", .{});
+        return error.NativeSpaceMappingUnavailable;
+    };
+    for (topology.displays[0..topology.display_count]) |display| {
+        if (display.workspaceForSpace(display.observed_space_id) != null) continue;
+        log.err("current Space {d} is not a configured ordinary workspace on display {d}", .{
+            display.observed_space_id,
+            display.display_id,
+        });
+        return error.NativeSpaceMappingUnavailable;
     }
+    dispatchStateEvent(.{ .initialize_native_topology = .{
+        .topology = topology,
+        .focused_display_id = primary_id,
+    } });
 
     // -- Signal transport (handler writes only; cleanup runs on main) --
     try signal_transport.init(gracefulStopNSApp);
     defer signal_transport.deinit();
-    errdefer restoreAllWindows();
+    errdefer resetDimming();
 
     // -- Discover existing windows and tile --
     discoverWindows();
@@ -2399,9 +2157,9 @@ pub fn main(init: std.process.Init.Minimal) !void {
 
     // -- Enter NSApp run loop --
     // Returns when CFRunLoopStop is called (e.g. graceful signal handler).
-    // The defer chain then runs restoreAllWindows() safely on the main thread.
+    // The defer chain then removes any dimming overlays on the main thread.
     log.info("entering run loop", .{});
-    defer restoreAllWindows();
+    defer resetDimming();
     NSApp.msgSend(void, "run", .{});
 }
 
@@ -2428,9 +2186,8 @@ fn bw_drain_events() void {
     }
     recoverFromEventOverflow();
 
-    // Flush retile BEFORE cleanup so windows are at their layout positions
-    // when cleanup checks on-screen status. Without this, cleanup sees
-    // corner-parked windows and incorrectly removes them as ghosts.
+    // Flush retile before cleanup so visible windows are at their accepted
+    // layout positions when cleanup checks WindowServer state.
     flushRetileRequests();
 
     flushCleanupRequests();
@@ -2447,8 +2204,7 @@ fn bw_drain_events() void {
 
 /// A dropped event has unknown semantics, so recover from authoritative OS
 /// state instead of guessing which individual mutation was lost. Cleanup is
-/// deferred through workspace transitions because parked windows are expected
-/// to be off-screen during that interval.
+/// deferred through workspace transitions while visibility is changing.
 fn recoverFromEventOverflow() void {
     if (!g_event_overflow_recovery_pending) return;
     if (g_state.isWorkspaceTransitionActive()) return;
@@ -2528,7 +2284,7 @@ fn reconcileDueGeometryObservations() void {
 /// retrying geometry; blindly reissuing the stale ID would loop forever.
 fn reconcileDivergedGeometryIntent(wid: u32, intent: geometry_mod.Intent) bool {
     switch (intent.source) {
-        .tab_sync, .workspace_park, .exit_restore => return false,
+        .tab_sync => return false,
         .layout, .floating_restore, .user_command, .animation => {},
     }
 
@@ -2625,10 +2381,8 @@ fn statusBarSwitchToWorkspace(workspace_id: u8) callconv(.c) void {
     switchWorkspace(workspace_id);
 }
 
-/// Restore windows before asking AppKit to terminate; the UI library must not
-/// own shutdown because restoration mutates all window-management state.
 fn statusBarQuit() callconv(.c) void {
-    restoreAllWindows();
+    resetDimming();
 
     const NSApplication = objc.getClass("NSApplication").?;
     const app = NSApplication.msgSend(objc.Object, "sharedApplication", .{});
@@ -3100,16 +2854,11 @@ fn handleEvent(ev: *const event_mod.Event) void {
             } });
         },
         .space_changed => {
-            if (nativeSpacesEnabled()) {
-                log.info("native space changed", .{});
-                dispatchStateEvent(.{ .native_space_changed = nativeStateNowMs() });
-                return;
-            }
-            log.debug("space changed", .{});
+            log.info("native space changed", .{});
+            dispatchStateEvent(.{ .native_space_changed = nativeStateNowMs() });
         },
         .role_poll_tick => {
             reconcileDueGeometryObservations();
-            processPendingWorkspaceParks();
             processPendingNativeWindowMoves();
             processPendingNativeWorkspaceMove();
             if (processDueNativeStateObservation()) return;
@@ -3316,7 +3065,6 @@ fn refreshRolePolling() void {
         g_state.hasScheduledObservation() or
         g_state.isWorkspaceTransitionActive() or
         g_state.hasDisplayResettleScheduled() or
-        g_state.hasPendingWorkspaceParks() or
         g_event_overflow_recovery_pending or
         g_state.geometry.hasPendingResamples();
     setRolePolling(has_pending);
@@ -3463,6 +3211,7 @@ fn captureNativeTopology() ?state_mod.NativeTopology {
     defer snapshot.deinit();
 
     var observation: state_mod.NativeTopologyObservation = .{};
+    var captured_space_count: u16 = 0;
     for (g_displays[0..g_display_count]) |display| {
         const observed_space_id = snapshot.currentSpaceId(display.id) orelse {
             log.warn("native topology: current Space unavailable display={d}", .{display.id});
@@ -3477,6 +3226,7 @@ fn captureNativeTopology() ?state_mod.NativeTopology {
             log.warn("native topology: display has no ordinary Spaces display={d}", .{display.id});
             return null;
         }
+        captured_space_count += captured_count;
 
         var observed_display: state_mod.NativeDisplayObservation = .{
             .display_id = display.id,
@@ -3496,6 +3246,13 @@ fn captureNativeTopology() ?state_mod.NativeTopology {
         }
         observation.addDisplay(observed_display);
     }
+    if (captured_space_count < workspaceCount()) {
+        log.warn("native topology: configured workspaces exceed ordinary Spaces configured={d} available={d}", .{
+            workspaceCount(),
+            captured_space_count,
+        });
+        return null;
+    }
 
     return state_mod.mapNativeTopology(
         observation,
@@ -3503,6 +3260,7 @@ fn captureNativeTopology() ?state_mod.NativeTopology {
         &g_state.workspace_topology,
         &g_state.spaces,
         workspaceCount(),
+        primaryDisplayId(),
     );
 }
 
@@ -3537,7 +3295,6 @@ fn executeStateEffect(effect: state_mod.Effect) void {
         .native_switch_failed => |value| failNativeSwitch(value),
         .native_topology_changed => reconcileObservedNativeTopology(),
         .workspace_switch_ready => |workspace_switch| executeWorkspaceSwitch(workspace_switch),
-        .virtual_workspace_move_ready => |workspace_move| executeVirtualWorkspaceMove(workspace_move),
         .native_switch_rejected => |space| log.warn("native workspace switch rejected display={d} workspace={d}", .{
             space.display_id,
             space.workspace_id,
@@ -3620,7 +3377,6 @@ fn executeStateEffect(effect: state_mod.Effect) void {
             reconcileFocusedWindow(resolved.process_id, resolved.window_id);
         },
         .focus_retry_expired => |process_id| log.debug("focus-retry: gave up pid={d}", .{process_id}),
-        .park_workspace => |park| executeWorkspacePark(park),
         .display_resettle_due => {
             log.info("display resettle", .{});
             reconcileDisplays();
@@ -3628,11 +3384,6 @@ fn executeStateEffect(effect: state_mod.Effect) void {
         .reconcile_displays => {
             log.info("display changed", .{});
             reconcileDisplays();
-        },
-        .virtual_displays_reconciled => {
-            parkHiddenWorkspaceWindows();
-            assertDisplayCoverage();
-            refreshRolePolling();
         },
         .focus_window => |focus| {
             _ = bw_ax_focus_window(focus.process_id, focus.window_id);
@@ -3722,7 +3473,6 @@ fn executeCenterWindow(center: state_mod.CenterWindowEffect) void {
 fn executeWindowMoved(move: state_mod.WindowMoveEffect) void {
     const current_space = managedWindowSpace(move.window_id) orelse return;
     if (!current_space.key.eql(move.target.key)) return;
-    if (move.should_hide) hideWindow(move.process_id, move.window_id);
     if (move.should_follow_focus) {
         const window = managedWindow(move.window_id) orelse return;
         observeWindowFocus(window, .keyboard, null);
@@ -3761,17 +3511,6 @@ fn executeAppLaunchRetry(process_id: i32) void {
     discoverWindows();
     retile();
     updateStatusBar();
-}
-
-fn executeWorkspacePark(park: state_mod.WorkspaceParkEffect) void {
-    if (park.did_time_out) {
-        log.warn("workspace switch reveal timed out current_workspace={d} target_workspace={d} display={d}; parking outgoing workspace", .{
-            park.outgoing.workspace_id,
-            park.target.workspace_id,
-            park.target.display_id,
-        });
-    }
-    parkOutgoingWorkspace(park.outgoing, park.target);
 }
 
 fn executeRetileRequest(request: state_mod.RetileRequest) void {
@@ -4054,10 +3793,7 @@ fn executeWorkspaceTransitionSettled(settlement: state_mod.WorkspaceTransitionSe
 
 fn executeNativeSwitch(effect: @FieldType(state_mod.Effect, "switch_native_space")) void {
     const request = effect.request;
-    const native_space_id = switch (request.target.key) {
-        .native => |space_id| space_id,
-        .virtual => unreachable,
-    };
+    const native_space_id = request.target.key.id;
     if (!g_sky.?.switchNativeSpaceId(request.target.display_id, native_space_id)) {
         dispatchStateEvent(.{ .native_switch_effect_failed = .{
             .epoch = effect.epoch,
@@ -4076,37 +3812,8 @@ fn executeNativeSwitch(effect: @FieldType(state_mod.Effect, "switch_native_space
 }
 
 fn executeWorkspaceSwitch(workspace_switch: state_mod.WorkspaceSwitchEffect) void {
-    if (workspace_switch.outgoing) |outgoing| {
-        ax_mod.beginGeometryBatch();
-        defer ax_mod.endGeometryBatch();
-        retileAllDisplays();
-        updateStatusBar();
-        focusWorkspaceWindow(workspace_switch.target);
-        parkOutgoingWhenRevealed(outgoing, workspace_switch.target);
-        return;
-    }
-
     updateStatusBar();
     focusWorkspaceWindow(workspace_switch.target);
-}
-
-fn executeVirtualWorkspaceMove(workspace_move: state_mod.VirtualWorkspaceMoveEffect) void {
-    const hctx = HideCtx.init(workspace_move.moving.display_id);
-    const displaced_windows = workspaceWindows(workspace_move.displaced);
-    for (displaced_windows.items()) |wid| {
-        const visible_wid = g_state.windowTabActive(wid);
-        const hide_wid = if (managedWindow(visible_wid) != null) visible_wid else wid;
-        const win = managedWindow(hide_wid) orelse continue;
-        const window_space = managedWindowSpace(hide_wid) orelse continue;
-        if (!window_space.key.eql(workspace_move.displaced.key)) continue;
-        g_animator.finish(hide_wid);
-        hctx.hide(win.pid, hide_wid);
-    }
-
-    assertDisplayCoverage();
-    retileAllDisplays();
-    updateStatusBar();
-    focusWorkspaceWindow(workspace_move.moving);
 }
 
 fn observeNativeTopology(epoch: state_mod.Epoch) void {
@@ -4149,15 +3856,9 @@ fn failNativeSwitch(failure: @FieldType(state_mod.Effect, "native_switch_failed"
         failure.epoch,
         failure.request.target.display_id,
         failure.request.target.workspace_id,
-        switch (failure.request.target.key) {
-            .native => |space_id| space_id,
-            .virtual => 0,
-        },
+        failure.request.target.key.id,
         @tagName(failure.reason),
-        if (failure.actual) |actual| switch (actual.key) {
-            .native => |space_id| space_id,
-            .virtual => 0,
-        } else 0,
+        if (failure.actual) |actual| actual.key.id else 0,
         if (failure.actual) |actual| actual.workspace_id else 0,
     });
     reconcileObservedNativeTopology();
@@ -4198,12 +3899,12 @@ fn reconcileNativeWindowAssignments(topology: *const skylight.NativeSpaceTopolog
         const current_space = managedWindowSpace(win.wid) orelse continue;
 
         const space_id = topology.spaceIdForWindow(sky, visible_wid, current_space.display_id) orelse continue;
-        if (current_space.key.eql(.{ .native = space_id })) continue;
+        if (current_space.key.eql(.{ .id = space_id })) continue;
         if (repair_count == repairs.len) {
             log.warn("native workspace assignment repair truncated limit={d}", .{repairs.len});
             break;
         }
-        const target = g_state.space(.{ .native = space_id }) orelse continue;
+        const target = g_state.space(.{ .id = space_id }) orelse continue;
         repairs[repair_count] = .{ .wid = win.wid, .target = target };
         repair_count += 1;
     }
@@ -4453,8 +4154,8 @@ fn discoverWindowsImpl(should_refresh_tabs: bool) usize {
                 untrackPendingRoleWindow(info.wid);
                 // Degenerate discovery bounds mean the window is still
                 // mid-construction. Defer for bounded re-evaluation instead
-                // of storing a garbage frame that would be tiled or parked
-                // at zero size. Deliberately not untracked first: tracking an
+                // of storing a garbage frame that would be tiled at zero size.
+                // Deliberately not untracked first: tracking an
                 // existing candidate preserves its remaining retry budget.
                 if (frame.width <= 1 or frame.height <= 1) {
                     trackDeferredWindowCandidate(info.pid, info.wid, target_ws);
@@ -4479,12 +4180,8 @@ fn discoverWindowsImpl(should_refresh_tabs: bool) usize {
         adopted_count += 1;
 
         if (!spaceVisible(target_ws)) {
-            if (nativeSpacesEnabled()) {
-                const source = spaceForWorkspace(discovered_display, activeWorkspaceIdForDisplay(discovered_display)) orelse continue;
-                requestNativeWindowMove(info.wid, source, target_ws);
-            } else {
-                hideWindow(info.pid, info.wid);
-            }
+            const source = spaceForWorkspace(discovered_display, activeWorkspaceIdForDisplay(discovered_display)) orelse continue;
+            requestNativeWindowMove(info.wid, source, target_ws);
         }
     }
 
@@ -4674,12 +4371,8 @@ fn addNewWindowManagedWithAssignment(pid: i32, wid: u32, assigned_space: state_m
     }
 
     // On-screen but no settled SkyLight bounds yet means mid-construction.
-    // Proceeding would record a garbage frame and, for an app assigned to a
-    // hidden workspace, park a zero-size window. Defer for bounded
-    // re-evaluation. Tracked before the untrack-defer below so it survives
-    // this early return. Only when SkyLight is available: without it bounds
-    // are always zero, and deferring would leave every new window unmanaged;
-    // without it, the layout pass supplies the initial frame.
+    // Proceeding would record garbage geometry. Track before the untrack-defer
+    // below so bounded re-evaluation survives this early return.
     if (g_sky != null and (window_frame.width <= 1 or window_frame.height <= 1)) {
         trackDeferredWindowCandidate(pid, wid, assigned_space);
         log.info("addNewWindow: deferred pid={d} wid={d} unsettled bounds", .{ pid, wid });
@@ -4731,13 +4424,9 @@ fn addNewWindowManagedWithAssignment(pid: i32, wid: u32, assigned_space: state_m
     // A native-space move must happen after the window exists in WindowServer
     // but before it can flash on the current workspace as managed content.
     if (!spaceVisible(ws)) {
-        if (nativeSpacesEnabled()) {
-            const source_display = inferDisplayIdForWindow(wid) orelse display_id;
-            const source = spaceForWorkspace(source_display, activeWorkspaceIdForDisplay(source_display)) orelse return true;
-            requestNativeWindowMove(wid, source, ws);
-        } else {
-            hideWindow(pid, wid);
-        }
+        const source_display = inferDisplayIdForWindow(wid) orelse display_id;
+        const source = spaceForWorkspace(source_display, activeWorkspaceIdForDisplay(source_display)) orelse return true;
+        requestNativeWindowMove(wid, source, ws);
     }
 
     const float_reason = if (mode == .tiled) "tiled" else if (rule_float) "floated (app rule)" else "floated (undersized+non-resizable)";
@@ -4823,8 +4512,7 @@ fn refreshTabGroupActiveTabsFromSnapshot(on_screen: *const OnScreenWindows) void
         const group = g_state.windowTabGroup(leader_window_id) orelse continue;
         const leader = managedWindow(group.leader_window_id) orelse continue;
         const leader_space = managedWindowSpace(leader.wid) orelse continue;
-        // A parked group is off-screen on purpose and nothing acts on it until
-        // its workspace is shown again.
+        // A group on another physical Space is off-screen on purpose.
         if (!spaceVisible(leader_space)) continue;
         if (on_screen.contains(group.active_window_id)) continue;
 
@@ -5077,9 +4765,8 @@ fn cleanupWorkspaceWindowsForPid(pid: i32) bool {
     var truncated = false;
 
     for (g_state.spaces.spaces[0..g_state.spaces.space_count]) |ws| {
-        // Windows on hidden workspaces are intentionally parked off-screen.
-        // AX role queries can be flaky for windows at corner positions,
-        // so skip hidden workspaces to avoid false positives.
+        // macOS keeps windows on inactive Spaces off-screen. Only validate the
+        // visible Space so native visibility is not mistaken for destruction.
         if (!spaceVisible(ws)) continue;
 
         const windows = workspaceWindows(ws);
@@ -5135,7 +4822,7 @@ fn cleanupOffscreenManagedWindows() bool {
     var truncated = false;
 
     for (g_state.spaces.spaces[0..g_state.spaces.space_count]) |ws| {
-        // Windows on hidden workspaces are intentionally parked off-screen.
+        // macOS keeps windows on inactive Spaces off-screen.
         if (!spaceVisible(ws)) continue;
 
         const windows = workspaceWindows(ws);
@@ -5352,9 +5039,8 @@ fn handleExternalWindowGeometry(wid: u32, frame: window_mod.Window.Frame) void {
     const space = managedWindowSpace(win.wid) orelse return;
 
     if (!spaceVisible(space)) {
-        // Parked windows intentionally differ from their layout frame while
-        // hidden. Never let their trailing AX echoes retile the visible
-        // workspace or adopt the parked position as floating restore state.
+        // Never let trailing AX events from an inactive physical Space retile
+        // the visible workspace or overwrite floating restore state.
         log.debug("geometry: ignored external sample for hidden wid={d}", .{wid});
         return;
     }
@@ -5383,117 +5069,27 @@ fn handleExternalWindowGeometry(wid: u32, frame: window_mod.Window.Frame) void {
 
 /// Reconciles workspace/display state after monitor topology changes.
 ///
-/// Surviving displays keep their active workspace and layout roots, recalled by
-/// stable UUID from a persistent table so a monitor absent across several
-/// events (staggered wake) or unplugged and replugged still reclaims the
-/// workspace it had — even if macOS hands it a new id. Every workspace stays
-/// homed on a surviving display (re-homed to primary if its monitor vanished,
-/// never left homeless), and each display gets a distinct active workspace.
-/// Window display assignment is then derived from the workspace home, so
-/// windows always follow their workspace — to the primary display when their
-/// monitor vanished, and back when it returns and reclaims the workspace.
+/// Native Space IDs preserve surviving assignments. New physical Spaces take
+/// the remaining logical workspace IDs during topology mapping.
 fn reconcileDisplayChange() void {
-    // Display slots and ids are about to be rebuilt. Any delayed park keyed
-    // by the old topology is invalid; parkHiddenWorkspaceWindows below
-    // re-establishes visibility from the new authoritative mapping.
-    dispatchStateEvent(.clear_workspace_parks);
-
-    // Snapshot present displays' active workspaces (by UUID) before the
-    // topology changes, so a monitor that vanishes keeps its binding and
-    // reclaims its workspace on return.
-    rememberDisplayWorkspaces();
-
     const focused_uuid: ?[16]u8 = blk: {
         const slot = displayIndexById(focusedDisplayId()) orelse break :blk null;
         break :blk g_displays[slot].uuid;
     };
 
-    // Snapshot every workspace home as a display UUID before the table is
-    // rebuilt. Numeric ids cannot be trusted across a topology change: macOS
-    // reuses CGDirectDisplayIDs, so a stale home id can name a different
-    // monitor afterwards while still looking "present".
-    var home_uuids: [workspace_mod.max_workspaces]?[16]u8 = @splat(null);
-    for (g_state.spaces.spaces[0..g_state.spaces.space_count]) |space| {
-        const slot = displayIndexById(space.display_id) orelse continue;
-        home_uuids[space.workspace_id - 1] = g_displays[slot].uuid;
-    }
-
     refreshDisplays();
 
     const restored_focused_display_id = displayIdForUuid(focused_uuid) orelse primaryDisplayId();
-    if (nativeSpacesEnabled()) {
-        const native_topology = captureNativeTopology() orelse {
-            log.warn("display reconcile could not observe native Space topology", .{});
-            return;
-        };
-        dispatchStateEvent(.{ .initialize_native_topology = .{
-            .topology = native_topology,
-            .focused_display_id = restored_focused_display_id,
-        } });
-        assertDisplayCoverage();
-        refreshRolePolling();
+    const native_topology = captureNativeTopology() orelse {
+        log.warn("display reconcile could not observe native Space topology", .{});
         return;
-    }
-
-    var observation: state_mod.VirtualDisplayObservation = .{
-        .primary_display_id = primaryDisplayId(),
-        .focused_display_id = restored_focused_display_id,
-        .workspace_home_uuids = home_uuids,
     };
-    for (g_displays[0..g_display_count]) |display| {
-        if (!observation.addDisplay(.{
-            .display_id = display.id,
-            .uuid = display.uuid,
-        })) return;
-    }
-    dispatchStateEvent(.{ .virtual_displays_observed = observation });
-}
-
-/// Park every window of every hidden workspace so a topology change never
-/// leaves windows at coordinates that no longer map to a live display.
-///
-/// Walks reducer workspace membership rather than gating on raw CG on-screen
-/// state: parked windows keep peek pixels visible, so CG counts them as
-/// on-screen, while genuinely stranded windows can be fully off-screen — CG
-/// presence distinguishes exactly the wrong ones. Windows already at their
-/// park position are skipped by comparing accepted frames. Targets are
-/// collected before any hide because hiding can replace window ids
-/// (native-tab fallback), which mutates the structures being iterated.
-fn parkHiddenWorkspaceWindows() void {
-    const ParkTarget = struct { pid: i32, wid: u32 };
-    var targets: [256]ParkTarget = undefined;
-    var target_count: usize = 0;
-
-    outer: for (g_state.spaces.spaces[0..g_state.spaces.space_count]) |ws| {
-        const home = ws.display_id;
-        if (spaceVisible(ws)) continue;
-
-        const ctx = HideCtx.init(home);
-        const snapshot = workspaceWindows(ws);
-        for (snapshot.items()) |wid| {
-            // Reducer membership holds tab-group leaders, but the on-screen
-            // window of a group is its active tab — which may not be the
-            // leader. Park the active tab; suppressed members are already
-            // off-screen behind it.
-            const visible_wid = g_state.windowTabActive(wid);
-            const win = managedWindow(visible_wid) orelse continue;
-
-            if (ctx.isParked(win.frame)) continue;
-
-            if (target_count == targets.len) {
-                log.warn("park: batch truncated at {d} windows", .{targets.len});
-                break :outer;
-            }
-            targets[target_count] = .{ .pid = win.pid, .wid = visible_wid };
-            target_count += 1;
-        }
-    }
-
-    ax_mod.beginGeometryBatch();
-    defer ax_mod.endGeometryBatch();
-    for (targets[0..target_count]) |target| {
-        hideWindow(target.pid, target.wid);
-    }
+    dispatchStateEvent(.{ .initialize_native_topology = .{
+        .topology = native_topology,
+        .focused_display_id = restored_focused_display_id,
+    } });
+    assertDisplayCoverage();
+    refreshRolePolling();
 }
 
 /// Apply a target frame to a window, moving without a resize whenever the
@@ -5601,11 +5197,9 @@ fn centeredFrame(width: f64, height: f64, display: shim.bw_frame) window_mod.Win
     };
 }
 
-/// Restore floating windows of a shown workspace to their remembered on-screen
-/// position. Only acts on windows whose live bounds are currently off-screen —
-/// parked on hide, or drifted by the app — so it never fights a placement the
-/// user set while the workspace was visible. Centers as a fallback when no
-/// position was captured.
+/// Restore floating windows of a shown workspace to their remembered position.
+/// Only acts when live bounds are off-display, so it never fights a placement
+/// the user set while the workspace was visible.
 ///
 /// Fullscreen floating windows are the exception: they own the whole content
 /// frame, so they are placed regardless of where they currently sit. `content`
@@ -5620,10 +5214,8 @@ fn restoreFloatingWindows(ws: state_mod.SpaceRef, display: shim.bw_frame, conten
         const leader = managedWindow(leader_wid) orelse continue;
         if (leader.mode != .floating) continue;
 
-        // The leader owns the workspace slot and the mode/fullscreen intent,
-        // but the window park moved off-screen is the group's active tab.
-        // Reading the leader's bounds here would leave a group whose active
-        // tab is not its leader parked forever.
+        // The leader owns the workspace slot and mode/fullscreen intent, but
+        // the active tab is the window contributing pixels.
         const wid = g_state.windowTabActive(leader_wid);
         var win = managedWindow(wid) orelse continue;
 
@@ -5796,34 +5388,8 @@ fn observeDiscoveredApps() void {
     }
 }
 
-// Exit recovery — restore all hidden windows to screen center
-
-fn restoreAllWindows() void {
-    // Undo any inactive-window dimming so windows are left undimmed.
+fn resetDimming() void {
     dim.resetAll();
-
-    for (g_state.spaces.spaces[0..g_state.spaces.space_count]) |ws| {
-        if (spaceVisible(ws)) continue;
-        const display_slot = displayIndexById(ws.display_id) orelse continue;
-        const display = g_displays[display_slot].visible;
-        const snapshot = workspaceWindows(ws);
-        for (snapshot.items()) |wid| {
-            if (managedWindow(wid)) |win| {
-                // Place at screen center with stored size (or sensible default)
-                const w = if (win.frame.width > 1) win.frame.width else display.w * 0.5;
-                const h = if (win.frame.height > 1) win.frame.height else display.h * 0.5;
-                const x = display.x + (display.w - w) / 2.0;
-                const y = display.y + (display.h - h) / 2.0;
-                const target: window_mod.Window.Frame = .{
-                    .x = x,
-                    .y = y,
-                    .width = w,
-                    .height = h,
-                };
-                _ = setWindowFrameTracked(win.pid, wid, target, .exit_restore);
-            }
-        }
-    }
 }
 
 // Tab group reconciliation
@@ -5920,17 +5486,14 @@ fn configuredWorkspace(pid: i32, display_id: u32) ?state_mod.SpaceRef {
 }
 
 fn resolveWorkspaceForWindow(pid: i32, wid: u32, display_id: u32) ?state_mod.SpaceRef {
-    const native_space_id = if (nativeSpacesEnabled())
-        g_sky.?.nativeSpaceIdForWindow(wid, display_id)
-    else
-        null;
+    const native_space_id = g_sky.?.nativeSpaceIdForWindow(wid, display_id);
     if (native_space_id) |space_id| {
-        if (g_state.space(.{ .native = space_id }) == null) return null;
+        if (g_state.space(.{ .id = space_id }) == null) return null;
     }
 
     if (configuredWorkspace(pid, display_id)) |ws| return ws;
     if (native_space_id) |space_id| {
-        if (g_state.space(.{ .native = space_id })) |ws| return ws;
+        if (g_state.space(.{ .id = space_id })) |ws| return ws;
     }
     const ws_id = activeWorkspaceIdForDisplay(display_id);
     return spaceForWorkspace(display_id, ws_id) orelse unreachable;
@@ -5938,155 +5501,12 @@ fn resolveWorkspaceForWindow(pid: i32, wid: u32, display_id: u32) ?state_mod.Spa
 
 // Workspace switching
 
-fn frameCenterOnDisplay(frame: window_mod.Window.Frame, display: shim.bw_frame) bool {
-    if (frame.width <= 0 or frame.height <= 0) return false;
-    const center_x = frame.x + frame.width / 2.0;
-    const center_y = frame.y + frame.height / 2.0;
-    return center_x >= display.x and center_x <= display.x + display.w and
-        center_y >= display.y and center_y <= display.y + display.h;
-}
-
-/// Confirm that every non-minimized incoming window physically covers its
-/// assigned target. AX returning success only means the app accepted the
-/// request; WindowServer can expose the parked frame for several more
-/// milliseconds. An empty workspace is immediately ready because revealing
-/// the wallpaper is the requested result.
-fn workspaceRevealSettled(ws: state_mod.SpaceRef) bool {
-    const display_id = ws.display_id;
-    const display_slot = displayIndexById(display_id) orelse return false;
-    const display = g_displays[display_slot].visible;
-    const on_screen = OnScreenWindows.snapshot();
-    if (on_screen.truncated) return false;
-
-    const snapshot = workspaceWindows(ws);
-    for (snapshot.items()) |leader_wid| {
-        const visible_wid = g_state.windowTabActive(leader_wid);
-        const win = managedWindow(visible_wid) orelse return false;
-        const window_space = managedWindowSpace(visible_wid) orelse return false;
-        if (!window_space.key.eql(ws.key) or window_space.display_id != display_id) return false;
-        if (!frameCenterOnDisplay(win.frame, display)) return false;
-
-        // CG can retain layer-0 Electron windows (and stale native-tab IDs)
-        // with plausible bounds after they stop contributing pixels.
-        if (!on_screen.contains(visible_wid)) return false;
-        const actual = liveWindowFrame(visible_wid) orelse return false;
-        if (!workspace_mod.frameCoversTarget(actual, win.frame)) return false;
-    }
-    return true;
-}
-
-fn waitForWorkspaceReveal(ws: state_mod.SpaceRef) bool {
-    var waited_us: u32 = 0;
-    while (waited_us < workspace_reveal_wait_max_us) : (waited_us += workspace_reveal_poll_interval_us) {
-        if (workspaceRevealSettled(ws)) return true;
-        _ = c.usleep(workspace_reveal_poll_interval_us);
-    }
-    return workspaceRevealSettled(ws);
-}
-
-/// Park immediately once the incoming pixels are visible. Slow AX servers use
-/// the role-poll path, which leaves the old workspace covering the display
-/// instead of exposing the wallpaper while the reveal is still in flight.
-fn parkOutgoingWhenRevealed(
-    outgoing_ws: state_mod.SpaceRef,
-    target_ws: state_mod.SpaceRef,
-) void {
-    dispatchStateEvent(.{ .workspace_reveal_observed = .{
-        .outgoing = outgoing_ws,
-        .target = target_ws,
-        .is_revealed = waitForWorkspaceReveal(target_ws),
-        .deadline_at_ms = nativeStateNowMs() +| workspace_reveal_deferred_timeout_ms,
-    } });
-    const pending = g_state.pending_workspace_parks.get(target_ws.display_id) orelse return;
-    log.debug("workspace switch deferring outgoing park current_workspace={d} target_workspace={d} display={d}", .{
-        pending.outgoing.workspace_id,
-        pending.target.workspace_id,
-        pending.target.display_id,
-    });
-}
-
-fn processPendingWorkspaceParks() void {
-    const pending_parks = g_state.pending_workspace_parks;
-    const at_ms = nativeStateNowMs();
-    for (pending_parks.items()) |pending| {
-        const target = g_state.space(pending.target.key) orelse continue;
-        dispatchStateEvent(.{ .workspace_park_timer_fired = .{
-            .display_id = target.display_id,
-            .is_revealed = workspaceRevealSettled(target),
-            .at_ms = at_ms,
-        } });
-    }
-}
-
 fn switchWorkspace(target_id: u8) void {
     const target_ws = spaceForCommand(focusedDisplayId(), target_id) orelse return;
     dispatchStateEvent(.{ .request_workspace_switch = .{
         .target = target_ws,
         .at_ms = nativeStateNowMs(),
     } });
-}
-
-/// Park every window the outgoing workspace has on `display_id`.
-///
-/// Runs last, after the incoming workspace has been placed and focused, so the
-/// outgoing windows keep covering the display until there is something to
-/// replace them. Parking first exposes the desktop for as long as the outgoing
-/// AX writes take — every one a synchronous round-trip into an app — which is
-/// what the switch flash was.
-///
-/// Safe to defer: the workspace transition stays active until its settle
-/// deadline even once focus lands, so the synthetic AX move events these writes
-/// generate are still suppressed.
-fn parkOutgoingWorkspace(ws: state_mod.SpaceRef, target: state_mod.SpaceRef) void {
-    const display_id = target.display_id;
-    const hctx = HideCtx.init(display_id);
-
-    var hidden_count: usize = 0;
-    const snapshot = workspaceWindows(ws);
-    for (snapshot.items()) |wid| {
-        const visible_wid = g_state.windowTabActive(wid);
-        const hide_wid = if (managedWindow(visible_wid) != null) visible_wid else wid;
-        const win = managedWindow(hide_wid) orelse continue;
-        const window_space = managedWindowSpace(hide_wid) orelse continue;
-        if (!window_space.key.eql(ws.key)) continue;
-
-        if (g_state.windowTabGroup(wid)) |group| {
-            log.debug("workspace switch hiding window workspace={d} layout_wid={d} hide_wid={d} group_leader={d} group_active={d} members={d}", .{
-                ws.workspace_id,
-                wid,
-                hide_wid,
-                group.leader_window_id,
-                group.active_window_id,
-                group.member_count,
-            });
-        } else {
-            log.debug("workspace switch hiding window workspace={d} layout_wid={d} hide_wid={d} group=none", .{
-                ws.workspace_id,
-                wid,
-                hide_wid,
-            });
-        }
-
-        g_animator.finish(hide_wid);
-        hctx.hide(win.pid, hide_wid);
-        hidden_count += 1;
-    }
-
-    var hidden_pending_count: usize = 0;
-    for (g_state.pending_role_windows.items()) |pending| {
-        if (!pending.space_key.eql(ws.key)) continue;
-        g_animator.finish(pending.window_id);
-        hctx.hide(pending.process_id, pending.window_id);
-        hidden_pending_count += 1;
-    }
-
-    log.debug("workspace switch hid current windows current_workspace={d} target_workspace={d} display={d} hidden={d} hidden_pending={d}", .{
-        ws.workspace_id,
-        target.workspace_id,
-        display_id,
-        hidden_count,
-        hidden_pending_count,
-    });
 }
 
 /// Focus the remembered (or first available) window on a workspace.
@@ -6146,8 +5566,7 @@ fn moveWindowToWorkspace(target_id: u8) void {
     const wid = ctx.focused_wid;
     const win = ctx.focused_win;
     const ws = ctx.workspace;
-    if (target_id == ws.workspace_id and
-        (!nativeSpacesEnabled() or ws.display_id == focusedDisplayId())) return;
+    if (target_id == ws.workspace_id and ws.display_id == focusedDisplayId()) return;
 
     log.debug("move workspace target wid={d} pid={d} source={d} target={d}", .{ wid, win.pid, ws.workspace_id, target_id });
 
@@ -6160,7 +5579,7 @@ fn moveWindowToWorkspace(target_id: u8) void {
         .window_id = wid,
         .target = target_ws,
         .layout = layout,
-        .should_move_native = nativeSpacesEnabled(),
+        .should_move_native = true,
     } });
 }
 
@@ -6217,21 +5636,13 @@ fn moveWorkspaceToDisplay(target_display_slot: usize) void {
     const target_display_id = g_displays[target_display_slot].id;
     if (source_display_id == target_display_id) return;
 
-    if (nativeSpacesEnabled()) {
-        const moving_workspace_id = activeWorkspaceIdForDisplay(source_display_id);
-        const displaced_workspace_id = activeWorkspaceIdForDisplay(target_display_id);
-        const source = spaceForWorkspace(source_display_id, moving_workspace_id) orelse return;
-        const target = spaceForWorkspace(target_display_id, displaced_workspace_id) orelse return;
-        dispatchStateEvent(.{ .request_native_workspace_move = .{
-            .source = source,
-            .target = target,
-            .at_ms = nativeStateNowMs(),
-        } });
-        return;
-    }
-    dispatchStateEvent(.{ .request_virtual_workspace_move = .{
-        .source_display_id = source_display_id,
-        .target_display_id = target_display_id,
+    const moving_workspace_id = activeWorkspaceIdForDisplay(source_display_id);
+    const displaced_workspace_id = activeWorkspaceIdForDisplay(target_display_id);
+    const source = spaceForWorkspace(source_display_id, moving_workspace_id) orelse return;
+    const target = spaceForWorkspace(target_display_id, displaced_workspace_id) orelse return;
+    dispatchStateEvent(.{ .request_native_workspace_move = .{
+        .source = source,
+        .target = target,
         .at_ms = nativeStateNowMs(),
     } });
 }

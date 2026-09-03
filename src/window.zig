@@ -17,9 +17,8 @@ pub const Window = struct {
     is_fullscreen: bool = false,
     mode: WindowMode = .tiled,
 
-    /// Last on-screen frame of a floating window, captured before it is parked
-    /// off-screen on workspace hide. Restored when the workspace is shown again;
-    /// tiled windows get their geometry from BSP instead, so this stays null.
+    /// Last non-fullscreen frame of a floating window. Used to restore user
+    /// geometry after fullscreen or off-display drift.
     float_frame: ?Frame = null,
 
     pub const Frame = struct {

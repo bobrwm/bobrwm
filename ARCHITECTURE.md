@@ -56,14 +56,14 @@ A configured `WorkspaceId` names one logical workspace across the application.
 It is never scoped to a display. Native Space IDs identify the physical backing
 instances supplied by macOS; they do not create additional Bobrwm workspaces.
 
-A logical workspace has exactly one current placement. In native mode that
-placement is a native Space ID on one display. Moving a workspace changes that
-placement and moves its windows; it never creates a display-scoped copy.
+A logical workspace has exactly one current placement: a native Space ID on
+one display. Moving a workspace changes that placement and moves its windows;
+it never creates a display-scoped copy.
 
 Conceptually:
 
 ```text
-SpaceKey = virtual WorkspaceId | native NativeSpaceId
+SpaceKey = NativeSpaceId
 
 WorkspaceState:
   WorkspaceId

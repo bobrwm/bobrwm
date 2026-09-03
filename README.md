@@ -208,21 +208,13 @@ Choose the tiling algorithm:
 
 ### Workspaces
 
-bobrwm uses virtual workspaces by default: hidden workspace windows are parked off-screen and restored when that workspace is focused.
-
-Native Mission Control spaces are available as an opt-in experimental backend:
-
-```zon
-.native_spaces = true,
-```
-
-Each workspace is assigned to exactly one ordinary native Space across all
-displays. The currently visible Space on each display is assigned first, so
+Each bobrwm workspace is assigned to exactly one ordinary Mission Control
+Space across all displays. The currently visible Space on each display is assigned first, so
 two displays always expose distinct Bobrwm workspaces even when both native
 Spaces have the same local ordinal. Remaining assignments are preserved by
 native Space ID across topology observations. Configure at least as many
-ordinary Mission Control spaces in total as Bobrwm workspaces, with at least
-one on every managed display. Extra native Spaces remain unmanaged.
+ordinary Mission Control Spaces in total as Bobrwm workspaces, with at least
+one on every managed display. Extra Spaces remain unmanaged.
 
 Full-screen application spaces are ignored when assigning workspace numbers,
 but are crossed when switching. Switching uses the

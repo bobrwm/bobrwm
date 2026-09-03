@@ -12,7 +12,6 @@ pub const max_managed_windows = window_catalog_mod.max_managed_windows;
 pub const max_pending_focus_entries = 16;
 pub const max_pending_window_candidates = 256;
 pub const max_process_retries = 64;
-pub const max_display_memory_entries = 16;
 pub const max_cleanup_processes = 16;
 pub const max_spaces_per_display = topology_mod.max_spaces_per_display;
 pub const max_workspace_focus_history = 32;
@@ -269,20 +268,8 @@ pub const DeferredWindowExpiryReason = enum {
     unsettled_bounds,
 };
 
-pub const WorkspaceParkEffect = struct {
-    outgoing: SpaceRef,
-    target: SpaceRef,
-    did_time_out: bool = false,
-};
-
 pub const WorkspaceSwitchEffect = struct {
     target: SpaceRef,
-    outgoing: ?SpaceRef = null,
-};
-
-pub const VirtualWorkspaceMoveEffect = struct {
-    moving: SpaceRef,
-    displaced: SpaceRef,
 };
 
 pub const FocusWindowEffect = struct {
@@ -329,10 +316,8 @@ pub const WindowMoveRequest = struct {
 
 pub const WindowMoveEffect = struct {
     window_id: WindowId,
-    process_id: i32,
     source: SpaceRef,
     target: SpaceRef,
-    should_hide: bool,
     should_follow_focus: bool,
 };
 
@@ -525,53 +510,6 @@ pub const ProcessRetries = struct {
     }
 };
 
-pub const PendingWorkspacePark = struct {
-    outgoing: SpaceRef,
-    target: SpaceRef,
-    deadline_at_ms: TimestampMs,
-};
-
-pub const PendingWorkspaceParks = struct {
-    entries: [max_displays]PendingWorkspacePark = undefined,
-    count: u8 = 0,
-
-    pub fn items(self: *const PendingWorkspaceParks) []const PendingWorkspacePark {
-        return self.entries[0..self.count];
-    }
-
-    pub fn get(self: *const PendingWorkspaceParks, display_id: DisplayId) ?PendingWorkspacePark {
-        const index = self.findIndex(display_id) orelse return null;
-        return self.entries[index];
-    }
-
-    pub fn put(self: *PendingWorkspaceParks, pending: PendingWorkspacePark) bool {
-        if (self.findIndex(pending.target.display_id)) |index| {
-            self.entries[index] = pending;
-            return true;
-        }
-        if (self.count == self.entries.len) return false;
-
-        self.entries[self.count] = pending;
-        self.count += 1;
-        return true;
-    }
-
-    pub fn remove(self: *PendingWorkspaceParks, display_id: DisplayId) ?PendingWorkspacePark {
-        const index = self.findIndex(display_id) orelse return null;
-        const removed = self.entries[index];
-        self.count -= 1;
-        self.entries[index] = self.entries[self.count];
-        return removed;
-    }
-
-    fn findIndex(self: *const PendingWorkspaceParks, display_id: DisplayId) ?usize {
-        for (self.items(), 0..) |pending, index| {
-            if (pending.target.display_id == display_id) return index;
-        }
-        return null;
-    }
-};
-
 pub const PointerDragState = struct {
     is_down: bool = false,
     candidate_window_id: ?WindowId = null,
@@ -591,81 +529,6 @@ pub const PointerDragCompletion = struct {
         first: WindowId,
         second: WindowId,
     } = null,
-};
-
-pub const DisplayMemoryEntry = struct {
-    uuid: [16]u8,
-    active_workspace_id: WorkspaceId,
-};
-
-pub const DisplayIdentity = struct {
-    display_id: DisplayId,
-    uuid: ?[16]u8,
-};
-
-pub const WorkspaceInitialization = struct {
-    display_ids: [max_displays]DisplayId = @splat(0),
-    display_count: u8 = 0,
-    workspace_count: WorkspaceId,
-    primary_display_id: DisplayId,
-
-    pub fn addDisplay(self: *WorkspaceInitialization, display_id: DisplayId) bool {
-        if (display_id == 0 or self.display_count == self.display_ids.len) return false;
-        for (self.display_ids[0..self.display_count]) |existing| {
-            if (existing == display_id) return false;
-        }
-        self.display_ids[self.display_count] = display_id;
-        self.display_count += 1;
-        return true;
-    }
-};
-
-pub const VirtualDisplayObservation = struct {
-    displays: [max_displays]DisplayIdentity = undefined,
-    display_count: u8 = 0,
-    primary_display_id: DisplayId,
-    focused_display_id: DisplayId,
-    workspace_home_uuids: [max_spaces_per_display]?[16]u8 = @splat(null),
-
-    pub fn addDisplay(self: *VirtualDisplayObservation, display: DisplayIdentity) bool {
-        if (display.display_id == 0 or self.display_count == self.displays.len) return false;
-        for (self.displays[0..self.display_count]) |existing| {
-            if (existing.display_id == display.display_id) return false;
-        }
-        self.displays[self.display_count] = display;
-        self.display_count += 1;
-        return true;
-    }
-};
-
-pub const DisplayMemory = struct {
-    entries: [max_display_memory_entries]DisplayMemoryEntry = undefined,
-    count: u8 = 0,
-
-    pub fn get(self: *const DisplayMemory, uuid: [16]u8) ?DisplayMemoryEntry {
-        for (self.entries[0..self.count]) |entry| {
-            if (std.mem.eql(u8, &entry.uuid, &uuid)) return entry;
-        }
-        return null;
-    }
-
-    pub fn remember(self: *DisplayMemory, entry: DisplayMemoryEntry) void {
-        for (self.entries[0..self.count]) |*existing| {
-            if (!std.mem.eql(u8, &existing.uuid, &entry.uuid)) continue;
-            existing.* = entry;
-            return;
-        }
-        if (self.count == self.entries.len) {
-            std.mem.copyForwards(
-                DisplayMemoryEntry,
-                self.entries[0 .. self.entries.len - 1],
-                self.entries[1..],
-            );
-            self.count -= 1;
-        }
-        self.entries[self.count] = entry;
-        self.count += 1;
-    }
 };
 
 pub const RetileRequest = struct {
@@ -777,21 +640,15 @@ pub const Model = struct {
     deferred_window_candidates: WindowCandidates = .{},
     app_launch_retries: ProcessRetries = .{},
     focus_retries: ProcessRetries = .{},
-    pending_workspace_parks: PendingWorkspaceParks = .{},
     display_resettle_due_at_ms: ?TimestampMs = null,
     bsp_split_mode: tiling_mod.SplitMode = .auto,
     bsp_insert_point: tiling_mod.InsertionPointPolicy = .focused,
     pointer_drag: PointerDragState = .{},
     drag_preview: DragPreviewState = .{},
-    display_memory: DisplayMemory = .{},
     retile_request: RetileRequest = .{},
     cleanup_request: CleanupRequest = .{},
     last_display_change_at_ms: ?TimestampMs = null,
     next_epoch: Epoch = 1,
-
-    pub fn rememberedDisplayWorkspace(self: *const Model, uuid: [16]u8) ?WorkspaceId {
-        return if (self.display_memory.get(uuid)) |entry| entry.active_workspace_id else null;
-    }
 
     pub fn isNativeSwitchPending(self: *const Model) bool {
         return self.pending_switch != null;
@@ -834,10 +691,6 @@ pub const Model = struct {
             self.deferred_window_candidates.count > 0 or
             self.app_launch_retries.count > 0 or
             self.focus_retries.count > 0;
-    }
-
-    pub fn hasPendingWorkspaceParks(self: *const Model) bool {
-        return self.pending_workspace_parks.count > 0;
     }
 
     pub fn hasDisplayResettleScheduled(self: *const Model) bool {
@@ -1024,7 +877,6 @@ pub const Model = struct {
 };
 
 pub const Event = union(enum) {
-    initialize_workspaces: WorkspaceInitialization,
     replace_space_catalog: SpaceCatalog,
     adopt_window: WindowAdoption,
     update_window: WindowUpdate,
@@ -1053,11 +905,6 @@ pub const Event = union(enum) {
     },
     request_workspace_switch: struct {
         target: SpaceRef,
-        at_ms: TimestampMs,
-    },
-    request_virtual_workspace_move: struct {
-        source_display_id: DisplayId,
-        target_display_id: DisplayId,
         at_ms: TimestampMs,
     },
     native_space_changed: TimestampMs,
@@ -1151,18 +998,6 @@ pub const Event = union(enum) {
         process_id: i32,
         focused_window_id: WindowId,
     },
-    workspace_reveal_observed: struct {
-        outgoing: SpaceRef,
-        target: SpaceRef,
-        is_revealed: bool,
-        deadline_at_ms: TimestampMs,
-    },
-    workspace_park_timer_fired: struct {
-        display_id: DisplayId,
-        is_revealed: bool,
-        at_ms: TimestampMs,
-    },
-    clear_workspace_parks,
     display_changed: struct {
         at_ms: TimestampMs,
         resettle_at_ms: TimestampMs,
@@ -1214,8 +1049,6 @@ pub const Event = union(enum) {
     },
     clear_drag_preview,
     pointer_up,
-    remember_display_workspace: DisplayMemoryEntry,
-    virtual_displays_observed: VirtualDisplayObservation,
     request_retile_all_displays,
     request_retile_display: DisplayId,
     flush_retile_requests,
@@ -1267,7 +1100,6 @@ pub const Effect = union(enum) {
     native_topology_changed,
     native_switch_rejected: SpaceRef,
     workspace_switch_ready: WorkspaceSwitchEffect,
-    virtual_workspace_move_ready: VirtualWorkspaceMoveEffect,
     window_catalog_rejected: struct {
         window_id: WindowId,
         reason: WindowCatalogRejectionReason,
@@ -1324,10 +1156,8 @@ pub const Effect = union(enum) {
         window_id: WindowId,
     },
     focus_retry_expired: i32,
-    park_workspace: WorkspaceParkEffect,
     display_resettle_due,
     reconcile_displays,
-    virtual_displays_reconciled,
     focus_window: FocusWindowEffect,
     windows_swapped: WindowSwapEffect,
     window_mode_changed: WindowModeEffect,
