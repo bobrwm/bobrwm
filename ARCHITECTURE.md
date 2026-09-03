@@ -90,9 +90,11 @@ WindowState:
   frame and mode
 ```
 
-Native Space ordinals are local macOS presentation. Bobrwm assigns each
-configured workspace to one physical Space globally, and preserves that
-binding by native Space ID rather than re-deriving identity from the ordinal.
+Native Space ordinals are local to each display. At startup, Bobrwm assigns the
+primary display's Spaces the lowest workspace IDs in native ordinal order, then
+assigns secondary displays in stable display identity order while reserving at
+least one workspace for each. It preserves those bindings by native Space ID
+across later topology observations rather than re-deriving them from ordinals.
 
 ## Events and effects
 

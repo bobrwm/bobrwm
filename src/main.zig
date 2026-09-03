@@ -159,6 +159,42 @@ fn primaryDisplayId() u32 {
     return g_displays[0].id;
 }
 
+fn displayTopologyComesBefore(left: DisplayInfo, right: DisplayInfo) bool {
+    if (left.is_primary != right.is_primary) return left.is_primary;
+
+    if (left.uuid) |left_uuid| {
+        const right_uuid = right.uuid orelse return true;
+        for (left_uuid, right_uuid) |left_byte, right_byte| {
+            if (left_byte == right_byte) continue;
+            return left_byte < right_byte;
+        }
+    } else if (right.uuid != null) {
+        return false;
+    }
+
+    return left.id < right.id;
+}
+
+fn stableDisplayIndices() [workspace_mod.max_displays]usize {
+    var indices: [workspace_mod.max_displays]usize = undefined;
+    for (0..g_display_count) |index| indices[index] = index;
+
+    var index: usize = 1;
+    while (index < g_display_count) : (index += 1) {
+        const candidate = indices[index];
+        var insertion_index = index;
+        while (insertion_index > 0 and displayTopologyComesBefore(
+            g_displays[candidate],
+            g_displays[indices[insertion_index - 1]],
+        )) : (insertion_index -= 1) {
+            indices[insertion_index] = indices[insertion_index - 1];
+        }
+        indices[insertion_index] = candidate;
+    }
+
+    return indices;
+}
+
 fn activeWorkspaceIdForDisplay(display_id: u32) u8 {
     return g_state.activeWorkspace(display_id) orelse unreachable;
 }
@@ -2086,9 +2122,8 @@ pub fn main(init: std.process.Init.Minimal) !void {
     refreshDisplays();
 
     const primary_id = primaryDisplayId();
-    // Start from WindowServer's truth. Assuming space 1 here would immediately
-    // tile windows from whichever native space happened to be visible into the
-    // wrong internal workspace after a relaunch.
+    // Capture WindowServer topology before discovering windows so native Space
+    // membership and the deterministic logical mapping agree from startup.
     const topology = captureNativeTopology() orelse {
         log.err("could not map configured workspaces to Mission Control Spaces", .{});
         return error.NativeSpaceMappingUnavailable;
@@ -3212,7 +3247,9 @@ fn captureNativeTopology() ?state_mod.NativeTopology {
 
     var observation: state_mod.NativeTopologyObservation = .{};
     var captured_space_count: u16 = 0;
-    for (g_displays[0..g_display_count]) |display| {
+    const display_indices = stableDisplayIndices();
+    for (display_indices[0..g_display_count]) |display_index| {
+        const display = g_displays[display_index];
         const observed_space_id = snapshot.currentSpaceId(display.id) orelse {
             log.warn("native topology: current Space unavailable display={d}", .{display.id});
             return null;

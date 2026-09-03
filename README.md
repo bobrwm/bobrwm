@@ -209,12 +209,13 @@ Choose the tiling algorithm:
 ### Workspaces
 
 Each bobrwm workspace is assigned to exactly one ordinary Mission Control
-Space across all displays. The currently visible Space on each display is assigned first, so
-two displays always expose distinct Bobrwm workspaces even when both native
-Spaces have the same local ordinal. Remaining assignments are preserved by
-native Space ID across topology observations. Configure at least as many
-ordinary Mission Control Spaces in total as Bobrwm workspaces, with at least
-one on every managed display. Extra Spaces remain unmanaged.
+Space across all displays. At startup, the primary display receives the lowest
+workspace numbers in native ordinal order, so Bobrwm workspace 1 maps to its
+native Space 1. Secondary displays follow in stable display order, with at
+least one workspace reserved for each. Assignments are then preserved by native
+Space ID across topology observations. Configure at least as many ordinary
+Mission Control Spaces in total as Bobrwm workspaces, with at least one on every
+managed display. Extra Spaces remain unmanaged.
 
 Full-screen application spaces are ignored when assigning workspace numbers,
 but are crossed when switching. Switching uses the

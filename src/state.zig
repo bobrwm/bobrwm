@@ -1225,11 +1225,31 @@ test "initial topology mapping binds logical workspaces to physical Spaces" {
         11,
     ).?;
 
-    try testing.expectEqual(@as(?WorkspaceId, 1), mapped.observedWorkspace(11));
+    try testing.expectEqual(@as(?WorkspaceId, 2), mapped.observedWorkspace(11));
     try testing.expectEqual(@as(?WorkspaceId, 4), mapped.observedWorkspace(22));
-    try testing.expectEqual(@as(?NativeSpaceId, 102), mapped.findDisplay(11).?.spaceForWorkspace(1));
+    try testing.expectEqual(@as(?NativeSpaceId, 101), mapped.findDisplay(11).?.spaceForWorkspace(1));
+    try testing.expectEqual(@as(?NativeSpaceId, 102), mapped.findDisplay(11).?.spaceForWorkspace(2));
+    try testing.expectEqual(@as(?NativeSpaceId, 103), mapped.findDisplay(11).?.spaceForWorkspace(3));
     try testing.expectEqual(@as(?NativeSpaceId, 201), mapped.findDisplay(22).?.spaceForWorkspace(4));
     try testing.expect(mapped.findDisplay(22).?.workspaceForSpace(202) == null);
+
+    var alternate_observation = observation;
+    alternate_observation.displays[1].observed_space_id = 103;
+    const alternate = mapNativeTopology(
+        alternate_observation,
+        &previous,
+        &workspace_topology,
+        &catalog,
+        4,
+        11,
+    ).?;
+    var workspace_id: WorkspaceId = 1;
+    while (workspace_id <= 4) : (workspace_id += 1) {
+        try testing.expectEqual(
+            mapped.spaceForWorkspace(workspace_id).?.key.id,
+            alternate.spaceForWorkspace(workspace_id).?.key.id,
+        );
+    }
 }
 
 test "switch effect preserves target Space identity across displays" {
