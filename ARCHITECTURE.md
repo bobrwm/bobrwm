@@ -96,7 +96,9 @@ assigns secondary displays in stable display identity order while reserving at
 least one workspace for each. It preserves those bindings by native Space ID
 across later topology observations rather than re-deriving them from ordinals.
 Startup creates missing physical Spaces on the primary display and removes
-trailing extras before this mapping is built.
+trailing extras before this mapping is built. A runtime topology watcher applies
+the same exact-count reconciliation after external Space creation or deletion,
+then rebuilds the physical mapping before window reconciliation.
 
 ## Events and effects
 

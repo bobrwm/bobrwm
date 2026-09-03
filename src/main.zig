@@ -84,6 +84,7 @@ const focus_retry_attempts_max: u8 = 10;
 const display_settle_delay_ms: u64 = 250;
 const native_space_capacity_settle_attempts: u8 = 20;
 const native_space_capacity_poll_delay_us: c_uint = 25_000;
+const native_space_topology_poll_interval_ms: u64 = 1000;
 const DisplayInfo = struct {
     id: u32,
     /// Stable per-display identity (CGDisplayCreateUUIDFromDisplayID) used to
@@ -1010,6 +1011,7 @@ var g_last_focused_pid: i32 = 0;
 var g_hotkey_bindings: []const shim.bw_keybind = &.{};
 var g_waker_source: c.CFRunLoopSourceRef = null;
 var g_role_poll_source: c.dispatch_source_t = null;
+var g_native_space_topology_poll_source: c.dispatch_source_t = null;
 var g_tap_port: c.CFMachPortRef = null;
 var g_layout_entries: std.ArrayList(tiling.LayoutEntry) = .empty;
 var g_event_drain_active = false;
@@ -1736,6 +1738,11 @@ fn rolePollTimerTick(context: ?*anyopaque) callconv(.c) void {
     bw_emit_event(shim.BW_EVENT_ROLE_POLL_TICK, 0, 0);
 }
 
+fn nativeSpaceTopologyPollTimerTick(context: ?*anyopaque) callconv(.c) void {
+    _ = context;
+    bw_emit_event(shim.BW_EVENT_NATIVE_TOPOLOGY_POLL_TICK, 0, 0);
+}
+
 fn rebuildTilingStatesForConfig() void {
     var rebuild: state_mod.LayoutRebuild = .{
         .kind = g_config.layout,
@@ -1854,6 +1861,36 @@ fn setRolePolling(enabled: bool) void {
     c.dispatch_source_set_event_handler_f(source, rolePollTimerTick);
     c.dispatch_resume(.{ ._ds = source });
     g_role_poll_source = source;
+}
+
+fn setNativeSpaceTopologyPolling(enabled: bool) void {
+    if (!enabled) {
+        if (g_native_space_topology_poll_source) |source| {
+            c.dispatch_source_cancel(source);
+            c.dispatch_release(.{ ._ds = source });
+            g_native_space_topology_poll_source = null;
+        }
+        return;
+    }
+
+    if (g_native_space_topology_poll_source != null) return;
+
+    const source = c.dispatch_source_create(
+        cg_extra.DISPATCH_SOURCE_TYPE_TIMER(),
+        0,
+        0,
+        cg_extra.dispatch_get_main_queue(),
+    ) orelse return;
+    const interval_ns = native_space_topology_poll_interval_ms * c.NSEC_PER_MSEC;
+    c.dispatch_source_set_timer(
+        source,
+        c.dispatch_time(c.DISPATCH_TIME_NOW, @intCast(interval_ns)),
+        interval_ns,
+        100 * c.NSEC_PER_MSEC,
+    );
+    c.dispatch_source_set_event_handler_f(source, nativeSpaceTopologyPollTimerTick);
+    c.dispatch_resume(.{ ._ds = source });
+    g_native_space_topology_poll_source = source;
 }
 
 fn modsFromEventFlags(flags: c.CGEventFlags) u8 {
@@ -2119,6 +2156,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     // -- Core state --
     defer {
         setRolePolling(false);
+        setNativeSpaceTopologyPolling(false);
         g_layout_entries.deinit(g_allocator);
     }
     refreshDisplays();
@@ -2175,6 +2213,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     defer ax_observer.deinit();
     setupHotkeyEventTap();
     initWakerSource();
+    setNativeSpaceTopologyPolling(true);
     try g_ipc_transport.start(g_ipc.fd, signalWaker);
     defer g_ipc_transport.stop();
     refreshRolePolling();
@@ -2911,6 +2950,7 @@ fn handleEvent(ev: *const event_mod.Event) void {
             processFocusRetries();
             processPendingFocusQueue();
         },
+        .native_topology_poll_tick => reconcileNativeSpaceTopologyIfNeeded(),
         .mouse_down => {
             dispatchStateEvent(.{ .pointer_down = managedWindowAtPoint(g_mouse_down_location) });
         },
@@ -3238,6 +3278,7 @@ fn completeNativeWorkspaceMove(pending: state_mod.PendingNativeWorkspaceMove) vo
 /// pick up windows, retile, refresh the bar.
 fn reconcileDisplays() void {
     reconcileDisplayChange();
+    reconcileNativeWindowAssignmentsFromWindowServer(false);
     discoverWindows();
     retile();
     updateStatusBar();
@@ -3351,6 +3392,34 @@ fn reconcileNativeSpaceCapacity() bool {
         });
     }
     return true;
+}
+
+fn reconcileNativeSpaceTopologyIfNeeded() void {
+    if (nativeSwitchPending()) return;
+    if (g_state.hasPendingNativeWindowMoves()) return;
+    if (g_state.pendingNativeWorkspaceMove() != null) return;
+    if (g_state.isWorkspaceTransitionActive()) return;
+    if (g_state.hasDisplayResettleScheduled()) return;
+
+    const capacity = nativeSpaceCapacity() orelse return;
+    if (capacity.total_count != workspaceCount()) {
+        log.info("native Space count changed required={d} available={d}", .{
+            workspaceCount(),
+            capacity.total_count,
+        });
+        if (!reconcileNativeSpaceCapacity()) {
+            log.warn("live native Space capacity reconciliation failed", .{});
+            return;
+        }
+        reconcileDisplays();
+        return;
+    }
+
+    const topology = captureNativeTopology() orelse return;
+    if (g_state.native_topology.eql(&topology)) return;
+
+    log.info("native Space topology changed", .{});
+    reconcileDisplays();
 }
 
 fn captureNativeTopology() ?state_mod.NativeTopology {
@@ -4019,15 +4088,7 @@ fn failNativeSwitch(failure: @FieldType(state_mod.Effect, "native_switch_failed"
 
 fn reconcileObservedNativeTopology() void {
     const started_ns = nanoTimestamp();
-    const sky = &g_sky.?;
-    var topology = sky.nativeSpaceTopology();
-    defer if (topology) |*snapshot| snapshot.deinit();
-
-    if (topology) |*snapshot| {
-        reconcileNativeWindowAssignments(snapshot);
-    } else {
-        log.warn("native workspace reconcile could not snapshot window assignments", .{});
-    }
+    reconcileNativeWindowAssignmentsFromWindowServer(true);
     discoverWindows();
     retile();
     updateStatusBar();
@@ -4036,28 +4097,33 @@ fn reconcileObservedNativeTopology() void {
     log.debug("[trace] native topology reconcile elapsed_ms={}", .{elapsed_ms});
 }
 
-fn reconcileNativeWindowAssignments(topology: *const skylight.NativeSpaceTopology) void {
+fn reconcileNativeWindowAssignmentsFromWindowServer(should_require_visible: bool) void {
     const sky = &g_sky.?;
-    const on_screen = OnScreenWindows.snapshot();
-    if (on_screen.truncated) return;
+    var topology = sky.nativeSpaceTopology() orelse {
+        log.warn("native workspace reconcile could not snapshot window assignments", .{});
+        return;
+    };
+    defer topology.deinit();
+
+    const on_screen = if (should_require_visible) OnScreenWindows.snapshot() else OnScreenWindows{};
+    if (should_require_visible and on_screen.truncated) return;
     var repairs: [256]struct { wid: u32, target: state_mod.SpaceRef } = undefined;
     var repair_count: usize = 0;
 
     for (g_state.windows.items()) |managed_window| {
         const win = managed_window.snapshot();
+        const managed = g_state.window(win.wid) orelse continue;
         if (g_state.windowTabLeader(win.wid) != win.wid) continue;
         if (g_state.pendingNativeWindowMove(win.wid) != null) continue;
         const visible_wid = g_state.windowTabActive(win.wid);
-        if (!on_screen.contains(visible_wid)) continue;
-        const current_space = managedWindowSpace(win.wid) orelse continue;
+        if (should_require_visible and !on_screen.contains(visible_wid)) continue;
 
-        const space_id = topology.spaceIdForWindow(sky, visible_wid, current_space.display_id) orelse continue;
-        if (current_space.key.eql(.{ .id = space_id })) continue;
+        const target = nativeWorkspaceForWindowInTopology(&topology, visible_wid) orelse continue;
+        if (managed.space_key.eql(target.key)) continue;
         if (repair_count == repairs.len) {
             log.warn("native workspace assignment repair truncated limit={d}", .{repairs.len});
             break;
         }
-        const target = g_state.space(.{ .id = space_id }) orelse continue;
         repairs[repair_count] = .{ .wid = win.wid, .target = target };
         repair_count += 1;
     }
@@ -4067,17 +4133,33 @@ fn reconcileNativeWindowAssignments(topology: *const skylight.NativeSpaceTopolog
     }
 }
 
+fn nativeWorkspaceForWindowInTopology(
+    topology: *const skylight.NativeSpaceTopology,
+    wid: u32,
+) ?state_mod.SpaceRef {
+    const sky = &g_sky.?;
+    for (g_displays[0..g_display_count]) |display| {
+        const space_id = topology.spaceIdForWindow(sky, wid, display.id) orelse continue;
+        return g_state.space(.{ .id = space_id });
+    }
+    return null;
+}
+
 fn reassignManagedWindowToNativeWorkspace(wid: u32, target: state_mod.SpaceRef) void {
     const win = managedWindow(wid) orelse return;
-    const source_ws = managedWindowSpace(win.wid) orelse return;
-    if (source_ws.key.eql(target.key)) return;
+    const managed = g_state.window(win.wid) orelse return;
+    if (managed.space_key.eql(target.key)) return;
 
     const target_ws = g_state.space(target.key) orelse return;
     if (!assignManagedWindowSpace(wid, target_ws)) return;
 
     if (focusedWorkspaceWindow(target_ws) == null) recordWorkspaceFocus(target_ws, wid);
 
-    log.debug("native workspace assignment repaired wid={d} source={d} target={d}", .{ wid, source_ws.workspace_id, target.workspace_id });
+    log.debug("native workspace assignment repaired wid={d} source_space={d} target={d}", .{
+        wid,
+        managed.space_key.id,
+        target.workspace_id,
+    });
 }
 
 fn processDueNativeStateObservation() bool {
