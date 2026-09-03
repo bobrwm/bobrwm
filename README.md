@@ -215,8 +215,9 @@ native Space 1. Secondary displays follow in stable display order, with at
 least one workspace reserved for each. Assignments are then preserved by native
 Space ID across topology observations. Configure at least as many ordinary
 Mission Control Spaces in total as Bobrwm workspaces, with at least one on every
-managed display. If the total is short at launch, Bobrwm creates the missing
-Spaces on the primary display. Extra Spaces remain unmanaged.
+managed display. At launch, Bobrwm creates missing Spaces on the primary
+display and removes trailing extras so the physical count matches the configured
+workspace count.
 
 Full-screen application spaces are ignored when assigning workspace numbers,
 but are crossed when switching. Switching uses the

@@ -82,8 +82,8 @@ const focus_retry_attempts_max: u8 = 10;
 /// an intermediate topology, so a reconcile this long after the final event
 /// converges on the settled arrangement.
 const display_settle_delay_ms: u64 = 250;
-const native_space_creation_settle_attempts: u8 = 20;
-const native_space_creation_poll_delay_us: c_uint = 25_000;
+const native_space_capacity_settle_attempts: u8 = 20;
+const native_space_capacity_poll_delay_us: c_uint = 25_000;
 const DisplayInfo = struct {
     id: u32,
     /// Stable per-display identity (CGDisplayCreateUUIDFromDisplayID) used to
@@ -2122,8 +2122,8 @@ pub fn main(init: std.process.Init.Minimal) !void {
         g_layout_entries.deinit(g_allocator);
     }
     refreshDisplays();
-    if (!ensureNativeSpaceCapacity()) {
-        log.err("could not create enough Mission Control Spaces", .{});
+    if (!reconcileNativeSpaceCapacity()) {
+        log.err("could not reconcile Mission Control Space count", .{});
         return error.NativeSpaceCapacityUnavailable;
     }
 
@@ -3243,45 +3243,63 @@ fn reconcileDisplays() void {
     updateStatusBar();
 }
 
-fn nativeOrdinarySpaceCount() ?u16 {
+const NativeSpaceCapacity = struct {
+    total_count: u16,
+    excess_space_id: ?u64,
+};
+
+fn nativeSpaceCapacity() ?NativeSpaceCapacity {
     var snapshot = g_sky.?.nativeSpaceTopology() orelse return null;
     defer snapshot.deinit();
 
     var total: u16 = 0;
-    for (g_displays[0..g_display_count]) |display| {
-        const count = snapshot.ordinarySpaceCount(display.id) orelse return null;
+    var excess_space_id: ?u64 = null;
+    var remaining_required: u16 = workspaceCount();
+    const display_indices = stableDisplayIndices();
+    for (display_indices[0..g_display_count], 0..) |display_index, order_index| {
+        const display = g_displays[display_index];
+        const count: u16 = snapshot.ordinarySpaceCount(display.id) orelse return null;
         total = std.math.add(u16, total, count) catch return null;
+
+        const later_display_count: u16 = @intCast(g_display_count - order_index - 1);
+        if (remaining_required <= later_display_count) return null;
+        const permitted_count = @min(count, remaining_required - later_display_count);
+        remaining_required -= permitted_count;
+        if (excess_space_id != null or count <= permitted_count) continue;
+
+        excess_space_id = snapshot.ordinarySpaceIdAtOrdinal(display.id, @intCast(count)) orelse return null;
     }
-    return total;
+    return .{ .total_count = total, .excess_space_id = excess_space_id };
 }
 
-fn ensureNativeSpaceCapacity() bool {
+fn reconcileNativeSpaceCapacity() bool {
     const required_count: u16 = workspaceCount();
-    var available_count = nativeOrdinarySpaceCount() orelse return false;
-    if (available_count >= required_count) return true;
+    var capacity = nativeSpaceCapacity() orelse return false;
 
     const sky = &g_sky.?;
     const display_id = primaryDisplayId();
-    log.info("creating missing Mission Control Spaces required={d} available={d} display={d}", .{
-        required_count,
-        available_count,
-        display_id,
-    });
+    if (capacity.total_count < required_count) {
+        log.info("creating missing Mission Control Spaces required={d} available={d} display={d}", .{
+            required_count,
+            capacity.total_count,
+            display_id,
+        });
+    }
 
-    while (available_count < required_count) {
+    while (capacity.total_count < required_count) {
         const space_id = sky.createNativeSpace(display_id) orelse {
             log.warn("native Space creation failed display={d}", .{display_id});
             return false;
         };
 
-        var observed_count = available_count;
+        var observed_capacity = capacity;
         var attempt: u8 = 0;
-        while (attempt < native_space_creation_settle_attempts) : (attempt += 1) {
-            _ = c.usleep(native_space_creation_poll_delay_us);
-            observed_count = nativeOrdinarySpaceCount() orelse continue;
-            if (observed_count > available_count) break;
+        while (attempt < native_space_capacity_settle_attempts) : (attempt += 1) {
+            _ = c.usleep(native_space_capacity_poll_delay_us);
+            observed_capacity = nativeSpaceCapacity() orelse continue;
+            if (observed_capacity.total_count > capacity.total_count) break;
         }
-        if (observed_count <= available_count) {
+        if (observed_capacity.total_count <= capacity.total_count) {
             log.warn("created native Space did not enter managed topology display={d} space={d}", .{
                 display_id,
                 space_id,
@@ -3289,11 +3307,47 @@ fn ensureNativeSpaceCapacity() bool {
             return false;
         }
 
-        available_count = observed_count;
+        capacity = observed_capacity;
         log.info("created Mission Control Space display={d} space={d} available={d}", .{
             display_id,
             space_id,
-            available_count,
+            capacity.total_count,
+        });
+    }
+
+    if (capacity.total_count > required_count) {
+        log.info("removing excess Mission Control Spaces required={d} available={d}", .{
+            required_count,
+            capacity.total_count,
+        });
+    }
+
+    while (capacity.total_count > required_count) {
+        const space_id = capacity.excess_space_id orelse {
+            log.warn("native Space removal found no removable excess Space", .{});
+            return false;
+        };
+        if (!sky.destroyNativeSpace(space_id)) {
+            log.warn("native Space removal failed space={d}", .{space_id});
+            return false;
+        }
+
+        var observed_capacity = capacity;
+        var attempt: u8 = 0;
+        while (attempt < native_space_capacity_settle_attempts) : (attempt += 1) {
+            _ = c.usleep(native_space_capacity_poll_delay_us);
+            observed_capacity = nativeSpaceCapacity() orelse continue;
+            if (observed_capacity.total_count < capacity.total_count) break;
+        }
+        if (observed_capacity.total_count >= capacity.total_count) {
+            log.warn("destroyed native Space did not leave managed topology space={d}", .{space_id});
+            return false;
+        }
+
+        capacity = observed_capacity;
+        log.info("removed Mission Control Space space={d} available={d}", .{
+            space_id,
+            capacity.total_count,
         });
     }
     return true;

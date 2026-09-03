@@ -84,6 +84,8 @@ pub const SkyLight = struct {
     moveWindowsToManagedSpace: ?MoveWindowsToManagedSpaceFn,
     bridgedSpaceCreateClass: ?objc.Class,
     bridgedSpaceCreateSelectorSupported: bool,
+    bridgedSpaceDestroyClass: ?objc.Class,
+    bridgedSpaceDestroySelectorSupported: bool,
     performBridgedMove: ?PerformBridgedMoveFn,
     bridgedMoveClass: ?objc.Class,
     bridgedMoveSelectorSupported: bool,
@@ -128,6 +130,11 @@ pub const SkyLight = struct {
             objc.c.class_getInstanceMethod(cls.value, objc.sel("performWithWMBridgeDelegate").value) != null
         else
             false;
+        const bridged_space_destroy_class = objc.getClass("SLSBridgedSpaceDestroyOperation");
+        const bridged_space_destroy_selector_supported = if (bridged_space_destroy_class) |cls|
+            objc.c.class_getInstanceMethod(cls.value, objc.sel("performWithWMBridgeDelegate").value) != null
+        else
+            false;
         const bridged_move_class = objc.getClass("SLSBridgedMoveWindowsToManagedSpaceOperation");
         const bridged_move_selector_supported = if (bridged_move_class) |cls|
             objc.c.class_getInstanceMethod(cls.value, objc.sel("performWithWMBridgeDelegate").value) != null
@@ -152,6 +159,8 @@ pub const SkyLight = struct {
             .moveWindowsToManagedSpace = move_windows_to_managed_space,
             .bridgedSpaceCreateClass = bridged_space_create_class,
             .bridgedSpaceCreateSelectorSupported = bridged_space_create_selector_supported,
+            .bridgedSpaceDestroyClass = bridged_space_destroy_class,
+            .bridgedSpaceDestroySelectorSupported = bridged_space_destroy_selector_supported,
             .performBridgedMove = perform_bridged_move,
             .bridgedMoveClass = bridged_move_class,
             .bridgedMoveSelectorSupported = bridged_move_selector_supported,
@@ -216,6 +225,22 @@ pub const SkyLight = struct {
         if (result.value == null) return null;
         const space_id = result.msgSend(u64, "spaceID", .{});
         return if (space_id == 0) null else space_id;
+    }
+
+    /// Destroy an ordinary native Space.
+    pub fn destroyNativeSpace(self: *const SkyLight, space_id: u64) bool {
+        if (space_id == 0) return false;
+        const bridged_class = self.bridgedSpaceDestroyClass orelse return false;
+        if (!self.bridgedSpaceDestroySelectorSupported) return false;
+
+        const allocated = bridged_class.msgSend(objc.Object, "alloc", .{});
+        if (allocated.value == null) return false;
+        const operation = allocated.msgSend(objc.Object, "initWithSpaceID:", .{space_id});
+        if (operation.value == null) return false;
+        defer operation.msgSend(void, "release", .{});
+
+        operation.msgSend(void, "performWithWMBridgeDelegate", .{});
+        return true;
     }
 
     /// Switch to a native Space by ID.
