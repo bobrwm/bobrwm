@@ -82,6 +82,8 @@ const focus_retry_attempts_max: u8 = 10;
 /// an intermediate topology, so a reconcile this long after the final event
 /// converges on the settled arrangement.
 const display_settle_delay_ms: u64 = 250;
+const native_space_creation_settle_attempts: u8 = 20;
+const native_space_creation_poll_delay_us: c_uint = 25_000;
 const DisplayInfo = struct {
     id: u32,
     /// Stable per-display identity (CGDisplayCreateUUIDFromDisplayID) used to
@@ -2120,6 +2122,10 @@ pub fn main(init: std.process.Init.Minimal) !void {
         g_layout_entries.deinit(g_allocator);
     }
     refreshDisplays();
+    if (!ensureNativeSpaceCapacity()) {
+        log.err("could not create enough Mission Control Spaces", .{});
+        return error.NativeSpaceCapacityUnavailable;
+    }
 
     const primary_id = primaryDisplayId();
     // Capture WindowServer topology before discovering windows so native Space
@@ -3237,6 +3243,62 @@ fn reconcileDisplays() void {
     updateStatusBar();
 }
 
+fn nativeOrdinarySpaceCount() ?u16 {
+    var snapshot = g_sky.?.nativeSpaceTopology() orelse return null;
+    defer snapshot.deinit();
+
+    var total: u16 = 0;
+    for (g_displays[0..g_display_count]) |display| {
+        const count = snapshot.ordinarySpaceCount(display.id) orelse return null;
+        total = std.math.add(u16, total, count) catch return null;
+    }
+    return total;
+}
+
+fn ensureNativeSpaceCapacity() bool {
+    const required_count: u16 = workspaceCount();
+    var available_count = nativeOrdinarySpaceCount() orelse return false;
+    if (available_count >= required_count) return true;
+
+    const sky = &g_sky.?;
+    const display_id = primaryDisplayId();
+    log.info("creating missing Mission Control Spaces required={d} available={d} display={d}", .{
+        required_count,
+        available_count,
+        display_id,
+    });
+
+    while (available_count < required_count) {
+        const space_id = sky.createNativeSpace(display_id) orelse {
+            log.warn("native Space creation failed display={d}", .{display_id});
+            return false;
+        };
+
+        var observed_count = available_count;
+        var attempt: u8 = 0;
+        while (attempt < native_space_creation_settle_attempts) : (attempt += 1) {
+            _ = c.usleep(native_space_creation_poll_delay_us);
+            observed_count = nativeOrdinarySpaceCount() orelse continue;
+            if (observed_count > available_count) break;
+        }
+        if (observed_count <= available_count) {
+            log.warn("created native Space did not enter managed topology display={d} space={d}", .{
+                display_id,
+                space_id,
+            });
+            return false;
+        }
+
+        available_count = observed_count;
+        log.info("created Mission Control Space display={d} space={d} available={d}", .{
+            display_id,
+            space_id,
+            available_count,
+        });
+    }
+    return true;
+}
+
 fn captureNativeTopology() ?state_mod.NativeTopology {
     const sky = &g_sky.?;
     var snapshot = sky.nativeSpaceTopology() orelse {
@@ -4165,8 +4227,6 @@ fn discoverWindowsImpl(should_refresh_tabs: bool) usize {
 
         const frame: window_mod.Window.Frame = .{ .x = info.x, .y = info.y, .width = info.w, .height = info.h };
         const discovered_display = displayIdForFrame(frame);
-        // Discovery only returns visible windows, so an unassigned window
-        // belongs to the display's active native Space.
         const target_ws = resolveWorkspaceForWindow(info.pid, info.wid, discovered_display) orelse {
             log.debug("discover: ignored pid={d} wid={d} on unmanaged native Space", .{ info.pid, info.wid });
             continue;
@@ -4203,6 +4263,12 @@ fn discoverWindowsImpl(should_refresh_tabs: bool) usize {
             },
         }
 
+        const source_ws = nativeWorkspaceForWindow(info.wid, discovered_display) orelse {
+            trackDeferredWindowCandidate(info.pid, info.wid, target_ws);
+            log.info("discover: deferred pid={d} wid={d} unsettled native Space", .{ info.pid, info.wid });
+            continue;
+        };
+
         const win = window_mod.Window{
             .wid = info.wid,
             .pid = info.pid,
@@ -4216,10 +4282,7 @@ fn discoverWindowsImpl(should_refresh_tabs: bool) usize {
         };
         adopted_count += 1;
 
-        if (!spaceVisible(target_ws)) {
-            const source = spaceForWorkspace(discovered_display, activeWorkspaceIdForDisplay(discovered_display)) orelse continue;
-            requestNativeWindowMove(info.wid, source, target_ws);
-        }
+        if (!source_ws.key.eql(target_ws.key)) requestNativeWindowMove(info.wid, source_ws, target_ws);
     }
 
     // Ensure a focused window is set on the active workspace
@@ -4416,6 +4479,13 @@ fn addNewWindowManagedWithAssignment(pid: i32, wid: u32, assigned_space: state_m
         return false;
     }
 
+    const source_display_id = inferDisplayIdForWindow(wid) orelse display_id;
+    const source_ws = nativeWorkspaceForWindow(wid, source_display_id) orelse {
+        trackDeferredWindowCandidate(pid, wid, assigned_space);
+        log.info("addNewWindow: deferred pid={d} wid={d} unsettled native Space", .{ pid, wid });
+        return false;
+    };
+
     defer untrackDeferredWindowCandidate(wid);
 
     // Check if this new on-screen window replaces an existing same-PID window
@@ -4458,13 +4528,7 @@ fn addNewWindowManagedWithAssignment(pid: i32, wid: u32, assigned_space: state_m
     };
     recordWorkspaceFocus(ws, wid);
 
-    // A native-space move must happen after the window exists in WindowServer
-    // but before it can flash on the current workspace as managed content.
-    if (!spaceVisible(ws)) {
-        const source_display = inferDisplayIdForWindow(wid) orelse display_id;
-        const source = spaceForWorkspace(source_display, activeWorkspaceIdForDisplay(source_display)) orelse return true;
-        requestNativeWindowMove(wid, source, ws);
-    }
+    if (!source_ws.key.eql(ws.key)) requestNativeWindowMove(wid, source_ws, ws);
 
     const float_reason = if (mode == .tiled) "tiled" else if (rule_float) "floated (app rule)" else "floated (undersized+non-resizable)";
     log.info("addNewWindow: {s} wid={d} on workspace {d}", .{ float_reason, wid, ws.workspace_id });
@@ -5534,6 +5598,11 @@ fn resolveWorkspaceForWindow(pid: i32, wid: u32, display_id: u32) ?state_mod.Spa
     }
     const ws_id = activeWorkspaceIdForDisplay(display_id);
     return spaceForWorkspace(display_id, ws_id) orelse unreachable;
+}
+
+fn nativeWorkspaceForWindow(wid: u32, display_id: u32) ?state_mod.SpaceRef {
+    const space_id = g_sky.?.nativeSpaceIdForWindow(wid, display_id) orelse return null;
+    return g_state.space(.{ .id = space_id });
 }
 
 // Workspace switching

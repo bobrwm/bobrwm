@@ -95,6 +95,8 @@ primary display's Spaces the lowest workspace IDs in native ordinal order, then
 assigns secondary displays in stable display identity order while reserving at
 least one workspace for each. It preserves those bindings by native Space ID
 across later topology observations rather than re-deriving them from ordinals.
+Startup creates any missing physical Spaces on the primary display before this
+mapping is built.
 
 ## Events and effects
 

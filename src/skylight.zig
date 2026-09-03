@@ -82,6 +82,8 @@ pub const SkyLight = struct {
     copyManagedDisplaySpaces: ?CopyManagedDisplaySpacesFn,
     copySpacesForWindows: ?CopySpacesForWindowsFn,
     moveWindowsToManagedSpace: ?MoveWindowsToManagedSpaceFn,
+    bridgedSpaceCreateClass: ?objc.Class,
+    bridgedSpaceCreateSelectorSupported: bool,
     performBridgedMove: ?PerformBridgedMoveFn,
     bridgedMoveClass: ?objc.Class,
     bridgedMoveSelectorSupported: bool,
@@ -121,6 +123,11 @@ pub const SkyLight = struct {
         const copy_spaces_for_windows = lib.lookup(CopySpacesForWindowsFn, "SLSCopySpacesForWindows");
         const move_windows_to_managed_space = lib.lookup(MoveWindowsToManagedSpaceFn, "SLSMoveWindowsToManagedSpace");
         const perform_bridged_move = resolveBridgedMove();
+        const bridged_space_create_class = objc.getClass("SLSBridgedSpaceCreateOperation");
+        const bridged_space_create_selector_supported = if (bridged_space_create_class) |cls|
+            objc.c.class_getInstanceMethod(cls.value, objc.sel("performWithWMBridgeDelegate").value) != null
+        else
+            false;
         const bridged_move_class = objc.getClass("SLSBridgedMoveWindowsToManagedSpaceOperation");
         const bridged_move_selector_supported = if (bridged_move_class) |cls|
             objc.c.class_getInstanceMethod(cls.value, objc.sel("performWithWMBridgeDelegate").value) != null
@@ -143,6 +150,8 @@ pub const SkyLight = struct {
             .copyManagedDisplaySpaces = copy_managed_display_spaces,
             .copySpacesForWindows = copy_spaces_for_windows,
             .moveWindowsToManagedSpace = move_windows_to_managed_space,
+            .bridgedSpaceCreateClass = bridged_space_create_class,
+            .bridgedSpaceCreateSelectorSupported = bridged_space_create_selector_supported,
             .performBridgedMove = perform_bridged_move,
             .bridgedMoveClass = bridged_move_class,
             .bridgedMoveSelectorSupported = bridged_move_selector_supported,
@@ -162,6 +171,51 @@ pub const SkyLight = struct {
             c.CFRelease(displays);
             return null;
         };
+    }
+
+    /// Create an ordinary native Space on a display.
+    pub fn createNativeSpace(self: *const SkyLight, display_id: u32) ?u64 {
+        const bridged_class = self.bridgedSpaceCreateClass orelse return null;
+        if (!self.bridgedSpaceCreateSelectorSupported) return null;
+
+        const display_uuid = cg_extra.CGDisplayCreateUUIDFromDisplayID(display_id) orelse return null;
+        defer c.CFRelease(display_uuid);
+        const display_name = c.CFUUIDCreateString(null, display_uuid) orelse return null;
+        defer c.CFRelease(display_name);
+
+        const type_key = cfString("type") orelse return null;
+        defer c.CFRelease(type_key);
+        const display_key = cfString("Display Identifier") orelse return null;
+        defer c.CFRelease(display_key);
+        var space_type: i32 = 0;
+        const type_value = c.CFNumberCreate(null, c.kCFNumberSInt32Type, &space_type) orelse return null;
+        defer c.CFRelease(type_value);
+
+        var keys = [_]?*const anyopaque{ type_key, display_key };
+        var values = [_]?*const anyopaque{ type_value, display_name };
+        const attributes = c.CFDictionaryCreate(
+            null,
+            &keys,
+            &values,
+            keys.len,
+            &c.kCFTypeDictionaryKeyCallBacks,
+            &c.kCFTypeDictionaryValueCallBacks,
+        ) orelse return null;
+        defer c.CFRelease(attributes);
+
+        const allocated = bridged_class.msgSend(objc.Object, "alloc", .{});
+        if (allocated.value == null) return null;
+        const operation = allocated.msgSend(objc.Object, "initWithOptions:values:", .{
+            @as(u32, 0),
+            objc.Object.fromId(@constCast(attributes)),
+        });
+        if (operation.value == null) return null;
+        defer operation.msgSend(void, "release", .{});
+
+        const result = operation.msgSend(objc.Object, "performWithWMBridgeDelegate", .{});
+        if (result.value == null) return null;
+        const space_id = result.msgSend(u64, "spaceID", .{});
+        return if (space_id == 0) null else space_id;
     }
 
     /// Switch to a native Space by ID.
