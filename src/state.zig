@@ -1189,6 +1189,49 @@ test "native topology mapping assigns one global workspace per physical slot" {
     try testing.expect(mapped.findDisplay(1).?.workspaceForSpace(103) == null);
 }
 
+test "native topology mapping ignores an activated extra Space" {
+    const testing = std.testing;
+    var previous: NativeTopology = .{};
+    var primary = DisplayTopology.init(1, 102);
+    primary.addSpace(.{ .id = 101, .workspace_id = 1 });
+    primary.addSpace(.{ .id = 102, .workspace_id = 2 });
+    previous.addDisplay(primary);
+    var secondary = DisplayTopology.init(2, 201);
+    secondary.addSpace(.{ .id = 201, .workspace_id = 3 });
+    previous.addDisplay(secondary);
+
+    var catalog: SpaceCatalog = .{};
+    catalog.add(.{ .key = .{ .native = 101 }, .workspace_id = 1, .display_id = 1 });
+    catalog.add(.{ .key = .{ .native = 102 }, .workspace_id = 2, .display_id = 1 });
+    catalog.add(.{ .key = .{ .native = 201 }, .workspace_id = 3, .display_id = 2 });
+    var workspace_topology: WorkspaceTopology = .{};
+    workspace_topology.addDisplay(.{ .display_id = 1, .active_workspace_id = 2 });
+    workspace_topology.addDisplay(.{ .display_id = 2, .active_workspace_id = 3 });
+
+    var observation: NativeTopologyObservation = .{};
+    var observed_primary: NativeDisplayObservation = .{
+        .display_id = 1,
+        .observed_space_id = 103,
+        .space_count = 3,
+    };
+    observed_primary.space_ids[0] = 101;
+    observed_primary.space_ids[1] = 102;
+    observed_primary.space_ids[2] = 103;
+    observation.addDisplay(observed_primary);
+    var observed_secondary: NativeDisplayObservation = .{
+        .display_id = 2,
+        .observed_space_id = 201,
+        .space_count = 1,
+    };
+    observed_secondary.space_ids[0] = 201;
+    observation.addDisplay(observed_secondary);
+
+    const mapped = mapNativeTopology(observation, &previous, &workspace_topology, &catalog, 3).?;
+
+    try testing.expect(mapped.eql(&previous));
+    try testing.expect(mapped.findDisplay(1).?.workspaceForSpace(103) == null);
+}
+
 test "switch effect preserves target Space identity across displays" {
     const testing = std.testing;
     const model = initializedModel(testTopology(102, 201));
@@ -2064,6 +2107,10 @@ test "window move command commits ownership layout and intent atomically" {
         .space_key = source_key,
         .layout = testLayoutInsertion(.bsp),
     } }).model;
+    model = reduce(model, .{ .record_workspace_focus = .{
+        .workspace_id = 1,
+        .window_id = 100,
+    } }).model;
 
     const transition = reduce(model, .{ .request_window_move = .{
         .window_id = 100,
@@ -2074,6 +2121,7 @@ test "window move command commits ownership layout and intent atomically" {
     try testing.expect(transition.model.window(100).?.space_key.eql(target_key));
     try testing.expect(!transition.model.layout.contains(source_key, 100));
     try testing.expect(transition.model.layout.contains(target_key, 100));
+    try testing.expectEqual(@as(?WindowId, null), transition.model.focusedWorkspaceWindow(1));
     try testing.expectEqual(@as(?WindowId, 100), transition.model.focusedWorkspaceWindow(2));
     try testing.expect(transition.model.retile_request.all_displays);
     try testing.expect(transition.effects[0].window_moved.should_hide);

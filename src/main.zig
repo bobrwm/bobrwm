@@ -3067,7 +3067,7 @@ fn handleEvent(ev: *const event_mod.Event) void {
                     // and let processDeferredWindowCandidates re-derive on
                     // promotion (it goes through addNewWindowManaged again).
                     const display_id = inferDisplayIdForWindow(ev.wid) orelse focusedDisplayId();
-                    const ws = resolveWorkspaceForWindow(ev.pid, ev.wid, display_id);
+                    const ws = resolveWorkspaceForWindow(ev.pid, ev.wid, display_id) orelse return;
                     trackDeferredWindowCandidate(ev.pid, ev.wid, ws);
                     log.info("window created: deferred pid={} wid={} while mouse is down (tab tear-off guard)", .{ ev.pid, ev.wid });
                 }
@@ -4429,7 +4429,10 @@ fn discoverWindowsImpl(should_refresh_tabs: bool) usize {
         const discovered_display = displayIdForFrame(frame);
         // Discovery only returns visible windows, so an unassigned window
         // belongs to the display's active native Space.
-        const target_ws = resolveWorkspace(info.pid, discovered_display);
+        const target_ws = resolveWorkspaceForWindow(info.pid, info.wid, discovered_display) orelse {
+            log.debug("discover: ignored pid={d} wid={d} on unmanaged native Space", .{ info.pid, info.wid });
+            continue;
+        };
         // A landing must not wait on an app's AX server. The role poll applies
         // the same gate after the switch path is free to accept more input.
         if (should_refresh_tabs) {
@@ -4748,7 +4751,10 @@ fn addNewWindowManaged(pid: i32, wid: u32) bool {
     // on the workspace that owns the destination monitor, not on whichever
     // display happened to be focused when the window was created.
     const display_id = inferDisplayIdForWindow(wid) orelse focusedDisplayId();
-    const ws = resolveWorkspaceForWindow(pid, wid, display_id);
+    const ws = resolveWorkspaceForWindow(pid, wid, display_id) orelse {
+        log.debug("addNewWindow: ignored pid={d} wid={d} on unmanaged native Space", .{ pid, wid });
+        return false;
+    };
 
     // A rule-pinned app's transient launch position is meaningless: place it
     // on the display that currently owns its assigned workspace, not wherever
@@ -4775,7 +4781,10 @@ fn addNewWindow(pid: i32, wid: u32) void {
             // the actual window position so a deferred candidate is later
             // promoted onto the correct workspace+display.
             const display_id = inferDisplayIdForWindow(wid) orelse focusedDisplayId();
-            const ws = resolveWorkspaceForWindow(pid, wid, display_id);
+            const ws = resolveWorkspaceForWindow(pid, wid, display_id) orelse {
+                log.debug("addNewWindow: ignored pending pid={d} wid={d} on unmanaged native Space", .{ pid, wid });
+                return;
+            };
             trackPendingRoleWindow(pid, wid, ws);
             trackDeferredWindowCandidate(pid, wid, ws);
             log.debug("addNewWindow: role gate pending pid={d} wid={d}", .{ pid, wid });
@@ -5910,18 +5919,18 @@ fn configuredWorkspace(pid: i32, display_id: u32) ?state_mod.SpaceRef {
     return null;
 }
 
-fn resolveWorkspace(pid: i32, display_id: u32) state_mod.SpaceRef {
-    if (configuredWorkspace(pid, display_id)) |ws| return ws;
-    const ws_id = activeWorkspaceIdForDisplay(display_id);
-    return spaceForWorkspace(display_id, ws_id) orelse unreachable;
-}
+fn resolveWorkspaceForWindow(pid: i32, wid: u32, display_id: u32) ?state_mod.SpaceRef {
+    const native_space_id = if (nativeSpacesEnabled())
+        g_sky.?.nativeSpaceIdForWindow(wid, display_id)
+    else
+        null;
+    if (native_space_id) |space_id| {
+        if (g_state.space(.{ .native = space_id }) == null) return null;
+    }
 
-fn resolveWorkspaceForWindow(pid: i32, wid: u32, display_id: u32) state_mod.SpaceRef {
     if (configuredWorkspace(pid, display_id)) |ws| return ws;
-    if (nativeSpacesEnabled()) {
-        if (g_sky.?.nativeSpaceIdForWindow(wid, display_id)) |space_id| {
-            if (g_state.space(.{ .native = space_id })) |ws| return ws;
-        }
+    if (native_space_id) |space_id| {
+        if (g_state.space(.{ .native = space_id })) |ws| return ws;
     }
     const ws_id = activeWorkspaceIdForDisplay(display_id);
     return spaceForWorkspace(display_id, ws_id) orelse unreachable;

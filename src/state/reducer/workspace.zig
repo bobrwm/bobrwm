@@ -551,6 +551,7 @@ pub fn reduceNativeWindowMoveRollbackResult(
         });
         const restored = transition.model.window(pending.window_id) orelse return;
         if (restored.space_key.eql(pending.source.key)) {
+            refreshWorkspaceFocus(&transition.model);
             if (transition.model.focusedWorkspaceWindow(pending.source.workspace_id) == null) {
                 window_reducer.reduceWorkspaceFocusRecorded(transition, .{
                     .workspace_id = pending.source.workspace_id,

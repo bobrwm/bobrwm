@@ -196,6 +196,7 @@ pub fn reduceWindowMoveRequest(transition: *Transition, request: WindowMoveReque
     });
     const moved = transition.model.window(action.leader.window_id) orelse return;
     if (!moved.space_key.eql(target.key)) return;
+    workspace_reducer.refreshWorkspaceFocus(&transition.model);
 
     if (transition.model.focusedWorkspaceWindow(target.workspace_id) == null) {
         window_reducer.reduceWorkspaceFocusRecorded(transition, .{

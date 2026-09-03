@@ -263,6 +263,7 @@ pub fn mapNativeTopology(
     workspace_count: u8,
 ) ?NativeTopology {
     if (workspace_count == 0 or observation.display_count > workspace_count) return null;
+    if (preserveStableNativeTopology(&observation, previous, workspace_count)) |topology| return topology;
 
     var assignments: [max_displays][max_spaces_per_display]WorkspaceId = @splat(@splat(0));
     var claimed: [max_spaces_per_display + 1]bool = @splat(false);
@@ -323,6 +324,32 @@ pub fn mapNativeTopology(
         }
         topology.addDisplay(mapped);
     }
+    return topology;
+}
+
+fn preserveStableNativeTopology(
+    observation: *const NativeTopologyObservation,
+    previous: *const NativeTopology,
+    workspace_count: u8,
+) ?NativeTopology {
+    if (observation.display_count != previous.display_count) return null;
+    var topology: NativeTopology = .{};
+    var mapped_count: u8 = 0;
+    for (observation.displays[0..observation.display_count]) |display| {
+        const previous_display = previous.findDisplay(display.display_id) orelse return null;
+        const observed_space_id = if (previous_display.workspaceForSpace(display.observed_space_id) != null)
+            display.observed_space_id
+        else
+            previous_display.observed_space_id;
+        var mapped = DisplayTopology.init(display.display_id, observed_space_id);
+        for (display.space_ids[0..display.space_count]) |space_id| {
+            const workspace_id = previous_display.workspaceForSpace(space_id) orelse continue;
+            mapped.addSpace(.{ .id = space_id, .workspace_id = workspace_id });
+            mapped_count += 1;
+        }
+        topology.addDisplay(mapped);
+    }
+    if (mapped_count != workspace_count) return null;
     return topology;
 }
 
