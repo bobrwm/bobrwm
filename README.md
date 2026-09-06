@@ -2,6 +2,9 @@
 
 A tiling window manager for macOS, written in Zig.
 
+The state-engine design and its invariants are defined in
+[ARCHITECTURE.md](ARCHITECTURE.md).
+
 ## Installation
 
 ```
@@ -205,7 +208,29 @@ Choose the tiling algorithm:
 
 ### Workspaces
 
-bobrwm uses virtual workspaces. They are not native macOS Spaces; hidden workspace windows are parked off-screen and restored when that workspace is focused.
+Each bobrwm workspace is assigned to exactly one ordinary Mission Control
+Space across all displays. At startup, the primary display receives the lowest
+workspace numbers in native ordinal order, so Bobrwm workspace 1 maps to its
+native Space 1. Secondary displays follow in stable display order, with at
+least one workspace reserved for each. Assignments are then preserved by native
+Space ID across topology observations. Configure at least as many ordinary
+Mission Control Spaces in total as Bobrwm workspaces, with at least one on every
+managed display. Bobrwm creates missing Spaces on the primary display and
+removes trailing extras so the physical count matches the configured workspace
+count. It watches the native topology while running and reapplies this invariant
+after external Space creation or deletion.
+
+Full-screen application spaces are ignored when assigning workspace numbers,
+but are crossed when switching. Switching uses the
+high-velocity synthetic Dock gesture pioneered by InstantSpaceSwitcher;
+on macOS 27 and later, Bobrwm also supplies the serialized IOHID payload now
+required by Dock. Window moves and topology queries use private, undocumented
+APIs. Either path can break on a future macOS release. Bobrwm waits for the
+native transition to settle, then reconciles the landed Space against
+WindowServer without injecting a second gesture from stale intermediate state.
+Rapid switch requests are serialized at native Space-change confirmations;
+while one is in flight, the newest requested workspace replaces older queued
+requests.
 
 By default, bobrwm creates 10 workspaces. To configure a smaller count, provide `.workspace_names`; the number of names is the workspace count:
 

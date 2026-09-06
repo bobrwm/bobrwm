@@ -31,8 +31,8 @@ pub const Candidate = struct {
     /// WindowServer bounds. Null when WindowServer no longer knows the window,
     /// which is how a destroyed one looks.
     live_frame: ?Frame,
-    /// Workspace-aware: false for a window parked on a hidden workspace, which
-    /// is why raw CG on-screen state is not enough on its own.
+    /// Workspace-aware: false for a window on an inactive physical Space,
+    /// which is why raw CG on-screen state is not enough on its own.
     is_visible_on_screen: bool,
     /// Whether this window appears in a workspace window list. Suppressed tab
     /// members live only in the store, and must not be mistaken for a window

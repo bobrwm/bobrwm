@@ -161,11 +161,22 @@ pub fn isTrusted() bool {
 /// Resolve a window id to its AX element by scanning the app's window list.
 /// The returned element is retained; the caller must CFRelease it.
 pub fn findWindow(pid: i32, target_wid: u32) ?c.AXUIElementRef {
+    return findWindowWithTimeout(pid, target_wid, null);
+}
+
+/// Resolve a window id while bounding messages sent through temporary AX elements.
+pub fn findWindowWithMessagingTimeout(pid: i32, target_wid: u32, timeout_seconds: f32) ?c.AXUIElementRef {
+    std.debug.assert(timeout_seconds > 0);
+    return findWindowWithTimeout(pid, target_wid, timeout_seconds);
+}
+
+fn findWindowWithTimeout(pid: i32, target_wid: u32, timeout_seconds: ?f32) ?c.AXUIElementRef {
     std.debug.assert(pid > 0);
     std.debug.assert(target_wid > 0);
 
     const app = c.AXUIElementCreateApplication(pid) orelse return null;
     defer c.CFRelease(@ptrCast(app));
+    if (timeout_seconds) |seconds| _ = c.AXUIElementSetMessagingTimeout(app, seconds);
 
     const ax = strings() orelse return null;
     const windows_attr = ax.windows_attr;
@@ -188,6 +199,7 @@ pub fn findWindow(pid: i32, target_wid: u32) ?c.AXUIElementRef {
         if (wid != target_wid) continue;
 
         _ = c.CFRetain(@ptrCast(win));
+        if (timeout_seconds) |seconds| _ = c.AXUIElementSetMessagingTimeout(win, seconds);
         return win;
     }
 
@@ -571,8 +583,8 @@ fn writeFrame(
     return size_err;
 }
 
-/// Move a window without touching its size. Off-screen parking and pure-move
-/// retiles use this instead of setWindowFrame: writing AXSize when only the
+/// Move a window without touching its size. Pure-move retiles use this instead
+/// of setWindowFrame: writing AXSize when only the
 /// position changes triggers a visible resize flash and a reflow storm in
 /// size-sensitive apps.
 pub fn setWindowPosition(pid: i32, wid: u32, x: f64, y: f64) bool {
