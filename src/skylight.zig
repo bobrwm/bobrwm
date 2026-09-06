@@ -2,6 +2,7 @@ const std = @import("std");
 const cg_extra = @import("cg_extra");
 const c = @import("c");
 const objc = @import("objc");
+const native_gesture = @import("native_gesture.zig");
 const log = std.log.scoped(.skylight);
 
 const CFArrayRef = *const anyopaque;
@@ -13,14 +14,9 @@ const CopySpacesForWindowsFn = *const fn (c_int, c_int, CFArrayRef) callconv(.c)
 const MoveWindowsToManagedSpaceFn = *const fn (c_int, CFArrayRef, u64) callconv(.c) void;
 const PerformBridgedMoveFn = *const fn (?*anyopaque) callconv(.c) i64;
 
-const DockSwipeDirection = enum {
-    left,
-    right,
-
-    fn sign(self: DockSwipeDirection) f64 {
-        return if (self == .right) 1.0 else -1.0;
-    }
-};
+const DockSwipeDirection = native_gesture.Direction;
+const DockSwipePhase = native_gesture.Phase;
+const ManagedDisplayIsAnimatingFn = *const fn (c_int, c.CFStringRef) callconv(.c) bool;
 
 const NativeSpaceSwitchPlan = struct {
     direction: DockSwipeDirection,
@@ -30,23 +26,10 @@ const NativeSpaceSwitchPlan = struct {
 const dock_swipe_velocity: f64 = 2000.0;
 const dock_swipe_progress: f64 = 1.401298464324817e-45;
 const dock_swipe_modern_progress: f64 = 0.000016;
-const dock_swipe_phase_delay_us: c_uint = 10_000;
 const serialized_event_capacity: usize = 4096;
 const native_window_batch_capacity: usize = 256;
 
 var g_requires_event_augmentation: ?bool = null;
-var g_dock_swipe: DockSwipeState = .{};
-
-const DockSwipeState = struct {
-    direction: DockSwipeDirection = .left,
-    phase: DockSwipePhase = .began,
-    velocity: f64 = 0,
-    steps_remaining: u8 = 0,
-
-    fn isActive(self: DockSwipeState) bool {
-        return self.steps_remaining > 0;
-    }
-};
 
 pub const CGRect = extern struct {
     origin: CGPoint,
@@ -80,6 +63,7 @@ pub const SkyLight = struct {
     setFrontProcessWithOptions: ?SetFrontProcessFn,
     postEventRecordTo: ?PostEventRecordFn,
     copyManagedDisplaySpaces: ?CopyManagedDisplaySpacesFn,
+    managedDisplayIsAnimating: ?ManagedDisplayIsAnimatingFn,
     copySpacesForWindows: ?CopySpacesForWindowsFn,
     moveWindowsToManagedSpace: ?MoveWindowsToManagedSpaceFn,
     bridgedSpaceCreateClass: ?objc.Class,
@@ -155,6 +139,7 @@ pub const SkyLight = struct {
             .setFrontProcessWithOptions = set_front,
             .postEventRecordTo = post_event,
             .copyManagedDisplaySpaces = copy_managed_display_spaces,
+            .managedDisplayIsAnimating = lib.lookup(ManagedDisplayIsAnimatingFn, "SLSManagedDisplayIsAnimating"),
             .copySpacesForWindows = copy_spaces_for_windows,
             .moveWindowsToManagedSpace = move_windows_to_managed_space,
             .bridgedSpaceCreateClass = bridged_space_create_class,
@@ -243,29 +228,31 @@ pub const SkyLight = struct {
         return true;
     }
 
-    /// Switch to a native Space by ID.
-    pub fn switchNativeSpaceId(self: *const SkyLight, display_id: u32, target_space_id: u64) bool {
-        const started_at_s = c.CFAbsoluteTimeGetCurrent();
+    /// Observe WindowServer's native Space animation state.
+    pub fn nativeDisplayIsAnimating(self: *const SkyLight, display_id: u32) ?bool {
+        const query = self.managedDisplayIsAnimating orelse return null;
+        const uuid = cg_extra.CGDisplayCreateUUIDFromDisplayID(display_id) orelse return null;
+        defer c.CFRelease(uuid);
+        const name = c.CFUUIDCreateString(null, uuid) orelse return null;
+        defer c.CFRelease(name);
+        return query(self.mainConnectionID(), name);
+    }
+
+    /// Prepare a gesture without posting any phases.
+    pub fn prepareNativeSpaceSwitch(self: *const SkyLight, display_id: u32, target_space_id: u64) ?native_gesture.Plan {
         if (!cg_extra.CGPreflightPostEventAccess()) {
             log.warn("native Space switching requires Accessibility permission to post events", .{});
-            return false;
+            return null;
         }
 
-        const plan = self.nativeSpaceSwitchPlanToId(display_id, target_space_id) orelse return false;
-        if (plan.steps == 0) return true;
-        if (!routeDockSwipeToDisplay(display_id)) return false;
-
-        const velocity = dock_swipe_velocity * @as(f64, @floatFromInt(plan.steps));
-        const scheduled = performDockSwipes(plan.direction, velocity, plan.steps);
-        const elapsed_ms = (c.CFAbsoluteTimeGetCurrent() - started_at_s) * std.time.ms_per_s;
-        log.debug("[trace] native Space gesture display={d} target={d} steps={d} scheduled={} elapsed_ms={d:.2}", .{
-            display_id,
-            target_space_id,
-            plan.steps,
-            scheduled,
-            elapsed_ms,
-        });
-        return scheduled;
+        const plan = self.nativeSpaceSwitchPlanToId(display_id, target_space_id) orelse return null;
+        if (plan.steps > 0 and !routeDockSwipeToDisplay(display_id)) return null;
+        return .{
+            .direction = plan.direction,
+            .steps = plan.steps,
+            .velocity = dock_swipe_velocity * @as(f64, @floatFromInt(plan.steps)),
+            .is_paced = requiresEventAugmentation(),
+        };
     }
 
     pub fn moveWindowToNativeSpace(self: *const SkyLight, wid: u32, space_id: u64) bool {
@@ -653,13 +640,8 @@ fn makeSwitchPlan(current_position: usize, target_position: usize) NativeSpaceSw
     return .{ .direction = direction, .steps = @intCast(steps) };
 }
 
-const DockSwipePhase = enum(i64) {
-    began = 1,
-    changed = 2,
-    ended = 4,
-};
-
-fn postDockSwipe(phase: DockSwipePhase, direction: DockSwipeDirection, velocity: f64) bool {
+/// Post one reducer-owned native Space gesture phase.
+pub fn postDockSwipe(phase: DockSwipePhase, direction: DockSwipeDirection, velocity: f64) bool {
     const event = cg_extra.CGEventCreate(null) orelse return false;
     defer c.CFRelease(event);
 
@@ -693,70 +675,6 @@ fn postDockSwipe(phase: DockSwipePhase, direction: DockSwipeDirection, velocity:
     cg_extra.CGEventSetDoubleValueField(event, 130, sign * velocity);
     cg_extra.CGEventPost(c.kCGSessionEventTap, event);
     return true;
-}
-
-fn performDockSwipes(direction: DockSwipeDirection, velocity: f64, steps: u8) bool {
-    std.debug.assert(steps > 0);
-    if (g_dock_swipe.isActive()) return false;
-
-    if (!requiresEventAugmentation()) {
-        for (0..steps) |_| {
-            if (!postDockSwipe(.began, direction, velocity)) return false;
-            if (!postDockSwipe(.changed, direction, velocity)) return false;
-            if (!postDockSwipe(.ended, direction, velocity)) return false;
-        }
-        return true;
-    }
-
-    if (!postDockSwipe(.began, direction, velocity)) return false;
-    g_dock_swipe = .{
-        .direction = direction,
-        .phase = .changed,
-        .velocity = velocity,
-        .steps_remaining = steps,
-    };
-    scheduleDockSwipePhase();
-    return true;
-}
-
-fn scheduleDockSwipePhase() void {
-    const delay_ns = @as(i64, dock_swipe_phase_delay_us) * std.time.ns_per_us;
-    c.dispatch_after_f(
-        c.dispatch_time(c.DISPATCH_TIME_NOW, delay_ns),
-        cg_extra.dispatch_get_main_queue(),
-        null,
-        dockSwipePhaseTick,
-    );
-}
-
-fn dockSwipePhaseTick(_: ?*anyopaque) callconv(.c) void {
-    if (!g_dock_swipe.isActive()) return;
-
-    const direction = g_dock_swipe.direction;
-    const velocity = g_dock_swipe.velocity;
-    if (!postDockSwipe(g_dock_swipe.phase, direction, velocity)) {
-        g_dock_swipe = .{};
-        return;
-    }
-
-    if (g_dock_swipe.phase == .changed) {
-        g_dock_swipe.phase = .ended;
-        scheduleDockSwipePhase();
-        return;
-    }
-
-    g_dock_swipe.steps_remaining -= 1;
-    if (g_dock_swipe.steps_remaining == 0) {
-        g_dock_swipe = .{};
-        return;
-    }
-
-    if (!postDockSwipe(.began, direction, velocity)) {
-        g_dock_swipe = .{};
-        return;
-    }
-    g_dock_swipe.phase = .changed;
-    scheduleDockSwipePhase();
 }
 
 fn augmentDockSwipeEvent(event: c.CGEventRef, phase: DockSwipePhase, progress: f64, velocity: f64) c.CGEventRef {

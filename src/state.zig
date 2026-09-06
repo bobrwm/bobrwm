@@ -156,6 +156,7 @@ pub fn reduce(model: Model, event: Event) Transition {
         },
         .initialize_native_topology => |initialization| {
             const workspace_transition = transition.model.workspace_transition;
+            workspace_reducer.cancelGesture(&transition);
             transition.model.native_topology = initialization.topology;
             transition.model.pending_switch = null;
             transition.model.queued_switch = null;
@@ -186,6 +187,9 @@ pub fn reduce(model: Model, event: Event) Transition {
         },
         .native_topology_unavailable => |unavailable| workspace_reducer.reduceTopologyUnavailable(&transition, unavailable),
         .native_switch_effect_failed => |failure| workspace_reducer.reduceSwitchEffectFailed(&transition, failure),
+        .native_gesture_prepared => |prepared| workspace_reducer.reduceGesturePrepared(&transition, prepared),
+        .native_gesture_posted => |posted| workspace_reducer.reduceGesturePosted(&transition, posted),
+        .native_gesture_timer_fired => |timer| workspace_reducer.reduceGestureTimer(&transition, timer),
         .start_workspace_transition => |start| workspace_reducer.reduceWorkspaceTransitionStart(&transition, start),
         .complete_workspace_transition => |completion| workspace_reducer.reduceWorkspaceTransitionCompletion(&transition, completion),
         .workspace_transition_timer_fired => |timer| workspace_reducer.reduceWorkspaceTransitionTimer(&transition, timer),
@@ -355,6 +359,30 @@ fn switchRequest(model: *const Model, display_id: DisplayId, workspace_id: Works
         .target = model.spaceForWorkspace(display_id, workspace_id).?,
         .at_ms = at_ms,
     } };
+}
+
+fn deliverTestSwitch(initial: Model, at_ms: TimestampMs) Model {
+    const epoch = initial.pending_switch.?.epoch;
+    var model = reduce(initial, .{ .native_topology_observed = .{
+        .topology = initial.native_topology,
+        .epoch = epoch,
+        .at_ms = at_ms,
+        .is_animating = false,
+    } }).model;
+    model = reduce(model, .{ .native_gesture_prepared = .{
+        .epoch = epoch,
+        .at_ms = at_ms,
+        .plan = .{ .direction = .right, .steps = 1, .velocity = 2000, .is_paced = false },
+    } }).model;
+    for ([_]model_mod.native_gesture.Phase{ .began, .changed, .ended }) |phase| {
+        model = reduce(model, .{ .native_gesture_posted = .{
+            .epoch = epoch,
+            .phase = phase,
+            .succeeded = true,
+            .at_ms = at_ms,
+        } }).model;
+    }
+    return model;
 }
 
 fn followFocusObservation(model: *const Model, target_key: SpaceKey, is_target_visible: bool) Event {
@@ -1005,20 +1033,21 @@ test "switch request preserves observed Space until confirmation" {
     try testing.expectEqual(transition.model.pending_switch.?.epoch, transition.model.workspace_transition.?.epoch);
     try testing.expectEqual(@as(u8, 2), transition.effect_count);
     try testing.expectEqual(std.meta.Tag(Effect).workspace_transition_started, std.meta.activeTag(transition.effects[0]));
-    try testing.expectEqual(std.meta.Tag(Effect).switch_native_space, std.meta.activeTag(transition.effects[1]));
+    try testing.expectEqual(std.meta.Tag(Effect).observe_native_topology, std.meta.activeTag(transition.effects[1]));
 }
 
 test "observed target completes native switch" {
     const testing = std.testing;
     var model = initializedModel(testTopology(101, null));
     var transition = reduce(model, switchRequest(&model, 1, 2, 100));
-    model = transition.model;
+    model = deliverTestSwitch(transition.model, 110);
     const epoch = model.pending_switch.?.epoch;
 
     transition = reduce(model, .{ .native_topology_observed = .{
         .topology = testTopology(102, null),
         .epoch = epoch,
         .at_ms = 200,
+        .is_animating = false,
     } });
 
     try testing.expectEqual(@as(?WorkspaceId, 2), transition.model.observedWorkspace(1));
@@ -1031,17 +1060,32 @@ test "observed target completes native switch" {
     try testing.expectEqual(std.meta.Tag(Effect).native_switch_completed, std.meta.activeTag(transition.effects[0]));
 }
 
-test "unexpected landing commits observation and fails request" {
+test "unexpected landing retries once then commits observation and fails request" {
     const testing = std.testing;
     var model = initializedModel(testTopology(101, null));
     var transition = reduce(model, switchRequest(&model, 1, 2, 100));
-    model = transition.model;
-    const pending = model.pending_switch.?;
+    model = deliverTestSwitch(transition.model, 110);
+    var pending = model.pending_switch.?;
 
     transition = reduce(model, .{ .native_topology_observed = .{
         .topology = testTopology(103, null),
         .epoch = pending.epoch,
         .at_ms = pending.deadline_at_ms,
+        .is_animating = false,
+    } });
+    model = transition.model;
+    try testing.expect(model.pending_switch.?.has_retried);
+    try testing.expect(model.pending_switch.?.epoch != pending.epoch);
+    try testing.expectEqual(@as(?WorkspaceId, 2), model.desiredWorkspace(1));
+    try testing.expectEqual(std.meta.Tag(Effect).observe_native_topology, std.meta.activeTag(transition.effects[transition.effect_count - 1]));
+    model = deliverTestSwitch(model, pending.deadline_at_ms + 1);
+    pending = model.pending_switch.?;
+
+    transition = reduce(model, .{ .native_topology_observed = .{
+        .topology = testTopology(103, null),
+        .epoch = pending.epoch,
+        .at_ms = pending.deadline_at_ms,
+        .is_animating = false,
     } });
 
     try testing.expectEqual(@as(?WorkspaceId, 3), transition.model.observedWorkspace(1));
@@ -1056,13 +1100,14 @@ test "intermediate Space becomes observed while request remains pending" {
     const testing = std.testing;
     var model = initializedModel(testTopology(101, null));
     var transition = reduce(model, switchRequest(&model, 1, 2, 100));
-    model = transition.model;
+    model = deliverTestSwitch(transition.model, 110);
     const pending = model.pending_switch.?;
 
     transition = reduce(model, .{ .native_topology_observed = .{
         .topology = testTopology(103, null),
         .epoch = pending.epoch,
         .at_ms = 200,
+        .is_animating = false,
     } });
 
     try testing.expectEqual(@as(?WorkspaceId, 3), transition.model.observedWorkspace(1));
@@ -1254,9 +1299,15 @@ test "initial topology mapping binds logical workspaces to physical Spaces" {
 
 test "switch effect preserves target Space identity across displays" {
     const testing = std.testing;
-    const model = initializedModel(testTopology(102, 201));
-    const transition = reduce(model, switchRequest(&model, 2, 5, 100));
-    const effect = transition.effects[1].switch_native_space;
+    var model = initializedModel(testTopology(102, 201));
+    model = reduce(model, switchRequest(&model, 2, 5, 100)).model;
+    const transition = reduce(model, .{ .native_topology_observed = .{
+        .topology = model.native_topology,
+        .epoch = model.pending_switch.?.epoch,
+        .at_ms = 110,
+        .is_animating = false,
+    } });
+    const effect = transition.effects[0].switch_native_space;
 
     try testing.expect(effect.request.target.key.eql(.{ .id = 202 }));
     try testing.expectEqual(@as(DisplayId, 2), effect.request.target.display_id);
@@ -1620,7 +1671,7 @@ test "hidden focus without a transition requests a workspace switch" {
 
     try testing.expect(transition.model.pending_switch.?.request.target.key.eql(.{ .id = 102 }));
     try testing.expectEqual(std.meta.Tag(Effect).workspace_transition_started, std.meta.activeTag(transition.effects[0]));
-    try testing.expectEqual(std.meta.Tag(Effect).switch_native_space, std.meta.activeTag(transition.effects[1]));
+    try testing.expectEqual(std.meta.Tag(Effect).observe_native_topology, std.meta.activeTag(transition.effects[1]));
     try testing.expect(!transition.model.hasDeferredFollowFocus());
 }
 
@@ -1778,6 +1829,251 @@ test "rapid switch requests keep only latest target" {
 
     try testing.expectEqual(@as(?WorkspaceId, 1), transition.model.desiredWorkspace(1));
     try testing.expectEqual(@as(?WorkspaceId, 1), if (transition.model.queued_switch) |queued| queued.target.workspace_id else null);
+}
+
+test "workspace hotkeys queue the observed workspace without replacing the pending transition" {
+    const testing = std.testing;
+    var model = initializedModel(testTopology(101, null));
+    model = reduce(model, .{ .request_workspace_switch = .{
+        .target = model.spaceForWorkspace(1, 2).?,
+        .at_ms = 100,
+    } }).model;
+    const epoch = model.pending_switch.?.epoch;
+    model = reduce(model, .{ .request_workspace_switch = .{
+        .target = model.spaceForWorkspace(1, 3).?,
+        .at_ms = 110,
+    } }).model;
+    const transition = reduce(model, .{ .request_workspace_switch = .{
+        .target = model.spaceForWorkspace(1, 1).?,
+        .at_ms = 120,
+    } });
+
+    try testing.expectEqual(@as(u8, 0), transition.effect_count);
+    try testing.expectEqual(epoch, transition.model.workspace_transition.?.epoch);
+    try testing.expectEqual(@as(WorkspaceId, 1), transition.model.queued_switch.?.target.workspace_id);
+}
+
+test "unexpected landing recovers toward latest queued target" {
+    const testing = std.testing;
+    var model = initializedModel(testTopology(101, null));
+    model = reduce(model, switchRequest(&model, 1, 2, 100)).model;
+    model = deliverTestSwitch(model, 105);
+    const pending = model.pending_switch.?;
+    model = reduce(model, switchRequest(&model, 1, 3, 110)).model;
+    var transition = reduce(model, .{ .native_topology_observed = .{
+        .topology = testTopology(101, null),
+        .epoch = pending.epoch,
+        .at_ms = pending.deadline_at_ms,
+        .is_animating = false,
+    } });
+
+    model = transition.model;
+    try testing.expectEqual(@as(?WorkspaceId, 3), model.desiredWorkspace(1));
+    try testing.expect(model.queued_switch == null);
+    try testing.expect(!model.pending_switch.?.has_retried);
+    model = deliverTestSwitch(model, pending.deadline_at_ms + 1);
+    const recovered = model.pending_switch.?;
+    transition = reduce(model, .{ .native_topology_observed = .{
+        .topology = testTopology(103, null),
+        .epoch = recovered.epoch,
+        .at_ms = recovered.deadline_at_ms - 1,
+        .is_animating = false,
+    } });
+    try testing.expect(!transition.model.isNativeSwitchPending());
+    try testing.expectEqual(@as(?WorkspaceId, 3), transition.model.activeWorkspace(1));
+    try testing.expectEqual(std.meta.Tag(Effect).native_switch_completed, std.meta.activeTag(transition.effects[0]));
+}
+
+test "native switch waits for idle before preparing gestures" {
+    const testing = std.testing;
+    var model = initializedModel(testTopology(101, null));
+    model = reduce(model, switchRequest(&model, 1, 2, 100)).model;
+    const epoch = model.pending_switch.?.epoch;
+    for ([_]?bool{ true, null }) |is_animating| {
+        const transition = reduce(model, .{ .native_topology_observed = .{
+            .topology = testTopology(101, null),
+            .epoch = epoch,
+            .at_ms = 200,
+            .is_animating = is_animating,
+        } });
+        try testing.expectEqual(@as(u8, 0), transition.effect_count);
+        try testing.expectEqual(.waiting_for_idle, transition.model.pending_switch.?.phase);
+        try testing.expect(transition.model.hasScheduledObservation());
+    }
+    const transition = reduce(model, .{ .native_topology_observed = .{
+        .topology = testTopology(101, null),
+        .epoch = epoch,
+        .at_ms = 250,
+        .is_animating = false,
+    } });
+    try testing.expectEqual(.preparing, transition.model.pending_switch.?.phase);
+    try testing.expectEqual(std.meta.Tag(Effect).switch_native_space, std.meta.activeTag(transition.effects[0]));
+}
+
+fn expectTestEffect(model: *Model, event: Event, expected: ?std.meta.Tag(Effect)) !void {
+    const transition = reduce(model.*, event);
+    model.* = transition.model;
+    if (expected) |tag| {
+        try std.testing.expect(transition.effect_count > 0);
+        try std.testing.expectEqual(tag, std.meta.activeTag(transition.effects[0]));
+        return;
+    }
+    try std.testing.expectEqual(@as(u8, 0), transition.effect_count);
+}
+
+test "gesture delivery and animation settlement gate queued switches" {
+    const testing = std.testing;
+    var model = initializedModel(testTopology(101, null));
+    try expectTestEffect(&model, switchRequest(&model, 1, 2, 100), .workspace_transition_started);
+    const epoch = model.pending_switch.?.epoch;
+    try expectTestEffect(&model, .{ .native_topology_observed = .{
+        .topology = testTopology(101, null),
+        .epoch = epoch,
+        .at_ms = 110,
+        .is_animating = false,
+    } }, .switch_native_space);
+    try expectTestEffect(&model, .{ .native_gesture_prepared = .{
+        .epoch = epoch,
+        .at_ms = 110,
+        .plan = .{ .direction = .right, .steps = 2, .velocity = 4000, .is_paced = true },
+    } }, .post_native_gesture);
+    try expectTestEffect(&model, switchRequest(&model, 1, 3, 115), null);
+
+    var at_ms: u64 = 120;
+    for (0..2) |step| {
+        for ([_]model_mod.native_gesture.Phase{ .began, .changed, .ended }) |phase| {
+            try expectTestEffect(&model, .{ .native_topology_observed = .{
+                .topology = testTopology(102, null),
+                .epoch = epoch,
+                .at_ms = at_ms,
+                .is_animating = false,
+            } }, null);
+            try testing.expectEqual(epoch, model.pending_switch.?.epoch);
+            try expectTestEffect(&model, .{ .native_gesture_posted = .{
+                .epoch = epoch,
+                .phase = phase,
+                .succeeded = true,
+                .at_ms = at_ms,
+            } }, if (step == 1 and phase == .ended) .observe_native_topology else .schedule_native_gesture);
+            if (model.pending_switch.?.phase == .observing) break;
+            try expectTestEffect(&model, .{ .native_gesture_timer_fired = .{ .epoch = epoch, .at_ms = at_ms + 9 } }, null);
+            at_ms += 10;
+            try expectTestEffect(&model, .{ .native_gesture_timer_fired = .{ .epoch = epoch, .at_ms = at_ms } }, .post_native_gesture);
+        }
+    }
+    try testing.expectEqual(.observing, model.pending_switch.?.phase);
+    for ([_]?bool{ true, null }) |is_animating| {
+        try expectTestEffect(&model, .{ .native_topology_observed = .{
+            .topology = testTopology(102, null),
+            .epoch = epoch,
+            .at_ms = 300,
+            .is_animating = is_animating,
+        } }, null);
+        try testing.expectEqual(epoch, model.pending_switch.?.epoch);
+    }
+    try expectTestEffect(&model, .{ .native_topology_observed = .{
+        .topology = testTopology(102, null),
+        .epoch = epoch,
+        .at_ms = 350,
+        .is_animating = false,
+    } }, .workspace_transition_started);
+    try testing.expect(model.pending_switch.?.epoch != epoch);
+    try testing.expectEqual(@as(WorkspaceId, 3), model.pending_switch.?.request.target.workspace_id);
+    try testing.expectEqual(.waiting_for_idle, model.pending_switch.?.phase);
+}
+
+test "late gesture failure cancels delivery and stale callbacks cannot affect its successor" {
+    const testing = std.testing;
+    var model = initializedModel(testTopology(101, null));
+    model = reduce(model, switchRequest(&model, 1, 2, 100)).model;
+    const epoch = model.pending_switch.?.epoch;
+    model = reduce(model, .{ .native_topology_observed = .{
+        .topology = testTopology(101, null),
+        .epoch = epoch,
+        .at_ms = 110,
+        .is_animating = false,
+    } }).model;
+    model = reduce(model, .{ .native_gesture_prepared = .{
+        .epoch = epoch,
+        .at_ms = 110,
+        .plan = .{ .direction = .right, .steps = 1, .velocity = 2000, .is_paced = false },
+    } }).model;
+    model = reduce(model, .{ .native_gesture_posted = .{
+        .epoch = epoch,
+        .phase = .began,
+        .succeeded = true,
+        .at_ms = 110,
+    } }).model;
+    model = reduce(model, switchRequest(&model, 1, 3, 115)).model;
+    var transition = reduce(model, .{ .native_gesture_posted = .{
+        .epoch = epoch,
+        .phase = .changed,
+        .succeeded = false,
+        .at_ms = 120,
+    } });
+    try testing.expectEqual(std.meta.Tag(Effect).cancel_native_gesture, std.meta.activeTag(transition.effects[0]));
+    try testing.expectEqual(SwitchFailureReason.effect_failed, transition.effects[2].native_switch_failed.reason);
+    model = transition.model;
+    const next_epoch = model.pending_switch.?.epoch;
+    for ([_]Event{
+        .{ .native_gesture_timer_fired = .{ .epoch = epoch, .at_ms = 200 } },
+        .{ .native_gesture_posted = .{ .epoch = epoch, .phase = .ended, .succeeded = true, .at_ms = 200 } },
+        .{ .native_topology_observed = .{ .topology = testTopology(102, null), .epoch = epoch, .at_ms = 200, .is_animating = false } },
+    }) |event| {
+        transition = reduce(model, event);
+        try testing.expectEqual(@as(u8, 0), transition.effect_count);
+        try testing.expectEqual(next_epoch, transition.model.pending_switch.?.epoch);
+        try testing.expectEqual(@as(?WorkspaceId, 1), transition.model.observedWorkspace(1));
+    }
+}
+
+test "unknown or stuck animation fails without pretending settlement" {
+    const testing = std.testing;
+    var model = initializedModel(testTopology(101, null));
+    model = reduce(model, switchRequest(&model, 1, 2, 100)).model;
+    model = deliverTestSwitch(model, 110);
+    const pending = model.pending_switch.?;
+    const timer = reduce(model, .{ .workspace_transition_timer_fired = .{
+        .epoch = pending.epoch,
+        .at_ms = pending.deadline_at_ms,
+    } });
+    try testing.expect(timer.model.isWorkspaceTransitionActive());
+    for ([_]?bool{ true, null }) |is_animating| {
+        const transition = reduce(model, .{ .native_topology_observed = .{
+            .topology = testTopology(102, null),
+            .epoch = pending.epoch,
+            .at_ms = pending.deadline_at_ms,
+            .is_animating = is_animating,
+        } });
+        try testing.expect(!transition.model.isNativeSwitchPending());
+        try testing.expectEqual(std.meta.Tag(Effect).native_switch_failed, std.meta.activeTag(transition.effects[1]));
+        try testing.expectEqual(if (is_animating == null) SwitchFailureReason.observation_unavailable else .animation_timeout, transition.effects[1].native_switch_failed.reason);
+    }
+}
+
+test "queued observed target still waits for idle after a failed switch" {
+    const testing = std.testing;
+    var model = initializedModel(testTopology(101, null));
+    try expectTestEffect(&model, switchRequest(&model, 1, 2, 100), .workspace_transition_started);
+    const epoch = model.pending_switch.?.epoch;
+    try expectTestEffect(&model, switchRequest(&model, 1, 1, 110), null);
+    try expectTestEffect(&model, .{ .native_switch_effect_failed = .{ .epoch = epoch, .at_ms = 120 } }, .workspace_transition_settled);
+    const next_epoch = model.pending_switch.?.epoch;
+    try testing.expect(next_epoch != epoch);
+    try expectTestEffect(&model, .{ .native_topology_observed = .{
+        .topology = testTopology(101, null),
+        .epoch = next_epoch,
+        .at_ms = 130,
+        .is_animating = true,
+    } }, null);
+    try testing.expect(model.isNativeSwitchPending());
+    try expectTestEffect(&model, .{ .native_topology_observed = .{
+        .topology = testTopology(101, null),
+        .epoch = next_epoch,
+        .at_ms = 140,
+        .is_animating = false,
+    } }, .native_switch_completed);
+    try testing.expect(!model.isNativeSwitchPending());
 }
 
 test "window discovery retries are reducer owned" {

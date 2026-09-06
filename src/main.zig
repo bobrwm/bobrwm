@@ -3512,6 +3512,11 @@ fn drainStateEffects() void {
 fn executeStateEffect(effect: state_mod.Effect) void {
     switch (effect) {
         .switch_native_space => |value| executeNativeSwitch(value),
+        .cancel_native_gesture => |direction| {
+            if (!skylight.postDockSwipe(.ended, direction, 0)) log.warn("native gesture cancellation failed", .{});
+        },
+        .post_native_gesture => |value| executeNativeGesture(value),
+        .schedule_native_gesture => |epoch| scheduleNativeGesture(epoch),
         .observe_native_topology => |epoch| observeNativeTopology(epoch),
         .native_switch_completed => |value| completeNativeSwitch(value.space, value.epoch),
         .native_switch_failed => |value| failNativeSwitch(value),
@@ -4014,15 +4019,23 @@ fn executeWorkspaceTransitionSettled(settlement: state_mod.WorkspaceTransitionSe
 }
 
 fn executeNativeSwitch(effect: @FieldType(state_mod.Effect, "switch_native_space")) void {
+    const pending = g_state.pending_switch orelse return;
+    if (pending.epoch != effect.epoch or pending.phase != .preparing) return;
     const request = effect.request;
     const native_space_id = request.target.key.id;
-    if (!g_sky.?.switchNativeSpaceId(request.target.display_id, native_space_id)) {
+    const plan = g_sky.?.prepareNativeSpaceSwitch(request.target.display_id, native_space_id) orelse {
         dispatchStateEvent(.{ .native_switch_effect_failed = .{
             .epoch = effect.epoch,
             .at_ms = nativeStateNowMs(),
         } });
         return;
-    }
+    };
+
+    dispatchStateEvent(.{ .native_gesture_prepared = .{
+        .epoch = effect.epoch,
+        .plan = plan,
+        .at_ms = nativeStateNowMs(),
+    } });
 
     log.debug("native workspace switch requested epoch={d} display={d} workspace={d} space={d}", .{
         effect.epoch,
@@ -4031,6 +4044,37 @@ fn executeNativeSwitch(effect: @FieldType(state_mod.Effect, "switch_native_space
         native_space_id,
     });
     updateStatusBar();
+}
+
+fn executeNativeGesture(effect: @FieldType(state_mod.Effect, "post_native_gesture")) void {
+    const pending = g_state.pending_switch orelse return;
+    if (pending.epoch != effect.epoch or pending.phase != .delivering) return;
+    const gesture = pending.gesture orelse return;
+    if (gesture.phase != effect.phase or gesture.due_at_ms != null) return;
+
+    const succeeded = skylight.postDockSwipe(effect.phase, effect.direction, effect.velocity);
+    dispatchStateEvent(.{ .native_gesture_posted = .{
+        .epoch = effect.epoch,
+        .phase = effect.phase,
+        .succeeded = succeeded,
+        .at_ms = nativeStateNowMs(),
+    } });
+}
+
+fn scheduleNativeGesture(epoch: state_mod.Epoch) void {
+    c.dispatch_after_f(
+        c.dispatch_time(c.DISPATCH_TIME_NOW, @import("native_gesture.zig").phase_delay_ms * std.time.ns_per_ms),
+        cg_extra.dispatch_get_main_queue(),
+        @ptrFromInt(epoch),
+        nativeGestureTimerFired,
+    );
+}
+
+fn nativeGestureTimerFired(context: ?*anyopaque) callconv(.c) void {
+    dispatchStateEvent(.{ .native_gesture_timer_fired = .{
+        .epoch = @intFromPtr(context),
+        .at_ms = nativeStateNowMs(),
+    } });
 }
 
 fn executeWorkspaceSwitch(workspace_switch: state_mod.WorkspaceSwitchEffect) void {
@@ -4051,6 +4095,10 @@ fn observeNativeTopology(epoch: state_mod.Epoch) void {
         .topology = topology,
         .epoch = epoch,
         .at_ms = at_ms,
+        .is_animating = if (g_state.pending_switch) |pending|
+            g_sky.?.nativeDisplayIsAnimating(pending.request.target.display_id)
+        else
+            null,
     } });
 }
 

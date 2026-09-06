@@ -1,6 +1,7 @@
 //! Workspace, native Space, and focus transitions.
 
 const std = @import("std");
+const native_gesture = @import("../../native_gesture.zig");
 const model_mod = @import("../model.zig");
 const layout_reducer = @import("layout.zig");
 const pointer_reducer = @import("pointer.zig");
@@ -52,7 +53,7 @@ pub fn reduceWorkspaceSwitchRequest(
 ) void {
     const target = transition.model.space(request.target.key) orelse return;
     const active_workspace_id = transition.model.activeWorkspace(target.display_id) orelse return;
-    if (active_workspace_id == target.workspace_id) {
+    if (transition.model.pending_switch == null and active_workspace_id == target.workspace_id) {
         startWorkspaceTransition(
             transition,
             .switch_workspace,
@@ -92,7 +93,7 @@ pub fn reduceSwitchRequest(
         return;
     }
 
-    startSwitch(transition, request, event.at_ms, true);
+    startSwitch(transition, request, event.at_ms);
 }
 
 pub fn reduceSpaceChanged(transition: *Transition, at_ms: TimestampMs) void {
@@ -125,6 +126,9 @@ pub fn reduceTopologyObserved(
     transition: *Transition,
     event: @FieldType(Event, "native_topology_observed"),
 ) void {
+    if (transition.model.pending_switch) |pending| {
+        if (event.epoch != pending.epoch) return;
+    }
     const has_changed = !transition.model.native_topology.eql(&event.topology);
     transition.model.native_topology = event.topology;
     syncNativeWorkspaceTopology(transition);
@@ -134,12 +138,27 @@ pub fn reduceTopologyObserved(
         if (has_changed) transition.addEffect(.native_topology_changed);
         return;
     };
-    if (event.epoch != pending.epoch) return;
-
     const display = event.topology.findDisplay(pending.request.target.display_id);
     const actual_space_id = if (display) |value| value.observed_space_id else null;
+    if (pending.phase == .preparing or pending.phase == .delivering or event.is_animating != false) {
+        if (event.at_ms < pending.deadline_at_ms) {
+            schedulePendingObservation(&transition.model, pending, event.at_ms);
+            return;
+        }
+        finishSwitch(transition, pending, event.at_ms, .{
+            .reason = if (event.is_animating == null) .observation_unavailable else .animation_timeout,
+            .actual = if (actual_space_id) |space_id| transition.model.space(.{ .id = space_id }) else null,
+        });
+        return;
+    }
     if (actual_space_id == pending.request.target.key.id) {
         finishSwitch(transition, pending, event.at_ms, null);
+        return;
+    }
+
+    if (pending.phase == .waiting_for_idle) {
+        transition.model.pending_switch.?.phase = .preparing;
+        transition.addEffect(.{ .switch_native_space = .{ .request = pending.request, .epoch = pending.epoch } });
         return;
     }
 
@@ -148,10 +167,101 @@ pub fn reduceTopologyObserved(
         return;
     }
 
+    if (recoverUnexpectedLanding(transition, pending, event.at_ms)) return;
+
     finishSwitch(transition, pending, event.at_ms, .{
         .reason = .unexpected_space,
         .actual = if (actual_space_id) |space_id| transition.model.space(.{ .id = space_id }) else null,
     });
+}
+
+pub fn reduceGesturePrepared(transition: *Transition, event: @FieldType(Event, "native_gesture_prepared")) void {
+    var pending = transition.model.pending_switch orelse return;
+    if (pending.epoch != event.epoch or pending.phase != .preparing) return;
+    if (event.plan.steps == 0) {
+        pending.phase = .observing;
+        transition.model.pending_switch = pending;
+        transition.addEffect(.{ .observe_native_topology = pending.epoch });
+        return;
+    }
+
+    pending.phase = .delivering;
+    pending.gesture = .{ .plan = event.plan, .steps_remaining = event.plan.steps };
+    transition.model.pending_switch = pending;
+    postGesturePhase(transition, pending);
+}
+
+pub fn reduceGesturePosted(transition: *Transition, event: @FieldType(Event, "native_gesture_posted")) void {
+    var pending = transition.model.pending_switch orelse return;
+    if (pending.epoch != event.epoch or pending.phase != .delivering) return;
+    var gesture = pending.gesture orelse return;
+    if (gesture.phase != event.phase or gesture.due_at_ms != null) return;
+    if (!event.succeeded) {
+        reduceSwitchEffectFailed(transition, .{ .epoch = event.epoch, .at_ms = event.at_ms });
+        return;
+    }
+
+    if (gesture.phase == .ended) {
+        gesture.steps_remaining -= 1;
+        if (gesture.steps_remaining == 0) {
+            pending.phase = .observing;
+            pending.gesture = null;
+            transition.model.pending_switch = pending;
+            transition.addEffect(.{ .observe_native_topology = pending.epoch });
+            return;
+        }
+    }
+    gesture.phase = switch (gesture.phase) {
+        .began => .changed,
+        .changed => .ended,
+        .ended => .began,
+    };
+    if (gesture.plan.is_paced) gesture.due_at_ms = event.at_ms +| native_gesture.phase_delay_ms;
+    pending.gesture = gesture;
+    transition.model.pending_switch = pending;
+    if (gesture.plan.is_paced) {
+        transition.addEffect(.{ .schedule_native_gesture = pending.epoch });
+        return;
+    }
+    postGesturePhase(transition, pending);
+}
+
+pub fn reduceGestureTimer(transition: *Transition, event: @FieldType(Event, "native_gesture_timer_fired")) void {
+    var pending = transition.model.pending_switch orelse return;
+    if (pending.epoch != event.epoch or pending.phase != .delivering) return;
+    const due_at_ms = pending.gesture.?.due_at_ms orelse return;
+    if (event.at_ms < due_at_ms) return;
+    pending.gesture.?.due_at_ms = null;
+    transition.model.pending_switch = pending;
+    postGesturePhase(transition, pending);
+}
+
+fn postGesturePhase(transition: *Transition, pending: PendingSwitch) void {
+    const gesture = pending.gesture.?;
+    transition.addEffect(.{ .post_native_gesture = .{
+        .epoch = pending.epoch,
+        .phase = gesture.phase,
+        .direction = gesture.plan.direction,
+        .velocity = gesture.plan.velocity,
+    } });
+}
+
+fn recoverUnexpectedLanding(transition: *Transition, pending: PendingSwitch, at_ms: TimestampMs) bool {
+    const queued = transition.model.queued_switch;
+    if (queued == null and pending.has_retried) return false;
+    const request = queued orelse pending.request;
+    if (transition.model.space(request.target.key) == null) return false;
+
+    // Dock can ignore gestures during an animation. Replan from observed
+    // topology after the deadline, giving the latest request precedence.
+    transition.model.pending_switch = null;
+    transition.model.queued_switch = null;
+    transition.model.observation_timer = null;
+    transition.model.deferred_follow_focus = null;
+    settleWorkspaceTransition(transition, pending.epoch, .superseded);
+    startSwitch(transition, request, at_ms);
+    if (transition.model.pending_switch) |*next| next.has_retried = queued == null;
+    return true;
 }
 
 pub fn syncNativeWorkspaceTopology(transition: *Transition) void {
@@ -243,6 +353,9 @@ pub fn reduceWorkspaceTransitionTimer(
 ) void {
     const current = transition.model.workspace_transition orelse return;
     if (current.epoch != event.epoch) return;
+    if (transition.model.pending_switch) |pending| {
+        if (pending.epoch == current.epoch) return;
+    }
     if (event.at_ms < current.deadline_at_ms) return;
 
     finalizeWorkspaceTransition(
@@ -646,6 +759,7 @@ pub fn finishSwitch(
     at_ms: TimestampMs,
     failure: ?FailedSwitch,
 ) void {
+    cancelGesture(transition);
     transition.model.pending_switch = null;
     transition.model.observation_timer = null;
 
@@ -677,38 +791,34 @@ pub fn finishSwitch(
                 .space = transition.model.space(pending.request.target.key) orelse pending.request.target,
                 .epoch = pending.epoch,
             } });
+            if (pending.phase == .waiting_for_idle) {
+                transition.addEffect(.{ .workspace_switch_ready = .{ .target = pending.request.target } });
+            }
         }
         return;
     };
     transition.model.queued_switch = null;
-    startSwitch(transition, queued, at_ms, failure != null);
+    startSwitch(transition, queued, at_ms);
+}
+
+pub fn cancelGesture(transition: *Transition) void {
+    const pending = transition.model.pending_switch orelse return;
+    const gesture = pending.gesture orelse return;
+    transition.addEffect(.{ .cancel_native_gesture = gesture.plan.direction });
 }
 
 pub fn startSwitch(
     transition: *Transition,
     request: SwitchRequest,
     at_ms: TimestampMs,
-    should_focus_if_observed: bool,
 ) void {
     const target = transition.model.space(request.target.key) orelse {
         transition.addEffect(.{ .native_switch_rejected = request.target });
         return;
     };
     const current_request: SwitchRequest = .{ .target = target };
-    const display = transition.model.native_topology.findDisplay(target.display_id) orelse {
+    if (transition.model.native_topology.findDisplay(target.display_id) == null) {
         transition.addEffect(.{ .native_switch_rejected = target });
-        return;
-    };
-    if (display.observed_space_id == target.key.id) {
-        if (should_focus_if_observed) {
-            transition.model.workspace_topology.focused_display_id = target.display_id;
-            transition.addEffect(.{ .workspace_switch_ready = .{ .target = target } });
-        } else {
-            transition.addEffect(.{ .native_switch_completed = .{
-                .space = target,
-                .epoch = 0,
-            } });
-        }
         return;
     }
 
@@ -730,10 +840,7 @@ pub fn startSwitch(
         pending.epoch,
     );
     schedulePendingObservation(&transition.model, pending, at_ms);
-    transition.addEffect(.{ .switch_native_space = .{
-        .request = current_request,
-        .epoch = epoch,
-    } });
+    transition.addEffect(.{ .observe_native_topology = epoch });
 }
 
 pub fn startWorkspaceTransition(

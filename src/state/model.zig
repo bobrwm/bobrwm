@@ -6,6 +6,7 @@ const topology_mod = @import("topology.zig");
 const window_catalog_mod = @import("window_catalog.zig");
 const tiling_mod = @import("../tiling.zig");
 const window_mod = @import("../window.zig");
+pub const native_gesture = @import("../native_gesture.zig");
 
 pub const max_displays = topology_mod.max_displays;
 pub const max_managed_windows = window_catalog_mod.max_managed_windows;
@@ -149,6 +150,9 @@ pub const PendingSwitch = struct {
     request: SwitchRequest,
     epoch: Epoch,
     deadline_at_ms: TimestampMs,
+    has_retried: bool = false,
+    phase: enum { waiting_for_idle, preparing, delivering, observing } = .waiting_for_idle,
+    gesture: ?native_gesture.Delivery = null,
 };
 
 pub const WorkspaceTransitionKind = enum {
@@ -173,6 +177,7 @@ pub const WorkspaceTransition = struct {
 
 pub const WorkspaceTransitionSettlementReason = enum {
     completed,
+    superseded,
     deadline_expired,
     native_switch_failed,
     target_unavailable,
@@ -916,7 +921,11 @@ pub const Event = union(enum) {
         topology: NativeTopology,
         epoch: Epoch,
         at_ms: TimestampMs,
+        is_animating: ?bool = null,
     },
+    native_gesture_prepared: struct { epoch: Epoch, plan: native_gesture.Plan, at_ms: TimestampMs },
+    native_gesture_posted: struct { epoch: Epoch, phase: native_gesture.Phase, succeeded: bool, at_ms: TimestampMs },
+    native_gesture_timer_fired: struct { epoch: Epoch, at_ms: TimestampMs },
     native_topology_unavailable: struct {
         epoch: Epoch,
         at_ms: TimestampMs,
@@ -1069,6 +1078,7 @@ pub const SwitchFailureReason = enum {
     effect_failed,
     observation_unavailable,
     unexpected_space,
+    animation_timeout,
 };
 
 pub const WindowCatalogRejectionReason = enum {
@@ -1082,6 +1092,9 @@ pub const WindowCatalogRejectionReason = enum {
 };
 
 pub const Effect = union(enum) {
+    cancel_native_gesture: native_gesture.Direction,
+    post_native_gesture: struct { epoch: Epoch, phase: native_gesture.Phase, direction: native_gesture.Direction, velocity: f64 },
+    schedule_native_gesture: Epoch,
     switch_native_space: struct {
         request: SwitchRequest,
         epoch: Epoch,
