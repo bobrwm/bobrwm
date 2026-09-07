@@ -32,6 +32,7 @@ typedef struct {
   uint8_t id;
   bool is_active;
   bool is_focused;
+  uint8_t display_order;
 } BWWorkspaceState;
 
 typedef struct {

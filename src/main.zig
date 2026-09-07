@@ -739,7 +739,19 @@ fn assertDisplayCoverage() void {
 fn updateStatusBar() void {
     const workspace_count = workspaceCount();
     const summaries = g_state.workspaceSummaries(workspace_count);
-    statusbar.updateState(summaries[0..workspace_count]);
+    var active_workspaces: [workspace_mod.max_displays]statusbar.ActiveWorkspace = undefined;
+    var active_count: usize = 0;
+    for (g_displays[0..g_display_count]) |display| {
+        const workspace_id = g_state.activeWorkspace(display.id) orelse continue;
+        active_workspaces[active_count] = .{
+            .workspace_id = workspace_id,
+            .display_id = display.id,
+            .x = display.full.x,
+            .y = display.full.y,
+        };
+        active_count += 1;
+    }
+    statusbar.updateState(summaries[0..workspace_count], active_workspaces[0..active_count]);
 }
 
 /// Rebuilds the current display snapshot from `NSScreen`.
