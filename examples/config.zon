@@ -68,16 +68,15 @@
     //     .easing = .ease_out,
     // },
 
-    // Virtual workspaces. If omitted, bobrwm creates 10 workspaces.
+    // Mission Control Spaces. If omitted, bobrwm manages 10 workspaces.
     // If set, the number of names is the workspace count. Workspace IDs
-    // remain 1-based, so this example would create workspaces 1 through 4.
+    // remain 1-based, so this example would manage workspaces 1 through 4.
     // .workspace_names = .{
     //     "term",
     //     "web",
     //     "code",
     //     "chat",
     // },
-
     // Keybinds merge with built-in defaults. Use the same key + modifiers to
     // override a default binding, or add new entries for additional shortcuts.
     .keybinds = .{

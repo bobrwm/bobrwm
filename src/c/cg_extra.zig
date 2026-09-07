@@ -21,6 +21,40 @@ pub extern fn CGEventGetFlags(event: c.CGEventRef) c.CGEventFlags;
 
 pub extern fn CGEventGetLocation(event: c.CGEventRef) c.CGPoint;
 
+pub extern fn CGEventCreate(source: c.CGEventSourceRef) c.CGEventRef;
+
+pub extern fn CGEventCreateData(allocator: c.CFAllocatorRef, event: c.CGEventRef) c.CFDataRef;
+
+pub extern fn CGEventCreateFromData(allocator: c.CFAllocatorRef, data: c.CFDataRef) c.CGEventRef;
+
+pub extern fn CGEventGetTimestamp(event: c.CGEventRef) u64;
+
+pub extern fn CGEventSetIntegerValueField(
+    event: c.CGEventRef,
+    field: c.CGEventField,
+    value: i64,
+) void;
+
+pub extern fn CGEventSetDoubleValueField(
+    event: c.CGEventRef,
+    field: c.CGEventField,
+    value: f64,
+) void;
+
+pub extern fn CGEventPost(tap: c.CGEventTapLocation, event: c.CGEventRef) void;
+
+pub extern fn CGPreflightPostEventAccess() bool;
+
+pub extern fn mach_absolute_time() u64;
+
+pub extern fn sysctlbyname(
+    name: [*:0]const u8,
+    old_value: ?*anyopaque,
+    old_length: *usize,
+    new_value: ?*const anyopaque,
+    new_length: usize,
+) c_int;
+
 pub extern fn CGEventGetIntegerValueField(
     event: c.CGEventRef,
     field: c.CGEventField,
@@ -67,6 +101,15 @@ pub extern fn CGWindowListCopyWindowInfo(
 // unplug/replug and sleep/wake, unlike CGDirectDisplayID which macOS reassigns.
 // Returns a +1 CFUUIDRef the caller must CFRelease.
 pub extern fn CGDisplayCreateUUIDFromDisplayID(display: u32) c.CFUUIDRef;
+
+pub extern fn CGDisplayBounds(display: u32) c.CGRect;
+
+pub extern fn CGGetDisplaysWithPoint(
+    point: c.CGPoint,
+    max_displays: u32,
+    displays: [*]u32,
+    matching_display_count: *u32,
+) c.CGError;
 
 // CFStringRef constants exported by CoreGraphics; resolved at link time.
 pub extern const kCGWindowNumber: c.CFStringRef;
