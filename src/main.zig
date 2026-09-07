@@ -3292,6 +3292,10 @@ fn nativeSpaceCapacity() ?NativeSpaceCapacity {
     var snapshot = g_sky.?.nativeSpaceTopology() orelse return null;
     defer snapshot.deinit();
 
+    return nativeSpaceCapacityFromSnapshot(&snapshot);
+}
+
+fn nativeSpaceCapacityFromSnapshot(snapshot: *const skylight.NativeSpaceTopology) ?NativeSpaceCapacity {
     var total: u16 = 0;
     var excess_space_id: ?u64 = null;
     var remaining_required: u16 = workspaceCount();
@@ -3400,7 +3404,10 @@ fn reconcileNativeSpaceTopologyIfNeeded() void {
     if (g_state.isWorkspaceTransitionActive()) return;
     if (g_state.hasDisplayResettleScheduled()) return;
 
-    const capacity = nativeSpaceCapacity() orelse return;
+    // Capacity and topology must describe the same WindowServer observation.
+    var snapshot = g_sky.?.nativeSpaceTopology() orelse return;
+    defer snapshot.deinit();
+    const capacity = nativeSpaceCapacityFromSnapshot(&snapshot) orelse return;
     if (capacity.total_count != workspaceCount()) {
         log.info("native Space count changed required={d} available={d}", .{
             workspaceCount(),
@@ -3414,7 +3421,7 @@ fn reconcileNativeSpaceTopologyIfNeeded() void {
         return;
     }
 
-    const topology = captureNativeTopology() orelse return;
+    const topology = nativeTopologyFromSnapshot(&snapshot) orelse return;
     if (g_state.native_topology.eql(&topology)) return;
 
     log.info("native Space topology changed", .{});
@@ -3429,6 +3436,10 @@ fn captureNativeTopology() ?state_mod.NativeTopology {
     };
     defer snapshot.deinit();
 
+    return nativeTopologyFromSnapshot(&snapshot);
+}
+
+fn nativeTopologyFromSnapshot(snapshot: *const skylight.NativeSpaceTopology) ?state_mod.NativeTopology {
     var observation: state_mod.NativeTopologyObservation = .{};
     var captured_space_count: u16 = 0;
     const display_indices = stableDisplayIndices();
