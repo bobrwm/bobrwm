@@ -245,12 +245,16 @@ pub const SkyLight = struct {
             return null;
         }
 
-        const plan = self.nativeSpaceSwitchPlanToId(display_id, target_space_id) orelse return null;
+        var topology = self.nativeSpaceTopology() orelse return null;
+        defer topology.deinit();
+        const origin_space_id = topology.currentSpaceId(display_id) orelse return null;
+        const plan = topology.switchPlanToId(display_id, target_space_id) orelse return null;
         if (plan.steps > 0 and !routeDockSwipeToDisplay(display_id)) return null;
         return .{
+            .origin_space_id = origin_space_id,
             .direction = plan.direction,
             .steps = plan.steps,
-            .velocity = dock_swipe_velocity * @as(f64, @floatFromInt(plan.steps)),
+            .velocity = dock_swipe_velocity,
             .is_paced = requiresEventAugmentation(),
         };
     }
@@ -328,12 +332,6 @@ pub const SkyLight = struct {
         var topology = self.nativeSpaceTopology() orelse return null;
         defer topology.deinit();
         return topology.spaceIdForWindow(self, wid, display_id);
-    }
-
-    fn nativeSpaceSwitchPlanToId(self: *const SkyLight, display_id: u32, target_space_id: u64) ?NativeSpaceSwitchPlan {
-        var topology = self.nativeSpaceTopology() orelse return null;
-        defer topology.deinit();
-        return topology.switchPlanToId(display_id, target_space_id);
     }
 };
 

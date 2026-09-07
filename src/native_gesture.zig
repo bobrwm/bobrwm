@@ -14,6 +14,7 @@ pub const Direction = enum {
 pub const Phase = enum(i64) { began = 1, changed = 2, ended = 4 };
 
 pub const Plan = struct {
+    origin_space_id: u64,
     direction: Direction,
     steps: u8,
     velocity: f64,
@@ -23,6 +24,5 @@ pub const Plan = struct {
 pub const Delivery = struct {
     plan: Plan,
     phase: Phase = .began,
-    steps_remaining: u8,
     due_at_ms: ?u64 = null,
 };

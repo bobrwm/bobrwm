@@ -151,7 +151,8 @@ pub const PendingSwitch = struct {
     epoch: Epoch,
     deadline_at_ms: TimestampMs,
     has_retried: bool = false,
-    phase: enum { waiting_for_idle, preparing, delivering, observing } = .waiting_for_idle,
+    phase: enum { waiting_for_idle, preparing, delivering, waiting_for_step, observing } = .waiting_for_idle,
+    gesture_origin_space_id: ?u64 = null,
     gesture: ?native_gesture.Delivery = null,
 };
 
