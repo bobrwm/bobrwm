@@ -281,7 +281,14 @@ pub fn observeApp(pid: i32) void {
         cancelObserveRetry(pid);
         return;
     }
-    scheduleObserveRetry(pid);
+    scheduleObserveRetry(pid, observe_retry_interval_ms);
+}
+
+/// Queue observer setup after latency-sensitive workspace landing work.
+pub fn observeAppDeferred(pid: i32) void {
+    std.debug.assert(pid > 0);
+    if (appObserverExists(pid)) return;
+    scheduleObserveRetry(pid, window_scan_interval_ms);
 }
 
 pub fn unobserveApp(pid: i32) void {
@@ -438,7 +445,7 @@ fn processObserveRetryTick() void {
     observeRetryStopIfIdle();
 }
 
-fn scheduleObserveRetry(pid: i32) void {
+fn scheduleObserveRetry(pid: i32, initial_delay_ms: u64) void {
     if (appObserverExists(pid)) return;
 
     if (observeRetryIndex(pid)) |existing| {
@@ -467,7 +474,7 @@ fn scheduleObserveRetry(pid: i32) void {
 
     c.dispatch_source_set_timer(
         source,
-        c.dispatch_time(c.DISPATCH_TIME_NOW, @as(i64, @intCast(observe_retry_interval_ms)) * c.NSEC_PER_MSEC),
+        c.dispatch_time(c.DISPATCH_TIME_NOW, @as(i64, @intCast(initial_delay_ms)) * c.NSEC_PER_MSEC),
         observe_retry_interval_ms * c.NSEC_PER_MSEC,
         @as(u64, 100) * c.NSEC_PER_MSEC,
     );

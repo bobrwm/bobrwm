@@ -123,8 +123,8 @@ Bobrwm reconciles AX, WindowServer/CG, SkyLight, and internal workspace/layout s
 
 **Visibility and cleanup:**
 - Treat CG on-screen presence as necessary but not always sufficient. Electron apps can keep layer-0 windows around after close-to-background; fully transparent CG windows should not be treated as visible.
-- Hidden workspace windows are intentionally parked off-screen with a few peek pixels visible. Use workspace-aware visibility helpers for cleanup and tab inference; do not call raw CG on-screen checks when workspace visibility matters.
-- Cleanup should skip hidden workspaces unless the code can distinguish Bobrwm-parked windows from real ghosts.
+- macOS keeps windows on inactive physical Spaces off-screen. Use workspace-aware visibility helpers for cleanup and tab inference; do not call raw CG on-screen checks when workspace visibility matters.
+- Cleanup should skip inactive Spaces unless it can distinguish native Space visibility from real ghosts.
 
 **Workspace transitions:**
 - Workspace transitions are two-phase. Mark them complete when target focus is accepted or when the target workspace is empty, but keep the transition active until the short settle deadline so synthetic AX move/resize events from hide/retile are suppressed.
