@@ -19,6 +19,7 @@ pub const BW_EVENT_MOUSE_DOWN: u8 = @intFromEnum(event_mod.EventKind.mouse_down)
 pub const BW_EVENT_MOUSE_UP: u8 = @intFromEnum(event_mod.EventKind.mouse_up);
 pub const BW_EVENT_MOUSE_DRAGGED: u8 = @intFromEnum(event_mod.EventKind.mouse_dragged);
 pub const BW_EVENT_ROLE_POLL_TICK: u8 = @intFromEnum(event_mod.EventKind.role_poll_tick);
+pub const BW_EVENT_NATIVE_TOPOLOGY_POLL_TICK: u8 = @intFromEnum(event_mod.EventKind.native_topology_poll_tick);
 
 pub const BW_HK_FOCUS_WORKSPACE: u8 = @intFromEnum(event_mod.EventKind.hk_focus_workspace);
 pub const BW_HK_MOVE_TO_WORKSPACE: u8 = @intFromEnum(event_mod.EventKind.hk_move_to_workspace);

@@ -1,4 +1,4 @@
-const std = @import("std");
+//! Window value types shared by the reducer and platform adapters.
 
 pub const WindowId = u32;
 
@@ -10,20 +10,15 @@ pub const WindowMode = enum {
 pub const Window = struct {
     wid: WindowId,
     pid: i32,
-    title: ?[]const u8,
     /// Last geometry bobrwm deliberately accepted: either a successful AX
     /// target or a user/external frame admitted by the ownership coordinator.
     /// This is not an unconditionally live WindowServer observation.
     frame: Frame,
-    is_minimized: bool,
     is_fullscreen: bool = false,
     mode: WindowMode = .tiled,
-    workspace_id: u8,
-    display_id: u32,
 
-    /// Last on-screen frame of a floating window, captured before it is parked
-    /// off-screen on workspace hide. Restored when the workspace is shown again;
-    /// tiled windows get their geometry from BSP instead, so this stays null.
+    /// Last non-fullscreen frame of a floating window. Used to restore user
+    /// geometry after fullscreen or off-display drift.
     float_frame: ?Frame = null,
 
     pub const Frame = struct {
@@ -51,56 +46,4 @@ pub const Window = struct {
                 @abs(self.height - other.height) <= tol;
         }
     };
-};
-
-/// Window store — maps window IDs to Window structs.
-pub const WindowStore = struct {
-    windows: std.AutoHashMap(WindowId, Window),
-    allocator: std.mem.Allocator,
-
-    pub fn init(allocator: std.mem.Allocator) WindowStore {
-        return .{
-            .windows = std.AutoHashMap(WindowId, Window).init(allocator),
-            .allocator = allocator,
-        };
-    }
-
-    pub fn deinit(self: *WindowStore) void {
-        self.windows.deinit();
-    }
-
-    pub fn put(self: *WindowStore, window: Window) !void {
-        std.debug.assert(window.wid > 0);
-        std.debug.assert(window.pid > 0);
-        std.debug.assert(window.workspace_id > 0);
-        std.debug.assert(window.display_id > 0);
-        try self.windows.put(window.wid, window);
-    }
-
-    /// Reserve entries before a mutation that must commit across multiple
-    /// containers. Capacity changes are harmless if a later reservation fails.
-    pub fn ensureUnusedCapacity(self: *WindowStore, additional_count: u32) !void {
-        try self.windows.ensureUnusedCapacity(additional_count);
-    }
-
-    /// Insert after a matching `ensureUnusedCapacity` call.
-    pub fn putAssumeCapacity(self: *WindowStore, window: Window) void {
-        std.debug.assert(window.wid > 0);
-        std.debug.assert(window.pid > 0);
-        std.debug.assert(window.workspace_id > 0);
-        std.debug.assert(window.display_id > 0);
-        self.windows.putAssumeCapacity(window.wid, window);
-    }
-
-    pub fn get(self: *const WindowStore, wid: WindowId) ?Window {
-        return self.windows.get(wid);
-    }
-
-    pub fn remove(self: *WindowStore, wid: WindowId) void {
-        _ = self.windows.remove(wid);
-    }
-
-    pub fn count(self: *const WindowStore) usize {
-        return self.windows.count();
-    }
 };

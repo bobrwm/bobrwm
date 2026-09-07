@@ -425,7 +425,7 @@ pub fn build(b: *std.Build) !void {
 
     const run_geometry_tests = b.addRunArtifact(geometry_tests);
 
-    // tabgroup.zig and tiling.zig are pure Zig (window.zig types only),
+    // Tab detection and tiling are pure Zig (window.zig types only),
     // so their test modules need no SDK or include wiring either.
     const tabgroup_test_mod = b.createModule(.{
         .root_source_file = b.path("src/tabgroup.zig"),
@@ -466,6 +466,19 @@ pub fn build(b: *std.Build) !void {
     });
 
     const run_workspace_tests = b.addRunArtifact(workspace_tests);
+
+    const state_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/state.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    const state_tests = b.addTest(.{
+        .name = "state-tests",
+        .root_module = state_test_mod,
+    });
+
+    const run_state_tests = b.addRunArtifact(state_tests);
 
     const statusbar_test_mod = b.createModule(.{
         .root_source_file = b.path("src/statusbar.zig"),
@@ -545,6 +558,7 @@ pub fn build(b: *std.Build) !void {
     test_step.dependOn(&run_tabgroup_tests.step);
     test_step.dependOn(&run_tiling_tests.step);
     test_step.dependOn(&run_workspace_tests.step);
+    test_step.dependOn(&run_state_tests.step);
     test_step.dependOn(&run_statusbar_tests.step);
     test_step.dependOn(&run_dim_tests.step);
     test_step.dependOn(&run_swipe_tests.step);

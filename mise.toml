@@ -1,0 +1,5 @@
+[tools]
+zig = "0.16.0"
+"github:rockorager/zigdoc" = "latest"
+"github:rockorager/prise" = "latest"
+"aqua:nushell/nushell" = "latest"

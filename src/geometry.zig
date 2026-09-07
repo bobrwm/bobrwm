@@ -25,12 +25,10 @@ pub const default_resample_delay_ns: i128 = 75 * std.time.ns_per_ms;
 
 pub const IntentSource = enum {
     layout,
-    workspace_park,
     floating_restore,
     user_command,
     animation,
     tab_sync,
-    exit_restore,
 };
 
 pub const Position = struct {
@@ -77,35 +75,184 @@ pub const ObservationOwner = enum {
 
 pub const SettlementOwner = enum {
     manager,
+    manager_unsettled,
     external,
 };
 
-allocator: std.mem.Allocator,
-entries: std.AutoHashMapUnmanaged(WindowId, Entry) = .empty,
+pub const Event = union(enum) {
+    seed: struct {
+        window_id: WindowId,
+        observed: Frame,
+    },
+    observe: struct {
+        process_id: i32,
+        window_id: WindowId,
+        observed: Frame,
+        is_move: bool,
+        at_ns: i128,
+        dragged_window_id: ?WindowId,
+    },
+    accept_frame: struct {
+        window_id: WindowId,
+        target: Frame,
+        source: IntentSource,
+        at_ns: i128,
+        settle_interval_ns: ?i128 = null,
+    },
+    accept_position: struct {
+        window_id: WindowId,
+        x: f64,
+        y: f64,
+        source: IntentSource,
+        at_ns: i128,
+    },
+    begin_resample: WindowId,
+    defer_resample: struct {
+        window_id: WindowId,
+        at_ns: i128,
+    },
+    settle: struct {
+        window_id: WindowId,
+        observed: Frame,
+        at_ns: i128,
+    },
+    forget: WindowId,
+    clear_intents,
+};
+
+pub const RejectionReason = enum {
+    catalog_full,
+    generation_exhausted,
+};
+
+pub const Effect = union(enum) {
+    observed: struct {
+        process_id: i32,
+        window_id: WindowId,
+        frame: Frame,
+        is_move: bool,
+        owner: ObservationOwner,
+    },
+    settled: struct {
+        window_id: WindowId,
+        frame: Frame,
+        pending_intent: ?Intent,
+        owner: SettlementOwner,
+    },
+    rejected: struct {
+        window_id: WindowId,
+        reason: RejectionReason,
+    },
+};
+
+pub const Transition = struct {
+    state: Self,
+    effect: ?Effect = null,
+};
+
+pub const max_entries = 1024;
+
+const StoredEntry = struct {
+    window_id: WindowId,
+    value: Entry,
+};
+
+entries: [max_entries]StoredEntry = undefined,
+entry_count: u16 = 0,
 next_generation: u64 = 1,
-settle_interval_ns: i128,
+settle_interval_ns: i128 = default_settle_interval_ns,
 
-pub fn init(allocator: std.mem.Allocator) Self {
-    return initWithSettleInterval(allocator, default_settle_interval_ns);
+pub fn init() Self {
+    return .{};
 }
 
-pub fn initWithSettleInterval(allocator: std.mem.Allocator, settle_interval_ns: i128) Self {
+pub fn initWithSettleInterval(settle_interval_ns: i128) Self {
     std.debug.assert(settle_interval_ns > 0);
-    return .{
-        .allocator = allocator,
-        .settle_interval_ns = settle_interval_ns,
-    };
+    return .{ .settle_interval_ns = settle_interval_ns };
 }
 
-pub fn deinit(self: *Self) void {
-    self.entries.deinit(self.allocator);
-}
-
-/// Reserve coordinator entries before window discovery starts. Geometry
-/// tracking must not become the first allocation attempted after AX has
-/// already accepted a write.
-pub fn ensureTotalCapacity(self: *Self, capacity: u32) !void {
-    try self.entries.ensureTotalCapacity(self.allocator, capacity);
+pub fn reduce(state: Self, event: Event) Transition {
+    var transition: Transition = .{ .state = state };
+    switch (event) {
+        .seed => |observation| {
+            transition.state.seedObserved(observation.window_id, observation.observed) catch |err| {
+                transition.effect = rejectionEffect(observation.window_id, err);
+            };
+        },
+        .observe => |observation| {
+            const owner = transition.state.observe(
+                observation.window_id,
+                observation.observed,
+                observation.at_ns,
+                observation.dragged_window_id,
+            ) catch |err| {
+                transition.effect = rejectionEffect(observation.window_id, err);
+                return transition;
+            };
+            transition.effect = .{ .observed = .{
+                .process_id = observation.process_id,
+                .window_id = observation.window_id,
+                .frame = observation.observed,
+                .is_move = observation.is_move,
+                .owner = owner,
+            } };
+        },
+        .accept_frame => |accepted| {
+            if (accepted.settle_interval_ns) |settle_interval_ns| {
+                _ = transition.state.recordFrameAcceptedFor(
+                    accepted.window_id,
+                    accepted.target,
+                    accepted.source,
+                    accepted.at_ns,
+                    settle_interval_ns,
+                ) catch |err| {
+                    transition.effect = rejectionEffect(accepted.window_id, err);
+                };
+            } else {
+                _ = transition.state.recordFrameAccepted(
+                    accepted.window_id,
+                    accepted.target,
+                    accepted.source,
+                    accepted.at_ns,
+                ) catch |err| {
+                    transition.effect = rejectionEffect(accepted.window_id, err);
+                };
+            }
+        },
+        .accept_position => |accepted| {
+            _ = transition.state.recordPositionAccepted(
+                accepted.window_id,
+                accepted.x,
+                accepted.y,
+                accepted.source,
+                accepted.at_ns,
+            ) catch |err| {
+                transition.effect = rejectionEffect(accepted.window_id, err);
+            };
+        },
+        .begin_resample => |window_id| transition.state.beginResample(window_id),
+        .defer_resample => |resample| transition.state.deferResample(resample.window_id, resample.at_ns),
+        .settle => |observation| {
+            const pending_intent = if (transition.state.get(observation.window_id)) |entry|
+                entry.intent
+            else
+                null;
+            const owner = transition.state.settle(
+                observation.window_id,
+                observation.observed,
+                observation.at_ns,
+            );
+            transition.effect = .{ .settled = .{
+                .window_id = observation.window_id,
+                .frame = observation.observed,
+                .pending_intent = pending_intent,
+                .owner = owner,
+            } };
+        },
+        .forget => |window_id| transition.state.forget(window_id),
+        .clear_intents => transition.state.clearIntents(),
+    }
+    return transition;
 }
 
 /// Record a frame write only after AX accepted the full operation. A newer
@@ -138,10 +285,9 @@ fn recordAccepted(
             std.math.maxInt(i128),
     };
 
-    const result = try self.entries.getOrPut(self.allocator, wid);
-    if (!result.found_existing) result.value_ptr.* = .{};
-    result.value_ptr.intent = intent;
-    result.value_ptr.resample_at_ns = std.math.add(i128, now_ns, default_resample_delay_ns) catch
+    const entry = try self.getOrPut(wid);
+    entry.intent = intent;
+    entry.resample_at_ns = std.math.add(i128, now_ns, default_resample_delay_ns) catch
         std.math.maxInt(i128);
     return intent;
 }
@@ -166,7 +312,7 @@ pub fn recordFrameAcceptedFor(
 ) !Intent {
     std.debug.assert(settle_interval_ns > 0);
     _ = try self.recordFrameAccepted(wid, target, source, now_ns);
-    const entry = self.entries.getPtr(wid).?;
+    const entry = self.getPtr(wid).?;
     entry.intent.?.settle_deadline_ns = std.math.add(i128, now_ns, settle_interval_ns) catch
         std.math.maxInt(i128);
     return entry.intent.?;
@@ -188,9 +334,8 @@ pub fn recordPositionAccepted(
 /// replacement paths that successfully wrote the replacement before adoption.
 pub fn seedObserved(self: *Self, wid: WindowId, observed: Frame) !void {
     std.debug.assert(wid > 0);
-    const result = try self.entries.getOrPut(self.allocator, wid);
-    if (!result.found_existing) result.value_ptr.* = .{};
-    result.value_ptr.observed = observed;
+    const entry = try self.getOrPut(wid);
+    entry.observed = observed;
 }
 
 /// Classify a WindowServer observation. Only the exact window identified as
@@ -206,9 +351,7 @@ pub fn observe(
     std.debug.assert(wid > 0);
     std.debug.assert(observed.width >= 0 and observed.height >= 0);
 
-    const result = try self.entries.getOrPut(self.allocator, wid);
-    if (!result.found_existing) result.value_ptr.* = .{};
-    const entry = result.value_ptr;
+    const entry = try self.getOrPut(wid);
     entry.observed = observed;
     entry.resample_at_ns = std.math.add(i128, now_ns, default_resample_delay_ns) catch
         std.math.maxInt(i128);
@@ -234,11 +377,11 @@ pub fn observe(
 }
 
 /// Record the mandatory trailing WindowServer sample. A manager intent keeps
-/// ownership while it is still settling; a divergent sample after its
-/// deadline is external. Matching samples retain the intent until its deadline
-/// so another late notification from the same AX write cannot steal ownership.
+/// ownership while it is still settling. Matching samples retain the intent
+/// until its deadline so another late notification from the same AX write
+/// cannot steal ownership.
 pub fn settle(self: *Self, wid: WindowId, observed: Frame, now_ns: i128) SettlementOwner {
-    const entry = self.entries.getPtr(wid) orelse return .external;
+    const entry = self.getPtr(wid) orelse return .external;
     entry.observed = observed;
     entry.resample_at_ns = null;
 
@@ -253,38 +396,39 @@ pub fn settle(self: *Self, wid: WindowId, observed: Frame, now_ns: i128) Settlem
         }
         entry.intent = null;
         if (reached_target) return .manager;
+        return .manager_unsettled;
     }
 
     return .external;
 }
 
-/// Collect due trailing samples without allocating. Entries beyond `out` stay
-/// armed for the next timer tick; callers can therefore use a fixed buffer
-/// without silently losing reconciliation work.
-pub fn collectDueResamples(self: *Self, now_ns: i128, out: []WindowId) usize {
+/// Project due trailing samples without consuming them.
+pub fn dueResamples(self: *const Self, now_ns: i128, out: []WindowId) usize {
     var count: usize = 0;
-    var it = self.entries.iterator();
-    while (it.next()) |entry| {
-        const due = entry.value_ptr.resample_at_ns orelse continue;
+    for (self.items()) |stored| {
+        const due = stored.value.resample_at_ns orelse continue;
         if (due > now_ns) continue;
         if (count == out.len) break;
-        out[count] = entry.key_ptr.*;
+        out[count] = stored.window_id;
         count += 1;
-        entry.value_ptr.resample_at_ns = null;
     }
     return count;
 }
 
 pub fn hasPendingResamples(self: *const Self) bool {
-    var it = self.entries.valueIterator();
-    while (it.next()) |entry| {
-        if (entry.resample_at_ns != null) return true;
+    for (self.items()) |stored| {
+        if (stored.value.resample_at_ns != null) return true;
     }
     return false;
 }
 
+pub fn beginResample(self: *Self, wid: WindowId) void {
+    const entry = self.getPtr(wid) orelse return;
+    entry.resample_at_ns = null;
+}
+
 pub fn deferResample(self: *Self, wid: WindowId, now_ns: i128) void {
-    const entry = self.entries.getPtr(wid) orelse return;
+    const entry = self.getPtr(wid) orelse return;
     entry.resample_at_ns = std.math.add(i128, now_ns, default_resample_delay_ns) catch
         std.math.maxInt(i128);
 }
@@ -293,7 +437,7 @@ pub fn deferResample(self: *Self, wid: WindowId, now_ns: i128) void {
 /// frame. An outstanding write to that same frame owns the settlement window,
 /// so its potentially stale observation must not trigger a duplicate write.
 pub fn needsRepair(self: *const Self, wid: WindowId, desired: Frame, now_ns: i128) bool {
-    const entry = self.entries.get(wid) orelse return false;
+    const entry = self.get(wid) orelse return false;
     if (entry.intent) |intent| {
         if (now_ns <= intent.settle_deadline_ns) {
             switch (intent.target) {
@@ -307,16 +451,71 @@ pub fn needsRepair(self: *const Self, wid: WindowId, desired: Frame, now_ns: i12
 }
 
 pub fn get(self: *const Self, wid: WindowId) ?Entry {
-    return self.entries.get(wid);
+    const index = self.findIndex(wid) orelse return null;
+    return self.entries[index].value;
+}
+
+/// Return the number of tracked window identities.
+pub fn windowCount(self: *const Self) usize {
+    return self.entry_count;
 }
 
 pub fn forget(self: *Self, wid: WindowId) void {
-    _ = self.entries.remove(wid);
+    const index = self.findIndex(wid) orelse return;
+    self.entry_count -= 1;
+    if (index != self.entry_count) self.entries[index] = self.entries[self.entry_count];
+}
+
+pub fn replaceWindowId(self: *Self, old_window_id: WindowId, new_window_id: WindowId) void {
+    const index = self.findIndex(old_window_id) orelse return;
+    std.debug.assert(self.findIndex(new_window_id) == null);
+    self.entries[index].window_id = new_window_id;
 }
 
 pub fn clearIntents(self: *Self) void {
-    var it = self.entries.valueIterator();
-    while (it.next()) |entry| entry.intent = null;
+    for (self.itemsMut()) |*stored| stored.value.intent = null;
+}
+
+fn items(self: *const Self) []const StoredEntry {
+    return self.entries[0..self.entry_count];
+}
+
+fn itemsMut(self: *Self) []StoredEntry {
+    return self.entries[0..self.entry_count];
+}
+
+fn findIndex(self: *const Self, wid: WindowId) ?usize {
+    for (self.items(), 0..) |stored, index| {
+        if (stored.window_id == wid) return index;
+    }
+    return null;
+}
+
+fn getPtr(self: *Self, wid: WindowId) ?*Entry {
+    const index = self.findIndex(wid) orelse return null;
+    return &self.entries[index].value;
+}
+
+fn getOrPut(self: *Self, wid: WindowId) !*Entry {
+    if (self.getPtr(wid)) |entry| return entry;
+    if (self.entry_count == self.entries.len) return error.GeometryCatalogFull;
+
+    const index = self.entry_count;
+    self.entry_count += 1;
+    self.entries[index] = .{ .window_id = wid, .value = .{} };
+    return &self.entries[index].value;
+}
+
+fn rejectionEffect(window_id: WindowId, err: anyerror) Effect {
+    const reason: RejectionReason = switch (err) {
+        error.GeometryCatalogFull => .catalog_full,
+        error.GenerationExhausted => .generation_exhausted,
+        else => unreachable,
+    };
+    return .{ .rejected = .{
+        .window_id = window_id,
+        .reason = reason,
+    } };
 }
 
 const testing = std.testing;
@@ -325,8 +524,7 @@ const tiled: Frame = .{ .x = 4, .y = 37, .width = 750, .height = 941 };
 const fullscreen: Frame = .{ .x = 4, .y = 37, .width = 1504, .height = 941 };
 
 test "stale observation inside settlement interval remains manager owned" {
-    var coordinator = Self.initWithSettleInterval(testing.allocator, 100);
-    defer coordinator.deinit();
+    var coordinator = Self.initWithSettleInterval(100);
 
     _ = try coordinator.recordFrameAccepted(10, fullscreen, .layout, 1_000);
     try testing.expectEqual(
@@ -338,8 +536,7 @@ test "stale observation inside settlement interval remains manager owned" {
 }
 
 test "matching delayed observation is still manager owned" {
-    var coordinator = Self.initWithSettleInterval(testing.allocator, 100);
-    defer coordinator.deinit();
+    var coordinator = Self.initWithSettleInterval(100);
 
     _ = try coordinator.recordFrameAccepted(10, fullscreen, .layout, 1_000);
     try testing.expectEqual(
@@ -350,8 +547,7 @@ test "matching delayed observation is still manager owned" {
 }
 
 test "divergent observation after settlement interval is external" {
-    var coordinator = Self.initWithSettleInterval(testing.allocator, 100);
-    defer coordinator.deinit();
+    var coordinator = Self.initWithSettleInterval(100);
 
     _ = try coordinator.recordFrameAccepted(10, fullscreen, .layout, 1_000);
     try testing.expectEqual(
@@ -362,8 +558,7 @@ test "divergent observation after settlement interval is external" {
 }
 
 test "only the dragged window overrides manager ownership" {
-    var coordinator = Self.initWithSettleInterval(testing.allocator, 100);
-    defer coordinator.deinit();
+    var coordinator = Self.initWithSettleInterval(100);
 
     _ = try coordinator.recordFrameAccepted(10, fullscreen, .layout, 1_000);
     try testing.expectEqual(
@@ -378,8 +573,7 @@ test "only the dragged window overrides manager ownership" {
 }
 
 test "new accepted write supersedes the prior generation" {
-    var coordinator = Self.initWithSettleInterval(testing.allocator, 100);
-    defer coordinator.deinit();
+    var coordinator = Self.initWithSettleInterval(100);
 
     const first = try coordinator.recordFrameAccepted(10, fullscreen, .layout, 1_000);
     const second = try coordinator.recordFrameAccepted(10, tiled, .layout, 1_010);
@@ -388,8 +582,7 @@ test "new accepted write supersedes the prior generation" {
 }
 
 test "clearIntents preserves physical observations" {
-    var coordinator = Self.initWithSettleInterval(testing.allocator, 100);
-    defer coordinator.deinit();
+    var coordinator = Self.initWithSettleInterval(100);
 
     _ = try coordinator.recordFrameAccepted(10, fullscreen, .layout, 1_000);
     _ = try coordinator.observe(10, fullscreen, 1_001, null);
@@ -401,8 +594,7 @@ test "clearIntents preserves physical observations" {
 }
 
 test "forget removes all window geometry state" {
-    var coordinator = Self.init(testing.allocator);
-    defer coordinator.deinit();
+    var coordinator = Self.init();
 
     _ = try coordinator.recordFrameAccepted(10, fullscreen, .layout, 1_000);
     coordinator.forget(10);
@@ -410,29 +602,26 @@ test "forget removes all window geometry state" {
 }
 
 test "seeding physical state does not arm reconciliation" {
-    var coordinator = Self.init(testing.allocator);
-    defer coordinator.deinit();
+    var coordinator = Self.init();
 
     try coordinator.seedObserved(10, tiled);
     var due: [1]WindowId = undefined;
-    try testing.expectEqual(@as(usize, 0), coordinator.collectDueResamples(std.math.maxInt(i128), &due));
+    try testing.expectEqual(@as(usize, 0), coordinator.dueResamples(std.math.maxInt(i128), &due));
 }
 
 test "position intent matches without requiring a known size" {
-    var coordinator = Self.initWithSettleInterval(testing.allocator, 100);
-    defer coordinator.deinit();
+    var coordinator = Self.initWithSettleInterval(100);
 
-    _ = try coordinator.recordPositionAccepted(10, 1507, 977, .workspace_park, 1_000);
-    const parked: Frame = .{ .x = 1507, .y = 977, .width = 750, .height = 941 };
+    _ = try coordinator.recordPositionAccepted(10, 1507, 977, .layout, 1_000);
+    const observed: Frame = .{ .x = 1507, .y = 977, .width = 750, .height = 941 };
     try testing.expectEqual(
         ObservationOwner.manager,
-        try coordinator.observe(10, parked, 1_500, null),
+        try coordinator.observe(10, observed, 1_500, null),
     );
 }
 
 test "pending desired frame suppresses repair until settlement ends" {
-    var coordinator = Self.initWithSettleInterval(testing.allocator, 100);
-    defer coordinator.deinit();
+    var coordinator = Self.initWithSettleInterval(100);
 
     _ = try coordinator.recordFrameAccepted(10, fullscreen, .layout, 1_000);
     _ = try coordinator.observe(10, tiled, 1_001, null);
@@ -441,35 +630,32 @@ test "pending desired frame suppresses repair until settlement ends" {
 }
 
 test "every notification schedules a trailing physical sample" {
-    var coordinator = Self.init(testing.allocator);
-    defer coordinator.deinit();
+    var coordinator = Self.init();
 
     _ = try coordinator.observe(10, tiled, 1_000, null);
     var due: [1]WindowId = undefined;
-    try testing.expectEqual(@as(usize, 0), coordinator.collectDueResamples(1_000, &due));
+    try testing.expectEqual(@as(usize, 0), coordinator.dueResamples(1_000, &due));
     try testing.expectEqual(
         @as(usize, 1),
-        coordinator.collectDueResamples(1_000 + default_resample_delay_ns, &due),
+        coordinator.dueResamples(1_000 + default_resample_delay_ns, &due),
     );
     try testing.expectEqual(@as(WindowId, 10), due[0]);
 }
 
 test "every accepted write schedules a trailing physical sample" {
-    var coordinator = Self.init(testing.allocator);
-    defer coordinator.deinit();
+    var coordinator = Self.init();
 
     _ = try coordinator.recordFrameAccepted(10, fullscreen, .layout, 1_000);
     var due: [1]WindowId = undefined;
     try testing.expectEqual(
         @as(usize, 1),
-        coordinator.collectDueResamples(1_000 + default_resample_delay_ns, &due),
+        coordinator.dueResamples(1_000 + default_resample_delay_ns, &due),
     );
     try testing.expectEqual(@as(WindowId, 10), due[0]);
 }
 
 test "trailing divergence after an old intent becomes external" {
-    var coordinator = Self.initWithSettleInterval(testing.allocator, 100);
-    defer coordinator.deinit();
+    var coordinator = Self.initWithSettleInterval(100);
 
     _ = try coordinator.recordFrameAccepted(10, tiled, .layout, 1_000);
     // The immediate notification still sees the old target and looks like a
@@ -482,16 +668,69 @@ test "trailing divergence after an old intent becomes external" {
 }
 
 test "trailing manager divergence resamples until its deadline" {
-    var coordinator = Self.initWithSettleInterval(testing.allocator, 1_000);
-    defer coordinator.deinit();
+    var coordinator = Self.initWithSettleInterval(1_000);
 
     _ = try coordinator.recordFrameAccepted(10, fullscreen, .layout, 1_000);
     try testing.expectEqual(SettlementOwner.manager, coordinator.settle(10, tiled, 1_100));
 
     var due: [1]WindowId = undefined;
-    try testing.expectEqual(@as(usize, 0), coordinator.collectDueResamples(1_100, &due));
+    try testing.expectEqual(@as(usize, 0), coordinator.dueResamples(1_100, &due));
     try testing.expectEqual(
         @as(usize, 1),
-        coordinator.collectDueResamples(1_100 + default_resample_delay_ns, &due),
+        coordinator.dueResamples(1_100 + default_resample_delay_ns, &due),
     );
+}
+
+test "unreached manager intent does not become external input" {
+    var coordinator = Self.initWithSettleInterval(100);
+
+    _ = try coordinator.recordFrameAccepted(10, fullscreen, .layout, 1_000);
+    try testing.expectEqual(
+        SettlementOwner.manager_unsettled,
+        coordinator.settle(10, tiled, 1_101),
+    );
+    try testing.expect(coordinator.get(10).?.intent == null);
+
+    var due: [1]WindowId = undefined;
+    try testing.expectEqual(@as(usize, 0), coordinator.dueResamples(1_101, &due));
+}
+
+test "value copies do not share geometry entries" {
+    var original = Self.init();
+    try original.seedObserved(10, tiled);
+
+    var copied = original;
+    copied.forget(10);
+    try copied.seedObserved(20, fullscreen);
+
+    try testing.expect(original.get(10) != null);
+    try testing.expect(original.get(20) == null);
+    try testing.expect(copied.get(10) == null);
+    try testing.expect(copied.get(20) != null);
+}
+
+test "reducer returns geometry state and ownership effects" {
+    var transition = reduce(.{}, .{ .accept_frame = .{
+        .window_id = 10,
+        .target = fullscreen,
+        .source = .layout,
+        .at_ns = 1_000,
+    } });
+    try testing.expect(transition.effect == null);
+
+    transition = reduce(transition.state, .{ .observe = .{
+        .process_id = 20,
+        .window_id = 10,
+        .observed = tiled,
+        .is_move = false,
+        .at_ns = 1_001,
+        .dragged_window_id = null,
+    } });
+    try testing.expectEqual(ObservationOwner.manager, transition.effect.?.observed.owner);
+
+    var due_window_ids: [1]WindowId = undefined;
+    const due_at_ns = 1_001 + default_resample_delay_ns;
+    try testing.expectEqual(@as(usize, 1), transition.state.dueResamples(due_at_ns, &due_window_ids));
+    transition = reduce(transition.state, .{ .begin_resample = 10 });
+    try testing.expectEqual(@as(usize, 0), transition.state.dueResamples(due_at_ns, &due_window_ids));
 }
