@@ -52,6 +52,10 @@ pub fn reduceWorkspaceSwitchRequest(
     request: @FieldType(Event, "request_workspace_switch"),
 ) void {
     const target = transition.model.space(request.target.key) orelse return;
+    if (transition.model.pending_native_workspace_move != null) {
+        transition.model.queued_switch = .{ .target = target };
+        return;
+    }
     const active_workspace_id = transition.model.activeWorkspace(target.display_id) orelse return;
     if (transition.model.pending_switch == null and active_workspace_id == target.workspace_id) {
         startWorkspaceTransition(
@@ -87,6 +91,11 @@ pub fn reduceSwitchRequest(
         return;
     }
     const request: SwitchRequest = .{ .target = target };
+
+    if (transition.model.pending_native_workspace_move != null) {
+        transition.model.queued_switch = request;
+        return;
+    }
 
     if (transition.model.pending_switch) |pending| {
         transition.model.queued_switch = if (sameRequest(request, pending.request)) null else request;
@@ -136,6 +145,7 @@ pub fn reduceTopologyObserved(
     const pending = transition.model.pending_switch orelse {
         transition.model.observation_timer = null;
         if (has_changed) transition.addEffect(.native_topology_changed);
+        if (transition.model.pending_native_workspace_move == null) resumeQueuedWorkspaceSwitch(transition, event.at_ms);
         return;
     };
     const display = event.topology.findDisplay(pending.request.target.display_id);
@@ -265,6 +275,7 @@ fn recoverUnexpectedLanding(transition: *Transition, pending: PendingSwitch, at_
 }
 
 pub fn syncNativeWorkspaceTopology(transition: *Transition) void {
+    const previous_catalog = transition.model.spaces;
     const focused_display_id = transition.model.workspace_topology.focused_display_id;
     var topology: WorkspaceTopology = .{};
     var catalog: SpaceCatalog = .{};
@@ -288,6 +299,26 @@ pub fn syncNativeWorkspaceTopology(transition: *Transition) void {
     }
     transition.model.spaces = catalog;
     transition.model.workspace_topology = topology;
+    for (previous_catalog.spaces[0..previous_catalog.space_count]) |previous_space| {
+        if (catalog.find(previous_space.key) != null) continue;
+        const target = catalog.findLogicalWorkspace(previous_space.workspace_id) orelse continue;
+        if (!layout_reducer.applyEvent(transition, .{ .rekey_layout = .{
+            .source_key = previous_space.key,
+            .target_key = target.key,
+        } })) continue;
+        transition.model.windows.swapSpaceKeys(previous_space.key, target.key);
+    }
+    pruneWindowCandidates(&transition.model.pending_role_windows, &catalog);
+    pruneWindowCandidates(&transition.model.deferred_window_candidates, &catalog);
+    if (transition.model.pending_native_workspace_move) |pending| {
+        const source = catalog.find(pending.source.key);
+        const target = catalog.find(pending.target.key);
+        if (source == null or target == null or source.?.display_id != pending.source.display_id or target.?.display_id != pending.target.display_id) {
+            transition.model.pending_native_workspace_move = null;
+            settleWorkspaceTransition(transition, pending.epoch, .target_unavailable);
+            transition.addEffect(.{ .native_workspace_move_failed = .{ .move = pending, .rollback_succeeded = false } });
+        }
+    }
     refreshWorkspaceTransition(transition);
     refreshPendingNativeWindowMoves(&transition.model);
 }
@@ -354,6 +385,9 @@ pub fn reduceWorkspaceTransitionTimer(
     const current = transition.model.workspace_transition orelse return;
     if (current.epoch != event.epoch) return;
     if (transition.model.pending_switch) |pending| {
+        if (pending.epoch == current.epoch) return;
+    }
+    if (transition.model.pending_native_workspace_move) |pending| {
         if (pending.epoch == current.epoch) return;
     }
     if (event.at_ms < current.deadline_at_ms) return;
@@ -526,12 +560,9 @@ pub fn reduceNativeWorkspaceMoveStarted(
     var pending = transition.model.pending_native_workspace_move orelse return;
     if (pending.epoch != result.epoch) return;
     if (!result.succeeded) {
-        transition.model.pending_native_workspace_move = null;
-        settleWorkspaceTransition(transition, pending.epoch, .native_switch_failed);
-        transition.addEffect(.{ .native_workspace_move_failed = .{
-            .move = pending,
-            .rollback_succeeded = true,
-        } });
+        pending.is_rolling_back = true;
+        transition.model.pending_native_workspace_move = pending;
+        transition.addEffect(.{ .rollback_native_workspace_contents = pending });
         return;
     }
 
@@ -577,6 +608,7 @@ pub fn reduceNativeWorkspaceMoveObserved(
     transition.model.workspace_topology.focused_display_id = moved.display_id;
     completeWorkspaceTransition(&transition.model, pending.epoch, .native_space_changed, event.at_ms);
     transition.addEffect(.{ .native_workspace_move_completed = pending });
+    resumeQueuedWorkspaceSwitch(transition, event.at_ms);
 }
 
 pub fn reduceNativeWorkspaceMoveRollbackResult(
@@ -592,6 +624,14 @@ pub fn reduceNativeWorkspaceMoveRollbackResult(
         .move = pending,
         .rollback_succeeded = result.succeeded,
     } });
+    resumeQueuedWorkspaceSwitch(transition, result.at_ms);
+}
+
+fn resumeQueuedWorkspaceSwitch(transition: *Transition, at_ms: TimestampMs) void {
+    const queued = transition.model.queued_switch orelse return;
+    transition.model.queued_switch = null;
+    const target = transition.model.logicalWorkspace(queued.target.workspace_id) orelse return;
+    reduceWorkspaceSwitchRequest(transition, .{ .target = target, .at_ms = at_ms });
 }
 
 pub fn reduceWindowFocusObserved(

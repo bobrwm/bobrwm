@@ -53,6 +53,7 @@ pub const Event = union(enum) {
         options: InsertOptions,
     },
     swap_layouts: struct { first_key: SpaceKey, second_key: SpaceKey },
+    rekey_layout: struct { source_key: SpaceKey, target_key: SpaceKey },
     set_active: struct { space_key: SpaceKey, window_id: WindowId },
     replace_window_id: struct {
         space_key: SpaceKey,
@@ -157,6 +158,12 @@ pub fn reduce(model: Self, event: Event) Transition {
                 transition.model = model;
                 transition.effect = rejectionEffect(swap.first_key, null, err);
             };
+        },
+        .rekey_layout => |replacement| {
+            std.debug.assert(replacement.source_key.eql(replacement.target_key) or transition.model.layoutKind(replacement.target_key) == null);
+            for (transition.model.layouts[0..transition.model.layout_count]) |*slot| {
+                if (slot.space_key.eql(replacement.source_key)) slot.space_key = replacement.target_key;
+            }
         },
         .set_active => |active| transition.model.setActive(active.space_key, active.window_id),
         .replace_window_id => |replacement| {

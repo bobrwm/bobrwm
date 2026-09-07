@@ -217,6 +217,7 @@ pub const NativeTopology = struct {
 pub const NativeTopologyInitialization = struct {
     topology: NativeTopology,
     focused_display_id: ?DisplayId = null,
+    at_ms: u64 = 0,
 };
 
 pub const NativeDisplayObservation = struct {
@@ -256,12 +257,23 @@ pub fn mapNativeTopology(
     var assignments: [max_displays][max_spaces_per_display]WorkspaceId = @splat(@splat(0));
     var claimed: [max_spaces_per_display + 1]bool = @splat(false);
 
+    // Reserve surviving Space identities before new displays claim numbers.
+    for (observation.displays[0..observation.display_count], 0..) |display, display_index| {
+        for (display.space_ids[0..display.space_count], 0..) |space_id, space_index| {
+            const workspace_id = workspaceForNativeSpace(previous, space_id) orelse continue;
+            if (workspace_id > workspace_count or claimed[workspace_id]) continue;
+            assignments[display_index][space_index] = workspace_id;
+            claimed[workspace_id] = true;
+        }
+    }
+
     for (observation.displays[0..observation.display_count], 0..) |display, display_index| {
         const observed_index = std.mem.indexOfScalar(
             NativeSpaceId,
             display.space_ids[0..display.space_count],
             display.observed_space_id,
         ) orelse return null;
+        if (assignments[display_index][observed_index] != 0) continue;
         var workspace_id = workspaceForNativeSpace(previous, display.observed_space_id) orelse
             workspace_topology.activeWorkspace(display.display_id) orelse 0;
         if (workspace_id == 0 or workspace_id > workspace_count or claimed[workspace_id]) {
@@ -269,16 +281,6 @@ pub fn mapNativeTopology(
         }
         assignments[display_index][observed_index] = workspace_id;
         claimed[workspace_id] = true;
-    }
-
-    for (observation.displays[0..observation.display_count], 0..) |display, display_index| {
-        for (display.space_ids[0..display.space_count], 0..) |space_id, space_index| {
-            if (assignments[display_index][space_index] != 0) continue;
-            const workspace_id = workspaceForNativeSpace(previous, space_id) orelse continue;
-            if (workspace_id > workspace_count or claimed[workspace_id]) continue;
-            assignments[display_index][space_index] = workspace_id;
-            claimed[workspace_id] = true;
-        }
     }
 
     for (observation.displays[0..observation.display_count], 0..) |display, display_index| {

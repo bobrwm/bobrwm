@@ -3200,6 +3200,7 @@ fn executeNativeWorkspaceMoveRollback(pending: state_mod.PendingNativeWorkspaceM
     dispatchStateEvent(.{ .native_workspace_move_rollback_result = .{
         .epoch = pending.epoch,
         .succeeded = succeeded,
+        .at_ms = nativeStateNowMs(),
     } });
 }
 
@@ -3213,13 +3214,11 @@ fn moveNativeWorkspaceContents(pending: state_mod.PendingNativeWorkspaceMove, is
 
     for (source_windows) |wid| {
         if (!moveTabGroupToNativeSpace(wid, source_target)) {
-            if (is_forward) _ = moveNativeWorkspaceContents(pending, false);
             return false;
         }
     }
     for (target_windows) |wid| {
         if (!moveTabGroupToNativeSpace(wid, target_target)) {
-            if (is_forward) _ = moveNativeWorkspaceContents(pending, false);
             return false;
         }
     }
@@ -3277,7 +3276,7 @@ fn completeNativeWorkspaceMove(pending: state_mod.PendingNativeWorkspaceMove) vo
 /// Full reconcile after a topology change: rebuild display/workspace state,
 /// pick up windows, retile, refresh the bar.
 fn reconcileDisplays() void {
-    reconcileDisplayChange();
+    if (!reconcileDisplayChange()) return;
     reconcileNativeWindowAssignmentsFromWindowServer(false);
     discoverWindows();
     retile();
@@ -3557,11 +3556,14 @@ fn executeStateEffect(effect: state_mod.Effect) void {
         .move_native_workspace_contents => |pending| executeNativeWorkspaceMove(pending),
         .rollback_native_workspace_contents => |pending| executeNativeWorkspaceMoveRollback(pending),
         .native_workspace_move_completed => |pending| completeNativeWorkspaceMove(pending),
-        .native_workspace_move_failed => |failure| log.warn("native workspace move failed source={d} target={d} rollback={}", .{
-            failure.move.source.workspace_id,
-            failure.move.target.workspace_id,
-            failure.rollback_succeeded,
-        }),
+        .native_workspace_move_failed => |failure| {
+            log.warn("native workspace move failed source={d} target={d} rollback={}", .{
+                failure.move.source.workspace_id,
+                failure.move.target.workspace_id,
+                failure.rollback_succeeded,
+            });
+            if (!failure.rollback_succeeded) reconcileObservedNativeTopology();
+        },
         .native_workspace_move_rejected => |request| log.warn("native workspace move rejected source={d} target={d}", .{
             request.source.workspace_id,
             request.target.workspace_id,
@@ -5356,25 +5358,32 @@ fn handleExternalWindowGeometry(wid: u32, frame: window_mod.Window.Frame) void {
 ///
 /// Native Space IDs preserve surviving assignments. New physical Spaces take
 /// the remaining logical workspace IDs during topology mapping.
-fn reconcileDisplayChange() void {
+fn reconcileDisplayChange() bool {
     const focused_uuid: ?[16]u8 = blk: {
         const slot = displayIndexById(focusedDisplayId()) orelse break :blk null;
         break :blk g_displays[slot].uuid;
     };
 
+    const previous_displays = g_displays;
+    const previous_display_count = g_display_count;
     refreshDisplays();
 
     const restored_focused_display_id = displayIdForUuid(focused_uuid) orelse primaryDisplayId();
-    const native_topology = captureNativeTopology() orelse {
-        log.warn("display reconcile could not observe native Space topology", .{});
-        return;
+    const native_topology = (if (reconcileNativeSpaceCapacity()) captureNativeTopology() else null) orelse {
+        g_displays = previous_displays;
+        g_display_count = previous_display_count;
+        dispatchStateEvent(.{ .display_reconcile_unavailable = nativeStateNowMs() });
+        log.debug("display reconcile deferred until native Space topology is available", .{});
+        return false;
     };
     dispatchStateEvent(.{ .initialize_native_topology = .{
         .topology = native_topology,
         .focused_display_id = restored_focused_display_id,
+        .at_ms = nativeStateNowMs(),
     } });
     assertDisplayCoverage();
     refreshRolePolling();
+    return true;
 }
 
 /// Apply a target frame to a window, moving without a resize whenever the

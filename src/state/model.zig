@@ -979,7 +979,9 @@ pub const Event = union(enum) {
     native_workspace_move_rollback_result: struct {
         epoch: Epoch,
         succeeded: bool,
+        at_ms: TimestampMs = 0,
     },
+    display_reconcile_unavailable: TimestampMs,
     window_focus_observed: WindowFocusObservation,
     request_pending_focus,
     follow_focus_observed: FollowFocusObservation,
