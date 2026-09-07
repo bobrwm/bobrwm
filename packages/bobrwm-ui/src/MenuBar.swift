@@ -71,7 +71,12 @@ final class MenuBarController: NSObject, NSMenuDelegate {
             item.rowState.isFocused = state?.is_focused ?? false
         }
 
-        statusModel.chips = workspaces.compactMap { workspace in
+        let orderedWorkspaces = workspaces.sorted {
+            let leftOrder = states[$0.id]?.display_order ?? UInt8.max
+            let rightOrder = states[$1.id]?.display_order ?? UInt8.max
+            return leftOrder == rightOrder ? $0.id < $1.id : leftOrder < rightOrder
+        }
+        statusModel.chips = orderedWorkspaces.compactMap { workspace in
             guard let state = states[workspace.id], state.is_active else { return nil }
             let hasName = !workspace.name.isEmpty && workspace.name != "\(workspace.id)"
             return .init(

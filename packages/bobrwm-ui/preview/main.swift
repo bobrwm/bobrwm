@@ -44,11 +44,10 @@ func actionState(highlighted: Bool = false) -> RowState {
     return state
 }
 
-/// Samples 1 and 2 are both active, so the chips exercise the focused display
-/// and another display's workspace.
+/// Display order can differ from numeric workspace order.
 func makeStatusModel() -> StatusModel {
     let model = StatusModel()
-    model.chips = samples.filter(\.isActive).map { sample in
+    model.chips = samples.filter(\.isActive).reversed().map { sample in
         .init(
             id: sample.id,
             label: sample.shortcut.map(shortcutKeyLabel) ?? "\(sample.id)",

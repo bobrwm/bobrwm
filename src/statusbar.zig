@@ -35,6 +35,15 @@ const WorkspaceState = extern struct {
     id: u8,
     is_active: bool,
     is_focused: bool,
+    display_order: u8,
+};
+
+/// Visible workspace and its display origin in global screen coordinates.
+pub const ActiveWorkspace = struct {
+    workspace_id: u8,
+    display_id: u32,
+    x: f64,
+    y: f64,
 };
 
 const ActionShortcuts = extern struct {
@@ -129,17 +138,30 @@ pub fn updateWorkspaceMenu(
 /// Publish reducer-derived logical workspace state.
 pub fn updateState(
     summaries: []const state_mod.WorkspaceSummary,
+    active_workspaces: []const ActiveWorkspace,
 ) void {
     if (!g_initialized) return;
     std.debug.assert(summaries.len > 0 and summaries.len <= workspace_mod.max_workspaces);
+    std.debug.assert(active_workspaces.len <= workspace_mod.max_displays);
+
+    var ordered: [workspace_mod.max_displays]ActiveWorkspace = undefined;
+    @memcpy(ordered[0..active_workspaces.len], active_workspaces);
+    sortActiveWorkspaces(ordered[0..active_workspaces.len]);
 
     var states: [workspace_mod.max_workspaces]WorkspaceState = undefined;
     for (summaries, 0..) |summary, index| {
+        var display_order: u8 = std.math.maxInt(u8);
+        for (ordered[0..active_workspaces.len], 0..) |active, order| {
+            if (active.workspace_id != summary.workspace_id) continue;
+            display_order = @intCast(order);
+            break;
+        }
         states[index] = .{
             .window_count = summary.window_count,
             .id = summary.workspace_id,
             .is_active = summary.is_active,
             .is_focused = summary.is_focused,
+            .display_order = display_order,
         };
     }
 
@@ -159,6 +181,16 @@ fn shortcutPtr(keybind: ?config_mod.Keybind, storage: []u8) ?[*:0]const u8 {
     const bind = keybind orelse return null;
     const rendered = bind.displayForm(storage) orelse return null;
     return rendered.ptr;
+}
+
+fn sortActiveWorkspaces(active_workspaces: []ActiveWorkspace) void {
+    std.mem.sortUnstable(ActiveWorkspace, active_workspaces, {}, struct {
+        fn lessThan(_: void, lhs: ActiveWorkspace, rhs: ActiveWorkspace) bool {
+            if (lhs.x != rhs.x) return lhs.x < rhs.x;
+            if (lhs.y != rhs.y) return lhs.y < rhs.y;
+            return lhs.display_id < rhs.display_id;
+        }
+    }.lessThan);
 }
 
 /// Copy a workspace name into the sentinel-terminated representation consumed
@@ -187,4 +219,22 @@ test "workspace ABI name truncation preserves valid UTF-8" {
     try std.testing.expect(std.unicode.utf8ValidateSlice(encoded));
     try std.testing.expectEqual(@as(usize, 62), encoded.len);
     try std.testing.expectEqualSlices(u8, name[0..62], encoded);
+}
+
+test "status chips follow display geometry rather than workspace or enumeration order" {
+    var active = [_]ActiveWorkspace{
+        .{ .workspace_id = 1, .display_id = 2, .x = 0, .y = 0 },
+        .{ .workspace_id = 7, .display_id = 5, .x = -1920, .y = 0 },
+        .{ .workspace_id = 4, .display_id = 9, .x = 0, .y = -1080 },
+    };
+    sortActiveWorkspaces(&active);
+    try std.testing.expectEqual(@as(u8, 7), active[0].workspace_id);
+    try std.testing.expectEqual(@as(u8, 4), active[1].workspace_id);
+    try std.testing.expectEqual(@as(u8, 1), active[2].workspace_id);
+
+    active[0].x = 1920;
+    sortActiveWorkspaces(&active);
+    try std.testing.expectEqual(@as(u8, 4), active[0].workspace_id);
+    try std.testing.expectEqual(@as(u8, 1), active[1].workspace_id);
+    try std.testing.expectEqual(@as(u8, 7), active[2].workspace_id);
 }
