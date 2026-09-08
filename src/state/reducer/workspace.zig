@@ -166,10 +166,7 @@ pub fn reduceTopologyObserved(
         return;
     }
 
-    // Dock can report idle before accepting a posted swipe.
-    const has_step_settled = pending.phase == .waiting_for_step and
-        actual_space_id != null and actual_space_id != pending.gesture_origin_space_id;
-    if (pending.phase == .waiting_for_idle or (has_step_settled and event.at_ms < pending.deadline_at_ms)) {
+    if (pending.phase == .waiting_for_idle) {
         transition.model.pending_switch.?.phase = .preparing;
         transition.addEffect(.{ .switch_native_space = .{ .request = pending.request, .epoch = pending.epoch } });
         return;
@@ -199,8 +196,7 @@ pub fn reduceGesturePrepared(transition: *Transition, event: @FieldType(Event, "
     }
 
     pending.phase = .delivering;
-    pending.gesture_origin_space_id = event.plan.origin_space_id;
-    pending.gesture = .{ .plan = event.plan };
+    pending.gesture = .{ .plan = event.plan, .steps_remaining = event.plan.steps };
     transition.model.pending_switch = pending;
     postGesturePhase(transition, pending);
 }
@@ -216,21 +212,26 @@ pub fn reduceGesturePosted(transition: *Transition, event: @FieldType(Event, "na
     }
 
     if (gesture.phase == .ended) {
-        pending.phase = if (gesture.plan.steps > 1) .waiting_for_step else .observing;
-        pending.gesture = null;
-        transition.model.pending_switch = pending;
-        transition.addEffect(.{ .observe_native_topology = pending.epoch });
-        return;
+        gesture.steps_remaining -= 1;
+        if (gesture.steps_remaining == 0) {
+            pending.phase = .observing;
+            pending.gesture = null;
+            transition.model.pending_switch = pending;
+            transition.addEffect(.{ .observe_native_topology = pending.epoch });
+            return;
+        }
     }
     gesture.phase = switch (gesture.phase) {
         .began => .changed,
         .changed => .ended,
-        .ended => unreachable,
+        .ended => .began,
     };
-    if (gesture.plan.is_paced) gesture.due_at_ms = event.at_ms +| native_gesture.phase_delay_ms;
+    // Pace phases within a swipe; waiting between swipes exposes intermediate Spaces.
+    const should_pace = gesture.plan.is_paced and gesture.phase != .began;
+    if (should_pace) gesture.due_at_ms = event.at_ms +| native_gesture.phase_delay_ms;
     pending.gesture = gesture;
     transition.model.pending_switch = pending;
-    if (gesture.plan.is_paced) {
+    if (should_pace) {
         transition.addEffect(.{ .schedule_native_gesture = pending.epoch });
         return;
     }
