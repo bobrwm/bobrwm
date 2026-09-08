@@ -38,7 +38,7 @@ jobs:
           RELEASE_TAG: ${{ github.event.release.tag_name }}
         run: |
           if [[ "$GITHUB_EVENT_NAME" == "push" ]]; then
-            version=tip
+            version="tip-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
             build_version=
           else
             version="$RELEASE_TAG"
@@ -216,7 +216,7 @@ jobs:
             --notes 'Latest continuous build from main.' \
             --prerelease \
             --target "$GITHUB_SHA"
-          gh release upload tip "$ARTIFACT_PATH" "$ARTIFACT_PATH.sha256" --clobber
+          gh release upload tip "$ARTIFACT_PATH" "$ARTIFACT_PATH.sha256"
 
       - name: Upload binary to release
         if: github.event_name == 'release'
@@ -230,15 +230,13 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.RELEASE_TOKEN }}
         run: |
-          # The cask points at the rolling `tip` asset, so its version exists
-          # only to make `brew upgrade` notice a new build. Read it back from
-          # the binary rather than recomputing it from git, and drop the `+`
-          # so the string stays comfortable in a cask.
+          # Run numbers order upgrades; commit hashes do not.
           version="$("$APP_PATH/Contents/MacOS/bobrwm-cli" --version | awk '{print $2}')"
+          base_version="${version%%[-+]*}"
 
           gh api repos/bobrwm/homebrew-tap/dispatches \
             -f event_type=cask \
-            -f "client_payload[version]=${version//+/-}" \
+            -f "client_payload[version]=${base_version}-main.${GITHUB_RUN_NUMBER}.${GITHUB_RUN_ATTEMPT}" \
             -f "client_payload[artifact]=$ARTIFACT_NAME" \
             -f "client_payload[sha256]=$ARTIFACT_SHA256"
 

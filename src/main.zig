@@ -406,7 +406,7 @@ fn focusedWindowIdForPid(pid: i32) ?u32 {
 
 fn focusedWindowIdForLoggedEvent(comptime event_name: []const u8, pid: i32) ?u32 {
     const focused_wid = focusedWindowIdForPid(pid);
-    log.info(event_name ++ " pid={} wid={}", .{ pid, focused_wid orelse 0 });
+    log.debug(event_name ++ " pid={} wid={}", .{ pid, focused_wid orelse 0 });
     return focused_wid;
 }
 
@@ -2709,7 +2709,7 @@ fn replaceManagedWindowId(old_wid: u32, new_wid: u32, frame: window_mod.Window.F
     _ = updateManagedWindow(updated);
     seedObservedFrame(new_wid, frame);
     ax_mod.invalidateWindow(old_wid);
-    log.info("window id replaced old={d} new={d} pid={d} workspace={d} display={d}", .{
+    log.debug("window id replaced old={d} new={d} pid={d} workspace={d} display={d}", .{
         old_wid,
         new_wid,
         updated.pid,
@@ -2851,14 +2851,14 @@ fn handleEvent(ev: *const event_mod.Event) void {
     switch (ev.kind) {
         // -- Window / app events --
         .app_launched => {
-            log.info("app launched pid={}", .{ev.pid});
+            log.debug("app launched pid={}", .{ev.pid});
             discoverWindows();
             ax_observer.observeApp(ev.pid);
             trackAppLaunchRetry(ev.pid);
             retile();
         },
         .app_terminated => {
-            log.info("app terminated pid={}", .{ev.pid});
+            log.debug("app terminated pid={}", .{ev.pid});
             untrackAppLaunchRetry(ev.pid);
             untrackFocusRetry(ev.pid);
             ax_mod.invalidateApp(ev.pid);
@@ -2895,7 +2895,7 @@ fn handleEvent(ev: *const event_mod.Event) void {
             reconcileFocusedWindow(ev.pid, focused_wid);
         },
         .window_created => {
-            log.info("window created pid={} wid={}", .{ ev.pid, ev.wid });
+            log.debug("window created pid={} wid={}", .{ ev.pid, ev.wid });
 
             if (g_state.hasPendingRoleWindow(ev.wid)) {
                 log.debug("window created: role check already pending pid={} wid={}", .{ ev.pid, ev.wid });
@@ -2915,7 +2915,7 @@ fn handleEvent(ev: *const event_mod.Event) void {
                     const display_id = inferDisplayIdForWindow(ev.wid) orelse focusedDisplayId();
                     const ws = resolveWorkspaceForWindow(ev.pid, ev.wid, display_id) orelse return;
                     trackDeferredWindowCandidate(ev.pid, ev.wid, ws);
-                    log.info("window created: deferred pid={} wid={} while mouse is down (tab tear-off guard)", .{ ev.pid, ev.wid });
+                    log.debug("window created: deferred pid={} wid={} while mouse is down (tab tear-off guard)", .{ ev.pid, ev.wid });
                 }
                 return;
             }
@@ -2924,17 +2924,17 @@ fn handleEvent(ev: *const event_mod.Event) void {
             retile();
         },
         .window_destroyed => {
-            log.info("window destroyed wid={}", .{ev.wid});
+            log.debug("window destroyed wid={}", .{ev.wid});
             removeWindow(ev.wid);
             retile();
         },
         .window_minimized => {
-            log.info("window minimized wid={}", .{ev.wid});
+            log.debug("window minimized wid={}", .{ev.wid});
             removeWindow(ev.wid);
             retile();
         },
         .window_deminimized => {
-            log.info("window deminimized wid={}", .{ev.wid});
+            log.debug("window deminimized wid={}", .{ev.wid});
             discoverWindows();
             retile();
         },
@@ -2946,7 +2946,7 @@ fn handleEvent(ev: *const event_mod.Event) void {
             } });
         },
         .space_changed => {
-            log.info("native space changed", .{});
+            log.debug("native space changed", .{});
             dispatchStateEvent(.{ .native_space_changed = nativeStateNowMs() });
         },
         .role_poll_tick => {
@@ -2994,7 +2994,7 @@ fn handleEvent(ev: *const event_mod.Event) void {
                 return;
             }
 
-            log.info("window {s} wid={}", .{
+            log.debug("window {s} wid={}", .{
                 if (ev.kind == .window_moved) "moved" else "resized",
                 ev.wid,
             });
@@ -3014,12 +3014,12 @@ fn handleEvent(ev: *const event_mod.Event) void {
         // -- Hotkey actions --
         .hk_focus_workspace => {
             const target: u8 = @intCast(ev.wid);
-            log.info("hotkey: focus workspace {}", .{target});
+            log.debug("hotkey: focus workspace {}", .{target});
             switchWorkspace(target);
         },
         .hk_move_to_workspace => {
             const target: u8 = @intCast(ev.wid);
-            log.info("hotkey: move to workspace {}", .{target});
+            log.debug("hotkey: move to workspace {}", .{target});
             moveWindowToWorkspace(target);
         },
         .hk_focus_previous_workspace => switchAdjacentWorkspace(.previous),
@@ -3034,7 +3034,7 @@ fn handleEvent(ev: *const event_mod.Event) void {
         .hk_swap_down => swapDirection(.down),
         .hk_toggle_split => {
             dispatchStateEvent(.toggle_split_mode);
-            log.info("split mode: {s}", .{@tagName(g_state.bsp_split_mode)});
+            log.debug("split mode: {s}", .{@tagName(g_state.bsp_split_mode)});
         },
         .hk_toggle_fullscreen => {
             const ctx = actionContext() orelse return;
@@ -3043,13 +3043,13 @@ fn handleEvent(ev: *const event_mod.Event) void {
         .hk_move_workspace_to_display => {
             const arg: u8 = @intCast(ev.wid);
             if (arg == config_mod.next_display_arg) {
-                log.info("hotkey: move workspace to display next", .{});
+                log.debug("hotkey: move workspace to display next", .{});
                 moveWorkspaceToDisplayNext();
             } else if (arg == config_mod.previous_display_arg) {
-                log.info("hotkey: move workspace to display prev", .{});
+                log.debug("hotkey: move workspace to display prev", .{});
                 moveWorkspaceToDisplayPrev();
             } else {
-                log.info("hotkey: move workspace to display {}", .{arg});
+                log.debug("hotkey: move workspace to display {}", .{arg});
                 moveWorkspaceToDisplay(@as(usize, arg) - 1);
             }
         },
@@ -3065,7 +3065,7 @@ fn handleEvent(ev: *const event_mod.Event) void {
         .hk_reload_config => _ = reloadConfig(),
         .hk_toggle_dimming => {
             const on = dim.toggle();
-            log.info("hotkey: dimming {s}", .{if (on) "on" else "off"});
+            log.debug("hotkey: dimming {s}", .{if (on) "on" else "off"});
             // Re-apply immediately when enabling so overlays appear without
             // waiting for the next settled drain. Disabling already hid them.
             if (on) pushDimSnapshot();
@@ -3421,7 +3421,7 @@ fn reconcileNativeSpaceTopologyIfNeeded() void {
     defer snapshot.deinit();
     const capacity = nativeSpaceCapacityFromSnapshot(&snapshot) orelse return;
     if (capacity.total_count != workspaceCount()) {
-        log.info("native Space count changed required={d} available={d}", .{
+        log.debug("native Space count changed required={d} available={d}", .{
             workspaceCount(),
             capacity.total_count,
         });
@@ -3436,7 +3436,7 @@ fn reconcileNativeSpaceTopologyIfNeeded() void {
     const topology = nativeTopologyFromSnapshot(&snapshot) orelse return;
     if (g_state.native_topology.eql(&topology)) return;
 
-    log.info("native Space topology changed", .{});
+    log.debug("native Space topology changed", .{});
     reconcileDisplays();
 }
 
@@ -3611,13 +3611,13 @@ fn executeStateEffect(effect: state_mod.Effect) void {
             if (deferred.transition.completion_reason) |reason| @tagName(reason) else "none",
         }),
         .pending_role_ready => |candidate| executePendingRoleReady(candidate),
-        .pending_role_expired => |candidate| log.info("pending-role: gave up pid={d} wid={d} after {d}ms", .{
+        .pending_role_expired => |candidate| log.debug("pending-role: gave up pid={d} wid={d} after {d}ms", .{
             candidate.process_id,
             candidate.window_id,
             @as(u64, role_poll_attempts_max) * role_poll_interval_ms,
         }),
         .deferred_window_ready => |candidate| executeDeferredWindowReady(candidate),
-        .deferred_window_expired => |expired| log.info("deferred-window: gave up pid={d} wid={d} after {d}ms reason={s}", .{
+        .deferred_window_expired => |expired| log.debug("deferred-window: gave up pid={d} wid={d} after {d}ms reason={s}", .{
             expired.candidate.process_id,
             expired.candidate.window_id,
             @as(u64, role_poll_attempts_max) * role_poll_interval_ms,
@@ -3625,16 +3625,16 @@ fn executeStateEffect(effect: state_mod.Effect) void {
         }),
         .app_launch_retry_ready => |process_id| executeAppLaunchRetry(process_id),
         .focus_retry_resolved => |resolved| {
-            log.info("focus-retry: resolved pid={d} wid={d}", .{ resolved.process_id, resolved.window_id });
+            log.debug("focus-retry: resolved pid={d} wid={d}", .{ resolved.process_id, resolved.window_id });
             reconcileFocusedWindow(resolved.process_id, resolved.window_id);
         },
         .focus_retry_expired => |process_id| log.debug("focus-retry: gave up pid={d}", .{process_id}),
         .display_resettle_due => {
-            log.info("display resettle", .{});
+            log.debug("display resettle", .{});
             reconcileDisplays();
         },
         .reconcile_displays => {
-            log.info("display changed", .{});
+            log.debug("display changed", .{});
             reconcileDisplays();
         },
         .focus_window => |focus| {
@@ -3642,12 +3642,12 @@ fn executeStateEffect(effect: state_mod.Effect) void {
             const window = managedWindow(focus.window_id) orelse return;
             observeWindowFocus(window, .keyboard, null);
         },
-        .windows_swapped => |swap| log.info("swap {s}: wid={d} <-> wid={d}", .{
+        .windows_swapped => |swap| log.debug("swap {s}: wid={d} <-> wid={d}", .{
             @tagName(swap.direction),
             swap.first_window_id,
             swap.second_window_id,
         }),
-        .window_mode_changed => |change| log.info("window {d} mode: {s} → {s}", .{
+        .window_mode_changed => |change| log.debug("window {d} mode: {s} → {s}", .{
             change.window_id,
             @tagName(change.previous),
             @tagName(change.current),
@@ -3659,7 +3659,7 @@ fn executeStateEffect(effect: state_mod.Effect) void {
         .hide_drag_preview => tile_preview.hide(),
         .pointer_drag_completed => |completion| {
             if (completion.swapped_window_ids) |swapped| {
-                log.info("window move swap wid={d} target={d}", .{ swapped.first, swapped.second });
+                log.debug("window move swap wid={d} target={d}", .{ swapped.first, swapped.second });
             }
             if (completion.should_retile) retile();
         },
@@ -3694,7 +3694,7 @@ fn executeFullscreenChanged(fullscreen: state_mod.FullscreenEffect) void {
         } });
         if (succeeded) applyFrameToTabGroup(fullscreen.leader_window_id, target);
     }
-    log.info("fullscreen {s} wid={d} mode={s}", .{
+    log.debug("fullscreen {s} wid={d} mode={s}", .{
         if (fullscreen.is_fullscreen) "on" else "off",
         fullscreen.leader_window_id,
         @tagName(fullscreen.mode),
@@ -3715,7 +3715,7 @@ fn executeCenterWindow(center: state_mod.CenterWindowEffect) void {
         return;
     }
     applyFrameToTabGroup(center.leader_window_id, center.target_frame);
-    log.info("center floating wid={d} → x={d:.0} y={d:.0}", .{
+    log.debug("center floating wid={d} → x={d:.0} y={d:.0}", .{
         center.window_id,
         center.target_frame.x,
         center.target_frame.y,
@@ -3758,7 +3758,7 @@ fn executeDeferredWindowReady(candidate: state_mod.WindowCandidate) void {
 }
 
 fn executeAppLaunchRetry(process_id: i32) void {
-    log.info("app-launch-retry: retrying discovery for pid={d}", .{process_id});
+    log.debug("app-launch-retry: retrying discovery for pid={d}", .{process_id});
     ax_observer.observeApp(process_id);
     discoverWindows();
     retile();
@@ -4465,7 +4465,7 @@ fn discoverWindowsImpl(should_refresh_tabs: bool) usize {
                 // existing candidate preserves its remaining retry budget.
                 if (frame.width <= 1 or frame.height <= 1) {
                     trackDeferredWindowCandidate(info.pid, info.wid, target_ws);
-                    log.info("discover: deferred pid={d} wid={d} unsettled bounds", .{ info.pid, info.wid });
+                    log.debug("discover: deferred pid={d} wid={d} unsettled bounds", .{ info.pid, info.wid });
                     continue;
                 }
                 untrackDeferredWindowCandidate(info.wid);
@@ -4474,7 +4474,7 @@ fn discoverWindowsImpl(should_refresh_tabs: bool) usize {
 
         const source_ws = nativeWorkspaceForWindow(info.wid, discovered_display) orelse {
             trackDeferredWindowCandidate(info.pid, info.wid, target_ws);
-            log.info("discover: deferred pid={d} wid={d} unsettled native Space", .{ info.pid, info.wid });
+            log.debug("discover: deferred pid={d} wid={d} unsettled native Space", .{ info.pid, info.wid });
             continue;
         };
 
@@ -4662,7 +4662,7 @@ fn addNewWindowManagedWithAssignment(pid: i32, wid: u32, assigned_space: state_m
     // than dropping them on a one-shot check.
     if (!on_screen) {
         trackDeferredWindowCandidate(pid, wid, assigned_space);
-        log.info("addNewWindow: deferred pid={d} wid={d} while off-screen", .{ pid, wid });
+        log.debug("addNewWindow: deferred pid={d} wid={d} while off-screen", .{ pid, wid });
         return false;
     }
     var window_frame: window_mod.Window.Frame = .{ .x = 0, .y = 0, .width = 0, .height = 0 };
@@ -4684,14 +4684,14 @@ fn addNewWindowManagedWithAssignment(pid: i32, wid: u32, assigned_space: state_m
     // below so bounded re-evaluation survives this early return.
     if (g_sky != null and (window_frame.width <= 1 or window_frame.height <= 1)) {
         trackDeferredWindowCandidate(pid, wid, assigned_space);
-        log.info("addNewWindow: deferred pid={d} wid={d} unsettled bounds", .{ pid, wid });
+        log.debug("addNewWindow: deferred pid={d} wid={d} unsettled bounds", .{ pid, wid });
         return false;
     }
 
     const source_display_id = inferDisplayIdForWindow(wid) orelse display_id;
     const source_ws = nativeWorkspaceForWindow(wid, source_display_id) orelse {
         trackDeferredWindowCandidate(pid, wid, assigned_space);
-        log.info("addNewWindow: deferred pid={d} wid={d} unsettled native Space", .{ pid, wid });
+        log.debug("addNewWindow: deferred pid={d} wid={d} unsettled native Space", .{ pid, wid });
         return false;
     };
 
@@ -4740,7 +4740,7 @@ fn addNewWindowManagedWithAssignment(pid: i32, wid: u32, assigned_space: state_m
     if (!source_ws.key.eql(ws.key)) requestNativeWindowMove(wid, source_ws, ws);
 
     const float_reason = if (mode == .tiled) "tiled" else if (rule_float) "floated (app rule)" else "floated (undersized+non-resizable)";
-    log.info("addNewWindow: {s} wid={d} on workspace {d}", .{ float_reason, wid, ws.workspace_id });
+    log.debug("addNewWindow: {s} wid={d} on workspace {d}", .{ float_reason, wid, ws.workspace_id });
     return true;
 }
 
@@ -4918,7 +4918,7 @@ fn tryFormTabGroupOnCreate(pid: i32, new_wid: u32) bool {
     };
 
     for (stale_wids[0..stale_count]) |stale_wid| {
-        log.info("tab detect: removing stale window wid={d}", .{stale_wid});
+        log.debug("tab detect: removing stale window wid={d}", .{stale_wid});
         removeWindow(stale_wid);
     }
 
@@ -4948,7 +4948,7 @@ fn joinTabGroup(pid: i32, sibling_wid: u32, new_wid: u32, new_frame: window_mod.
     const leader = g_state.windowTabLeader(sibling_wid);
     const member_count = if (g_state.windowTabGroup(leader)) |group| group.member_count else 1;
     recordWorkspaceFocus(ws, leader);
-    log.info("tab group formed pid={d} leader={d} active={d} members={d}", .{
+    log.debug("tab group formed pid={d} leader={d} active={d} members={d}", .{
         pid,
         leader,
         new_wid,
@@ -5088,10 +5088,10 @@ fn cleanupWorkspaceWindowsForPid(pid: i32) bool {
             var rect: skylight.CGRect = undefined;
             if (sky.getWindowBounds(conn, wid, &rect) != 0) {
                 should_remove = true;
-                log.info("cleanup: removing wid={d} pid={d} reason=missing-windowserver", .{ wid, pid });
+                log.debug("cleanup: removing wid={d} pid={d} reason=missing-windowserver", .{ wid, pid });
             } else if (!windowMayRemainManaged(pid, wid)) {
                 should_remove = true;
-                log.info("cleanup: removing wid={d} pid={d} reason=should-manage=false", .{ wid, pid });
+                log.debug("cleanup: removing wid={d} pid={d} reason=should-manage=false", .{ wid, pid });
             }
 
             if (!should_remove) continue;
@@ -5183,7 +5183,7 @@ fn cleanupOffscreenManagedWindows() bool {
                     });
                     continue;
                 }
-                log.info("cleanup: removing wid={d} pid={d} reason=offscreen", .{ win.wid, win.pid });
+                log.debug("cleanup: removing wid={d} pid={d} reason=offscreen", .{ win.wid, win.pid });
                 removeWindow(suspect.wid);
                 mutated = true;
             },
@@ -5276,7 +5276,7 @@ fn adoptWindowAsBackgroundTab(win: window_mod.Window) tab_detect.OffscreenOutcom
     if (frame) |f| updated.frame = f;
     _ = updateManagedWindow(updated);
 
-    log.info("cleanup: adopted wid={d} as background tab, leader={d} pid={d}", .{
+    log.debug("cleanup: adopted wid={d} as background tab, leader={d} pid={d}", .{
         win.wid, g_state.windowTabLeader(sibling_wid), win.pid,
     });
     return .adopt;
@@ -5309,7 +5309,7 @@ fn updateDraggedWindowGeometry(dragged_wid: u32, frame: window_mod.Window.Frame)
     if (managedWindow(leader_wid)) |updated| {
         observeWindowFocus(updated, .drag, null);
     }
-    log.info("window moved to display dragged_wid={d} leader={d} display={d}", .{
+    log.debug("window moved to display dragged_wid={d} leader={d} display={d}", .{
         dragged_wid,
         leader_wid,
         next_display_id,
@@ -5734,7 +5734,7 @@ fn reconcileFocusedWindow(pid: i32, focused_wid: u32) void {
     if (syncFocusStateForWindowId(focused_wid, .ax)) {
         const leader = g_state.windowTabLeader(focused_wid);
         if (suppressed) {
-            log.info("reconcile case 2: tab switch, active={d} leader={d}", .{ focused_wid, leader });
+            log.debug("reconcile case 2: tab switch, active={d} leader={d}", .{ focused_wid, leader });
         } else {
             log.debug("reconcile case 1: known window, leader={d}", .{leader});
         }
@@ -5768,7 +5768,7 @@ fn checkTabDragOut(_: i32, wid: u32) bool {
         .promote_to_standalone => {},
     }
 
-    log.info("tab drag-out detected: wid={d} promoted to standalone", .{wid});
+    log.debug("tab drag-out detected: wid={d} promoted to standalone", .{wid});
     if (!detachWindowTab(wid)) return false;
     reconcileTabGroupAfterRemoval(&group, wid);
 
