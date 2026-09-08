@@ -247,14 +247,12 @@ pub const SkyLight = struct {
 
         var topology = self.nativeSpaceTopology() orelse return null;
         defer topology.deinit();
-        const origin_space_id = topology.currentSpaceId(display_id) orelse return null;
         const plan = topology.switchPlanToId(display_id, target_space_id) orelse return null;
         if (plan.steps > 0 and !routeDockSwipeToDisplay(display_id)) return null;
         return .{
-            .origin_space_id = origin_space_id,
             .direction = plan.direction,
             .steps = plan.steps,
-            .velocity = dock_swipe_velocity,
+            .velocity = dock_swipe_velocity * @as(f64, @floatFromInt(plan.steps)),
             .is_paced = requiresEventAugmentation(),
         };
     }

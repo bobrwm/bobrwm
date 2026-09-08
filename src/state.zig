@@ -381,7 +381,7 @@ fn deliverTestSwitch(initial: Model, at_ms: TimestampMs) Model {
     model = reduce(model, .{ .native_gesture_prepared = .{
         .epoch = epoch,
         .at_ms = at_ms,
-        .plan = .{ .origin_space_id = 101, .direction = .right, .steps = 1, .velocity = 2000, .is_paced = false },
+        .plan = .{ .direction = .right, .steps = 1, .velocity = 2000, .is_paced = false },
     } }).model;
     for ([_]model_mod.native_gesture.Phase{ .began, .changed, .ended }) |phase| {
         model = reduce(model, .{ .native_gesture_posted = .{
@@ -1944,12 +1944,12 @@ test "gesture delivery and animation settlement gate queued switches" {
     try expectTestEffect(&model, .{ .native_gesture_prepared = .{
         .epoch = epoch,
         .at_ms = 110,
-        .plan = .{ .origin_space_id = 101, .direction = .right, .steps = 1, .velocity = 2000, .is_paced = true },
+        .plan = .{ .direction = .right, .steps = 2, .velocity = 4000, .is_paced = true },
     } }, .post_native_gesture);
     try expectTestEffect(&model, switchRequest(&model, 1, 3, 115), null);
 
     var at_ms: u64 = 120;
-    {
+    for (0..2) |step| {
         for ([_]model_mod.native_gesture.Phase{ .began, .changed, .ended }) |phase| {
             try expectTestEffect(&model, .{ .native_topology_observed = .{
                 .topology = testTopology(102, null),
@@ -1963,8 +1963,9 @@ test "gesture delivery and animation settlement gate queued switches" {
                 .phase = phase,
                 .succeeded = true,
                 .at_ms = at_ms,
-            } }, if (phase == .ended) .observe_native_topology else .schedule_native_gesture);
+            } }, if (step == 1 and phase == .ended) .observe_native_topology else if (phase == .ended) .post_native_gesture else .schedule_native_gesture);
             if (model.pending_switch.?.phase == .observing) break;
+            if (phase == .ended) continue;
             try expectTestEffect(&model, .{ .native_gesture_timer_fired = .{ .epoch = epoch, .at_ms = at_ms + 9 } }, null);
             at_ms += 10;
             try expectTestEffect(&model, .{ .native_gesture_timer_fired = .{ .epoch = epoch, .at_ms = at_ms } }, .post_native_gesture);
@@ -1991,82 +1992,45 @@ test "gesture delivery and animation settlement gate queued switches" {
     try testing.expectEqual(.waiting_for_idle, model.pending_switch.?.phase);
 }
 
-test "each intermediate swipe waits for progress and idle before replanning" {
-    for ([_]bool{ false, true }) |is_paced| {
-        var model = initializedModel(testTopology(101, null));
-        try expectTestEffect(&model, switchRequest(&model, 1, 3, 100), .workspace_transition_started);
-        const epoch = model.pending_switch.?.epoch;
-        try expectTestEffect(&model, .{ .native_topology_observed = .{
-            .topology = testTopology(101, null),
-            .epoch = epoch,
-            .at_ms = 110,
-            .is_animating = false,
-        } }, .switch_native_space);
-        try expectTestEffect(&model, .{ .native_gesture_prepared = .{
-            .epoch = epoch,
-            .at_ms = 110,
-            .plan = .{ .origin_space_id = 101, .direction = .right, .steps = 2, .velocity = 2000, .is_paced = is_paced },
-        } }, .post_native_gesture);
-        var at_ms: u64 = 120;
+test "unpaced multi-space delivery reaches the target before completing" {
+    var model = initializedModel(testTopology(101, null));
+    try expectTestEffect(&model, switchRequest(&model, 1, 3, 100), .workspace_transition_started);
+    const epoch = model.pending_switch.?.epoch;
+    try expectTestEffect(&model, .{ .native_topology_observed = .{
+        .topology = testTopology(101, null),
+        .epoch = epoch,
+        .at_ms = 110,
+        .is_animating = false,
+    } }, .switch_native_space);
+    try expectTestEffect(&model, .{ .native_gesture_prepared = .{
+        .epoch = epoch,
+        .at_ms = 110,
+        .plan = .{ .direction = .right, .steps = 2, .velocity = 4000, .is_paced = false },
+    } }, .post_native_gesture);
+    for (0..2) |step| {
         for ([_]model_mod.native_gesture.Phase{ .began, .changed, .ended }) |phase| {
             try expectTestEffect(&model, .{ .native_gesture_posted = .{
                 .epoch = epoch,
                 .phase = phase,
                 .succeeded = true,
-                .at_ms = at_ms,
-            } }, if (phase == .ended) .observe_native_topology else if (is_paced) .schedule_native_gesture else .post_native_gesture);
-            at_ms += 10;
-            if (is_paced and phase != .ended) {
-                try expectTestEffect(&model, .{ .native_gesture_timer_fired = .{ .epoch = epoch, .at_ms = at_ms } }, .post_native_gesture);
-            }
+                .at_ms = 120,
+            } }, if (step == 1 and phase == .ended) .observe_native_topology else .post_native_gesture);
         }
-        try std.testing.expectEqual(.waiting_for_step, model.pending_switch.?.phase);
-        try std.testing.expect(model.pending_switch.?.gesture == null);
-        try expectTestEffect(&model, .{ .native_gesture_timer_fired = .{ .epoch = epoch, .at_ms = 200 } }, null);
-        try expectTestEffect(&model, .{ .native_topology_observed = .{
-            .topology = testTopology(101, null),
-            .epoch = epoch,
-            .at_ms = 210,
-            .is_animating = false,
-        } }, null);
-        for ([_]?bool{ true, null }) |is_animating| {
-            try expectTestEffect(&model, .{ .native_topology_observed = .{
-                .topology = testTopology(102, null),
-                .epoch = epoch,
-                .at_ms = 220,
-                .is_animating = is_animating,
-            } }, null);
-        }
-        try expectTestEffect(&model, .{ .native_topology_observed = .{
-            .topology = testTopology(102, null),
-            .epoch = epoch,
-            .at_ms = 230,
-            .is_animating = false,
-        } }, .switch_native_space);
-        try std.testing.expectEqual(.preparing, model.pending_switch.?.phase);
-        try std.testing.expectEqual(epoch, model.pending_switch.?.epoch);
-        try std.testing.expectEqual(@as(u64, 3300), model.pending_switch.?.deadline_at_ms);
-        try expectTestEffect(&model, .{ .native_gesture_prepared = .{
-            .epoch = epoch,
-            .at_ms = 230,
-            .plan = .{ .origin_space_id = 102, .direction = .right, .steps = 1, .velocity = 2000, .is_paced = false },
-        } }, .post_native_gesture);
-        for ([_]model_mod.native_gesture.Phase{ .began, .changed, .ended }) |phase| {
-            try expectTestEffect(&model, .{ .native_gesture_posted = .{
-                .epoch = epoch,
-                .phase = phase,
-                .succeeded = true,
-                .at_ms = 240,
-            } }, if (phase == .ended) .observe_native_topology else .post_native_gesture);
-        }
-        try expectTestEffect(&model, .{ .native_topology_observed = .{
-            .topology = testTopology(103, null),
-            .epoch = epoch,
-            .at_ms = 250,
-            .is_animating = false,
-        } }, .native_switch_completed);
-        try std.testing.expect(model.pending_switch == null);
     }
+    try expectTestEffect(&model, .{ .native_topology_observed = .{
+        .topology = testTopology(102, null),
+        .epoch = epoch,
+        .at_ms = 130,
+        .is_animating = false,
+    } }, null);
+    try std.testing.expectEqual(.observing, model.pending_switch.?.phase);
+    try expectTestEffect(&model, .{ .native_topology_observed = .{
+        .topology = testTopology(103, null),
+        .epoch = epoch,
+        .at_ms = 140,
+        .is_animating = false,
+    } }, .native_switch_completed);
+    try std.testing.expect(model.pending_switch == null);
 }
 
 test "late gesture failure cancels delivery and stale callbacks cannot affect its successor" {
@@ -2083,7 +2047,7 @@ test "late gesture failure cancels delivery and stale callbacks cannot affect it
     model = reduce(model, .{ .native_gesture_prepared = .{
         .epoch = epoch,
         .at_ms = 110,
-        .plan = .{ .origin_space_id = 101, .direction = .right, .steps = 1, .velocity = 2000, .is_paced = false },
+        .plan = .{ .direction = .right, .steps = 1, .velocity = 2000, .is_paced = false },
     } }).model;
     model = reduce(model, .{ .native_gesture_posted = .{
         .epoch = epoch,
