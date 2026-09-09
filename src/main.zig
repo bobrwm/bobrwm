@@ -3611,18 +3611,24 @@ fn executeStateEffect(effect: state_mod.Effect) void {
             if (deferred.transition.completion_reason) |reason| @tagName(reason) else "none",
         }),
         .pending_role_ready => |candidate| executePendingRoleReady(candidate),
-        .pending_role_expired => |candidate| log.debug("pending-role: gave up pid={d} wid={d} after {d}ms", .{
+        .pending_role_expired => |candidate| log.warn("pending-role: retry budget exhausted pid={d} wid={d}", .{
             candidate.process_id,
             candidate.window_id,
-            @as(u64, role_poll_attempts_max) * role_poll_interval_ms,
         }),
         .deferred_window_ready => |candidate| executeDeferredWindowReady(candidate),
-        .deferred_window_expired => |expired| log.debug("deferred-window: gave up pid={d} wid={d} after {d}ms reason={s}", .{
-            expired.candidate.process_id,
-            expired.candidate.window_id,
-            @as(u64, role_poll_attempts_max) * role_poll_interval_ms,
-            @tagName(expired.reason),
-        }),
+        .deferred_window_expired => |expired| {
+            const message = "deferred-window: retry budget exhausted pid={d} wid={d} reason={s}";
+            const args = .{
+                expired.candidate.process_id,
+                expired.candidate.window_id,
+                @tagName(expired.reason),
+            };
+            // Off-screen candidates may legitimately stay hidden.
+            switch (expired.reason) {
+                .off_screen => log.debug(message, args),
+                .role_pending, .unsettled_bounds => log.warn(message, args),
+            }
+        },
         .app_launch_retry_ready => |process_id| executeAppLaunchRetry(process_id),
         .focus_retry_resolved => |resolved| {
             log.debug("focus-retry: resolved pid={d} wid={d}", .{ resolved.process_id, resolved.window_id });
