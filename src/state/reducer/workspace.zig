@@ -991,6 +991,18 @@ pub fn sameRequest(left: SwitchRequest, right: SwitchRequest) bool {
     return left.target.key.eql(right.target.key);
 }
 
+/// Renumbering a surviving Space must carry its focus history with its windows.
+/// Replaced Spaces still inherit the history of their logical workspace.
+pub fn remapWorkspaceFocus(model: *Model, previous_catalog: *const SpaceCatalog) void {
+    const previous_focus = model.workspace_focus;
+    model.workspace_focus = @splat(.{});
+    for (model.spaces.spaces[0..model.spaces.space_count]) |space| {
+        const previous = previous_catalog.find(space.key) orelse
+            previous_catalog.findLogicalWorkspace(space.workspace_id) orelse continue;
+        model.workspace_focus[space.workspace_id - 1] = previous_focus[previous.workspace_id - 1];
+    }
+}
+
 pub fn refreshWorkspaceFocus(model: *Model) void {
     for (&model.workspace_focus, 0..) |*focus, index| {
         const had_focus = focus.focused_window_id != null;

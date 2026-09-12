@@ -2180,7 +2180,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     const primary_id = primaryDisplayId();
     // Capture WindowServer topology before discovering windows so native Space
     // membership and the deterministic logical mapping agree from startup.
-    const topology = captureNativeTopology() orelse {
+    const topology = captureNativeTopology(.native_order) orelse {
         log.err("could not map configured workspaces to Mission Control Spaces", .{});
         return error.NativeSpaceMappingUnavailable;
     };
@@ -3287,8 +3287,8 @@ fn completeNativeWorkspaceMove(pending: state_mod.PendingNativeWorkspaceMove) vo
 
 /// Full reconcile after a topology change: rebuild display/workspace state,
 /// pick up windows, retile, refresh the bar.
-fn reconcileDisplays() void {
-    if (!reconcileDisplayChange()) return;
+fn reconcileDisplays(mapping: state_mod.NativeTopologyMapping) void {
+    if (!reconcileDisplayChange(mapping)) return;
     reconcileNativeWindowAssignmentsFromWindowServer(false);
     discoverWindows();
     retile();
@@ -3429,18 +3429,18 @@ fn reconcileNativeSpaceTopologyIfNeeded() void {
             log.warn("live native Space capacity reconciliation failed", .{});
             return;
         }
-        reconcileDisplays();
+        reconcileDisplays(.preserve_space_ids);
         return;
     }
 
-    const topology = nativeTopologyFromSnapshot(&snapshot) orelse return;
+    const topology = nativeTopologyFromSnapshot(&snapshot, .preserve_space_ids) orelse return;
     if (g_state.native_topology.eql(&topology)) return;
 
     log.debug("native Space topology changed", .{});
-    reconcileDisplays();
+    reconcileDisplays(.preserve_space_ids);
 }
 
-fn captureNativeTopology() ?state_mod.NativeTopology {
+fn captureNativeTopology(mapping: state_mod.NativeTopologyMapping) ?state_mod.NativeTopology {
     const sky = &g_sky.?;
     var snapshot = sky.nativeSpaceTopology() orelse {
         log.warn("native topology: WindowServer snapshot unavailable", .{});
@@ -3448,10 +3448,10 @@ fn captureNativeTopology() ?state_mod.NativeTopology {
     };
     defer snapshot.deinit();
 
-    return nativeTopologyFromSnapshot(&snapshot);
+    return nativeTopologyFromSnapshot(&snapshot, mapping);
 }
 
-fn nativeTopologyFromSnapshot(snapshot: *const skylight.NativeSpaceTopology) ?state_mod.NativeTopology {
+fn nativeTopologyFromSnapshot(snapshot: *const skylight.NativeSpaceTopology, mapping: state_mod.NativeTopologyMapping) ?state_mod.NativeTopology {
     var observation: state_mod.NativeTopologyObservation = .{};
     var captured_space_count: u16 = 0;
     const display_indices = stableDisplayIndices();
@@ -3505,6 +3505,7 @@ fn nativeTopologyFromSnapshot(snapshot: *const skylight.NativeSpaceTopology) ?st
         &g_state.spaces,
         workspaceCount(),
         primaryDisplayId(),
+        mapping,
     );
 }
 
@@ -3637,11 +3638,11 @@ fn executeStateEffect(effect: state_mod.Effect) void {
         .focus_retry_expired => |process_id| log.debug("focus-retry: gave up pid={d}", .{process_id}),
         .display_resettle_due => {
             log.debug("display resettle", .{});
-            reconcileDisplays();
+            reconcileDisplays(g_state.display_resettle_mapping);
         },
         .reconcile_displays => {
             log.debug("display changed", .{});
-            reconcileDisplays();
+            reconcileDisplays(.native_order);
         },
         .focus_window => |focus| {
             _ = bw_ax_focus_window(focus.process_id, focus.window_id);
@@ -4115,7 +4116,7 @@ fn executeWorkspaceSwitch(workspace_switch: state_mod.WorkspaceSwitchEffect) voi
 
 fn observeNativeTopology(epoch: state_mod.Epoch) void {
     const at_ms = nativeStateNowMs();
-    const topology = captureNativeTopology() orelse {
+    const topology = captureNativeTopology(.preserve_space_ids) orelse {
         dispatchStateEvent(.{ .native_topology_unavailable = .{
             .epoch = epoch,
             .at_ms = at_ms,
@@ -5385,9 +5386,10 @@ fn handleExternalWindowGeometry(wid: u32, frame: window_mod.Window.Frame) void {
 
 /// Reconciles workspace/display state after monitor topology changes.
 ///
-/// Native Space IDs preserve surviving assignments. New physical Spaces take
-/// the remaining logical workspace IDs during topology mapping.
-fn reconcileDisplayChange() bool {
+/// Display events rebuild native ordinal numbering on both the leading and
+/// trailing observations because macOS can restore Space order after its
+/// first display notification. Routine topology repair preserves Space IDs.
+fn reconcileDisplayChange(mapping: state_mod.NativeTopologyMapping) bool {
     const focused_uuid: ?[16]u8 = blk: {
         const slot = displayIndexById(focusedDisplayId()) orelse break :blk null;
         break :blk g_displays[slot].uuid;
@@ -5398,10 +5400,13 @@ fn reconcileDisplayChange() bool {
     refreshDisplays();
 
     const restored_focused_display_id = displayIdForUuid(focused_uuid) orelse primaryDisplayId();
-    const native_topology = (if (reconcileNativeSpaceCapacity()) captureNativeTopology() else null) orelse {
+    const native_topology = (if (reconcileNativeSpaceCapacity()) captureNativeTopology(mapping) else null) orelse {
         g_displays = previous_displays;
         g_display_count = previous_display_count;
-        dispatchStateEvent(.{ .display_reconcile_unavailable = nativeStateNowMs() });
+        dispatchStateEvent(.{ .display_reconcile_unavailable = .{
+            .at_ms = nativeStateNowMs(),
+            .mapping = mapping,
+        } });
         log.debug("display reconcile deferred until native Space topology is available", .{});
         return false;
     };

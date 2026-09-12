@@ -44,6 +44,7 @@ pub const NativeTopology = topology_mod.NativeTopology;
 pub const NativeTopologyInitialization = topology_mod.NativeTopologyInitialization;
 pub const NativeDisplayObservation = topology_mod.NativeDisplayObservation;
 pub const NativeTopologyObservation = topology_mod.NativeTopologyObservation;
+pub const NativeTopologyMapping = topology_mod.NativeTopologyMapping;
 pub const mapNativeTopology = topology_mod.mapNativeTopology;
 pub const ManagedWindow = window_catalog_mod.ManagedWindow;
 pub const WindowTabGroupObservation = window_catalog_mod.WindowTabGroupObservation;
@@ -646,6 +647,7 @@ pub const Model = struct {
     app_launch_retries: ProcessRetries = .{},
     focus_retries: ProcessRetries = .{},
     display_resettle_due_at_ms: ?TimestampMs = null,
+    display_resettle_mapping: NativeTopologyMapping = .native_order,
     bsp_split_mode: tiling_mod.SplitMode = .auto,
     bsp_insert_point: tiling_mod.InsertionPointPolicy = .focused,
     pointer_drag: PointerDragState = .{},
@@ -981,7 +983,10 @@ pub const Event = union(enum) {
         succeeded: bool,
         at_ms: TimestampMs = 0,
     },
-    display_reconcile_unavailable: TimestampMs,
+    display_reconcile_unavailable: struct {
+        at_ms: TimestampMs,
+        mapping: NativeTopologyMapping,
+    },
     window_focus_observed: WindowFocusObservation,
     request_pending_focus,
     follow_focus_observed: FollowFocusObservation,

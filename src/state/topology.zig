@@ -238,6 +238,12 @@ pub const NativeTopologyObservation = struct {
     }
 };
 
+/// Display changes rebuild ordinal numbering; ordinary observations preserve it.
+pub const NativeTopologyMapping = enum {
+    preserve_space_ids,
+    native_order,
+};
+
 /// Assign global logical workspaces to an observed physical Space topology.
 pub fn mapNativeTopology(
     observation: NativeTopologyObservation,
@@ -246,13 +252,17 @@ pub fn mapNativeTopology(
     catalog: *const SpaceCatalog,
     workspace_count: u8,
     primary_display_id: DisplayId,
+    mapping: NativeTopologyMapping,
 ) ?NativeTopology {
     if (workspace_count == 0 or observation.display_count > workspace_count) return null;
     if (!observationContainsDisplay(&observation, primary_display_id)) return null;
-    if (preserveStableNativeTopology(&observation, previous, workspace_count)) |topology| return topology;
-    if (previous.display_count == 0 and catalog.space_count == 0) {
-        return mapInitialTopology(observation, workspace_count, primary_display_id);
+    // Reconnecting displays can restore old Space IDs at different ordinals.
+    // Display reconciliation explicitly renumbers them; ordinary observations
+    // preserve identities so switching or moving a workspace cannot renumber it.
+    if (mapping == .native_order or (previous.display_count == 0 and catalog.space_count == 0)) {
+        return mapTopologyInNativeOrder(observation, workspace_count, primary_display_id);
     }
+    if (preserveStableNativeTopology(&observation, previous, workspace_count)) |topology| return topology;
 
     var assignments: [max_displays][max_spaces_per_display]WorkspaceId = @splat(@splat(0));
     var claimed: [max_spaces_per_display + 1]bool = @splat(false);
@@ -317,7 +327,7 @@ pub fn mapNativeTopology(
     return topology;
 }
 
-fn mapInitialTopology(
+fn mapTopologyInNativeOrder(
     observation: NativeTopologyObservation,
     workspace_count: WorkspaceId,
     primary_display_id: DisplayId,
