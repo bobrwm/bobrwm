@@ -212,10 +212,13 @@ Each bobrwm workspace is assigned to exactly one ordinary Mission Control
 Space across all displays. At startup, the primary display receives the lowest
 workspace numbers in native ordinal order, so Bobrwm workspace 1 maps to its
 native Space 1. Secondary displays follow in stable display order, with at
-least one workspace reserved for each. Assignments are then preserved by native
-Space ID across topology observations. Configure at least as many ordinary
-Mission Control Spaces in total as Bobrwm workspaces, with at least one on every
-managed display. Bobrwm creates missing Spaces on the primary display and
+least one workspace reserved for each. Display configuration changes, including
+disconnecting or reconnecting a monitor, rebuild this numbering in native Space
+order. Renumbering keeps windows, layouts and focus history attached to surviving
+Spaces. Ordinary Space observations preserve assignments by native Space ID.
+Configure at least as many ordinary Mission Control Spaces in total as Bobrwm
+workspaces, with at least one on every managed display. Bobrwm creates missing
+Spaces on the primary display and
 removes trailing extras so the physical count matches the configured workspace
 count. It watches the native topology while running and reapplies this invariant
 after external Space creation or deletion.
