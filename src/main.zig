@@ -3344,21 +3344,32 @@ fn reconcileNativeSpaceCapacity() bool {
 
     while (capacity.total_count < required_count) {
         const space_id = sky.createNativeSpace(display_id) orelse {
-            log.warn("native Space creation failed display={d}", .{display_id});
+            log.warn("native Space creation failed display={d} required={d} available={d}", .{ display_id, required_count, capacity.total_count });
             return false;
         };
 
         var observed_capacity = capacity;
+        const started_ns = nanoTimestamp();
+        var unavailable_samples: u8 = 0;
         var attempt: u8 = 0;
         while (attempt < native_space_capacity_settle_attempts) : (attempt += 1) {
             _ = c.usleep(native_space_capacity_poll_delay_us);
-            observed_capacity = nativeSpaceCapacity() orelse continue;
+            observed_capacity = nativeSpaceCapacity() orelse {
+                unavailable_samples += 1;
+                continue;
+            };
             if (observed_capacity.total_count > capacity.total_count) break;
         }
         if (observed_capacity.total_count <= capacity.total_count) {
-            log.warn("created native Space did not enter managed topology display={d} space={d}", .{
+            log.warn("created native Space did not enter managed topology display={d} space={d} required={d} before={d} last_available={d} polls={d} unavailable_samples={d} elapsed_ms={d}", .{
                 display_id,
                 space_id,
+                required_count,
+                capacity.total_count,
+                observed_capacity.total_count,
+                attempt,
+                unavailable_samples,
+                @divTrunc(nanoTimestamp() - started_ns, std.time.ns_per_ms),
             });
             return false;
         }
@@ -3389,14 +3400,27 @@ fn reconcileNativeSpaceCapacity() bool {
         }
 
         var observed_capacity = capacity;
+        const started_ns = nanoTimestamp();
+        var unavailable_samples: u8 = 0;
         var attempt: u8 = 0;
         while (attempt < native_space_capacity_settle_attempts) : (attempt += 1) {
             _ = c.usleep(native_space_capacity_poll_delay_us);
-            observed_capacity = nativeSpaceCapacity() orelse continue;
+            observed_capacity = nativeSpaceCapacity() orelse {
+                unavailable_samples += 1;
+                continue;
+            };
             if (observed_capacity.total_count < capacity.total_count) break;
         }
         if (observed_capacity.total_count >= capacity.total_count) {
-            log.warn("destroyed native Space did not leave managed topology space={d}", .{space_id});
+            log.warn("destroyed native Space did not leave managed topology space={d} required={d} before={d} last_available={d} polls={d} unavailable_samples={d} elapsed_ms={d}", .{
+                space_id,
+                required_count,
+                capacity.total_count,
+                observed_capacity.total_count,
+                attempt,
+                unavailable_samples,
+                @divTrunc(nanoTimestamp() - started_ns, std.time.ns_per_ms),
+            });
             return false;
         }
 
@@ -3426,7 +3450,11 @@ fn reconcileNativeSpaceTopologyIfNeeded() void {
             capacity.total_count,
         });
         if (!reconcileNativeSpaceCapacity()) {
-            log.warn("live native Space capacity reconciliation failed", .{});
+            log.warn("live native Space capacity reconciliation failed required={d} initial_available={d} displays={d}", .{
+                workspaceCount(),
+                capacity.total_count,
+                g_display_count,
+            });
             return;
         }
         reconcileDisplays(.preserve_space_ids);
@@ -3485,7 +3513,14 @@ fn nativeTopologyFromSnapshot(snapshot: *const skylight.NativeSpaceTopology, map
             };
         }
         if (std.mem.indexOfScalar(u64, observed_display.space_ids[0..captured_count], observed_space_id) == null) {
-            log.warn("native topology: observed Space outside managed range display={d} space={d}", .{ display.id, observed_space_id });
+            log.warn("native topology: observed Space outside managed range display={d} space={d} ordinary_count={d} captured_count={d} limit={d} captured_space_ids={any}", .{
+                display.id,
+                observed_space_id,
+                available_count,
+                captured_count,
+                state_mod.max_spaces_per_display,
+                observed_display.space_ids[0..captured_count],
+            });
             return null;
         }
         observation.addDisplay(observed_display);
@@ -3498,7 +3533,7 @@ fn nativeTopologyFromSnapshot(snapshot: *const skylight.NativeSpaceTopology, map
         return null;
     }
 
-    return state_mod.mapNativeTopology(
+    const topology = state_mod.mapNativeTopology(
         observation,
         &g_state.native_topology,
         &g_state.workspace_topology,
@@ -3506,7 +3541,13 @@ fn nativeTopologyFromSnapshot(snapshot: *const skylight.NativeSpaceTopology, map
         workspaceCount(),
         primaryDisplayId(),
         mapping,
-    );
+    ) orelse {
+        log.warn("native topology: workspace mapping failed mapping={s} configured={d} captured={d} displays={d} primary_display={d}", .{
+            @tagName(mapping), workspaceCount(), captured_space_count, observation.display_count, primaryDisplayId(),
+        });
+        return null;
+    };
+    return topology;
 }
 
 fn dispatchStateEvent(event: state_mod.Event) void {
@@ -3866,31 +3907,30 @@ fn executeWindowGeometrySettled(
             const intent = observation.pending_intent orelse return;
             if (reconcileDivergedGeometryIntent(observation.window_id, intent)) return;
 
-            switch (intent.target) {
-                .frame => |target| log.warn("geometry: frame intent did not converge wid={d} source={s} target=({d:.0},{d:.0},{d:.0},{d:.0}) observed=({d:.0},{d:.0},{d:.0},{d:.0})", .{
-                    observation.window_id,
-                    @tagName(intent.source),
-                    target.x,
-                    target.y,
-                    target.width,
-                    target.height,
-                    observation.frame.x,
-                    observation.frame.y,
-                    observation.frame.width,
-                    observation.frame.height,
-                }),
-                .position => |target| log.warn("geometry: position intent did not converge wid={d} source={s} target=({d:.0},{d:.0}) observed=({d:.0},{d:.0})", .{
-                    observation.window_id,
-                    @tagName(intent.source),
-                    target.x,
-                    target.y,
-                    observation.frame.x,
-                    observation.frame.y,
-                }),
-            }
+            logUnsettledGeometry(observation, intent);
             return;
         },
         .external => handleExternalWindowGeometry(observation.window_id, observation.frame),
+    }
+}
+
+fn logUnsettledGeometry(observation: @FieldType(geometry_mod.Effect, "settled"), intent: geometry_mod.Intent) void {
+    const win = managedWindow(observation.window_id) orelse return;
+    const space = managedWindowSpace(observation.window_id) orelse return;
+    var app_buf: [256]u8 = undefined;
+    const app = osutil.appBundleId(win.pid, &app_buf) orelse "unknown";
+    switch (intent.target) {
+        .frame => |target| log.warn("geometry: frame intent did not converge wid={d} pid={d} app={s} workspace={d} display={d} source={s} generation={d} target=({d:.0},{d:.0},{d:.0},{d:.0}) observed=({d:.0},{d:.0},{d:.0},{d:.0}) delta=({d:.0},{d:.0},{d:.0},{d:.0})", .{
+            observation.window_id,          win.pid,                        app,                                    space.workspace_id,                       space.display_id,
+            @tagName(intent.source),        intent.generation,              target.x,                               target.y,                                 target.width,
+            target.height,                  observation.frame.x,            observation.frame.y,                    observation.frame.width,                  observation.frame.height,
+            observation.frame.x - target.x, observation.frame.y - target.y, observation.frame.width - target.width, observation.frame.height - target.height,
+        }),
+        .position => |target| log.warn("geometry: position intent did not converge wid={d} pid={d} app={s} workspace={d} display={d} source={s} generation={d} target=({d:.0},{d:.0}) observed=({d:.0},{d:.0}) delta=({d:.0},{d:.0})", .{
+            observation.window_id,   win.pid,                        app,                            space.workspace_id, space.display_id,
+            @tagName(intent.source), intent.generation,              target.x,                       target.y,           observation.frame.x,
+            observation.frame.y,     observation.frame.x - target.x, observation.frame.y - target.y,
+        }),
     }
 }
 
