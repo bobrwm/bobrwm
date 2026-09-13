@@ -54,6 +54,20 @@
     //     .inner = 4,
     //     .outer = .{ .left = 4, .right = 4, .top = 4, .bottom = 4 },
     // },
+    //
+    // Per-display gap overrides. Each entry sets exactly one selector:
+    //   .main       — the primary display
+    //   .display_id — a CG display id (may change across replug/reboot)
+    //   .uuid       — stable CG display UUID, 32 hex chars (run
+    //                 `system_profiler SPDisplaysDataType` or check
+    //                 bobrwm's debug logs after attaching the display)
+    // Entries are evaluated in order and the first match wins; displays
+    // matching no entry fall back to the global `gaps` above.
+    // .display_gaps = .{
+    //     .{ .main = true, .gaps = .{ .inner = 2 } },
+    //     .{ .display_id = 1, .gaps = .{ .inner = 8, .outer = .{ .top = 8 } } },
+    //     .{ .uuid = "A1B2C3D4E5F60718293A4B5C6D7E8F90", .gaps = .{ .inner = 6 } },
+    // },
 
     // ALPHA: Animate window movements during layout changes.
     // Animating windows issue synchronous AX calls on every 16ms tick from
