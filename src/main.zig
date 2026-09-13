@@ -6439,6 +6439,17 @@ fn writeWorkspaceJsonEntry(json: *std.json.Stringify, space: state_mod.SpaceRef)
     try json.endObject();
 }
 
+/// Formats display UUID bytes as 32 lowercase hex chars, the form
+/// config.display_gaps selectors accept. uuid_hex_buf must be at least 32.
+fn formatDisplayUuid(uuid: [16]u8, uuid_hex_buf: []u8) []const u8 {
+    const hex = "0123456789abcdef";
+    for (uuid, 0..) |byte, i| {
+        uuid_hex_buf[i * 2] = hex[byte >> 4];
+        uuid_hex_buf[i * 2 + 1] = hex[byte & 0xf];
+    }
+    return uuid_hex_buf[0..32];
+}
+
 fn ipcQueryDisplays(fd: posix.socket_t, format: ipc.IpcCommand.QueryFormat) void {
     var out: std.Io.Writer.Allocating = .init(g_allocator);
     defer out.deinit();
@@ -6447,9 +6458,15 @@ fn ipcQueryDisplays(fd: posix.socket_t, format: ipc.IpcCommand.QueryFormat) void
     switch (format) {
         .text => for (g_displays[0..g_display_count], 0..) |display, slot| {
             const workspace_id = activeWorkspaceIdForDisplay(g_displays[slot].id);
-            w.print("{d} {d} {d:.0} {d:.0} {d:.0} {d:.0} {d}\n", .{
+            var uuid_hex_buf: [32]u8 = undefined;
+            const uuid_hex = if (display.uuid) |uuid|
+                formatDisplayUuid(uuid, &uuid_hex_buf)
+            else
+                "-";
+            w.print("{d} {d} {s} {d:.0} {d:.0} {d:.0} {d:.0} {d}\n", .{
                 slot + 1,
                 display.id,
+                uuid_hex,
                 display.visible.x,
                 display.visible.y,
                 display.visible.w,
@@ -6467,6 +6484,13 @@ fn ipcQueryDisplays(fd: posix.socket_t, format: ipc.IpcCommand.QueryFormat) void
                 json.write(slot + 1) catch break;
                 json.objectField("display_id") catch break;
                 json.write(display.id) catch break;
+                json.objectField("uuid") catch break;
+                if (display.uuid) |uuid| {
+                    var uuid_hex_buf: [32]u8 = undefined;
+                    json.write(formatDisplayUuid(uuid, &uuid_hex_buf)) catch break;
+                } else {
+                    json.write(null) catch break;
+                }
                 json.objectField("workspace_id") catch break;
                 json.write(workspace_id) catch break;
                 json.objectField("visible_frame") catch break;
