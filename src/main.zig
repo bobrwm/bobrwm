@@ -1765,7 +1765,7 @@ fn rebuildTilingStatesForConfig() void {
         .split_ratio = g_config.bsp_split_ratio,
     };
     for (g_state.spaces.spaces[0..g_state.spaces.space_count]) |ws| {
-        if (!rebuild.addSpace(ws.key, displayContentFrame(ws.display_id))) {
+        if (!rebuild.addSpace(ws.key, displayContentFrame(ws.display_id), @floatFromInt(gapsForDisplay(ws.display_id).inner))) {
             log.err("layout rebuild rejected workspace={d}", .{ws.workspace_id});
             return;
         }
@@ -2528,7 +2528,7 @@ fn tilingInsertOptions(space_key: state_mod.SpaceKey, wid: u32) !tiling.InsertOp
         .child = g_config.new_window_split,
         .anchor_wid = anchor_wid,
         .root_frame = displayContentFrame(ws.display_id),
-        .inner_gap = @floatFromInt(g_config.gaps.inner),
+        .inner_gap = @floatFromInt(gapsForDisplay(ws.display_id).inner),
         .split_ratio = g_config.bsp_split_ratio,
     };
 }
@@ -2741,16 +2741,43 @@ fn clearDragPreview() void {
     dispatchStateEvent(.clear_drag_preview);
 }
 
-fn displayContentFrame(display_id: u32) ?window_mod.Window.Frame {
-    const display_slot = displayIndexById(display_id) orelse return null;
-    const display = g_displays[display_slot].visible;
-    const outer = g_config.gaps.outer;
+/// Effective gap config for a display: the first matching `display_gaps`
+/// entry wins, otherwise the global `gaps` default. Matching is re-resolved
+/// on every use so config reloads and display hotplug (uuid re-matching)
+/// take effect without extra wiring.
+fn gapsForDisplay(display_id: u32) config_mod.Gaps {
+    if (g_config.display_gaps.len == 0) return g_config.gaps;
+    const display_slot = displayIndexById(display_id) orelse return g_config.gaps;
+    const display = g_displays[display_slot];
+    for (g_config.display_gaps) |entry| {
+        if (entry.main and display.is_primary) return entry.gaps;
+        if (entry.display_id) |id| {
+            if (id == display_id) return entry.gaps;
+        }
+        if (entry.uuid) |hex| {
+            if (display.uuid) |uuid| {
+                if (config_mod.parseDisplayUuid(hex)) |parsed| {
+                    if (std.mem.eql(u8, &parsed, &uuid)) return entry.gaps;
+                }
+            }
+        }
+    }
+    return g_config.gaps;
+}
+
+fn contentFrameWithInsets(display: shim.bw_frame, outer: config_mod.OuterGaps) window_mod.Window.Frame {
     return .{
         .x = display.x + @as(f64, @floatFromInt(outer.left)),
         .y = display.y + @as(f64, @floatFromInt(outer.top)),
         .width = display.w - @as(f64, @floatFromInt(@as(u32, outer.left) + @as(u32, outer.right))),
         .height = display.h - @as(f64, @floatFromInt(@as(u32, outer.top) + @as(u32, outer.bottom))),
     };
+}
+
+fn displayContentFrame(display_id: u32) ?window_mod.Window.Frame {
+    const display_slot = displayIndexById(display_id) orelse return null;
+    const display = g_displays[display_slot].visible;
+    return contentFrameWithInsets(display, gapsForDisplay(display_id).outer);
 }
 
 fn updateWindowMovePreview(wid: u32) void {
@@ -5658,18 +5685,14 @@ fn retileDisplay(display_id: u32) void {
     const ws_id = activeWorkspaceIdForDisplay(display_id);
     const ws = spaceForWorkspace(display_id, ws_id) orelse return;
     const display_slot = displayIndexById(display_id) orelse return;
-    const display = g_displays[display_slot].visible;
+    const display_info = g_displays[display_slot];
+    const display = display_info.visible;
 
     ax_mod.beginGeometryBatch();
     defer ax_mod.endGeometryBatch();
 
-    const outer = g_config.gaps.outer;
-    const frame = window_mod.Window.Frame{
-        .x = display.x + @as(f64, @floatFromInt(outer.left)),
-        .y = display.y + @as(f64, @floatFromInt(outer.top)),
-        .width = display.w - @as(f64, @floatFromInt(@as(u32, outer.left) + @as(u32, outer.right))),
-        .height = display.h - @as(f64, @floatFromInt(@as(u32, outer.top) + @as(u32, outer.bottom))),
-    };
+    const gaps = gapsForDisplay(display_id);
+    const frame = contentFrameWithInsets(display, gaps.outer);
 
     restoreFloatingWindows(ws, display, frame);
 
@@ -5681,7 +5704,7 @@ fn retileDisplay(display_id: u32) void {
         log.err("retile: layout buffer reserve failed display={d} windows={d}", .{ display_id, window_count });
         return;
     };
-    g_state.layout.computeLayout(ws.key, frame, @floatFromInt(g_config.gaps.inner), &g_layout_entries);
+    g_state.layout.computeLayout(ws.key, frame, @floatFromInt(gaps.inner), &g_layout_entries);
     std.debug.assert(g_layout_entries.items.len == window_count);
 
     for (g_layout_entries.items) |entry| {

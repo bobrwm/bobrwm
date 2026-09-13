@@ -646,14 +646,14 @@ test "layout rebuild replaces every Space atomically" {
         .inner_gap = 8,
         .split_ratio = 0.5,
     };
-    try testing.expect(rebuild.addSpace(space_key, .{ .x = 0, .y = 0, .width = 1000, .height = 800 }));
+    try testing.expect(rebuild.addSpace(space_key, .{ .x = 0, .y = 0, .width = 1000, .height = 800 }, 8));
     var transition = reduce(model, .{ .rebuild_layout = rebuild });
 
     try testing.expectEqual(tiling_mod.LayoutKind.monocle, transition.model.layout.layoutKind(space_key).?);
     try testing.expect(transition.model.layout.contains(space_key, 101));
     try testing.expect(transition.model.layout.contains(space_key, 102));
 
-    try testing.expect(rebuild.addSpace(.{ .id = 2 }, null));
+    try testing.expect(rebuild.addSpace(.{ .id = 2 }, null, 8));
     transition = reduce(model, .{ .rebuild_layout = rebuild });
     try testing.expectEqual(tiling_mod.LayoutKind.bsp, transition.model.layout.layoutKind(space_key).?);
     try testing.expect(transition.model.layout.contains(space_key, 101));
