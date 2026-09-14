@@ -24,6 +24,8 @@ pub const Config = struct {
     swipe: SwipeConfig = .{},
     dimmed_inactive: DimConfig = .{},
     gaps: Gaps = .{},
+    /// Per-display gap overrides, first match wins. See `DisplayGaps`.
+    display_gaps: []const DisplayGaps = &.{},
     layout: tiling.LayoutKind = .bsp,
     bsp_split: tiling.SplitMode = .auto,
     bsp_insert_point: tiling.InsertionPointPolicy = .focused,
@@ -346,6 +348,18 @@ pub const Gaps = struct {
     outer: OuterGaps = .{},
 };
 
+/// One per-display gap override. Exactly one selector must be set: `main`
+/// matches the primary display, `display_id` matches a CG display id, and
+/// `uuid` matches the stable CG display UUID (32 hex chars) so overrides
+/// survive replug/reboot. Entries are evaluated in order and the first
+/// match wins; unmatched displays fall back to the global `gaps`.
+pub const DisplayGaps = struct {
+    main: bool = false,
+    display_id: ?u32 = null,
+    uuid: ?[]const u8 = null,
+    gaps: Gaps = .{},
+};
+
 // Default keybinds (matches the previously hardcoded behaviour)
 
 const default_keybinds = blk: {
@@ -528,6 +542,45 @@ pub fn validate(config: *const Config) !void {
     try validateKeybinds(config.keybinds, workspace_count);
     try validateAppRules(config.app_rules, workspace_count);
     try validateWorkspaceAssignments(config.workspace_assignments, workspace_count);
+    try validateDisplayGaps(config.display_gaps);
+}
+
+pub const max_display_gaps = 16;
+pub const uuid_hex_len = 32;
+
+fn hexNibble(ch: u8) ?u4 {
+    return switch (ch) {
+        '0'...'9' => @intCast(ch - '0'),
+        'a'...'f' => @intCast(ch - 'a' + 10),
+        'A'...'F' => @intCast(ch - 'A' + 10),
+        else => null,
+    };
+}
+
+/// Parses a 32-hex-char display UUID string into its 16 bytes. Case
+/// insensitive; null when the string is not a well-formed UUID.
+pub fn parseDisplayUuid(hex: []const u8) ?[16]u8 {
+    if (hex.len != uuid_hex_len) return null;
+    var bytes: [16]u8 = undefined;
+    for (0..16) |i| {
+        const hi = hexNibble(hex[i * 2]) orelse return null;
+        const lo = hexNibble(hex[i * 2 + 1]) orelse return null;
+        bytes[i] = (@as(u8, hi) << 4) | lo;
+    }
+    return bytes;
+}
+
+fn validateDisplayGaps(entries: []const DisplayGaps) !void {
+    if (entries.len > max_display_gaps) return error.TooManyDisplayGaps;
+    for (entries) |entry| {
+        const selectors = @as(usize, @intFromBool(entry.main)) +
+            @as(usize, @intFromBool(entry.display_id != null)) +
+            @as(usize, @intFromBool(entry.uuid != null));
+        if (selectors != 1) return error.DisplayGapsSelector;
+        if (entry.uuid) |uuid| {
+            if (parseDisplayUuid(uuid) == null) return error.InvalidDisplayUuid;
+        }
+    }
 }
 
 fn validateKeybinds(keybinds: []const Keybind, workspace_count: usize) !void {
@@ -1032,6 +1085,11 @@ test "loadFromPath: custom zon" {
         \\    },
         \\    .swipe = .{ .enabled = true, .fingers = 4, .distance_pct = 0.1 },
         \\    .gaps = .{ .inner = 8, .outer = .{ .left = 4, .right = 4, .top = 4, .bottom = 4 } },
+        \\    .display_gaps = .{
+        \\        .{ .main = true, .gaps = .{ .inner = 2 } },
+        \\        .{ .display_id = 1, .gaps = .{ .inner = 8, .outer = .{ .top = 8 } } },
+        \\        .{ .uuid = "A1B2C3D4E5F60718293A4B5C6D7E8F90", .gaps = .{ .inner = 6 } },
+        \\    },
         \\    .layout = .monocle,
         \\    .bsp_split = .vertical,
         \\    .bsp_insert_point = .last,
@@ -1066,9 +1124,58 @@ test "loadFromPath: custom zon" {
     try t.expectEqual(@as(u16, 4), cfg.gaps.outer.right);
     try t.expectEqual(@as(u16, 4), cfg.gaps.outer.top);
     try t.expectEqual(@as(u16, 4), cfg.gaps.outer.bottom);
+    try t.expectEqual(@as(usize, 3), cfg.display_gaps.len);
+    try t.expect(cfg.display_gaps[0].main);
+    try t.expectEqual(@as(u16, 2), cfg.display_gaps[0].gaps.inner);
+    try t.expectEqual(@as(u32, 1), cfg.display_gaps[1].display_id.?);
+    try t.expectEqual(@as(u16, 8), cfg.display_gaps[1].gaps.inner);
+    try t.expectEqual(@as(u16, 8), cfg.display_gaps[1].gaps.outer.top);
+    try t.expectEqualStrings("A1B2C3D4E5F60718293A4B5C6D7E8F90", cfg.display_gaps[2].uuid.?);
+    try t.expectEqual(@as(u16, 6), cfg.display_gaps[2].gaps.inner);
+    validate(&cfg) catch return error.TestUnexpectedResult;
     try t.expectEqual(tiling.LayoutKind.monocle, cfg.layout);
     try t.expectEqual(tiling.SplitMode.vertical, cfg.bsp_split);
     try t.expectEqual(tiling.InsertionPointPolicy.last, cfg.bsp_insert_point);
     try t.expectApproxEqAbs(@as(f64, 0.6), cfg.bsp_split_ratio, 0.0001);
     try t.expectEqual(tiling.InsertChild.first, cfg.new_window_split);
+}
+
+test "parseDisplayUuid" {
+    try t.expect(parseDisplayUuid("A1B2C3D4E5F60718293A4B5C6D7E8F90") != null);
+    try t.expect(parseDisplayUuid("a1b2c3d4e5f60718293a4b5c6d7e8f90") != null);
+    // Both cases decode to the same bytes.
+    try t.expectEqualSlices(
+        u8,
+        &parseDisplayUuid("A1B2C3D4E5F60718293A4B5C6D7E8F90").?,
+        &parseDisplayUuid("a1b2c3d4e5f60718293a4b5c6d7e8f90").?,
+    );
+    try t.expect(parseDisplayUuid("A1B2") == null);
+    try t.expect(parseDisplayUuid("A1B2C3D4E5F60718293A4B5C6D7E8F9Z") == null);
+    try t.expect(parseDisplayUuid("A1B2C3D4E5F60718293A4B5C6D7E8F9") == null);
+}
+
+test "validate: display_gaps selectors" {
+    const base: DisplayGaps = .{ .main = true, .gaps = .{ .inner = 2 } };
+
+    try validateDisplayGaps(&.{base});
+    try validateDisplayGaps(&.{.{ .display_id = 7, .gaps = .{} }});
+    try validateDisplayGaps(&.{.{ .uuid = "A1B2C3D4E5F60718293A4B5C6D7E8F90", .gaps = .{} }});
+
+    // No selector set.
+    try t.expectError(error.DisplayGapsSelector, validateDisplayGaps(&.{.{ .gaps = .{} }}));
+    // Multiple selectors set.
+    try t.expectError(error.DisplayGapsSelector, validateDisplayGaps(&.{.{
+        .main = true,
+        .display_id = 7,
+        .gaps = .{},
+    }}));
+    // Malformed uuid.
+    try t.expectError(error.InvalidDisplayUuid, validateDisplayGaps(&.{.{
+        .uuid = "not-a-uuid",
+        .gaps = .{},
+    }}));
+    // Too many entries.
+    var many: [max_display_gaps + 1]DisplayGaps = undefined;
+    for (&many) |*entry| entry.* = .{ .display_id = 1, .gaps = .{} };
+    try t.expectError(error.TooManyDisplayGaps, validateDisplayGaps(&many));
 }

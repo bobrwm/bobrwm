@@ -61,7 +61,7 @@ pub fn rebuild(transition: *Transition, request: LayoutRebuild) void {
                     .child = request.insert_child,
                     .anchor_wid = anchor_window_id,
                     .root_frame = layout_space.root_frame,
-                    .inner_gap = request.inner_gap,
+                    .inner_gap = layout_space.inner_gap,
                     .split_ratio = request.split_ratio,
                 },
             } })) {

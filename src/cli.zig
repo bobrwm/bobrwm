@@ -159,7 +159,7 @@ const help_text =
     \\Query Commands (IPC):
     \\  query windows [--json]    List windows on the active workspace
     \\  query workspaces [--json] List all workspaces
-    \\  query displays [--json]   List connected displays
+    \\  query displays [--json]   List connected displays (id, uuid, frame)
     \\  query apps [--json]       List managed applications
     \\
     \\Options:
