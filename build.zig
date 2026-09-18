@@ -174,7 +174,9 @@ pub fn build(b: *std.Build) !void {
 
     // BW* Objective-C classes (BWStatusBarDelegate, BWObserver, BWLaunchGate)
     // are registered at runtime by src/objc_classes.zig via zig-objc's
-    // allocateClassPair. No clang-compiled translation unit is required.
+    // allocateClassPair, so no Objective-C is compiled. The one C file wraps
+    // os_log_with_type, a compiler macro with no symbol to call from Zig.
+    exe_mod.addCSourceFile(.{ .file = b.path("src/c/oslog.c") });
 
     // SwiftUI menu bar. `swiftc` ships with the Command Line Tools, so no
     // Xcode project is involved, and the Swift runtime is part of the OS
@@ -534,6 +536,23 @@ pub fn build(b: *std.Build) !void {
 
     const run_trace_tests = b.addRunArtifact(trace_tests);
 
+    // filelog.zig's tests cover the env parser and level mapping, neither of
+    // which reaches the os_log externs, so the C shim stays out of the link.
+    const filelog_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/filelog.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    filelog_test_mod.addImport("build_options", build_options_mod);
+
+    const filelog_tests = b.addTest(.{
+        .name = "filelog-tests",
+        .root_module = filelog_test_mod,
+    });
+
+    const run_filelog_tests = b.addRunArtifact(filelog_tests);
+
     const swipe_test_mod = b.createModule(.{
         .root_source_file = b.path("packages/bobrwm-swipe/src/main.zig"),
         .target = target,
@@ -577,6 +596,7 @@ pub fn build(b: *std.Build) !void {
     test_step.dependOn(&run_statusbar_tests.step);
     test_step.dependOn(&run_dim_tests.step);
     test_step.dependOn(&run_trace_tests.step);
+    test_step.dependOn(&run_filelog_tests.step);
     test_step.dependOn(&run_swipe_tests.step);
 }
 
