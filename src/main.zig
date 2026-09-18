@@ -1778,9 +1778,14 @@ fn rolePollTimerTick(context: ?*anyopaque) callconv(.c) void {
     bw_emit_event(shim.BW_EVENT_ROLE_POLL_TICK, 0, 0);
 }
 
+/// Avoid waking the main-thread drain when the polled topology is unchanged.
 fn nativeSpaceTopologyPollTimerTick(context: ?*anyopaque) callconv(.c) void {
     _ = context;
-    bw_emit_event(shim.BW_EVENT_NATIVE_TOPOLOGY_POLL_TICK, 0, 0);
+
+    // Keyboard tab switches emit no notification and still need this heartbeat.
+    if (hasWindowTabGroups() or nativeSpaceTopologyDiverged()) {
+        bw_emit_event(shim.BW_EVENT_NATIVE_TOPOLOGY_POLL_TICK, 0, 0);
+    }
 }
 
 fn rebuildTilingStatesForConfig() void {
@@ -3526,6 +3531,25 @@ fn reconcileNativeSpaceCapacity() bool {
         });
     }
     return true;
+}
+
+/// Read only; reconciliation rechecks before mutating state.
+fn nativeSpaceTopologyDiverged() bool {
+    if (nativeSwitchPending()) return false;
+    if (g_state.hasPendingNativeWindowMoves()) return false;
+    if (g_state.pendingNativeWorkspaceMove() != null) return false;
+    if (g_state.isWorkspaceTransitionActive()) return false;
+    if (g_state.hasDisplayResettleScheduled()) return false;
+
+    const sky = g_sky orelse return false;
+    var snapshot = sky.nativeSpaceTopology() orelse return false;
+    defer snapshot.deinit();
+
+    const capacity = nativeSpaceCapacityFromSnapshot(&snapshot) orelse return false;
+    if (capacity.total_count != workspaceCount()) return true;
+
+    const topology = nativeTopologyFromSnapshot(&snapshot, .preserve_space_ids) orelse return false;
+    return !g_state.native_topology.eql(&topology);
 }
 
 fn reconcileNativeSpaceTopologyIfNeeded() void {
