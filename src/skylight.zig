@@ -3,6 +3,7 @@ const cg_extra = @import("cg_extra");
 const c = @import("c");
 const objc = @import("objc");
 const native_gesture = @import("native_gesture.zig");
+const trace = @import("trace.zig");
 const log = std.log.scoped(.skylight);
 
 const CFArrayRef = *const anyopaque;
@@ -160,6 +161,7 @@ pub const SkyLight = struct {
     /// Copy the native Space topology for reuse across one reconciliation pass.
     pub fn nativeSpaceTopology(self: *const SkyLight) ?NativeSpaceTopology {
         const copy_spaces = self.copyManagedDisplaySpaces orelse return null;
+        trace.countSkylight();
         const displays = copy_spaces(self.mainConnectionID()) orelse return null;
         return NativeSpaceTopology.init(displays) orelse {
             c.CFRelease(displays);
