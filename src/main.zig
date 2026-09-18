@@ -4954,6 +4954,11 @@ fn addNewWindow(pid: i32, wid: u32) void {
     }
 }
 
+fn hasWindowTabGroups() bool {
+    var leader_window_ids: [state_mod.max_managed_windows]u32 = undefined;
+    return g_state.windowTabGroupLeaderIds(&leader_window_ids).len != 0;
+}
+
 /// Correct each tab group's recorded active tab against the window carrying its
 /// app's tab bar.
 ///
@@ -4969,6 +4974,8 @@ fn addNewWindow(pid: i32, wid: u32) void {
 fn refreshTabGroupActiveTabs() void {
     const span = trace.begin("tab bar refresh");
     defer _ = span.endIfSlow();
+
+    if (!hasWindowTabGroups()) return;
 
     const on_screen = OnScreenWindows.snapshot();
     refreshTabGroupActiveTabsFromSnapshot(&on_screen);
