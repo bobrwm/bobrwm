@@ -391,6 +391,8 @@ fn frontmostApplicationPid() ?i32 {
     const workspace = NSWorkspace.msgSend(objc.Object, "sharedWorkspace", .{});
     if (workspace.value == null) return null;
 
+    const lookup = trace.call(.launch_services);
+    defer _ = lookup.finish();
     const app = workspace.msgSend(objc.Object, "frontmostApplication", .{});
     if (app.value == null) return null;
 
@@ -708,8 +710,10 @@ fn reconcileVisibleFramesFromWindowServer() void {
         if (!isVisibleManaged(&win)) continue;
 
         var rect: skylight.CGRect = undefined;
-        trace.countSkylight();
-        if (sky.getWindowBounds(conn, win.wid, &rect) != 0) continue;
+        const bounds = trace.call(.skylight);
+        const bounds_err = sky.getWindowBounds(conn, win.wid, &rect);
+        _ = bounds.finish();
+        if (bounds_err != 0) continue;
 
         const frame: window_mod.Window.Frame = .{
             .x = rect.origin.x,
@@ -942,8 +946,10 @@ fn inferDisplayIdForWindow(wid: u32) ?u32 {
 fn liveWindowFrame(wid: u32) ?window_mod.Window.Frame {
     const sky = g_sky orelse return null;
     var rect: skylight.CGRect = undefined;
-    trace.countSkylight();
-    if (sky.getWindowBounds(sky.mainConnectionID(), wid, &rect) != 0) return null;
+    const bounds = trace.call(.skylight);
+    const bounds_err = sky.getWindowBounds(sky.mainConnectionID(), wid, &rect);
+    _ = bounds.finish();
+    if (bounds_err != 0) return null;
     return .{
         .x = rect.origin.x,
         .y = rect.origin.y,
@@ -1243,18 +1249,15 @@ fn bw_ax_get_focused_window(pid: i32) u32 {
     const focused_attr = ax.focused_window_attr;
 
     var focused: c.AXUIElementRef = null;
-    trace.countAxN(2);
-    const err = c.AXUIElementCopyAttributeValue(
-        app,
-        focused_attr,
-        @ptrCast(&focused),
-    );
+    const err = ax_mod.countedCopy(app, focused_attr, @ptrCast(&focused), "AXFocusedWindow", pid, 0);
     if (err != c.kAXErrorSuccess or focused == null) return 0;
     const focused_ref = focused orelse return 0;
     defer c.CFRelease(@ptrCast(focused_ref));
 
     var wid: u32 = 0;
+    const id = trace.call(.ax);
     _ = _AXUIElementGetWindow(focused_ref, &wid);
+    _ = id.finish();
     return wid;
 }
 
@@ -1265,8 +1268,10 @@ fn bw_is_window_on_screen(target_wid: u32) bool {
 
     const options: cg_extra.CGWindowListOption =
         cg_extra.kCGWindowListOptionOnScreenOnly | cg_extra.kCGWindowListExcludeDesktopElements;
-    trace.countWindowList();
-    const list = cg_extra.CGWindowListCopyWindowInfo(options, cg_extra.kCGNullWindowID) orelse return false;
+    const copy = trace.call(.window_list);
+    const copied = cg_extra.CGWindowListCopyWindowInfo(options, cg_extra.kCGNullWindowID);
+    _ = copy.finish();
+    const list = copied orelse return false;
     defer c.CFRelease(@ptrCast(list));
 
     const count = c.CFArrayGetCount(list);
@@ -1306,8 +1311,10 @@ fn cgWindowInfoVisible(info: c.CFDictionaryRef) bool {
 fn managedWindowAtPoint(point: c.CGPoint) ?u32 {
     const options: cg_extra.CGWindowListOption =
         cg_extra.kCGWindowListOptionOnScreenOnly | cg_extra.kCGWindowListExcludeDesktopElements;
-    trace.countWindowList();
-    const list = cg_extra.CGWindowListCopyWindowInfo(options, cg_extra.kCGNullWindowID) orelse return null;
+    const copy = trace.call(.window_list);
+    const copied = cg_extra.CGWindowListCopyWindowInfo(options, cg_extra.kCGNullWindowID);
+    _ = copy.finish();
+    const list = copied orelse return null;
     defer c.CFRelease(@ptrCast(list));
 
     const count = c.CFArrayGetCount(list);
@@ -1362,12 +1369,7 @@ fn bw_get_app_window_ids(pid: i32, out: []u32) BoundedSnapshotResult {
     const windows_attr = ax.windows_attr;
 
     var windows: c.CFArrayRef = null;
-    trace.countAx();
-    const err = c.AXUIElementCopyAttributeValue(
-        app,
-        windows_attr,
-        @ptrCast(&windows),
-    );
+    const err = ax_mod.countedCopy(app, windows_attr, @ptrCast(&windows), "AXWindows", pid, 0);
     if (err != c.kAXErrorSuccess or windows == null) return .{ .count = 0, .truncated = false };
     const windows_ref = windows orelse return .{ .count = 0, .truncated = false };
     defer c.CFRelease(@ptrCast(windows_ref));
@@ -1375,7 +1377,9 @@ fn bw_get_app_window_ids(pid: i32, out: []u32) BoundedSnapshotResult {
     var written: usize = 0;
     const total = c.CFArrayGetCount(windows_ref);
     std.debug.assert(total >= 0);
-    trace.countAxN(@intCast(@max(total, 0)));
+    // See findWindowWithTimeout: charged as one wait for the whole loop.
+    const ids = trace.call(.ax);
+    defer _ = ids.finishN(@intCast(@max(total, 0)));
 
     var i: c.CFIndex = 0;
     var truncated = false;
@@ -1402,6 +1406,8 @@ fn isRegularActivationApp(pid: i32) bool {
     std.debug.assert(pid > 0);
 
     const NSRunningApplication = objc.getClass("NSRunningApplication") orelse return false;
+    const lookup = trace.call(.launch_services);
+    defer _ = lookup.finish();
     const app = NSRunningApplication.msgSend(objc.Object, "runningApplicationWithProcessIdentifier:", .{pid});
     if (app.value == null) return false;
 
@@ -1524,12 +1530,11 @@ fn manageStateForWindowWithMessagingTimeout(pid: i32, wid: u32, timeout_seconds:
     // Native open/save panels are app-modal AX windows. They expose enough
     // top-level-window signals to pass the dialog heuristic below, but tiling
     // them resizes the parent app while the user is choosing a file.
-    if (axBooleanAttributeTrue(win_ref, ax.modal_attr)) return shim.BW_MANAGE_REJECT;
+    if (axBooleanAttributeTrue(win_ref, ax.modal_attr, "AXModal", pid, wid)) return shim.BW_MANAGE_REJECT;
 
     const role_attr = ax.role_attr;
     var role_any: c.CFTypeRef = null;
-    trace.countAx();
-    const role_err = c.AXUIElementCopyAttributeValue(win_ref, role_attr, @ptrCast(&role_any));
+    const role_err = ax_mod.countedCopy(win_ref, role_attr, @ptrCast(&role_any), "AXRole", pid, wid);
     if (role_err != c.kAXErrorSuccess or role_any == null) return shim.BW_MANAGE_PENDING;
     const role_ref: c.CFStringRef = @ptrCast(role_any orelse return shim.BW_MANAGE_PENDING);
     defer c.CFRelease(@ptrCast(role_ref));
@@ -1545,8 +1550,7 @@ fn manageStateForWindowWithMessagingTimeout(pid: i32, wid: u32, timeout_seconds:
 
     const subrole_attr = ax.subrole_attr;
     var subrole_any: c.CFTypeRef = null;
-    trace.countAx();
-    const subrole_err = c.AXUIElementCopyAttributeValue(win_ref, subrole_attr, @ptrCast(&subrole_any));
+    const subrole_err = ax_mod.countedCopy(win_ref, subrole_attr, @ptrCast(&subrole_any), "AXSubrole", pid, wid);
     if (subrole_err != c.kAXErrorSuccess or subrole_any == null) return shim.BW_MANAGE_PENDING;
     const subrole_ref: c.CFStringRef = @ptrCast(subrole_any orelse return shim.BW_MANAGE_PENDING);
     defer c.CFRelease(@ptrCast(subrole_ref));
@@ -1568,7 +1572,7 @@ fn manageStateForWindowWithMessagingTimeout(pid: i32, wid: u32, timeout_seconds:
     // the popup is created and destroyed (a resize storm).
     const is_dialog_like = c.CFEqual(@ptrCast(subrole_ref), @ptrCast(ax.floating_window_subrole)) != 0 or
         c.CFEqual(@ptrCast(subrole_ref), @ptrCast(ax.dialog_subrole)) != 0;
-    if (is_dialog_like and windowHasRealWindowSignal(win_ref, ax)) {
+    if (is_dialog_like and windowHasRealWindowSignal(win_ref, ax, pid, wid)) {
         return shim.BW_MANAGE_READY;
     }
 
@@ -1581,34 +1585,32 @@ fn manageStateForWindowWithMessagingTimeout(pid: i32, wid: u32, timeout_seconds:
 /// context menus — report a dialog/floating subrole but have none of these, so
 /// this guard keeps them from being tiled. Mirrors the button/subrole heuristics
 /// used by yabai, AeroSpace, and OmniWM.
-fn windowHasRealWindowSignal(win: c.AXUIElementRef, ax: *const AxStrings) bool {
+fn windowHasRealWindowSignal(win: c.AXUIElementRef, ax: *const AxStrings, pid: i32, wid: u32) bool {
     std.debug.assert(win != null);
     std.debug.assert(ax.modal_attr != null);
 
-    if (axAttributePresent(win, ax.close_button_attr)) return true;
-    if (axAttributePresent(win, ax.minimize_button_attr)) return true;
-    if (axAttributePresent(win, ax.zoom_button_attr)) return true;
-    if (axAttributePresent(win, ax.fullscreen_button_attr)) return true;
-    if (axBooleanAttributeTrue(win, ax.main_attr)) return true;
-    if (axBooleanAttributeTrue(win, ax.focused_attr)) return true;
+    if (axAttributePresent(win, ax.close_button_attr, "AXCloseButton", pid, wid)) return true;
+    if (axAttributePresent(win, ax.minimize_button_attr, "AXMinimizeButton", pid, wid)) return true;
+    if (axAttributePresent(win, ax.zoom_button_attr, "AXZoomButton", pid, wid)) return true;
+    if (axAttributePresent(win, ax.fullscreen_button_attr, "AXFullScreenButton", pid, wid)) return true;
+    if (axBooleanAttributeTrue(win, ax.main_attr, "AXMain", pid, wid)) return true;
+    if (axBooleanAttributeTrue(win, ax.focused_attr, "AXFocused", pid, wid)) return true;
     return false;
 }
 
 /// True when the AX attribute exists and is non-null on the element.
-fn axAttributePresent(win: c.AXUIElementRef, attr: c.CFStringRef) bool {
+fn axAttributePresent(win: c.AXUIElementRef, attr: c.CFStringRef, what: []const u8, pid: i32, wid: u32) bool {
     var value: c.CFTypeRef = null;
-    trace.countAx();
-    const err = c.AXUIElementCopyAttributeValue(win, attr, &value);
+    const err = ax_mod.countedCopy(win, attr, &value, what, pid, wid);
     if (err != c.kAXErrorSuccess or value == null) return false;
     c.CFRelease(value.?);
     return true;
 }
 
 /// True when the AX attribute is a CFBoolean set to true.
-fn axBooleanAttributeTrue(win: c.AXUIElementRef, attr: c.CFStringRef) bool {
+fn axBooleanAttributeTrue(win: c.AXUIElementRef, attr: c.CFStringRef, what: []const u8, pid: i32, wid: u32) bool {
     var value: c.CFTypeRef = null;
-    trace.countAx();
-    const err = c.AXUIElementCopyAttributeValue(win, attr, &value);
+    const err = ax_mod.countedCopy(win, attr, &value, what, pid, wid);
     if (err != c.kAXErrorSuccess or value == null) return false;
     defer c.CFRelease(value.?);
     return c.CFEqual(value.?, @ptrCast(c.kCFBooleanTrue)) != 0;
@@ -1637,9 +1639,10 @@ fn bw_discover_windows(out: []shim.bw_window_info, on_screen: ?*OnScreenWindows)
 
     const options: cg_extra.CGWindowListOption =
         cg_extra.kCGWindowListOptionOnScreenOnly | cg_extra.kCGWindowListExcludeDesktopElements;
-    trace.countWindowList();
-    const window_list = cg_extra.CGWindowListCopyWindowInfo(options, cg_extra.kCGNullWindowID) orelse
-        return .{ .count = 0, .truncated = false };
+    const copy = trace.call(.window_list);
+    const copied = cg_extra.CGWindowListCopyWindowInfo(options, cg_extra.kCGNullWindowID);
+    _ = copy.finish();
+    const window_list = copied orelse return .{ .count = 0, .truncated = false };
     defer c.CFRelease(@ptrCast(window_list));
 
     const total = c.CFArrayGetCount(window_list);
@@ -2373,14 +2376,12 @@ fn bw_drain_events() void {
     const elapsed_us = drain_span.elapsedUs();
     const spent = drain_span.cost();
     const ms = trace.Millis.from(elapsed_us);
-    log.debug("drain: {d} events from {s} in {d}.{d:0>3}ms ax={d} sky={d} cg={d}{s}", .{
+    log.debug("drain: {d} events from {s} in {d}.{d:0>3}ms {f}{s}", .{
         handled,
         first_kind,
         ms.whole,
         ms.frac,
-        spent.ax,
-        spent.skylight,
-        spent.window_list,
+        trace.breakdown(spent, elapsed_us),
         if (elapsed_us >= trace.frame_budget_us) " SLOW" else "",
     });
 }
@@ -2412,7 +2413,7 @@ fn handleTracedEvent(ev: *const event_mod.Event) void {
 
     const queued = trace.Millis.from(queued_us);
     const took = trace.Millis.from(elapsed_us);
-    log.debug("event {s} pid={d} wid={d} queued={d}.{d:0>3}ms took={d}.{d:0>3}ms ax={d} sky={d} cg={d}{s}", .{
+    log.debug("event {s} pid={d} wid={d} queued={d}.{d:0>3}ms took={d}.{d:0>3}ms {f}{s}", .{
         @tagName(ev.kind),
         ev.pid,
         ev.wid,
@@ -2420,9 +2421,7 @@ fn handleTracedEvent(ev: *const event_mod.Event) void {
         queued.frac,
         took.whole,
         took.frac,
-        spent.ax,
-        spent.skylight,
-        spent.window_list,
+        trace.breakdown(spent, elapsed_us),
         if (elapsed_us >= trace.frame_budget_us) " SLOW" else "",
     });
 }
@@ -3996,10 +3995,19 @@ fn executeRetileRequest(request: state_mod.RetileRequest) void {
 
 fn executeCleanupRequest(request: state_mod.CleanupRequest) void {
     var removed_any = false;
+    // Two phases with different costs: per-pid cleanup asks the app for its
+    // window list over AX, offscreen cleanup asks WindowServer about every
+    // managed window. Named apart so a slow flush says which.
     for (request.process_ids[0..request.process_count]) |process_id| {
+        const span = trace.beginWindow("cleanup pid", process_id, 0);
+        defer _ = span.endIfSlow();
         if (cleanupWorkspaceWindowsForPid(process_id)) removed_any = true;
     }
-    if (request.should_clean_offscreen and cleanupOffscreenManagedWindows()) removed_any = true;
+    if (request.should_clean_offscreen) {
+        const span = trace.begin("cleanup offscreen");
+        defer _ = span.endIfSlow();
+        if (cleanupOffscreenManagedWindows()) removed_any = true;
+    }
     if (removed_any) requestRetileAllDisplays();
 }
 
@@ -4735,14 +4743,13 @@ fn discoverWindowsImpl(should_refresh_tabs: bool) usize {
     const adopt_ms = trace.Millis.from(adopt_us);
     const spent = span.cost();
     log.debug(
-        "discover: candidates={d} adopted={d} enumerate={d}.{d:0>3}ms tabs={d}.{d:0>3}ms adopt={d}.{d:0>3}ms ax={d} sky={d} cg={d}",
+        "discover: candidates={d} adopted={d} enumerate={d}.{d:0>3}ms tabs={d}.{d:0>3}ms adopt={d}.{d:0>3}ms {f}",
         .{
-            discovery.count,    adopted_count,
-            enumerate_ms.whole, enumerate_ms.frac,
-            tabs_ms.whole,      tabs_ms.frac,
-            adopt_ms.whole,     adopt_ms.frac,
-            spent.ax,           spent.skylight,
-            spent.window_list,
+            discovery.count,                          adopted_count,
+            enumerate_ms.whole,                       enumerate_ms.frac,
+            tabs_ms.whole,                            tabs_ms.frac,
+            adopt_ms.whole,                           adopt_ms.frac,
+            trace.breakdown(spent, span.elapsedUs()),
         },
     );
     return adopted_count;
@@ -4763,8 +4770,10 @@ const OnScreenWindows = struct {
 
         const options: cg_extra.CGWindowListOption =
             cg_extra.kCGWindowListOptionOnScreenOnly | cg_extra.kCGWindowListExcludeDesktopElements;
-        trace.countWindowList();
-        const list = cg_extra.CGWindowListCopyWindowInfo(options, cg_extra.kCGNullWindowID) orelse return self;
+        const copy = trace.call(.window_list);
+        const copied = cg_extra.CGWindowListCopyWindowInfo(options, cg_extra.kCGNullWindowID);
+        _ = copy.finish();
+        const list = copied orelse return self;
         defer c.CFRelease(@ptrCast(list));
 
         const total = c.CFArrayGetCount(list);
@@ -4920,8 +4929,10 @@ fn addNewWindowManagedWithAssignment(
     const display_id = assigned_space.display_id;
     if (g_sky) |sky| {
         var rect: skylight.CGRect = undefined;
-        trace.countSkylight();
-        if (sky.getWindowBounds(sky.mainConnectionID(), wid, &rect) == 0) {
+        const bounds = trace.call(.skylight);
+        const bounds_err = sky.getWindowBounds(sky.mainConnectionID(), wid, &rect);
+        _ = bounds.finish();
+        if (bounds_err == 0) {
             window_frame = .{
                 .x = rect.origin.x,
                 .y = rect.origin.y,
@@ -4961,7 +4972,10 @@ fn addNewWindowManagedWithAssignment(
     const rule_float = blk: {
         if (g_config.app_rules.len == 0) break :blk false;
         var id_buf: [256]u8 = undefined;
-        const bundle_id = config_mod.getAppBundleId(pid, &id_buf) orelse break :blk false;
+        const lookup = trace.call(.launch_services);
+        const looked_up = config_mod.getAppBundleId(pid, &id_buf);
+        _ = lookup.finish();
+        const bundle_id = looked_up orelse break :blk false;
         break :blk g_config.shouldFloatApp(bundle_id);
     };
 
@@ -5350,6 +5364,8 @@ fn removeAppWindows(pid: i32) void {
 fn isAppRunning(pid: i32) ?bool {
     std.debug.assert(pid > 0);
     const NSRunningApplication = objc.getClass("NSRunningApplication") orelse return null;
+    const lookup = trace.call(.launch_services);
+    defer _ = lookup.finish();
     const app = NSRunningApplication.msgSend(objc.Object, "runningApplicationWithProcessIdentifier:", .{pid});
     return app.value != null;
 }
@@ -5403,8 +5419,10 @@ fn cleanupWorkspaceWindowsForPid(pid: i32) bool {
 
             var should_remove = false;
             var rect: skylight.CGRect = undefined;
-            trace.countSkylight();
-            if (sky.getWindowBounds(conn, wid, &rect) != 0) {
+            const bounds = trace.call(.skylight);
+            const bounds_err = sky.getWindowBounds(conn, wid, &rect);
+            _ = bounds.finish();
+            if (bounds_err != 0) {
                 should_remove = true;
                 log.debug("cleanup: removing wid={d} pid={d} reason=missing-windowserver", .{ wid, pid });
             } else if (!windowMayRemainManaged(pid, wid)) {
@@ -5877,8 +5895,10 @@ fn restoreFloatingWindows(ws: state_mod.SpaceRef, display: shim.bw_frame, conten
         }
 
         var rect: skylight.CGRect = undefined;
-        trace.countSkylight();
-        if (sky.getWindowBounds(conn, wid, &rect) != 0) continue;
+        const bounds = trace.call(.skylight);
+        const bounds_err = sky.getWindowBounds(conn, wid, &rect);
+        _ = bounds.finish();
+        if (bounds_err != 0) continue;
 
         const center_x = rect.origin.x + rect.size.width / 2.0;
         const center_y = rect.origin.y + rect.size.height / 2.0;
@@ -6124,7 +6144,10 @@ fn checkTabDragOut(_: i32, wid: u32) bool {
 fn configuredWorkspace(pid: i32, display_id: u32) ?state_mod.SpaceRef {
     if (g_config.hasAppWorkspaceRules()) {
         var id_buf: [256]u8 = undefined;
-        if (config_mod.getAppBundleId(pid, &id_buf)) |bundle_id| {
+        const lookup = trace.call(.launch_services);
+        const looked_up = config_mod.getAppBundleId(pid, &id_buf);
+        _ = lookup.finish();
+        if (looked_up) |bundle_id| {
             if (g_config.workspaceForApp(bundle_id)) |ws_id| {
                 return spaceForCommand(display_id, ws_id);
             }

@@ -182,15 +182,17 @@ fn findWindowWithTimeout(pid: i32, target_wid: u32, timeout_seconds: ?f32) ?c.AX
     const ax = strings() orelse return null;
     const windows_attr = ax.windows_attr;
     var windows: c.CFArrayRef = null;
-    trace.countAx();
-    const err = c.AXUIElementCopyAttributeValue(app, windows_attr, @ptrCast(&windows));
+    const err = countedCopy(app, windows_attr, @ptrCast(&windows), "AXWindows", pid, target_wid);
     if (err != c.kAXErrorSuccess or windows == null) return null;
     const windows_ref = windows orelse return null;
     defer c.CFRelease(@ptrCast(windows_ref));
 
     const count = c.CFArrayGetCount(windows_ref);
     std.debug.assert(count >= 0);
-    trace.countAxN(@intCast(@max(count, 0)));
+    // _AXUIElementGetWindow per element. Usually answered from the element's
+    // own token, but not guaranteed to be, so the loop is charged as one wait.
+    const ids = trace.call(.ax);
+    defer _ = ids.finishN(@intCast(@max(count, 0)));
 
     var i: c.CFIndex = 0;
     while (i < count) : (i += 1) {
@@ -315,12 +317,40 @@ pub fn deinitElementCache() void {
     }
 }
 
-/// `AXUIElementSetAttributeValue` with the round trip recorded. Every geometry
-/// write is IPC into the target app, and a retile writes several per window,
-/// so these are what a slow layout is actually made of.
-fn countedSet(element: c.AXUIElementRef, attribute: c.CFStringRef, value: c.CFTypeRef) c.AXError {
-    trace.countAx();
-    return c.AXUIElementSetAttributeValue(element, attribute, value);
+/// `AXUIElementCopyAttributeValue` with the round trip timed and, when it was
+/// slow, named. `what` is the attribute as a reader of the log knows it; a
+/// static string, since a slow call is kept for the next stall report.
+pub fn countedCopy(
+    element: c.AXUIElementRef,
+    attribute: c.CFStringRef,
+    value: *c.CFTypeRef,
+    what: []const u8,
+    pid: i32,
+    wid: u32,
+) c.AXError {
+    const read = trace.call(.ax);
+    const err = c.AXUIElementCopyAttributeValue(element, attribute, value);
+    const elapsed_us = read.finish();
+    if (elapsed_us >= trace.slow_call_us) trace.noteSlowCall("read", what, pid, wid, read.started_ns, elapsed_us, err);
+    return err;
+}
+
+/// `AXUIElementSetAttributeValue`, timed and named the same way. Every
+/// geometry write is IPC into the target app, and a retile writes several per
+/// window, so these are what a slow layout is actually made of.
+fn countedSet(
+    element: c.AXUIElementRef,
+    attribute: c.CFStringRef,
+    value: c.CFTypeRef,
+    what: []const u8,
+    pid: i32,
+    wid: u32,
+) c.AXError {
+    const write = trace.call(.ax);
+    const err = c.AXUIElementSetAttributeValue(element, attribute, value);
+    const elapsed_us = write.finish();
+    if (elapsed_us >= trace.slow_call_us) trace.noteSlowCall("write", what, pid, wid, write.started_ns, elapsed_us, err);
+    return err;
 }
 
 /// Whether a geometry write failed because the cached element no longer refers
@@ -346,13 +376,15 @@ pub fn focusedWindowIfMatches(pid: i32, target_wid: u32) ?c.AXUIElementRef {
 
     const ax = strings() orelse return null;
     var focused: c.AXUIElementRef = null;
-    trace.countAxN(2);
-    const err = c.AXUIElementCopyAttributeValue(app, ax.focused_window_attr, @ptrCast(&focused));
+    const err = countedCopy(app, ax.focused_window_attr, @ptrCast(&focused), "AXFocusedWindow", pid, target_wid);
     if (err != c.kAXErrorSuccess or focused == null) return null;
     const focused_ref = focused orelse return null;
 
     var wid: u32 = 0;
-    if (_AXUIElementGetWindow(focused_ref, &wid) != c.kAXErrorSuccess or wid != target_wid) {
+    const id = trace.call(.ax);
+    const id_err = _AXUIElementGetWindow(focused_ref, &wid);
+    _ = id.finish();
+    if (id_err != c.kAXErrorSuccess or wid != target_wid) {
         c.CFRelease(@ptrCast(focused_ref));
         return null;
     }
@@ -381,8 +413,7 @@ pub fn tabCount(pid: i32, wid: u32) usize {
     defer c.CFRelease(@ptrCast(win));
 
     var children: c.CFArrayRef = null;
-    trace.countAx();
-    if (c.AXUIElementCopyAttributeValue(win, ax.children_attr, @ptrCast(&children)) != c.kAXErrorSuccess) return 0;
+    if (countedCopy(win, ax.children_attr, @ptrCast(&children), "AXChildren", pid, wid) != c.kAXErrorSuccess) return 0;
     const children_ref = children orelse return 0;
     defer c.CFRelease(@ptrCast(children_ref));
 
@@ -393,15 +424,13 @@ pub fn tabCount(pid: i32, wid: u32) usize {
         const child: c.AXUIElementRef = @ptrCast(child_any);
 
         var role: c.CFTypeRef = null;
-        trace.countAx();
-        if (c.AXUIElementCopyAttributeValue(child, ax.role_attr, &role) != c.kAXErrorSuccess) continue;
+        if (countedCopy(child, ax.role_attr, &role, "AXRole (child)", pid, wid) != c.kAXErrorSuccess) continue;
         const role_ref = role orelse continue;
         defer c.CFRelease(role_ref);
         if (c.CFEqual(role_ref, @ptrCast(ax.tab_group_role)) == 0) continue;
 
         var tabs: c.CFArrayRef = null;
-        trace.countAx();
-        if (c.AXUIElementCopyAttributeValue(child, ax.tabs_attr, @ptrCast(&tabs)) != c.kAXErrorSuccess) return 0;
+        if (countedCopy(child, ax.tabs_attr, @ptrCast(&tabs), "AXTabs", pid, wid) != c.kAXErrorSuccess) return 0;
         const tabs_ref = tabs orelse return 0;
         defer c.CFRelease(@ptrCast(tabs_ref));
 
@@ -414,9 +443,11 @@ pub fn tabCount(pid: i32, wid: u32) usize {
 
 /// Query whether AXEnhancedUserInterface is currently enabled on an app element.
 fn readEnhancedUserInterface(app: c.AXUIElementRef, ax: *const AxStrings) ?bool {
+    // The pid lives in the element token; reading it back is local.
+    var pid: c.pid_t = 0;
+    _ = c.AXUIElementGetPid(app, &pid);
     var value: c.CFTypeRef = null;
-    trace.countAx();
-    const err = c.AXUIElementCopyAttributeValue(app, ax.enhanced_ui_attr, &value);
+    const err = countedCopy(app, ax.enhanced_ui_attr, &value, "AXEnhancedUserInterface", pid, 0);
     if (err != c.kAXErrorSuccess or value == null) return null;
     defer c.CFRelease(value.?);
     return c.CFEqual(value.?, @ptrCast(c.kCFBooleanTrue)) != 0;
@@ -528,7 +559,7 @@ fn suspendEnhancedUi(app: c.AXUIElementRef, pid: i32, ax: *const AxStrings) bool
     if (g_geometry_batch_depth == 0) {
         const was_enabled = shouldSuspendEnhancedUi(app, pid, ax);
         if (was_enabled) {
-            _ = countedSet(app, ax.enhanced_ui_attr, c.kCFBooleanFalse);
+            _ = countedSet(app, ax.enhanced_ui_attr, c.kCFBooleanFalse, "AXEnhancedUserInterface", pid, 0);
         }
         return was_enabled;
     }
@@ -540,7 +571,7 @@ fn suspendEnhancedUi(app: c.AXUIElementRef, pid: i32, ax: *const AxStrings) bool
 
     const was_enabled = shouldSuspendEnhancedUi(app, pid, ax);
     if (was_enabled) {
-        _ = countedSet(app, ax.enhanced_ui_attr, c.kCFBooleanFalse);
+        _ = countedSet(app, ax.enhanced_ui_attr, c.kCFBooleanFalse, "AXEnhancedUserInterface", pid, 0);
     }
     g_enhanced_ui_batch = .{ .pid = pid, .was_enabled = was_enabled };
     return false;
@@ -555,7 +586,7 @@ fn restoreEnhancedUiBatch() void {
     const app = boundedApp(batch.pid) orelse return;
     defer c.CFRelease(@ptrCast(app));
 
-    _ = countedSet(app, ax.enhanced_ui_attr, c.kCFBooleanTrue);
+    _ = countedSet(app, ax.enhanced_ui_attr, c.kCFBooleanTrue, "AXEnhancedUserInterface", batch.pid, 0);
 }
 
 /// Move and resize a window using AX attributes.
@@ -616,12 +647,12 @@ fn writeFrame(
 
     const owns_restore = suspendEnhancedUi(app, pid, ax);
     defer if (owns_restore) {
-        _ = countedSet(app, ax.enhanced_ui_attr, c.kCFBooleanTrue);
+        _ = countedSet(app, ax.enhanced_ui_attr, c.kCFBooleanTrue, "AXEnhancedUserInterface", pid, 0);
     };
 
-    _ = countedSet(element, ax.size_attr, @ptrCast(size_value));
-    const position_err = countedSet(element, ax.position_attr, @ptrCast(position_value));
-    const size_err = countedSet(element, ax.size_attr, @ptrCast(size_value));
+    _ = countedSet(element, ax.size_attr, @ptrCast(size_value), "AXSize", pid, 0);
+    const position_err = countedSet(element, ax.position_attr, @ptrCast(position_value), "AXPosition", pid, 0);
+    const size_err = countedSet(element, ax.size_attr, @ptrCast(size_value), "AXSize", pid, 0);
 
     if (position_err != c.kAXErrorSuccess) return position_err;
     return size_err;
@@ -664,10 +695,10 @@ fn writePosition(
 ) c.AXError {
     const owns_restore = suspendEnhancedUi(app, pid, ax);
     defer if (owns_restore) {
-        _ = countedSet(app, ax.enhanced_ui_attr, c.kCFBooleanTrue);
+        _ = countedSet(app, ax.enhanced_ui_attr, c.kCFBooleanTrue, "AXEnhancedUserInterface", pid, 0);
     };
 
-    return countedSet(element, ax.position_attr, @ptrCast(position_value));
+    return countedSet(element, ax.position_attr, @ptrCast(position_value), "AXPosition", pid, 0);
 }
 
 /// Retained AX element plus the state needed to undo animationBegin.
@@ -694,7 +725,7 @@ pub fn animationBegin(pid: i32, wid: u32) ?AnimationHandle {
         if (boundedApp(pid)) |app| {
             defer c.CFRelease(@ptrCast(app));
             if (shouldSuspendEnhancedUi(app, pid, ax)) {
-                _ = countedSet(app, ax.enhanced_ui_attr, c.kCFBooleanFalse);
+                _ = countedSet(app, ax.enhanced_ui_attr, c.kCFBooleanFalse, "AXEnhancedUserInterface", pid, 0);
                 restore_enhanced_ui = true;
             }
         }
@@ -716,13 +747,13 @@ pub fn animationStep(handle: AnimationHandle, x: f64, y: f64, w: f64, h: f64, se
         const size: c.CGSize = .{ .width = w, .height = h };
         const size_value = c.AXValueCreate(c.kAXValueTypeCGSize, &size) orelse return;
         defer c.CFRelease(@ptrCast(size_value));
-        _ = countedSet(handle.win, ax.size_attr, @ptrCast(size_value));
+        _ = countedSet(handle.win, ax.size_attr, @ptrCast(size_value), "AXSize", handle.pid, 0);
     }
 
     const position: c.CGPoint = .{ .x = x, .y = y };
     const position_value = c.AXValueCreate(c.kAXValueTypeCGPoint, &position) orelse return;
     defer c.CFRelease(@ptrCast(position_value));
-    _ = countedSet(handle.win, ax.position_attr, @ptrCast(position_value));
+    _ = countedSet(handle.win, ax.position_attr, @ptrCast(position_value), "AXPosition", handle.pid, 0);
 }
 
 /// Release the cached AX element and restore AXEnhancedUserInterface if
@@ -733,7 +764,7 @@ pub fn animationEnd(handle: AnimationHandle) void {
         const ax = strings() orelse return;
         const app = boundedApp(handle.pid) orelse return;
         defer c.CFRelease(@ptrCast(app));
-        _ = countedSet(app, ax.enhanced_ui_attr, c.kCFBooleanTrue);
+        _ = countedSet(app, ax.enhanced_ui_attr, c.kCFBooleanTrue, "AXEnhancedUserInterface", handle.pid, 0);
     }
 }
 
