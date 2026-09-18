@@ -955,6 +955,9 @@ fn framesEqual(lhs: window_mod.Window.Frame, rhs: window_mod.Window.Frame) bool 
 // Globals
 
 var g_event_queue: EventQueue = .{};
+/// Last drag owner named in the log, so a drag logs its window once rather
+/// than once per pointer sample. 0 means no drag is currently claimed.
+var g_logged_drag_window_id: u32 = 0;
 var g_event_overflowed: std.atomic.Value(bool) = .init(false);
 var g_event_dropped: usize = 0;
 /// Serializes producers before they enter the single-producer event queue.
@@ -3047,12 +3050,20 @@ fn handleEvent(ev: *const event_mod.Event) void {
         },
         .mouse_dragged => {
             dispatchStateEvent(.pointer_dragged);
-            if (g_state.pointer_drag.active_window_id) |wid| {
-                log.debug("geometry: pointer drag claimed wid={d}", .{wid});
+            // A drag emits one of these per pointer sample. Only the moment
+            // ownership changes carries information; repeating it for every
+            // sample buries the events around it.
+            const claimed = g_state.pointer_drag.active_window_id orelse 0;
+            if (claimed != g_logged_drag_window_id) {
+                g_logged_drag_window_id = claimed;
+                if (claimed != 0) log.debug("geometry: pointer drag claimed wid={d}", .{claimed});
             }
         },
         .mouse_up => {
             dispatchStateEvent(.pointer_up);
+            // Arm the drag log for the next drag, so dragging the same window
+            // twice in a row still records the second one.
+            g_logged_drag_window_id = 0;
 
             // Flush windows that were deferred during the drag (tab tear-off guard).
             // Processing them here avoids waiting for the next role_poll_tick.
