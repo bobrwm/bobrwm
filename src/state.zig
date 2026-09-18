@@ -2580,3 +2580,41 @@ test "window move command commits ownership layout and intent atomically" {
     try testing.expect(transition.model.retile_request.all_displays);
     try testing.expectEqual(std.meta.Tag(Effect).window_moved, std.meta.activeTag(transition.effects[0]));
 }
+
+test "tab group presence gate agrees with the leader list it guards" {
+    const testing = std.testing;
+    var catalog: SpaceCatalog = .{};
+    catalog.add(.{ .key = .{ .id = 1 }, .workspace_id = 1, .display_id = 11 });
+    var model: Model = .{ .spaces = catalog };
+
+    var leader_ids: [max_managed_windows]WindowId = undefined;
+    try testing.expect(!model.hasWindowTabGroups());
+
+    for ([_]WindowId{ 101, 102 }) |window_id| {
+        model = reduce(model, .{ .adopt_window = .{
+            .window_id = window_id,
+            .process_id = 1001,
+            .space_key = .{ .id = 1 },
+        } }).model;
+    }
+
+    // Standalone windows are their own leaders, so the gate must not fire on
+    // them — that is the case it exists to skip the window-list copy for.
+    try testing.expect(!model.hasWindowTabGroups());
+    try testing.expectEqual(@as(usize, 0), model.windowTabGroupLeaderIds(&leader_ids).len);
+
+    var group: WindowTabGroupObservation = .{
+        .leader_window_id = 101,
+        .active_window_id = 102,
+    };
+    try testing.expect(group.addMember(101));
+    try testing.expect(group.addMember(102));
+    model = reduce(model, .{ .observe_window_tab_group = group }).model;
+
+    try testing.expect(model.hasWindowTabGroups());
+    try testing.expectEqual(@as(usize, 1), model.windowTabGroupLeaderIds(&leader_ids).len);
+
+    model = reduce(model, .{ .detach_window_tab = .{ .window_id = 102 } }).model;
+    try testing.expect(!model.hasWindowTabGroups());
+    try testing.expectEqual(@as(usize, 0), model.windowTabGroupLeaderIds(&leader_ids).len);
+}

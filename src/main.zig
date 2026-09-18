@@ -4985,6 +4985,14 @@ fn refreshTabGroupActiveTabs() void {
     const span = trace.begin("tab bar refresh");
     defer _ = span.endIfSlow();
 
+    // The snapshot below is a full CGWindowListCopyWindowInfo: every on-screen
+    // window, parsed. Since this opens every drain, a session with no tab
+    // groups open was discarding one whole window-list copy per drain — timer
+    // ticks included. The group check is in-memory, so paying it first costs
+    // nothing and skips the copy entirely. The discovery path keeps its own
+    // check inside FromSnapshot, where the snapshot is already paid for.
+    if (!g_state.hasWindowTabGroups()) return;
+
     const on_screen = OnScreenWindows.snapshot();
     refreshTabGroupActiveTabsFromSnapshot(&on_screen);
 }
