@@ -29,6 +29,7 @@ const animation_mod = @import("animation.zig");
 const ax_mod = @import("ax.zig");
 const geometry_mod = @import("geometry.zig");
 const spsc_queue = @import("spsc_queue.zig");
+const trace = @import("trace.zig");
 
 extern fn _AXUIElementGetWindow(element: c.AXUIElementRef, wid: *u32) c.AXError;
 
@@ -331,6 +332,9 @@ fn isVisibleManaged(win: *const window_mod.Window) bool {
 /// directly (no WindowServer round-trip): retile and move/resize events have
 /// already synchronized them by the time this runs at the end of the drain.
 fn pushDimSnapshot() void {
+    const span = trace.begin("dim snapshot");
+    defer _ = span.endIfSlow();
+
     // Precondition: callers gate on dim.enabled, so the disabled feature never
     // reaches the window-scan loops below. Assert rather than early-return so
     // the invariant is documented and compiles out in release builds.
@@ -684,6 +688,7 @@ fn reconcileVisibleFramesFromWindowServer() void {
         if (!isVisibleManaged(&win)) continue;
 
         var rect: skylight.CGRect = undefined;
+        trace.countSkylight();
         if (sky.getWindowBounds(conn, win.wid, &rect) != 0) continue;
 
         const frame: window_mod.Window.Frame = .{
@@ -917,6 +922,7 @@ fn inferDisplayIdForWindow(wid: u32) ?u32 {
 fn liveWindowFrame(wid: u32) ?window_mod.Window.Frame {
     const sky = g_sky orelse return null;
     var rect: skylight.CGRect = undefined;
+    trace.countSkylight();
     if (sky.getWindowBounds(sky.mainConnectionID(), wid, &rect) != 0) return null;
     return .{
         .x = rect.origin.x,
@@ -1069,6 +1075,9 @@ fn requestOffscreenCleanup() void {
 }
 
 fn flushCleanupRequests() void {
+    const span = trace.begin("flush cleanup");
+    defer _ = span.endIfSlow();
+
     dispatchStateEvent(.flush_cleanup_requests);
 }
 
@@ -1209,6 +1218,7 @@ fn bw_ax_get_focused_window(pid: i32) u32 {
     const focused_attr = ax.focused_window_attr;
 
     var focused: c.AXUIElementRef = null;
+    trace.countAx();
     const err = c.AXUIElementCopyAttributeValue(
         app,
         focused_attr,
@@ -1219,6 +1229,7 @@ fn bw_ax_get_focused_window(pid: i32) u32 {
     defer c.CFRelease(@ptrCast(focused_ref));
 
     var wid: u32 = 0;
+    trace.countAx();
     _ = _AXUIElementGetWindow(focused_ref, &wid);
     return wid;
 }
@@ -1230,6 +1241,7 @@ fn bw_is_window_on_screen(target_wid: u32) bool {
 
     const options: cg_extra.CGWindowListOption =
         cg_extra.kCGWindowListOptionOnScreenOnly | cg_extra.kCGWindowListExcludeDesktopElements;
+    trace.countWindowList();
     const list = cg_extra.CGWindowListCopyWindowInfo(options, cg_extra.kCGNullWindowID) orelse return false;
     defer c.CFRelease(@ptrCast(list));
 
@@ -1270,6 +1282,7 @@ fn cgWindowInfoVisible(info: c.CFDictionaryRef) bool {
 fn managedWindowAtPoint(point: c.CGPoint) ?u32 {
     const options: cg_extra.CGWindowListOption =
         cg_extra.kCGWindowListOptionOnScreenOnly | cg_extra.kCGWindowListExcludeDesktopElements;
+    trace.countWindowList();
     const list = cg_extra.CGWindowListCopyWindowInfo(options, cg_extra.kCGNullWindowID) orelse return null;
     defer c.CFRelease(@ptrCast(list));
 
@@ -1325,6 +1338,7 @@ fn bw_get_app_window_ids(pid: i32, out: []u32) BoundedSnapshotResult {
     const windows_attr = ax.windows_attr;
 
     var windows: c.CFArrayRef = null;
+    trace.countAx();
     const err = c.AXUIElementCopyAttributeValue(
         app,
         windows_attr,
@@ -1345,6 +1359,7 @@ fn bw_get_app_window_ids(pid: i32, out: []u32) BoundedSnapshotResult {
         const win: c.AXUIElementRef = @ptrCast(win_any);
 
         var wid: u32 = 0;
+        trace.countAx();
         if (_AXUIElementGetWindow(win, &wid) == c.kAXErrorSuccess and wid != 0) {
             if (written == out_buf.len) {
                 truncated = true;
@@ -1401,7 +1416,9 @@ fn bw_ax_focus_window(pid: i32, wid: u32) bool {
     const is_same_process = (g_last_focused_pid == pid);
     g_last_focused_pid = pid;
 
+    trace.countAx();
     _ = c.AXUIElementPerformAction(win, raise_action);
+    trace.countAx();
     _ = c.AXUIElementSetAttributeValue(win, main_attr, c.kCFBooleanTrue);
 
     // Delay activation for same-process switches so the app has time to
@@ -1437,14 +1454,17 @@ fn setFrontProcessViaSkylight(pid: i32, wid: u32) bool {
         return false;
     }
 
+    trace.countSkylight();
     if (set_front(&psn, wid, kCPSUserGenerated) != 0) {
         log.debug("focus activation: SLPSSetFrontProcessWithOptions failed pid={d} wid={d}", .{ pid, wid });
         return false;
     }
 
     var focus_event = focusEventRecord(wid, 0x01);
+    trace.countSkylight();
     _ = post_event(&psn, &focus_event);
     var raise_event = focusEventRecord(wid, 0x02);
+    trace.countSkylight();
     _ = post_event(&psn, &raise_event);
     return true;
 }
@@ -1489,6 +1509,7 @@ fn manageStateForWindowWithMessagingTimeout(pid: i32, wid: u32, timeout_seconds:
 
     const role_attr = ax.role_attr;
     var role_any: c.CFTypeRef = null;
+    trace.countAx();
     const role_err = c.AXUIElementCopyAttributeValue(win_ref, role_attr, @ptrCast(&role_any));
     if (role_err != c.kAXErrorSuccess or role_any == null) return shim.BW_MANAGE_PENDING;
     const role_ref: c.CFStringRef = @ptrCast(role_any orelse return shim.BW_MANAGE_PENDING);
@@ -1505,6 +1526,7 @@ fn manageStateForWindowWithMessagingTimeout(pid: i32, wid: u32, timeout_seconds:
 
     const subrole_attr = ax.subrole_attr;
     var subrole_any: c.CFTypeRef = null;
+    trace.countAx();
     const subrole_err = c.AXUIElementCopyAttributeValue(win_ref, subrole_attr, @ptrCast(&subrole_any));
     if (subrole_err != c.kAXErrorSuccess or subrole_any == null) return shim.BW_MANAGE_PENDING;
     const subrole_ref: c.CFStringRef = @ptrCast(subrole_any orelse return shim.BW_MANAGE_PENDING);
@@ -1556,6 +1578,7 @@ fn windowHasRealWindowSignal(win: c.AXUIElementRef, ax: *const AxStrings) bool {
 /// True when the AX attribute exists and is non-null on the element.
 fn axAttributePresent(win: c.AXUIElementRef, attr: c.CFStringRef) bool {
     var value: c.CFTypeRef = null;
+    trace.countAx();
     const err = c.AXUIElementCopyAttributeValue(win, attr, &value);
     if (err != c.kAXErrorSuccess or value == null) return false;
     c.CFRelease(value.?);
@@ -1565,6 +1588,7 @@ fn axAttributePresent(win: c.AXUIElementRef, attr: c.CFStringRef) bool {
 /// True when the AX attribute is a CFBoolean set to true.
 fn axBooleanAttributeTrue(win: c.AXUIElementRef, attr: c.CFStringRef) bool {
     var value: c.CFTypeRef = null;
+    trace.countAx();
     const err = c.AXUIElementCopyAttributeValue(win, attr, &value);
     if (err != c.kAXErrorSuccess or value == null) return false;
     defer c.CFRelease(value.?);
@@ -1594,6 +1618,7 @@ fn bw_discover_windows(out: []shim.bw_window_info, on_screen: ?*OnScreenWindows)
 
     const options: cg_extra.CGWindowListOption =
         cg_extra.kCGWindowListOptionOnScreenOnly | cg_extra.kCGWindowListExcludeDesktopElements;
+    trace.countWindowList();
     const window_list = cg_extra.CGWindowListCopyWindowInfo(options, cg_extra.kCGNullWindowID) orelse
         return .{ .count = 0, .truncated = false };
     defer c.CFRelease(@ptrCast(window_list));
@@ -1993,10 +2018,12 @@ fn setupHotkeyEventTap() void {
 // and push events here.  The os_unfair_lock serialises concurrent pushes
 // while the main-thread consumer (pop) is wait-free.
 export fn bw_emit_event(kind: u8, pid: i32, wid: u32) void {
+    // Stamp before taking the lock so contention counts as queue time.
     const event: event_mod.Event = .{
         .kind = @enumFromInt(kind),
         .pid = pid,
         .wid = wid,
+        .enqueued_ns = trace.enqueueTimestamp(),
     };
 
     c.os_unfair_lock_lock(&g_ring_lock);
@@ -2261,12 +2288,20 @@ fn bw_drain_events() void {
     g_event_drain_active = true;
     defer g_event_drain_active = false;
 
+    const drain_span = trace.begin("drain");
+
     if (!nativeSwitchPending()) {
         refreshTabGroupActiveTabs();
     }
 
+    var handled: u32 = 0;
+    var reported: u32 = 0;
+    // Name the first event so timer-driven drains remain attributable.
+    var first_kind: []const u8 = "none";
     while (g_event_queue.pop()) |ev| {
-        handleEvent(&ev);
+        if (handled == 0) first_kind = @tagName(ev.kind);
+        if (handleTracedEvent(&ev)) reported += 1;
+        handled += 1;
     }
     drainIpcRequests();
 
@@ -2290,6 +2325,50 @@ fn bw_drain_events() void {
     if (dim.enabled and !nativeSwitchPending()) {
         pushDimSnapshot();
     }
+
+    if (!trace.enabled) return;
+    const elapsed_us = drain_span.elapsedUs();
+    const spent = drain_span.cost();
+    // Poll ticks wake the drain ten times a second; reporting those drains
+    // would bury the ones that did real work.
+    if (reported == 0 and trace.isQuiet(elapsed_us, spent)) return;
+    trace.emit("drain: events={d} first={s} elapsed_us={d} ax={d} sky={d} cg={d}{s}", .{
+        handled,
+        first_kind,
+        elapsed_us,
+        spent.ax,
+        spent.skylight,
+        spent.window_list,
+        if (elapsed_us >= trace.frame_budget_us) " SLOW" else "",
+    });
+}
+
+/// Separate time queued behind earlier work from the event's own cost.
+/// Returns whether the event was reported.
+fn handleTracedEvent(ev: *const event_mod.Event) bool {
+    const span = trace.beginWindow(@tagName(ev.kind), ev.pid, ev.wid);
+    handleEvent(ev);
+    if (!trace.enabled) return false;
+
+    const elapsed_us = span.elapsedUs();
+    const spent = span.cost();
+
+    const poll_tick = ev.kind == .role_poll_tick or ev.kind == .native_topology_poll_tick;
+    if (poll_tick and trace.isQuiet(elapsed_us, spent)) return false;
+
+    const queued_us = trace.queuedUs(ev.enqueued_ns, span.start_ns);
+    trace.emit("event {s} pid={d} wid={d} queued_us={d} elapsed_us={d} ax={d} sky={d} cg={d}{s}", .{
+        @tagName(ev.kind),
+        ev.pid,
+        ev.wid,
+        queued_us,
+        elapsed_us,
+        spent.ax,
+        spent.skylight,
+        spent.window_list,
+        if (elapsed_us >= trace.frame_budget_us) " SLOW" else "",
+    });
+    return true;
 }
 
 /// A dropped event has unknown semantics, so recover from authoritative OS
@@ -2442,6 +2521,9 @@ fn handleIpcRequest(request: ipc_transport.Request) void {
 }
 
 fn drainIpcRequests() void {
+    const span = trace.begin("ipc");
+    defer _ = span.endIfSlow();
+
     while (g_ipc_transport.pop()) |request| {
         handleIpcRequest(request);
     }
@@ -2829,6 +2911,9 @@ fn requestRetileAllDisplays() void {
 }
 
 fn flushRetileRequests() void {
+    const span = trace.begin("flush retile");
+    defer _ = span.endIfSlow();
+
     dispatchStateEvent(.flush_retile_requests);
 }
 
@@ -4431,6 +4516,7 @@ fn discoverWindowsImpl(should_refresh_tabs: bool) usize {
     if (nativeSwitchPending()) return 0;
     const started_ns = nanoTimestamp();
 
+    const span = trace.begin("discover");
     var buf: [256]shim.bw_window_info = undefined;
     var on_screen: OnScreenWindows = .{};
     const discovery = bw_discover_windows(&buf, if (should_refresh_tabs) &on_screen else null);
@@ -4438,8 +4524,10 @@ fn discoverWindowsImpl(should_refresh_tabs: bool) usize {
     if (discovery.truncated) {
         log.warn("window discovery truncated limit={d}; excess windows remain unmanaged", .{buf.len});
     }
+
     if (should_refresh_tabs) refreshTabGroupActiveTabsFromSnapshot(&on_screen);
     const tabs_refreshed_ns = nanoTimestamp();
+
     var observed_pids: [128]i32 = undefined;
     var observed_pid_count: usize = 0;
     var adopted_count: usize = 0;
@@ -4547,12 +4635,16 @@ fn discoverWindowsImpl(should_refresh_tabs: bool) usize {
     }
 
     const completed_ns = nanoTimestamp();
-    log.debug("[trace] window discovery candidates={} adopted={} enumerate_ms={} tabs_ms={} adopt_ms={}", .{
+    const spent = span.cost();
+    trace.emit("discover: candidates={d} adopted={d} enumerate_us={d} tabs_us={d} adopt_us={d} ax={d} sky={d} cg={d}", .{
         discovery.count,
         adopted_count,
-        @divTrunc(enumerated_ns - started_ns, std.time.ns_per_ms),
-        @divTrunc(tabs_refreshed_ns - enumerated_ns, std.time.ns_per_ms),
-        @divTrunc(completed_ns - tabs_refreshed_ns, std.time.ns_per_ms),
+        @divTrunc(enumerated_ns - started_ns, std.time.ns_per_us),
+        @divTrunc(tabs_refreshed_ns - enumerated_ns, std.time.ns_per_us),
+        @divTrunc(completed_ns - tabs_refreshed_ns, std.time.ns_per_us),
+        spent.ax,
+        spent.skylight,
+        spent.window_list,
     });
     return adopted_count;
 }
@@ -4572,6 +4664,7 @@ const OnScreenWindows = struct {
 
         const options: cg_extra.CGWindowListOption =
             cg_extra.kCGWindowListOptionOnScreenOnly | cg_extra.kCGWindowListExcludeDesktopElements;
+        trace.countWindowList();
         const list = cg_extra.CGWindowListCopyWindowInfo(options, cg_extra.kCGNullWindowID) orelse return self;
         defer c.CFRelease(@ptrCast(list));
 
@@ -4714,6 +4807,7 @@ fn addNewWindowManagedWithAssignment(pid: i32, wid: u32, assigned_space: state_m
     const display_id = assigned_space.display_id;
     if (g_sky) |sky| {
         var rect: skylight.CGRect = undefined;
+        trace.countSkylight();
         if (sky.getWindowBounds(sky.mainConnectionID(), wid, &rect) == 0) {
             window_frame = .{
                 .x = rect.origin.x,
@@ -4849,6 +4943,9 @@ fn addNewWindow(pid: i32, wid: u32) void {
 /// screen cannot have changed selection, so the AX work only happens on an actual
 /// switch. Only the active tab moves here; membership is decided elsewhere.
 fn refreshTabGroupActiveTabs() void {
+    const span = trace.begin("tab bar refresh");
+    defer _ = span.endIfSlow();
+
     const on_screen = OnScreenWindows.snapshot();
     refreshTabGroupActiveTabsFromSnapshot(&on_screen);
 }
@@ -5131,6 +5228,7 @@ fn cleanupWorkspaceWindowsForPid(pid: i32) bool {
 
             var should_remove = false;
             var rect: skylight.CGRect = undefined;
+            trace.countSkylight();
             if (sky.getWindowBounds(conn, wid, &rect) != 0) {
                 should_remove = true;
                 log.debug("cleanup: removing wid={d} pid={d} reason=missing-windowserver", .{ wid, pid });
@@ -5604,6 +5702,7 @@ fn restoreFloatingWindows(ws: state_mod.SpaceRef, display: shim.bw_frame, conten
         }
 
         var rect: skylight.CGRect = undefined;
+        trace.countSkylight();
         if (sky.getWindowBounds(conn, wid, &rect) != 0) continue;
 
         const center_x = rect.origin.x + rect.size.width / 2.0;
@@ -5657,6 +5756,9 @@ fn retileDisplay(display_id: u32) void {
     const ws = spaceForWorkspace(display_id, ws_id) orelse return;
     const display_slot = displayIndexById(display_id) orelse return;
     const display = g_displays[display_slot].visible;
+
+    const span = trace.begin("retile display");
+    defer _ = span.endIfSlow();
 
     ax_mod.beginGeometryBatch();
     defer ax_mod.endGeometryBatch();

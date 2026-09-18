@@ -44,4 +44,6 @@ pub const Event = extern struct {
     kind: EventKind,
     pid: i32,
     wid: u32,
+    /// Monotonic publication time; zero when the producer does not set it.
+    enqueued_ns: i64 = 0,
 };

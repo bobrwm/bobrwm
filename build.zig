@@ -553,6 +553,21 @@ pub fn build(b: *std.Build) !void {
 
     const run_logging_tests = b.addRunArtifact(logging_tests);
 
+    // trace.zig is pure Zig over libc (osutil's clock), so no SDK wiring.
+    const trace_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/trace.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+
+    const trace_tests = b.addTest(.{
+        .name = "trace-tests",
+        .root_module = trace_test_mod,
+    });
+
+    const run_trace_tests = b.addRunArtifact(trace_tests);
+
     const swipe_test_mod = b.createModule(.{
         .root_source_file = b.path("packages/bobrwm-swipe/src/main.zig"),
         .target = target,
@@ -596,6 +611,7 @@ pub fn build(b: *std.Build) !void {
     test_step.dependOn(&run_statusbar_tests.step);
     test_step.dependOn(&run_dim_tests.step);
     test_step.dependOn(&run_logging_tests.step);
+    test_step.dependOn(&run_trace_tests.step);
     test_step.dependOn(&run_swipe_tests.step);
 }
 

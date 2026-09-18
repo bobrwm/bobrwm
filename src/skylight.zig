@@ -3,6 +3,7 @@ const cg_extra = @import("cg_extra");
 const c = @import("c");
 const objc = @import("objc");
 const native_gesture = @import("native_gesture.zig");
+const trace = @import("trace.zig");
 const log = std.log.scoped(.skylight);
 
 const CFArrayRef = *const anyopaque;
@@ -160,6 +161,7 @@ pub const SkyLight = struct {
     /// Copy the native Space topology for reuse across one reconciliation pass.
     pub fn nativeSpaceTopology(self: *const SkyLight) ?NativeSpaceTopology {
         const copy_spaces = self.copyManagedDisplaySpaces orelse return null;
+        trace.countSkylight();
         const displays = copy_spaces(self.mainConnectionID()) orelse return null;
         return NativeSpaceTopology.init(displays) orelse {
             c.CFRelease(displays);
@@ -206,6 +208,7 @@ pub const SkyLight = struct {
         if (operation.value == null) return null;
         defer operation.msgSend(void, "release", .{});
 
+        trace.countSkylight();
         const result = operation.msgSend(objc.Object, "performWithWMBridgeDelegate", .{});
         if (result.value == null) return null;
         const space_id = result.msgSend(u64, "spaceID", .{});
@@ -224,6 +227,7 @@ pub const SkyLight = struct {
         if (operation.value == null) return false;
         defer operation.msgSend(void, "release", .{});
 
+        trace.countSkylight();
         operation.msgSend(void, "performWithWMBridgeDelegate", .{});
         return true;
     }
@@ -235,6 +239,7 @@ pub const SkyLight = struct {
         defer c.CFRelease(uuid);
         const name = c.CFUUIDCreateString(null, uuid) orelse return null;
         defer c.CFRelease(name);
+        trace.countSkylight();
         return query(self.mainConnectionID(), name);
     }
 
@@ -286,16 +291,19 @@ pub const SkyLight = struct {
             // The operation's own bridge keeps the move durable across later
             // Space switches; the local symbol remains a compatibility path.
             if (self.bridgedMoveSelectorSupported) {
+                trace.countSkylight();
                 operation.msgSend(void, "performWithWMBridgeDelegate", .{});
                 return true;
             }
             if (self.performBridgedMove) |perform| {
+                trace.countSkylight();
                 _ = perform(operation.value);
                 return true;
             }
         }
 
         const move = self.moveWindowsToManagedSpace orelse return false;
+        trace.countSkylight();
         move(self.mainConnectionID(), windows, space_id);
         return true;
     }
@@ -307,6 +315,7 @@ pub const SkyLight = struct {
         var values = [_]?*const anyopaque{number};
         const windows = c.CFArrayCreate(null, &values, 1, &c.kCFTypeArrayCallBacks) orelse return null;
         defer c.CFRelease(windows);
+        trace.countSkylight();
         const spaces = copy_spaces(self.mainConnectionID(), 0x7, windows) orelse return null;
         defer c.CFRelease(spaces);
 
@@ -370,6 +379,7 @@ pub const NativeSpaceTopology = struct {
         var values = [_]?*const anyopaque{number};
         const windows = c.CFArrayCreate(null, &values, 1, &c.kCFTypeArrayCallBacks) orelse return null;
         defer c.CFRelease(windows);
+        trace.countSkylight();
         const window_spaces = copy_window_spaces(sky.mainConnectionID(), 0x7, windows) orelse return null;
         defer c.CFRelease(window_spaces);
 
