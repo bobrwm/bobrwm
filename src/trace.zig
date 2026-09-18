@@ -122,8 +122,14 @@ pub const Span = struct {
     /// that run at poll cadence, where a line per tick would bury the ones
     /// that matter.
     pub fn endIfSlow(self: Span) u64 {
+        return self.endIfSlowerThan(frame_budget_us);
+    }
+
+    /// `endIfSlow` against a caller's own threshold, for work whose normal
+    /// cost is already known and is not one frame.
+    pub fn endIfSlowerThan(self: Span, threshold_us: u64) u64 {
         const elapsed_us = self.elapsedUs();
-        if (elapsed_us >= frame_budget_us) self.report(elapsed_us);
+        if (elapsed_us >= threshold_us) self.report(elapsed_us);
         return elapsed_us;
     }
 

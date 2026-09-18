@@ -244,10 +244,35 @@ fn cachedElement(pid: i32, wid: u32) ?c.AXUIElementRef {
     return entry.element;
 }
 
+/// Ceiling on one AX message to another process.
+///
+/// Every geometry write blocks the main thread until the target app answers,
+/// and a retile issues several per window: an app that stops answering would
+/// otherwise hang the window manager for the system default of six seconds.
+/// Set well above what a merely busy app costs — writes into an app opening a
+/// window were measured around 43ms each — so this bounds a hang without
+/// rejecting work that would have succeeded.
+const geometry_ax_timeout_s: f32 = 0.1;
+
+/// A write slower than this is worth naming: it is the app's responsiveness,
+/// not our own work, and it is otherwise invisible inside an aggregate span.
+const slow_write_us: u64 = 40_000;
+
+/// Application element with its messaging bounded. Callers own the reference.
+fn boundedApp(pid: i32) ?c.AXUIElementRef {
+    const app = c.AXUIElementCreateApplication(pid) orelse return null;
+    _ = c.AXUIElementSetMessagingTimeout(app, geometry_ax_timeout_s);
+    return app;
+}
+
 /// Resolve (pid, wid) through findWindow and cache it, evicting whatever
 /// shared its slot. Borrowed — the cache owns the reference.
 fn resolveElement(pid: i32, wid: u32) ?c.AXUIElementRef {
-    const element = findWindow(pid, wid) orelse return null;
+    // Bounded, and not only for the write that follows: the enumeration this
+    // does is itself a message into the app, and the cache outlives this call,
+    // so resolving through the timeout variant bounds every later use of the
+    // element without threading a timeout through each call site.
+    const element = findWindowWithMessagingTimeout(pid, wid, geometry_ax_timeout_s) orelse return null;
 
     const slot = elementCacheSlot(wid);
     if (g_element_cache[slot]) |evicted| c.CFRelease(@ptrCast(evicted.element));
@@ -527,7 +552,7 @@ fn restoreEnhancedUiBatch() void {
     if (!batch.was_enabled) return;
 
     const ax = strings() orelse return;
-    const app = c.AXUIElementCreateApplication(batch.pid) orelse return;
+    const app = boundedApp(batch.pid) orelse return;
     defer c.CFRelease(@ptrCast(app));
 
     _ = countedSet(app, ax.enhanced_ui_attr, c.kCFBooleanTrue);
@@ -552,7 +577,7 @@ pub fn setWindowFrame(pid: i32, wid: u32, x: f64, y: f64, w: f64, h: f64) bool {
 
     const ax = strings() orelse return false;
 
-    const app = c.AXUIElementCreateApplication(pid) orelse return false;
+    const app = boundedApp(pid) orelse return false;
     defer c.CFRelease(@ptrCast(app));
 
     const position: c.CGPoint = .{ .x = x, .y = y };
@@ -586,6 +611,9 @@ fn writeFrame(
     position_value: c.AXValueRef,
     size_value: c.AXValueRef,
 ) c.AXError {
+    const span = trace.beginWindow("ax frame write", pid, 0);
+    defer _ = span.endIfSlowerThan(slow_write_us);
+
     const owns_restore = suspendEnhancedUi(app, pid, ax);
     defer if (owns_restore) {
         _ = countedSet(app, ax.enhanced_ui_attr, c.kCFBooleanTrue);
@@ -609,7 +637,7 @@ pub fn setWindowPosition(pid: i32, wid: u32, x: f64, y: f64) bool {
 
     const ax = strings() orelse return false;
 
-    const app = c.AXUIElementCreateApplication(pid) orelse return false;
+    const app = boundedApp(pid) orelse return false;
     defer c.CFRelease(@ptrCast(app));
 
     const position: c.CGPoint = .{ .x = x, .y = y };
@@ -663,7 +691,7 @@ pub fn animationBegin(pid: i32, wid: u32) ?AnimationHandle {
 
     var restore_enhanced_ui = false;
     if (strings()) |ax| {
-        if (c.AXUIElementCreateApplication(pid)) |app| {
+        if (boundedApp(pid)) |app| {
             defer c.CFRelease(@ptrCast(app));
             if (shouldSuspendEnhancedUi(app, pid, ax)) {
                 _ = countedSet(app, ax.enhanced_ui_attr, c.kCFBooleanFalse);
@@ -703,7 +731,7 @@ pub fn animationEnd(handle: AnimationHandle) void {
     c.CFRelease(@ptrCast(handle.win));
     if (handle.restore_enhanced_ui) {
         const ax = strings() orelse return;
-        const app = c.AXUIElementCreateApplication(handle.pid) orelse return;
+        const app = boundedApp(handle.pid) orelse return;
         defer c.CFRelease(@ptrCast(app));
         _ = countedSet(app, ax.enhanced_ui_attr, c.kCFBooleanTrue);
     }
