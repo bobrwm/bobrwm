@@ -165,9 +165,11 @@ pub const SkyLight = struct {
     /// free lookup its call sites read like. The topology poll runs it once a
     /// second for the process lifetime, so it must show up in a span's cost.
     pub fn nativeSpaceTopology(self: *const SkyLight) ?NativeSpaceTopology {
-        trace.countSkylight();
         const copy_spaces = self.copyManagedDisplaySpaces orelse return null;
-        const displays = copy_spaces(self.mainConnectionID()) orelse return null;
+        const copy = trace.call(.skylight);
+        const copied = copy_spaces(self.mainConnectionID());
+        _ = copy.finish();
+        const displays = copied orelse return null;
         return NativeSpaceTopology.init(displays) orelse {
             c.CFRelease(displays);
             return null;

@@ -138,7 +138,7 @@ Bobrwm reconciles AX, WindowServer/CG, SkyLight, and internal workspace/layout s
 
 **Focus reconciliation:** Unknown focused window IDs should go through the tab-aware reconciliation path before falling back to broad discovery. Broad discovery during a workspace switch can assign ownership from the wrong active workspace.
 
-**Diagnostics:** Keep high-signal transition, cleanup, tab, and AX-reconciliation logs as `log.debug`; they are useful for reproducing event-order bugs and compile away when debug logging is disabled. Use `log.warn` only for failed repair paths or invariants that require attention, such as watchdog expiry or failed cleanup/replacement.
+**Diagnostics:** Keep high-signal transition, cleanup, tab, and AX-reconciliation logs as `log.debug`; they are useful for reproducing event-order bugs and compile away when debug logging is disabled. Use `log.warn` only for failed repair paths or invariants that require attention, such as watchdog expiry or failed cleanup/replacement. Debug lines never reach stderr outside a Debug build: a pty blocks `write(2)` after ~1 KiB and bobrwm manages the terminal it logs into. Read them with `log stream --level debug --predicate 'subsystem == "com.bobrwm.bobrwm"'` or by tailing the file `filelog.init` reports at startup; `BOBRWM_LOG=no-stderr,no-macos` toggles sinks.
 
 ## Verification for Window-Management Changes
 
