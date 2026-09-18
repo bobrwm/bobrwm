@@ -44,4 +44,11 @@ pub const Event = extern struct {
     kind: EventKind,
     pid: i32,
     wid: u32,
+    /// Monotonic nanoseconds at the moment the producer published the event.
+    ///
+    /// Separates the two halves of "this felt slow": time spent waiting behind
+    /// the drain of earlier events, and time spent handling this one. Only the
+    /// second is bobrwm's own work, and only the first grows when an unrelated
+    /// app's AX server blocks the main thread. 0 when unset.
+    enqueued_ns: i64 = 0,
 };

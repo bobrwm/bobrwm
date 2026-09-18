@@ -2010,6 +2010,7 @@ export fn bw_emit_event(kind: u8, pid: i32, wid: u32) void {
         .kind = @enumFromInt(kind),
         .pid = pid,
         .wid = wid,
+        .enqueued_ns = @truncate(nanoTimestamp()),
     };
 
     c.os_unfair_lock_lock(&g_ring_lock);
@@ -2276,12 +2277,19 @@ fn bw_drain_events() void {
     g_event_drain_active = true;
     defer g_event_drain_active = false;
 
+    // Spans the whole drain, not just the event loop: the settle work below
+    // (retile, cleanup, dimming) runs before the run loop can service anything
+    // else, so from the user's side it is part of the same unresponsive gap.
+    const drain_span = trace.begin("drain");
+
     if (!nativeSwitchPending()) {
         refreshTabGroupActiveTabs();
     }
 
+    var handled: u32 = 0;
     while (g_event_queue.pop()) |ev| {
-        handleEvent(&ev);
+        handleTracedEvent(&ev);
+        handled += 1;
     }
     drainIpcRequests();
 
@@ -2305,6 +2313,64 @@ fn bw_drain_events() void {
     if (dim.enabled and !nativeSwitchPending()) {
         pushDimSnapshot();
     }
+
+    // An idle waker (a signal with nothing queued) is the common case, and a
+    // line per occurrence would drown the drains that did work.
+    if (handled == 0 and drain_span.cost().total() == 0) return;
+    const elapsed_us = drain_span.elapsedUs();
+    const spent = drain_span.cost();
+    const ms = trace.Millis.from(elapsed_us);
+    log.debug("drain: {d} events in {d}.{d:0>3}ms ax={d} sky={d} cg={d}{s}", .{
+        handled,
+        ms.whole,
+        ms.frac,
+        spent.ax,
+        spent.skylight,
+        spent.window_list,
+        if (elapsed_us >= trace.frame_budget_us) " SLOW" else "",
+    });
+}
+
+/// Handle one event and record what it cost.
+///
+/// `queued` is how long the event sat behind earlier work, `took` is this
+/// event's own handling. When a new window feels slow, exactly one of the two
+/// is large, and which one it is decides where to look: a large `queued` means
+/// some earlier event monopolized the main thread, a large `took` with a high
+/// `ax` count means this event's own AX queries did.
+fn handleTracedEvent(ev: *const event_mod.Event) void {
+    const span = trace.beginWindow(@tagName(ev.kind), ev.pid, ev.wid);
+    handleEvent(ev);
+
+    const elapsed_us = span.elapsedUs();
+    const spent = span.cost();
+
+    // Poll ticks that found nothing to do are the bulk of all events and say
+    // nothing; anything that reached out of the process is worth a line.
+    const idle_tick = (ev.kind == .role_poll_tick or ev.kind == .native_topology_poll_tick) and
+        elapsed_us < trace.frame_budget_us and spent.total() == 0;
+    if (idle_tick) return;
+
+    const queued_us: u64 = if (ev.enqueued_ns == 0) 0 else blk: {
+        const waited_ns = @as(i64, @truncate(span.start_ns)) - ev.enqueued_ns;
+        break :blk if (waited_ns <= 0) 0 else @intCast(@divTrunc(waited_ns, std.time.ns_per_us));
+    };
+
+    const queued = trace.Millis.from(queued_us);
+    const took = trace.Millis.from(elapsed_us);
+    log.debug("event {s} pid={d} wid={d} queued={d}.{d:0>3}ms took={d}.{d:0>3}ms ax={d} sky={d} cg={d}{s}", .{
+        @tagName(ev.kind),
+        ev.pid,
+        ev.wid,
+        queued.whole,
+        queued.frac,
+        took.whole,
+        took.frac,
+        spent.ax,
+        spent.skylight,
+        spent.window_list,
+        if (elapsed_us >= trace.frame_budget_us) " SLOW" else "",
+    });
 }
 
 /// A dropped event has unknown semantics, so recover from authoritative OS
