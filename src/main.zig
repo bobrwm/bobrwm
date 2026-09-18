@@ -332,6 +332,9 @@ fn isVisibleManaged(win: *const window_mod.Window) bool {
 /// directly (no WindowServer round-trip): retile and move/resize events have
 /// already synchronized them by the time this runs at the end of the drain.
 fn pushDimSnapshot() void {
+    const span = trace.begin("dim snapshot");
+    defer _ = span.endIfSlow();
+
     // Precondition: callers gate on dim.enabled, so the disabled feature never
     // reaches the window-scan loops below. Assert rather than early-return so
     // the invariant is documented and compiles out in release builds.
@@ -1075,6 +1078,11 @@ fn requestOffscreenCleanup() void {
 }
 
 fn flushCleanupRequests() void {
+    // dispatchStateEvent drains its effects synchronously, so cleanup's AX
+    // and WindowServer work is inside this span rather than behind a queue.
+    const span = trace.begin("flush cleanup");
+    defer _ = span.endIfSlow();
+
     dispatchStateEvent(.flush_cleanup_requests);
 }
 
@@ -2549,6 +2557,9 @@ fn handleIpcRequest(request: ipc_transport.Request) void {
 }
 
 fn drainIpcRequests() void {
+    const span = trace.begin("ipc");
+    defer _ = span.endIfSlow();
+
     while (g_ipc_transport.pop()) |request| {
         handleIpcRequest(request);
     }
@@ -2936,6 +2947,9 @@ fn requestRetileAllDisplays() void {
 }
 
 fn flushRetileRequests() void {
+    const span = trace.begin("flush retile");
+    defer _ = span.endIfSlow();
+
     dispatchStateEvent(.flush_retile_requests);
 }
 
