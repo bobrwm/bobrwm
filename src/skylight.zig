@@ -3,6 +3,7 @@ const cg_extra = @import("cg_extra");
 const c = @import("c");
 const objc = @import("objc");
 const native_gesture = @import("native_gesture.zig");
+const trace = @import("trace.zig");
 const log = std.log.scoped(.skylight);
 
 const CFArrayRef = *const anyopaque;
@@ -158,7 +159,13 @@ pub const SkyLight = struct {
     }
 
     /// Copy the native Space topology for reuse across one reconciliation pass.
+    ///
+    /// SLSCopyManagedDisplaySpaces returns a dictionary per Space of every
+    /// display, so this is a WindowServer round trip plus CF parsing — not the
+    /// free lookup its call sites read like. The topology poll runs it once a
+    /// second for the process lifetime, so it must show up in a span's cost.
     pub fn nativeSpaceTopology(self: *const SkyLight) ?NativeSpaceTopology {
+        trace.countSkylight();
         const copy_spaces = self.copyManagedDisplaySpaces orelse return null;
         const displays = copy_spaces(self.mainConnectionID()) orelse return null;
         return NativeSpaceTopology.init(displays) orelse {

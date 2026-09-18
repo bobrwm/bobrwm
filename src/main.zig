@@ -2290,7 +2290,13 @@ fn bw_drain_events() void {
     }
 
     var handled: u32 = 0;
+    // Most drains carry exactly one event, and the events that wake the loop
+    // without doing anything are precisely the ones handleTracedEvent filters
+    // out — so without naming the first one here, a log full of drains cannot
+    // say which timer is waking us.
+    var first_kind: []const u8 = "none";
     while (g_event_queue.pop()) |ev| {
+        if (handled == 0) first_kind = @tagName(ev.kind);
         handleTracedEvent(&ev);
         handled += 1;
     }
@@ -2323,8 +2329,9 @@ fn bw_drain_events() void {
     const elapsed_us = drain_span.elapsedUs();
     const spent = drain_span.cost();
     const ms = trace.Millis.from(elapsed_us);
-    log.debug("drain: {d} events in {d}.{d:0>3}ms ax={d} sky={d} cg={d}{s}", .{
+    log.debug("drain: {d} events from {s} in {d}.{d:0>3}ms ax={d} sky={d} cg={d}{s}", .{
         handled,
+        first_kind,
         ms.whole,
         ms.frac,
         spent.ax,
