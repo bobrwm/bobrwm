@@ -414,6 +414,26 @@ fn focusedWindowIdForLoggedEvent(comptime event_name: []const u8, pid: i32) ?u32
     return focused_wid;
 }
 
+/// Prefer the window id the AX notification carried over asking the app again.
+///
+/// The observer resolves it on its own thread from the element the
+/// notification delivered, so the common path costs nothing here. Falling back
+/// to AXFocusedWindow keeps the answer for the case the observer could not
+/// resolve — an element whose CGWindowID is not assigned yet.
+///
+/// The two are not identical: the carried id is the window that became
+/// focused, while the fallback is whatever is focused by the time this drains.
+/// The carried one is the better answer, because it is the event being
+/// handled; a focus change that superseded it has its own notification behind
+/// this one in the queue.
+fn focusedWindowIdForEvent(comptime event_name: []const u8, pid: i32, event_wid: u32) ?u32 {
+    if (event_wid != 0) {
+        log.debug(event_name ++ " pid={} wid={} (from notification)", .{ pid, event_wid });
+        return event_wid;
+    }
+    return focusedWindowIdForLoggedEvent(event_name, pid);
+}
+
 fn managedLeaderForFocusedWindow(pid: i32, focused_wid: u32) ?window_mod.Window {
     std.debug.assert(pid > 0);
     std.debug.assert(focused_wid != 0);
@@ -3001,7 +3021,7 @@ fn handleEvent(ev: *const event_mod.Event) void {
             }
         },
         .focused_window_changed => {
-            const focused_wid_opt = focusedWindowIdForLoggedEvent("focused window changed", ev.pid);
+            const focused_wid_opt = focusedWindowIdForEvent("focused window changed", ev.pid, ev.wid);
             if (!g_state.isWorkspaceTransitionActive()) {
                 requestCleanupForPid(ev.pid);
                 requestOffscreenCleanup();
