@@ -4510,17 +4510,27 @@ fn discoverWindowsImpl(should_refresh_tabs: bool) usize {
     // A multi-step native switch exposes intermediate Spaces long enough for
     // CG and AX discovery. Adopt only after SkyLight confirms the destination.
     if (nativeSwitchPending()) return 0;
-    const started_ns = nanoTimestamp();
 
+    // Split three ways because the phases fail for different reasons:
+    // enumeration is one WindowServer list copy, the tab refresh reads every
+    // group leader's tab bar over AX, and adoption runs the role gate — also
+    // AX — once per candidate window. The round trips are attributed to the
+    // whole, since the outer span is the only one still open at the end.
+    const span = trace.begin("discover");
+    const enumerate_span = trace.begin("discover enumerate");
     var buf: [256]shim.bw_window_info = undefined;
     var on_screen: OnScreenWindows = .{};
     const discovery = bw_discover_windows(&buf, if (should_refresh_tabs) &on_screen else null);
-    const enumerated_ns = nanoTimestamp();
+    const enumerate_us = enumerate_span.elapsedUs();
     if (discovery.truncated) {
         log.warn("window discovery truncated limit={d}; excess windows remain unmanaged", .{buf.len});
     }
+
+    const tabs_span = trace.begin("discover tabs");
     if (should_refresh_tabs) refreshTabGroupActiveTabsFromSnapshot(&on_screen);
-    const tabs_refreshed_ns = nanoTimestamp();
+    const tabs_us = tabs_span.elapsedUs();
+
+    const adopt_span = trace.begin("discover adopt");
     var observed_pids: [128]i32 = undefined;
     var observed_pid_count: usize = 0;
     var adopted_count: usize = 0;
@@ -4627,14 +4637,22 @@ fn discoverWindowsImpl(should_refresh_tabs: bool) usize {
         recordWorkspaceFocus(active_ws, active_windows.items()[0]);
     }
 
-    const completed_ns = nanoTimestamp();
-    log.debug("[trace] window discovery candidates={} adopted={} enumerate_ms={} tabs_ms={} adopt_ms={}", .{
-        discovery.count,
-        adopted_count,
-        @divTrunc(enumerated_ns - started_ns, std.time.ns_per_ms),
-        @divTrunc(tabs_refreshed_ns - enumerated_ns, std.time.ns_per_ms),
-        @divTrunc(completed_ns - tabs_refreshed_ns, std.time.ns_per_ms),
-    });
+    const adopt_us = adopt_span.elapsedUs();
+    const enumerate_ms = trace.Millis.from(enumerate_us);
+    const tabs_ms = trace.Millis.from(tabs_us);
+    const adopt_ms = trace.Millis.from(adopt_us);
+    const spent = span.cost();
+    log.debug(
+        "discover: candidates={d} adopted={d} enumerate={d}.{d:0>3}ms tabs={d}.{d:0>3}ms adopt={d}.{d:0>3}ms ax={d} sky={d} cg={d}",
+        .{
+            discovery.count,    adopted_count,
+            enumerate_ms.whole, enumerate_ms.frac,
+            tabs_ms.whole,      tabs_ms.frac,
+            adopt_ms.whole,     adopt_ms.frac,
+            spent.ax,           spent.skylight,
+            spent.window_list,
+        },
+    );
     return adopted_count;
 }
 
@@ -4932,6 +4950,11 @@ fn addNewWindow(pid: i32, wid: u32) void {
 /// screen cannot have changed selection, so the AX work only happens on an actual
 /// switch. Only the active tab moves here; membership is decided elsewhere.
 fn refreshTabGroupActiveTabs() void {
+    // Opens every drain, so its cost is charged to whatever event follows it
+    // unless it is measured here.
+    const span = trace.begin("tab bar refresh");
+    defer _ = span.endIfSlow();
+
     const on_screen = OnScreenWindows.snapshot();
     refreshTabGroupActiveTabsFromSnapshot(&on_screen);
 }
@@ -5742,6 +5765,10 @@ fn retileDisplay(display_id: u32) void {
     const ws = spaceForWorkspace(display_id, ws_id) orelse return;
     const display_slot = displayIndexById(display_id) orelse return;
     const display = g_displays[display_slot].visible;
+
+    // Retiles run on every layout change, so only overruns are worth a line.
+    const span = trace.begin("retile display");
+    defer _ = span.endIfSlow();
 
     ax_mod.beginGeometryBatch();
     defer ax_mod.endGeometryBatch();
