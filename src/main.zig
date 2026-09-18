@@ -29,6 +29,7 @@ const animation_mod = @import("animation.zig");
 const ax_mod = @import("ax.zig");
 const geometry_mod = @import("geometry.zig");
 const spsc_queue = @import("spsc_queue.zig");
+const trace = @import("trace.zig");
 
 extern fn _AXUIElementGetWindow(element: c.AXUIElementRef, wid: *u32) c.AXError;
 
@@ -684,6 +685,7 @@ fn reconcileVisibleFramesFromWindowServer() void {
         if (!isVisibleManaged(&win)) continue;
 
         var rect: skylight.CGRect = undefined;
+        trace.countSkylight();
         if (sky.getWindowBounds(conn, win.wid, &rect) != 0) continue;
 
         const frame: window_mod.Window.Frame = .{
@@ -917,6 +919,7 @@ fn inferDisplayIdForWindow(wid: u32) ?u32 {
 fn liveWindowFrame(wid: u32) ?window_mod.Window.Frame {
     const sky = g_sky orelse return null;
     var rect: skylight.CGRect = undefined;
+    trace.countSkylight();
     if (sky.getWindowBounds(sky.mainConnectionID(), wid, &rect) != 0) return null;
     return .{
         .x = rect.origin.x,
@@ -1209,6 +1212,7 @@ fn bw_ax_get_focused_window(pid: i32) u32 {
     const focused_attr = ax.focused_window_attr;
 
     var focused: c.AXUIElementRef = null;
+    trace.countAxN(2);
     const err = c.AXUIElementCopyAttributeValue(
         app,
         focused_attr,
@@ -1230,6 +1234,7 @@ fn bw_is_window_on_screen(target_wid: u32) bool {
 
     const options: cg_extra.CGWindowListOption =
         cg_extra.kCGWindowListOptionOnScreenOnly | cg_extra.kCGWindowListExcludeDesktopElements;
+    trace.countWindowList();
     const list = cg_extra.CGWindowListCopyWindowInfo(options, cg_extra.kCGNullWindowID) orelse return false;
     defer c.CFRelease(@ptrCast(list));
 
@@ -1270,6 +1275,7 @@ fn cgWindowInfoVisible(info: c.CFDictionaryRef) bool {
 fn managedWindowAtPoint(point: c.CGPoint) ?u32 {
     const options: cg_extra.CGWindowListOption =
         cg_extra.kCGWindowListOptionOnScreenOnly | cg_extra.kCGWindowListExcludeDesktopElements;
+    trace.countWindowList();
     const list = cg_extra.CGWindowListCopyWindowInfo(options, cg_extra.kCGNullWindowID) orelse return null;
     defer c.CFRelease(@ptrCast(list));
 
@@ -1325,6 +1331,7 @@ fn bw_get_app_window_ids(pid: i32, out: []u32) BoundedSnapshotResult {
     const windows_attr = ax.windows_attr;
 
     var windows: c.CFArrayRef = null;
+    trace.countAx();
     const err = c.AXUIElementCopyAttributeValue(
         app,
         windows_attr,
@@ -1337,6 +1344,7 @@ fn bw_get_app_window_ids(pid: i32, out: []u32) BoundedSnapshotResult {
     var written: usize = 0;
     const total = c.CFArrayGetCount(windows_ref);
     std.debug.assert(total >= 0);
+    trace.countAxN(@intCast(@max(total, 0)));
 
     var i: c.CFIndex = 0;
     var truncated = false;
@@ -1489,6 +1497,7 @@ fn manageStateForWindowWithMessagingTimeout(pid: i32, wid: u32, timeout_seconds:
 
     const role_attr = ax.role_attr;
     var role_any: c.CFTypeRef = null;
+    trace.countAx();
     const role_err = c.AXUIElementCopyAttributeValue(win_ref, role_attr, @ptrCast(&role_any));
     if (role_err != c.kAXErrorSuccess or role_any == null) return shim.BW_MANAGE_PENDING;
     const role_ref: c.CFStringRef = @ptrCast(role_any orelse return shim.BW_MANAGE_PENDING);
@@ -1505,6 +1514,7 @@ fn manageStateForWindowWithMessagingTimeout(pid: i32, wid: u32, timeout_seconds:
 
     const subrole_attr = ax.subrole_attr;
     var subrole_any: c.CFTypeRef = null;
+    trace.countAx();
     const subrole_err = c.AXUIElementCopyAttributeValue(win_ref, subrole_attr, @ptrCast(&subrole_any));
     if (subrole_err != c.kAXErrorSuccess or subrole_any == null) return shim.BW_MANAGE_PENDING;
     const subrole_ref: c.CFStringRef = @ptrCast(subrole_any orelse return shim.BW_MANAGE_PENDING);
@@ -1556,6 +1566,7 @@ fn windowHasRealWindowSignal(win: c.AXUIElementRef, ax: *const AxStrings) bool {
 /// True when the AX attribute exists and is non-null on the element.
 fn axAttributePresent(win: c.AXUIElementRef, attr: c.CFStringRef) bool {
     var value: c.CFTypeRef = null;
+    trace.countAx();
     const err = c.AXUIElementCopyAttributeValue(win, attr, &value);
     if (err != c.kAXErrorSuccess or value == null) return false;
     c.CFRelease(value.?);
@@ -1565,6 +1576,7 @@ fn axAttributePresent(win: c.AXUIElementRef, attr: c.CFStringRef) bool {
 /// True when the AX attribute is a CFBoolean set to true.
 fn axBooleanAttributeTrue(win: c.AXUIElementRef, attr: c.CFStringRef) bool {
     var value: c.CFTypeRef = null;
+    trace.countAx();
     const err = c.AXUIElementCopyAttributeValue(win, attr, &value);
     if (err != c.kAXErrorSuccess or value == null) return false;
     defer c.CFRelease(value.?);
@@ -1594,6 +1606,7 @@ fn bw_discover_windows(out: []shim.bw_window_info, on_screen: ?*OnScreenWindows)
 
     const options: cg_extra.CGWindowListOption =
         cg_extra.kCGWindowListOptionOnScreenOnly | cg_extra.kCGWindowListExcludeDesktopElements;
+    trace.countWindowList();
     const window_list = cg_extra.CGWindowListCopyWindowInfo(options, cg_extra.kCGNullWindowID) orelse
         return .{ .count = 0, .truncated = false };
     defer c.CFRelease(@ptrCast(window_list));
@@ -4574,6 +4587,7 @@ const OnScreenWindows = struct {
 
         const options: cg_extra.CGWindowListOption =
             cg_extra.kCGWindowListOptionOnScreenOnly | cg_extra.kCGWindowListExcludeDesktopElements;
+        trace.countWindowList();
         const list = cg_extra.CGWindowListCopyWindowInfo(options, cg_extra.kCGNullWindowID) orelse return self;
         defer c.CFRelease(@ptrCast(list));
 
@@ -4716,6 +4730,7 @@ fn addNewWindowManagedWithAssignment(pid: i32, wid: u32, assigned_space: state_m
     const display_id = assigned_space.display_id;
     if (g_sky) |sky| {
         var rect: skylight.CGRect = undefined;
+        trace.countSkylight();
         if (sky.getWindowBounds(sky.mainConnectionID(), wid, &rect) == 0) {
             window_frame = .{
                 .x = rect.origin.x,
@@ -5133,6 +5148,7 @@ fn cleanupWorkspaceWindowsForPid(pid: i32) bool {
 
             var should_remove = false;
             var rect: skylight.CGRect = undefined;
+            trace.countSkylight();
             if (sky.getWindowBounds(conn, wid, &rect) != 0) {
                 should_remove = true;
                 log.debug("cleanup: removing wid={d} pid={d} reason=missing-windowserver", .{ wid, pid });
@@ -5606,6 +5622,7 @@ fn restoreFloatingWindows(ws: state_mod.SpaceRef, display: shim.bw_frame, conten
         }
 
         var rect: skylight.CGRect = undefined;
+        trace.countSkylight();
         if (sky.getWindowBounds(conn, wid, &rect) != 0) continue;
 
         const center_x = rect.origin.x + rect.size.width / 2.0;
