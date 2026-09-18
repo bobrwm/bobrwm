@@ -332,6 +332,9 @@ fn isVisibleManaged(win: *const window_mod.Window) bool {
 /// directly (no WindowServer round-trip): retile and move/resize events have
 /// already synchronized them by the time this runs at the end of the drain.
 fn pushDimSnapshot() void {
+    const span = trace.begin("dim snapshot");
+    defer _ = span.endIfSlow();
+
     // Precondition: callers gate on dim.enabled, so the disabled feature never
     // reaches the window-scan loops below. Assert rather than early-return so
     // the invariant is documented and compiles out in release builds.
@@ -409,6 +412,26 @@ fn focusedWindowIdForLoggedEvent(comptime event_name: []const u8, pid: i32) ?u32
     const focused_wid = focusedWindowIdForPid(pid);
     log.debug(event_name ++ " pid={} wid={}", .{ pid, focused_wid orelse 0 });
     return focused_wid;
+}
+
+/// Prefer the window id the AX notification carried over asking the app again.
+///
+/// The observer resolves it on its own thread from the element the
+/// notification delivered, so the common path costs nothing here. Falling back
+/// to AXFocusedWindow keeps the answer for the case the observer could not
+/// resolve — an element whose CGWindowID is not assigned yet.
+///
+/// The two are not identical: the carried id is the window that became
+/// focused, while the fallback is whatever is focused by the time this drains.
+/// The carried one is the better answer, because it is the event being
+/// handled; a focus change that superseded it has its own notification behind
+/// this one in the queue.
+fn focusedWindowIdForEvent(comptime event_name: []const u8, pid: i32, event_wid: u32) ?u32 {
+    if (event_wid != 0) {
+        log.debug(event_name ++ " pid={} wid={} (from notification)", .{ pid, event_wid });
+        return event_wid;
+    }
+    return focusedWindowIdForLoggedEvent(event_name, pid);
 }
 
 fn managedLeaderForFocusedWindow(pid: i32, focused_wid: u32) ?window_mod.Window {
@@ -1075,6 +1098,11 @@ fn requestOffscreenCleanup() void {
 }
 
 fn flushCleanupRequests() void {
+    // dispatchStateEvent drains its effects synchronously, so cleanup's AX
+    // and WindowServer work is inside this span rather than behind a queue.
+    const span = trace.begin("flush cleanup");
+    defer _ = span.endIfSlow();
+
     dispatchStateEvent(.flush_cleanup_requests);
 }
 
@@ -2549,6 +2577,9 @@ fn handleIpcRequest(request: ipc_transport.Request) void {
 }
 
 fn drainIpcRequests() void {
+    const span = trace.begin("ipc");
+    defer _ = span.endIfSlow();
+
     while (g_ipc_transport.pop()) |request| {
         handleIpcRequest(request);
     }
@@ -2936,6 +2967,9 @@ fn requestRetileAllDisplays() void {
 }
 
 fn flushRetileRequests() void {
+    const span = trace.begin("flush retile");
+    defer _ = span.endIfSlow();
+
     dispatchStateEvent(.flush_retile_requests);
 }
 
@@ -2987,7 +3021,7 @@ fn handleEvent(ev: *const event_mod.Event) void {
             }
         },
         .focused_window_changed => {
-            const focused_wid_opt = focusedWindowIdForLoggedEvent("focused window changed", ev.pid);
+            const focused_wid_opt = focusedWindowIdForEvent("focused window changed", ev.pid, ev.wid);
             if (!g_state.isWorkspaceTransitionActive()) {
                 requestCleanupForPid(ev.pid);
                 requestOffscreenCleanup();
@@ -3025,7 +3059,7 @@ fn handleEvent(ev: *const event_mod.Event) void {
                 return;
             }
 
-            addNewWindow(ev.pid, ev.wid);
+            addNewWindow(ev.pid, ev.wid, .needed);
             retile();
         },
         .window_destroyed => {
@@ -3922,7 +3956,7 @@ fn executeWindowMoved(move: state_mod.WindowMoveEffect) void {
 }
 
 fn executePendingRoleReady(candidate: state_mod.WindowCandidate) void {
-    if (!addNewWindowManaged(candidate.process_id, candidate.window_id) and
+    if (!addNewWindowManaged(candidate.process_id, candidate.window_id, .needed) and
         managedWindow(candidate.window_id) == null) return;
 
     retile();
@@ -3930,7 +3964,7 @@ fn executePendingRoleReady(candidate: state_mod.WindowCandidate) void {
 }
 
 fn executeDeferredWindowReady(candidate: state_mod.WindowCandidate) void {
-    if (addNewWindowManaged(candidate.process_id, candidate.window_id) or
+    if (addNewWindowManaged(candidate.process_id, candidate.window_id, .needed) or
         managedWindow(candidate.window_id) != null)
     {
         untrackDeferredWindowCandidate(candidate.window_id);
@@ -4850,7 +4884,12 @@ fn appWindowSnapshot(
     return .{ .count = count, .truncated = truncated };
 }
 
-fn addNewWindowManagedWithAssignment(pid: i32, wid: u32, assigned_space: state_mod.SpaceRef) bool {
+fn addNewWindowManagedWithAssignment(
+    pid: i32,
+    wid: u32,
+    assigned_space: state_mod.SpaceRef,
+    detect: TabDetectPass,
+) bool {
     // The window the user is waiting to see appear, start to finish. Every
     // early return below is a reason it will not appear on this pass, and each
     // one costs another poll interval before the next attempt.
@@ -4917,7 +4956,7 @@ fn addNewWindowManagedWithAssignment(pid: i32, wid: u32, assigned_space: state_m
     // Check if this new on-screen window replaces an existing same-PID window
     // that just went off-screen (i.e. a new tab was created and became active,
     // pushing the old tab to background). If so, form a tab group.
-    if (tryFormTabGroupOnCreate(pid, wid, .adopt)) return false;
+    if (detect == .needed and tryFormTabGroupOnCreate(pid, wid, .adopt)) return false;
     // An app_rules entry with .float = true floats every window of that app.
     const rule_float = blk: {
         if (g_config.app_rules.len == 0) break :blk false;
@@ -4967,7 +5006,7 @@ fn addNewWindowManagedWithAssignment(pid: i32, wid: u32, assigned_space: state_m
     return true;
 }
 
-fn addNewWindowManaged(pid: i32, wid: u32) bool {
+fn addNewWindowManaged(pid: i32, wid: u32, detect: TabDetectPass) bool {
     // Prefer the window's actual on-screen position over the currently
     // focused display: a torn-off tab dropped on another monitor must land
     // on the workspace that owns the destination monitor, not on whichever
@@ -4981,10 +5020,10 @@ fn addNewWindowManaged(pid: i32, wid: u32) bool {
     // A rule-pinned app's transient launch position is meaningless: place it
     // on the display that currently owns its assigned workspace, not wherever
     // it happened to launch.
-    return addNewWindowManagedWithAssignment(pid, wid, ws);
+    return addNewWindowManagedWithAssignment(pid, wid, ws, detect);
 }
 
-fn addNewWindow(pid: i32, wid: u32) void {
+fn addNewWindow(pid: i32, wid: u32, detect: TabDetectPass) void {
     std.debug.assert(wid != 0);
     if (managedWindow(wid) != null) return;
 
@@ -4996,7 +5035,7 @@ fn addNewWindow(pid: i32, wid: u32) void {
         },
         .ready => {
             untrackPendingRoleWindow(wid);
-            _ = addNewWindowManaged(pid, wid);
+            _ = addNewWindowManaged(pid, wid, detect);
         },
         .pending => {
             // Same rationale as addNewWindowManaged: derive the display from
@@ -5122,6 +5161,22 @@ const TabDetectReason = enum {
     focus_unknown,
     /// The adoption path is about to take ownership of a new window.
     adopt,
+};
+
+/// Whether the caller has already run a detection pass for this window during
+/// this event.
+///
+/// A pass reads every AX window of the app and every window's tab bar, so it
+/// is the most expensive thing on the new-window path — and an app that is
+/// mid-layout for the very window being adopted is exactly when its AX server
+/// answers slowest. Measured at 14ms for the first pass and 322ms for an
+/// immediately following second one that reached the same verdict.
+const TabDetectPass = enum {
+    /// No pass has run; the adoption path must run one.
+    needed,
+    /// A pass just ran for this window and declined to absorb it. The adoption
+    /// path re-derives everything else it needs, but not this.
+    ruled_out,
 };
 
 /// Check whether a window that just appeared — created, or focused while
@@ -6023,7 +6078,10 @@ fn reconcileFocusedWindow(pid: i32, focused_wid: u32) void {
         return;
     }
 
-    addNewWindow(pid, focused_wid);
+    // The pass above already reached a verdict for this window, microseconds
+    // ago and in this same handler. Asking again is what made adopting a new
+    // window slow.
+    addNewWindow(pid, focused_wid, .ruled_out);
     retile();
 }
 

@@ -761,8 +761,22 @@ fn axNotificationHandler(
     }
 
     if (isNotification(notification, strings.focused_window_changed_notification)) {
-        // App-level (wid=0 in refcon): emit so Zig can reconcile tab groups.
-        shim.bw_emit_event(shim.BW_EVENT_FOCUSED_WINDOW_CHANGED, pid, 0);
+        // App-level (wid=0 in refcon): resolve from the element the
+        // notification carries, exactly as the creation branch above does.
+        //
+        // The main thread would otherwise have to ask the app for
+        // AXFocusedWindow itself, and that read is a synchronous round trip
+        // into an application that is frequently busy at precisely this
+        // moment — measured at ~99ms while the app was opening a window, with
+        // the whole window manager blocked behind it. Here it is a local call
+        // on an element already delivered, and this thread exists to absorb a
+        // slow app.
+        //
+        // Emits 0 when the element has no CGWindowID yet, which keeps the
+        // main thread's AXFocusedWindow fallback as the answer for that case.
+        var focused_wid: u32 = 0;
+        _ = _AXUIElementGetWindow(element, &focused_wid);
+        shim.bw_emit_event(shim.BW_EVENT_FOCUSED_WINDOW_CHANGED, pid, focused_wid);
         return;
     }
 
