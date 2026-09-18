@@ -1766,9 +1766,25 @@ fn rolePollTimerTick(context: ?*anyopaque) callconv(.c) void {
     bw_emit_event(shim.BW_EVENT_ROLE_POLL_TICK, 0, 0);
 }
 
+/// Fires once a second for the process lifetime, so what it does when nothing
+/// has changed is what it costs.
+///
+/// Runs on the main queue — the same serialized context as the event drain —
+/// so it can read state directly instead of enqueuing an event to ask. That
+/// matters because waking the drain is not free: the drain pays its whole
+/// envelope, tab-bar refresh and dim snapshot included, before it discovers
+/// the tick had nothing to settle. Enqueue only when there is.
 fn nativeSpaceTopologyPollTimerTick(context: ?*anyopaque) callconv(.c) void {
     _ = context;
-    bw_emit_event(shim.BW_EVENT_NATIVE_TOPOLOGY_POLL_TICK, 0, 0);
+
+    // macOS announces a native tab switch through no notification of any kind,
+    // so the refresh at the head of the drain is the only thing that notices
+    // one. A switch made by mouse is covered by the click's own events, but a
+    // keyboard switch produces nothing at all — this tick is its heartbeat.
+    // Only worth waking for while a tab group actually exists.
+    if (g_state.hasWindowTabGroups() or nativeSpaceTopologyDiverged()) {
+        bw_emit_event(shim.BW_EVENT_NATIVE_TOPOLOGY_POLL_TICK, 0, 0);
+    }
 }
 
 fn rebuildTilingStatesForConfig() void {
@@ -3528,6 +3544,30 @@ fn reconcileNativeSpaceCapacity() bool {
         });
     }
     return true;
+}
+
+/// Whether WindowServer's Space topology no longer matches the model's.
+///
+/// The same comparisons reconcileNativeSpaceTopologyIfNeeded makes before it
+/// decides to act, with none of the acting — so the poll can ask the question
+/// without waking a drain to answer it. The reconcile still re-checks, which
+/// makes a disagreement between the two a wasted drain rather than a fault.
+fn nativeSpaceTopologyDiverged() bool {
+    if (nativeSwitchPending()) return false;
+    if (g_state.hasPendingNativeWindowMoves()) return false;
+    if (g_state.pendingNativeWorkspaceMove() != null) return false;
+    if (g_state.isWorkspaceTransitionActive()) return false;
+    if (g_state.hasDisplayResettleScheduled()) return false;
+
+    const sky = g_sky orelse return false;
+    var snapshot = sky.nativeSpaceTopology() orelse return false;
+    defer snapshot.deinit();
+
+    const capacity = nativeSpaceCapacityFromSnapshot(&snapshot) orelse return false;
+    if (capacity.total_count != workspaceCount()) return true;
+
+    const topology = nativeTopologyFromSnapshot(&snapshot, .preserve_space_ids) orelse return false;
+    return !g_state.native_topology.eql(&topology);
 }
 
 fn reconcileNativeSpaceTopologyIfNeeded() void {
