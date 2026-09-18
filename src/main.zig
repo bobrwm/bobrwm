@@ -1,7 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const posix = std.posix;
-const filelog = @import("filelog.zig");
+const logging = @import("logging.zig");
 const log_options = @import("log_options.zig");
 const c = @import("c");
 const cg_extra = @import("cg_extra");
@@ -53,7 +53,7 @@ const NSRect = extern struct {
 
 pub const std_options = std.Options{
     .log_level = log_options.level,
-    .logFn = filelog.logFn,
+    .logFn = logging.logFn,
 };
 
 const log = std.log.scoped(.bobrwm);
@@ -2103,9 +2103,7 @@ fn parseConfigPath(process_args: std.process.Args) ?[]const u8 {
 }
 
 pub fn main(init: std.process.Init.Minimal) !void {
-    // Before any thread starts, so logFn never races on the descriptor.
-    filelog.init();
-    defer filelog.deinit();
+    logging.init();
     log.info("bobrwm starting (log_level={s})...", .{@tagName(std_options.log_level)});
 
     var debug_allocator: ?std.heap.DebugAllocator(.{}) = switch (builtin.mode) {
