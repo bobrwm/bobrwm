@@ -793,6 +793,21 @@ pub const Model = struct {
         return snapshot;
     }
 
+    /// Whether any tab group exists at all, without materializing the leaders.
+    ///
+    /// A leader points at itself, so any window pointing elsewhere is a member
+    /// of somebody's group. Callers that would otherwise pay for an expensive
+    /// snapshot before discovering there is nothing to refresh gate on this
+    /// first. Deliberately conservative: a member left pointing at a leader
+    /// that has since been removed answers true, which costs one wasted
+    /// refresh rather than a missed one.
+    pub fn hasWindowTabGroups(self: *const Model) bool {
+        for (self.windows.items()) |managed_window| {
+            if (managed_window.tab_leader_window_id != managed_window.window_id) return true;
+        }
+        return false;
+    }
+
     /// Return the leaders of every reducer-owned tab group.
     pub fn windowTabGroupLeaderIds(
         self: *const Model,

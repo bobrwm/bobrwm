@@ -7,6 +7,7 @@
 const std = @import("std");
 const c = @import("c");
 const osutil = @import("osutil.zig");
+const trace = @import("trace.zig");
 
 extern fn _AXUIElementGetWindow(element: c.AXUIElementRef, wid: *u32) c.AXError;
 
@@ -181,6 +182,7 @@ fn findWindowWithTimeout(pid: i32, target_wid: u32, timeout_seconds: ?f32) ?c.AX
     const ax = strings() orelse return null;
     const windows_attr = ax.windows_attr;
     var windows: c.CFArrayRef = null;
+    trace.countAx();
     const err = c.AXUIElementCopyAttributeValue(app, windows_attr, @ptrCast(&windows));
     if (err != c.kAXErrorSuccess or windows == null) return null;
     const windows_ref = windows orelse return null;
@@ -188,6 +190,7 @@ fn findWindowWithTimeout(pid: i32, target_wid: u32, timeout_seconds: ?f32) ?c.AX
 
     const count = c.CFArrayGetCount(windows_ref);
     std.debug.assert(count >= 0);
+    trace.countAxN(@intCast(@max(count, 0)));
 
     var i: c.CFIndex = 0;
     while (i < count) : (i += 1) {
@@ -287,6 +290,14 @@ pub fn deinitElementCache() void {
     }
 }
 
+/// `AXUIElementSetAttributeValue` with the round trip recorded. Every geometry
+/// write is IPC into the target app, and a retile writes several per window,
+/// so these are what a slow layout is actually made of.
+fn countedSet(element: c.AXUIElementRef, attribute: c.CFStringRef, value: c.CFTypeRef) c.AXError {
+    trace.countAx();
+    return c.AXUIElementSetAttributeValue(element, attribute, value);
+}
+
 /// Whether a geometry write failed because the cached element no longer refers
 /// to a live window — the window was destroyed and its id recycled, or the app
 /// replaced its AX element. Any other error is the app refusing the write, and
@@ -310,6 +321,7 @@ pub fn focusedWindowIfMatches(pid: i32, target_wid: u32) ?c.AXUIElementRef {
 
     const ax = strings() orelse return null;
     var focused: c.AXUIElementRef = null;
+    trace.countAxN(2);
     const err = c.AXUIElementCopyAttributeValue(app, ax.focused_window_attr, @ptrCast(&focused));
     if (err != c.kAXErrorSuccess or focused == null) return null;
     const focused_ref = focused orelse return null;
@@ -344,6 +356,7 @@ pub fn tabCount(pid: i32, wid: u32) usize {
     defer c.CFRelease(@ptrCast(win));
 
     var children: c.CFArrayRef = null;
+    trace.countAx();
     if (c.AXUIElementCopyAttributeValue(win, ax.children_attr, @ptrCast(&children)) != c.kAXErrorSuccess) return 0;
     const children_ref = children orelse return 0;
     defer c.CFRelease(@ptrCast(children_ref));
@@ -355,12 +368,14 @@ pub fn tabCount(pid: i32, wid: u32) usize {
         const child: c.AXUIElementRef = @ptrCast(child_any);
 
         var role: c.CFTypeRef = null;
+        trace.countAx();
         if (c.AXUIElementCopyAttributeValue(child, ax.role_attr, &role) != c.kAXErrorSuccess) continue;
         const role_ref = role orelse continue;
         defer c.CFRelease(role_ref);
         if (c.CFEqual(role_ref, @ptrCast(ax.tab_group_role)) == 0) continue;
 
         var tabs: c.CFArrayRef = null;
+        trace.countAx();
         if (c.AXUIElementCopyAttributeValue(child, ax.tabs_attr, @ptrCast(&tabs)) != c.kAXErrorSuccess) return 0;
         const tabs_ref = tabs orelse return 0;
         defer c.CFRelease(@ptrCast(tabs_ref));
@@ -375,6 +390,7 @@ pub fn tabCount(pid: i32, wid: u32) usize {
 /// Query whether AXEnhancedUserInterface is currently enabled on an app element.
 fn readEnhancedUserInterface(app: c.AXUIElementRef, ax: *const AxStrings) ?bool {
     var value: c.CFTypeRef = null;
+    trace.countAx();
     const err = c.AXUIElementCopyAttributeValue(app, ax.enhanced_ui_attr, &value);
     if (err != c.kAXErrorSuccess or value == null) return null;
     defer c.CFRelease(value.?);
@@ -487,7 +503,7 @@ fn suspendEnhancedUi(app: c.AXUIElementRef, pid: i32, ax: *const AxStrings) bool
     if (g_geometry_batch_depth == 0) {
         const was_enabled = shouldSuspendEnhancedUi(app, pid, ax);
         if (was_enabled) {
-            _ = c.AXUIElementSetAttributeValue(app, ax.enhanced_ui_attr, c.kCFBooleanFalse);
+            _ = countedSet(app, ax.enhanced_ui_attr, c.kCFBooleanFalse);
         }
         return was_enabled;
     }
@@ -499,7 +515,7 @@ fn suspendEnhancedUi(app: c.AXUIElementRef, pid: i32, ax: *const AxStrings) bool
 
     const was_enabled = shouldSuspendEnhancedUi(app, pid, ax);
     if (was_enabled) {
-        _ = c.AXUIElementSetAttributeValue(app, ax.enhanced_ui_attr, c.kCFBooleanFalse);
+        _ = countedSet(app, ax.enhanced_ui_attr, c.kCFBooleanFalse);
     }
     g_enhanced_ui_batch = .{ .pid = pid, .was_enabled = was_enabled };
     return false;
@@ -514,7 +530,7 @@ fn restoreEnhancedUiBatch() void {
     const app = c.AXUIElementCreateApplication(batch.pid) orelse return;
     defer c.CFRelease(@ptrCast(app));
 
-    _ = c.AXUIElementSetAttributeValue(app, ax.enhanced_ui_attr, c.kCFBooleanTrue);
+    _ = countedSet(app, ax.enhanced_ui_attr, c.kCFBooleanTrue);
 }
 
 /// Move and resize a window using AX attributes.
@@ -572,12 +588,12 @@ fn writeFrame(
 ) c.AXError {
     const owns_restore = suspendEnhancedUi(app, pid, ax);
     defer if (owns_restore) {
-        _ = c.AXUIElementSetAttributeValue(app, ax.enhanced_ui_attr, c.kCFBooleanTrue);
+        _ = countedSet(app, ax.enhanced_ui_attr, c.kCFBooleanTrue);
     };
 
-    _ = c.AXUIElementSetAttributeValue(element, ax.size_attr, @ptrCast(size_value));
-    const position_err = c.AXUIElementSetAttributeValue(element, ax.position_attr, @ptrCast(position_value));
-    const size_err = c.AXUIElementSetAttributeValue(element, ax.size_attr, @ptrCast(size_value));
+    _ = countedSet(element, ax.size_attr, @ptrCast(size_value));
+    const position_err = countedSet(element, ax.position_attr, @ptrCast(position_value));
+    const size_err = countedSet(element, ax.size_attr, @ptrCast(size_value));
 
     if (position_err != c.kAXErrorSuccess) return position_err;
     return size_err;
@@ -620,10 +636,10 @@ fn writePosition(
 ) c.AXError {
     const owns_restore = suspendEnhancedUi(app, pid, ax);
     defer if (owns_restore) {
-        _ = c.AXUIElementSetAttributeValue(app, ax.enhanced_ui_attr, c.kCFBooleanTrue);
+        _ = countedSet(app, ax.enhanced_ui_attr, c.kCFBooleanTrue);
     };
 
-    return c.AXUIElementSetAttributeValue(element, ax.position_attr, @ptrCast(position_value));
+    return countedSet(element, ax.position_attr, @ptrCast(position_value));
 }
 
 /// Retained AX element plus the state needed to undo animationBegin.
@@ -650,7 +666,7 @@ pub fn animationBegin(pid: i32, wid: u32) ?AnimationHandle {
         if (c.AXUIElementCreateApplication(pid)) |app| {
             defer c.CFRelease(@ptrCast(app));
             if (shouldSuspendEnhancedUi(app, pid, ax)) {
-                _ = c.AXUIElementSetAttributeValue(app, ax.enhanced_ui_attr, c.kCFBooleanFalse);
+                _ = countedSet(app, ax.enhanced_ui_attr, c.kCFBooleanFalse);
                 restore_enhanced_ui = true;
             }
         }
@@ -672,13 +688,13 @@ pub fn animationStep(handle: AnimationHandle, x: f64, y: f64, w: f64, h: f64, se
         const size: c.CGSize = .{ .width = w, .height = h };
         const size_value = c.AXValueCreate(c.kAXValueTypeCGSize, &size) orelse return;
         defer c.CFRelease(@ptrCast(size_value));
-        _ = c.AXUIElementSetAttributeValue(handle.win, ax.size_attr, @ptrCast(size_value));
+        _ = countedSet(handle.win, ax.size_attr, @ptrCast(size_value));
     }
 
     const position: c.CGPoint = .{ .x = x, .y = y };
     const position_value = c.AXValueCreate(c.kAXValueTypeCGPoint, &position) orelse return;
     defer c.CFRelease(@ptrCast(position_value));
-    _ = c.AXUIElementSetAttributeValue(handle.win, ax.position_attr, @ptrCast(position_value));
+    _ = countedSet(handle.win, ax.position_attr, @ptrCast(position_value));
 }
 
 /// Release the cached AX element and restore AXEnhancedUserInterface if
@@ -689,7 +705,7 @@ pub fn animationEnd(handle: AnimationHandle) void {
         const ax = strings() orelse return;
         const app = c.AXUIElementCreateApplication(handle.pid) orelse return;
         defer c.CFRelease(@ptrCast(app));
-        _ = c.AXUIElementSetAttributeValue(app, ax.enhanced_ui_attr, c.kCFBooleanTrue);
+        _ = countedSet(app, ax.enhanced_ui_attr, c.kCFBooleanTrue);
     }
 }
 

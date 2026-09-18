@@ -141,6 +141,10 @@ pub fn logFn(
     _ = std.c.write(fd, &buf, end + 1);
 }
 
+/// Second resolution is useless for the problem these logs exist to solve.
+/// A slow window is a few hundred milliseconds of main-thread work, so a whole
+/// event drain lands inside one second and its steps become unorderable.
+/// strftime has no millisecond conversion, so append the field by hand.
 fn writeTimestamp(writer: *std.Io.Writer) void {
     var ts: std.c.timespec = undefined;
     if (std.c.clock_gettime(std.c.CLOCK.REALTIME, &ts) != 0) return;
@@ -150,8 +154,9 @@ fn writeTimestamp(writer: *std.Io.Writer) void {
     if (localtime_r(&now, &tm) == null) return;
 
     var stamp: [32]u8 = undefined;
-    const n = strftime(&stamp, stamp.len, "%Y-%m-%d %H:%M:%S ", &tm);
+    const n = strftime(&stamp, stamp.len, "%Y-%m-%d %H:%M:%S", &tm);
     if (n == 0) return;
 
     writer.writeAll(stamp[0..n]) catch {};
+    writer.print(".{d:0>3} ", .{@as(u64, @intCast(ts.nsec)) / std.time.ns_per_ms}) catch {};
 }
