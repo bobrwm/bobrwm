@@ -300,13 +300,14 @@ When bobrwm has an adjacent workspace, the swipe listener consumes the matching 
 ## Development
 
 `zig build` assembles `zig-out/Bobrwm.app`. The build system writes the bundle
-tree itself, so no Xcode project is involved. `zig build run` execs the
+tree itself, so no Xcode project is involved. Swift owns the AppKit application
+and statically links the Zig window-manager core. `zig build run` execs the
 executable inside the bundle rather than `open`ing the app, which keeps logs on
 the terminal while still giving the process its bundle identity.
 
 ```
 Bobrwm.app/Contents/MacOS/
-  Bobrwm         # the window manager; links AppKit, AX, SkyLight
+  Bobrwm         # native Swift app with the embedded Zig core
   bobrwm-cli     # the client; links libSystem only
   bobrwm-swipe   # optional trackpad companion
 ```
