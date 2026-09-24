@@ -40,6 +40,18 @@ pub fn register(allocator: std.mem.Allocator, callbacks: Callbacks) void {
     registerLaunchGate();
 }
 
+/// Detach every outstanding KVO gate and release application-owned storage.
+/// Runtime classes remain registered for the process lifetime, as required by
+/// the Objective-C runtime.
+pub fn deinit() void {
+    while (g_launch_gates.count() > 0) {
+        var iterator = g_launch_gates.iterator();
+        const entry = iterator.next() orelse unreachable;
+        dropLaunchGate(entry.key_ptr.*);
+    }
+    g_launch_gates.deinit();
+}
+
 // BWObserver
 
 fn registerObserver() void {

@@ -1,5 +1,4 @@
 const std = @import("std");
-const builtin = @import("builtin");
 const posix = std.posix;
 const logging = @import("logging.zig");
 const log_options = @import("log_options.zig");
@@ -1034,6 +1033,7 @@ var g_waker_source: c.CFRunLoopSourceRef = null;
 var g_role_poll_source: c.dispatch_source_t = null;
 var g_native_space_topology_poll_source: c.dispatch_source_t = null;
 var g_tap_port: c.CFMachPortRef = null;
+var g_tap_source: c.CFRunLoopSourceRef = null;
 var g_layout_entries: std.ArrayList(tiling.LayoutEntry) = .empty;
 var g_event_drain_active = false;
 var g_event_overflow_recovery_pending = false;
@@ -1042,6 +1042,32 @@ var g_on_screen_truncation_logged = false;
 var g_animator: animation_mod.Animator = undefined;
 var g_animator_source: c.dispatch_source_t = null;
 var g_ipc_transport: ipc_transport.Transport = .{};
+
+const CoreLifecycle = enum {
+    uninitialized,
+    starting,
+    running,
+    stopping,
+    stopped,
+};
+
+/// Startup is linear, so a single stage represents every valid resource set.
+/// Teardown walks the completed prefix in reverse after success or failure.
+const CoreStage = enum(u8) {
+    none,
+    ipc,
+    config_path,
+    config,
+    layout,
+    signal_transport,
+    workspace_observer,
+    ax_observer,
+    ipc_transport,
+    statusbar,
+};
+
+var g_core_lifecycle: CoreLifecycle = .uninitialized;
+var g_core_stage: CoreStage = .none;
 
 const ConfigRuntime = struct {
     arena: std.heap.ArenaAllocator,
@@ -1082,19 +1108,6 @@ fn flushCleanupRequests() void {
     defer _ = span.endIfSlow();
 
     dispatchStateEvent(.flush_cleanup_requests);
-}
-
-// NSApp lifecycle (zig-objc)
-
-/// Initialise NSApplication with accessory activation policy (menu bar icon,
-/// no dock icon). Returns the shared application object for the run loop.
-fn initApp() objc.Object {
-    const NSApplication = objc.getClass("NSApplication") orelse
-        @panic("NSApplication class not found");
-    const app = NSApplication.msgSend(objc.Object, "sharedApplication", .{});
-    // NSApplicationActivationPolicyAccessory = 1
-    _ = app.msgSend(bool, "setActivationPolicy:", .{@as(i64, 1)});
-    return app;
 }
 
 /// Register NSWorkspace/NSNotificationCenter observers via zig-objc while
@@ -1147,6 +1160,20 @@ fn initWorkspaceObservers() void {
         nsString("NSApplicationDidChangeScreenParametersNotification"),
         nil_object,
     });
+}
+
+fn deinitWorkspaceObservers() void {
+    const observer = g_workspace_observer orelse return;
+    const NSWorkspace = objc.getClass("NSWorkspace") orelse return;
+    const NSNotificationCenter = objc.getClass("NSNotificationCenter") orelse return;
+
+    const workspace = NSWorkspace.msgSend(objc.Object, "sharedWorkspace", .{});
+    const workspace_notification_center = workspace.msgSend(objc.Object, "notificationCenter", .{});
+    const default_notification_center = NSNotificationCenter.msgSend(objc.Object, "defaultCenter", .{});
+    workspace_notification_center.msgSend(void, "removeObserver:", .{observer});
+    default_notification_center.msgSend(void, "removeObserver:", .{observer});
+    observer.msgSend(void, "release", .{});
+    g_workspace_observer = null;
 }
 
 /// Get the usable display frame (menu bar / dock excluded), CG coordinates.
@@ -2014,10 +2041,28 @@ fn setupHotkeyEventTap() void {
     const tap = g_tap_port orelse return;
 
     const tap_source = c.CFMachPortCreateRunLoopSource(null, tap, 0) orelse return;
-    defer c.CFRelease(@ptrCast(tap_source));
-
+    g_tap_source = tap_source;
     c.CFRunLoopAddSource(c.CFRunLoopGetMain(), tap_source, c.kCFRunLoopCommonModes);
     cg_extra.CGEventTapEnable(tap, true);
+}
+
+fn deinitMainRunLoopSources() void {
+    const main_run_loop = c.CFRunLoopGetMain();
+    if (g_tap_source) |source| {
+        c.CFRunLoopRemoveSource(main_run_loop, source, c.kCFRunLoopCommonModes);
+        c.CFRelease(@ptrCast(source));
+        g_tap_source = null;
+    }
+    if (g_tap_port) |tap| {
+        c.CFMachPortInvalidate(tap);
+        c.CFRelease(@ptrCast(tap));
+        g_tap_port = null;
+    }
+    if (g_waker_source) |source| {
+        c.CFRunLoopRemoveSource(main_run_loop, source, c.kCFRunLoopCommonModes);
+        c.CFRelease(@ptrCast(source));
+        g_waker_source = null;
+    }
 }
 
 // Event bridge (called from ObjC shim)
@@ -2119,41 +2164,38 @@ fn bw_hotkey_handle_keydown(keycode: u16, mods: u8) bool {
     return false;
 }
 
-// Entry point
+// Embedded application lifecycle
 
-/// Read `-c` / `--config` off the command line. The window manager takes no
-/// other arguments; everything users type goes to the `bobrwm` client, which
-/// forwards it over IPC.
-fn parseConfigPath(process_args: std.process.Args) ?[]const u8 {
-    var args = process_args.iterate();
-    defer args.deinit();
-    _ = args.skip(); // program name
+/// Start the Zig window-manager core after Swift has finished launching
+/// NSApplication. All state mutation remains on this AppKit main thread.
+export fn bw_core_start(config_path: ?[*:0]const u8) callconv(.c) c_int {
+    if (g_core_lifecycle != .uninitialized) return 1;
+    g_core_lifecycle = .starting;
 
-    while (args.next()) |arg| {
-        if (std.mem.eql(u8, arg, "-c") or std.mem.eql(u8, arg, "--config")) {
-            return args.next();
-        }
-    }
-    return null;
+    startCore(if (config_path) |path| std.mem.span(path) else null) catch |err| {
+        log.err("core initialization failed: {}", .{err});
+        stopCore();
+        return 1;
+    };
+
+    g_core_lifecycle = .running;
+    return 0;
 }
 
-pub fn main(init: std.process.Init.Minimal) !void {
+/// Stop the core exactly once from NSApplicationDelegate.applicationWillTerminate.
+export fn bw_core_stop() callconv(.c) void {
+    if (g_core_lifecycle != .running) return;
+    stopCore();
+}
+
+fn startCore(config_path_arg: ?[]const u8) !void {
     logging.init();
     log.info("bobrwm starting (log_level={s})...", .{@tagName(std_options.log_level)});
 
-    var debug_allocator: ?std.heap.DebugAllocator(.{}) = switch (builtin.mode) {
-        .Debug => .init,
-        .ReleaseSafe, .ReleaseFast, .ReleaseSmall => null,
-    };
-    defer {
-        if (debug_allocator) |*value| _ = value.deinit();
-    }
-    g_allocator = if (debug_allocator) |*value|
-        value.allocator()
-    else
-        std.heap.c_allocator;
-    defer deinitAxStrings();
-    defer ax_mod.deinitElementCache();
+    // The embedded static library must not instantiate Zig's thread-local
+    // DebugAllocator runtime: ld64 rejects its under-aligned Mach-O TLS section.
+    // Ghostty's embedded core likewise uses a process-lifetime global allocator.
+    g_allocator = std.heap.c_allocator;
 
     // Claim the single-instance endpoint before config reconciliation,
     // accessibility prompts, SkyLight, or window discovery can mutate any
@@ -2162,15 +2204,15 @@ pub fn main(init: std.process.Init.Minimal) !void {
         log.err("IPC init failed: {}", .{err});
         return err;
     };
-    defer g_ipc.deinit(g_allocator);
+    g_core_stage = .ipc;
     ipc.g_dispatch = ipcDispatch;
 
     // -- Config --
-    const config_path = config_mod.resolvePath(g_allocator, parseConfigPath(init.args)) catch null;
-    defer if (config_path) |path| g_allocator.free(path);
+    const config_path = config_mod.resolvePath(g_allocator, config_path_arg) catch null;
     g_config_path = config_path;
+    g_core_stage = .config_path;
     g_config_runtime = try ConfigRuntime.init(g_allocator, config_path, true);
-    defer g_config_runtime.?.deinit();
+    g_core_stage = .config;
     g_config = g_config_runtime.?.config;
 
     dispatchStateEvent(.{ .configure_layout_interaction = .{
@@ -2199,11 +2241,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     }
 
     // -- Core state --
-    defer {
-        setRolePolling(false);
-        setNativeSpaceTopologyPolling(false);
-        g_layout_entries.deinit(g_allocator);
-    }
+    g_core_stage = .layout;
     refreshDisplays();
     if (!reconcileNativeSpaceCapacity()) {
         log.err("could not reconcile Mission Control Space count", .{});
@@ -2231,16 +2269,14 @@ pub fn main(init: std.process.Init.Minimal) !void {
     } });
 
     // -- Signal transport (handler writes only; cleanup runs on main) --
-    try signal_transport.init(gracefulStopNSApp);
-    defer signal_transport.deinit();
-    errdefer resetDimming();
+    try signal_transport.init(requestAppTermination);
+    g_core_stage = .signal_transport;
 
     // -- Discover existing windows and tile --
     discoverWindows();
     log.info("discovered {} windows", .{g_state.windows.count});
     retileAllDisplays();
 
-    // -- NSApp (zig-objc) --
     // Register runtime ObjC classes (BWObserver / BWLaunchGate) before
     // any code does objc.getClass on them.
     objc_classes.register(g_allocator, .{
@@ -2250,17 +2286,17 @@ pub fn main(init: std.process.Init.Minimal) !void {
         .space_changed = workspaceSpaceChanged,
         .display_changed = workspaceDisplayChanged,
     });
-    const NSApp = initApp();
     initWorkspaceObservers();
+    g_core_stage = .workspace_observer;
 
     // -- Sources (observers, CGEventTap, waker, IPC) --
     ax_observer.init();
-    defer ax_observer.deinit();
+    g_core_stage = .ax_observer;
     setupHotkeyEventTap();
     initWakerSource();
     setNativeSpaceTopologyPolling(true);
     try g_ipc_transport.start(g_ipc.fd, signalWaker);
-    defer g_ipc_transport.stop();
+    g_core_stage = .ipc_transport;
     refreshRolePolling();
     observeDiscoveredApps();
 
@@ -2277,15 +2313,67 @@ pub fn main(init: std.process.Init.Minimal) !void {
             .quit = statusBarQuit,
         },
     );
-    defer statusbar.deinit();
+    g_core_stage = .statusbar;
     updateStatusBar();
 
-    // -- Enter NSApp run loop --
-    // Returns when CFRunLoopStop is called (e.g. graceful signal handler).
-    // The defer chain then removes any dimming overlays on the main thread.
-    log.info("entering run loop", .{});
-    defer resetDimming();
-    NSApp.msgSend(void, "run", .{});
+    log.info("core initialized", .{});
+}
+
+fn stopCore() void {
+    if (g_core_lifecycle == .stopping or g_core_lifecycle == .stopped) return;
+    g_core_lifecycle = .stopping;
+
+    if (coreReached(.statusbar)) {
+        statusbar.deinit();
+    }
+    if (coreReached(.ipc_transport)) {
+        g_ipc_transport.stop();
+    }
+    setRolePolling(false);
+    setNativeSpaceTopologyPolling(false);
+    if (g_animator_source) |source| {
+        c.dispatch_source_cancel(source);
+        c.dispatch_release(.{ ._ds = source });
+        g_animator_source = null;
+    }
+    deinitMainRunLoopSources();
+    if (coreReached(.ax_observer)) {
+        ax_observer.deinit();
+    }
+    if (coreReached(.workspace_observer)) {
+        deinitWorkspaceObservers();
+        objc_classes.deinit();
+    }
+    resetDimming();
+    if (coreReached(.signal_transport)) {
+        signal_transport.deinit();
+    }
+    if (coreReached(.layout)) {
+        g_animator.deinit();
+        g_layout_entries.deinit(g_allocator);
+    }
+    if (coreReached(.config)) {
+        g_config_runtime.?.deinit();
+        g_config_runtime = null;
+    }
+    if (coreReached(.config_path)) {
+        if (g_config_path) |path| g_allocator.free(path);
+        g_config_path = null;
+    }
+    if (coreReached(.ipc)) {
+        g_ipc.deinit(g_allocator);
+        ipc.g_dispatch = null;
+    }
+    deinitAxStrings();
+    ax_mod.deinitElementCache();
+
+    g_core_stage = .none;
+    g_core_lifecycle = .stopped;
+}
+
+fn coreReached(stage: CoreStage) bool {
+    std.debug.assert(stage != .none);
+    return @intFromEnum(g_core_stage) >= @intFromEnum(stage);
 }
 
 // Exported callbacks (called from ObjC shim on main thread)
@@ -2485,33 +2573,12 @@ fn reconcileDivergedGeometryIntent(wid: u32, intent: geometry_mod.Intent) bool {
     return true;
 }
 
-/// Exit `[NSApp run]` cleanly by setting NSApplication's stop flag and posting
-/// a wake-up event. Must be called on the main thread inside the run loop.
-fn gracefulStopNSApp() void {
-    const NSApplication = objc.getClass("NSApplication") orelse return;
-    const app = NSApplication.msgSend(objc.Object, "sharedApplication", .{});
-    app.msgSend(void, "stop:", .{@as(?*anyopaque, null)});
+extern fn bw_app_terminate() callconv(.c) void;
 
-    // [NSApp stop:] only takes effect after nextEventMatchingMask: returns,
-    // so post a dummy event to ensure the run loop wakes and re-checks.
-    const NSEvent = objc.getClass("NSEvent") orelse return;
-    // NSEventTypeApplicationDefined = 15
-    const event = NSEvent.msgSend(
-        objc.Object,
-        "otherEventWithType:location:modifierFlags:timestamp:windowNumber:context:subtype:data1:data2:",
-        .{
-            @as(u64, 15),
-            NSPoint{ .x = 0, .y = 0 },
-            @as(u64, 0),
-            @as(f64, 0),
-            @as(i64, 0),
-            @as(?*anyopaque, null),
-            @as(i16, 0),
-            @as(i64, 0),
-            @as(i64, 0),
-        },
-    );
-    app.msgSend(void, "postEvent:atStart:", .{ event, true });
+/// Ask the Swift host to terminate NSApplication. Signal transport dispatches
+/// this callback on the main queue, where AppKit lifecycle calls are valid.
+fn requestAppTermination() void {
+    bw_app_terminate();
 }
 
 fn handleIpcRequest(request: ipc_transport.Request) void {
@@ -2564,10 +2631,7 @@ fn statusBarSwitchToWorkspace(workspace_id: u8) callconv(.c) void {
 
 fn statusBarQuit() callconv(.c) void {
     resetDimming();
-
-    const NSApplication = objc.getClass("NSApplication").?;
-    const app = NSApplication.msgSend(objc.Object, "sharedApplication", .{});
-    app.msgSend(void, "terminate:", .{@as(objc.Object, .{ .value = null })});
+    requestAppTermination();
 }
 
 fn openConfigFile() void {

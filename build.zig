@@ -15,9 +15,6 @@ const bundle_macos = bundle_contents ++ "/MacOS";
 const server_exe_name = "Bobrwm";
 const cli_exe_name = "bobrwm-cli";
 
-// SwiftUI menu bar, loaded from Contents/Frameworks via @rpath.
-const ui_dylib_name = "libbobrwm-ui.dylib";
-
 // launchd requires Label to match the plist's basename. src/loginitem.zig
 // registers this same name through SMAppService.
 const launchd_label = "com.bobrwm.bobrwm";
@@ -172,67 +169,86 @@ pub fn build(b: *std.Build) !void {
     };
     configureAppModule(exe_mod, app_module_dependencies);
 
-    // Ghostty statically links this bridge into an XCFramework and lets Xcode
-    // perform the final link. Zig 0.16's Mach-O linker folds __oslogstring into
-    // __cstring, which makes logd drop the records, so keep the same bridge
-    // behind a tiny clang-linked dylib until the linker preserves the section.
-    const oslog_dylib_name = "libbobrwm-oslog.dylib";
-    const oslog_build = b.addSystemCommand(&.{
+    // Match Ghostty's embedding model: Zig emits a static core and Swift owns
+    // the final Apple-linker invocation and NSApplication lifecycle.
+    const app_lib = b.addLibrary(.{
+        .name = "bobrwm-core",
+        .linkage = .static,
+        .root_module = exe_mod,
+        .use_llvm = true,
+    });
+    app_lib.bundle_compiler_rt = true;
+    app_lib.bundle_ubsan_rt = true;
+
+    // Normalize Zig's archive before libtool. Newer Apple tools otherwise drop
+    // members whose archive offsets are not aligned to eight bytes.
+    const normalize_core = b.addSystemCommand(&.{
+        "/bin/sh",
+        "-c",
+        "/bin/cp \"$1\" \"$2\" && /usr/bin/ranlib \"$2\"",
+        "_",
+    });
+    normalize_core.addFileArg(app_lib.getEmittedBin());
+    const normalized_archive = normalize_core.addOutputFileArg("libbobrwm-core-normalized.a");
+
+    // Repack with Apple's libtool, as Ghostty does for its embedded library.
+    const repack_core = b.addSystemCommand(&.{ "xcrun", "libtool", "-static" });
+    repack_core.addFileArg(normalized_archive);
+    repack_core.addArg("-o");
+    const app_archive = repack_core.addOutputFileArg("libbobrwm-core.a");
+
+    // Keep the bundled compiler-rt intrinsics Zig needs, but make its libc and
+    // libm fallbacks local so the app binds to Apple's optimized libSystem.
+    const prefer_libsystem = b.addSystemCommand(&.{"/bin/sh"});
+    prefer_libsystem.addFileArg(b.path("script/libsystem-override.sh"));
+    prefer_libsystem.addFileArg(app_archive);
+    const linked_archive = prefer_libsystem.addOutputFileArg("libbobrwm-core.a");
+
+    // Clang must compile the os_log macro so its __oslogstring metadata reaches
+    // Apple's linker unchanged. The object is linked directly into the app.
+    const oslog_compile = b.addSystemCommand(&.{
         "clang",
-        "-dynamiclib",
+        "-c",
         "-target",
         "arm64-apple-macos13.0",
         "-isysroot",
         sdk_root,
-        "-install_name",
-        "@rpath/" ++ oslog_dylib_name,
     });
-    const oslog_dylib = oslog_build.addPrefixedOutputFileArg("-o", oslog_dylib_name);
-    oslog_build.addFileArg(b.path("src/c/oslog.c"));
-    exe_mod.addLibraryPath(oslog_dylib.dirname());
-    exe_mod.linkSystemLibrary("bobrwm-oslog", .{});
+    const oslog_object = oslog_compile.addPrefixedOutputFileArg("-o", "oslog.o");
+    oslog_compile.addFileArg(b.path("src/c/oslog.c"));
 
-    // SwiftUI menu bar. `swiftc` ships with the Command Line Tools, so no
-    // Xcode project is involved, and the Swift runtime is part of the OS
-    // (/usr/lib/swift) — nothing has to ship next to the dylib.
-    const swift_ui = b.addSystemCommand(&.{
+    const swift_app = b.addSystemCommand(&.{
         "swiftc",
-        // Swift 6 strict concurrency rejects the process-wide controller the
-        // C entry points share. Every call already arrives on the main thread,
-        // so the checking would buy nothing here.
         "-swift-version",
         "5",
         "-target",
         "arm64-apple-macos13.0",
-        "-emit-library",
         "-module-name",
-        "BobrwmUI",
-        "-Xlinker",
-        "-install_name",
-        "-Xlinker",
-        "@rpath/" ++ ui_dylib_name,
+        "Bobrwm",
         "-sdk",
         sdk_root,
     });
-    if (optimize != .Debug) swift_ui.addArg("-O");
+    if (optimize != .Debug) swift_app.addArg("-O");
     // Carries both bobrwm_ui.h and the modulemap that makes it importable.
-    swift_ui.addPrefixedDirectoryArg("-I", b.path("packages/bobrwm-ui/include"));
-    const ui_dylib = swift_ui.addPrefixedOutputFileArg("-o", ui_dylib_name);
-    swift_ui.addFileArg(b.path("packages/bobrwm-ui/src/MenuBar.swift"));
-    swift_ui.addFileArg(b.path("packages/bobrwm-ui/src/MenuRow.swift"));
+    swift_app.addPrefixedDirectoryArg("-I", b.path("packages/bobrwm-ui/include"));
+    const app_exe = swift_app.addPrefixedOutputFileArg("-o", server_exe_name);
+    swift_app.addFileArg(b.path("packages/bobrwm-ui/src/main.swift"));
+    swift_app.addFileArg(b.path("packages/bobrwm-ui/src/MenuBar.swift"));
+    swift_app.addFileArg(b.path("packages/bobrwm-ui/src/MenuRow.swift"));
+    swift_app.addFileArg(linked_archive);
+    swift_app.addFileArg(oslog_object);
+    for ([_][]const u8{
+        "ApplicationServices",
+        "CoreGraphics",
+        "Carbon",
+        "AppKit",
+        "CoreFoundation",
+        "ServiceManagement",
+    }) |framework| {
+        swift_app.addArgs(&.{ "-framework", framework });
+    }
 
-    exe_mod.addLibraryPath(ui_dylib.dirname());
-    exe_mod.linkSystemLibrary("bobrwm-ui", .{});
-    // addRPath would resolve this against the build cwd; the loader needs the
-    // @executable_path token emitted verbatim.
-    exe_mod.addRPathSpecial("@executable_path/../Frameworks");
-
-    const exe = b.addExecutable(.{
-        .name = server_exe_name,
-        .root_module = exe_mod,
-    });
-
-    installBundleArtifact(b, exe);
+    installBundleFile(b, app_exe, "Contents/MacOS", server_exe_name);
 
     // The client links no frameworks at all: it only parses arguments and
     // talks to the daemon over a unix socket. Loading AppKit and friends here
@@ -293,9 +309,6 @@ pub fn build(b: *std.Build) !void {
 
     installBundleArtifact(b, swipe_exe);
 
-    installBundleFile(b, ui_dylib, "Contents/Frameworks", ui_dylib_name);
-    installBundleFile(b, oslog_dylib, "Contents/Frameworks", oslog_dylib_name);
-
     installBundleFile(b, bundleInfoPlist(b, app_version), "Contents", "Info.plist");
     // Classic-era type/creator record. LaunchServices no longer needs it, but
     // some tooling still probes for it and it costs eight bytes.
@@ -319,8 +332,6 @@ pub fn build(b: *std.Build) !void {
         for ([_][3][]const u8{
             .{ bundle_macos, cli_exe_name, "com.bobrwm.cli" },
             .{ bundle_macos, "bobrwm-swipe", "com.bobrwm.swipe" },
-            .{ bundle_contents ++ "/Frameworks", ui_dylib_name, "com.bobrwm.ui" },
-            .{ bundle_contents ++ "/Frameworks", oslog_dylib_name, "com.bobrwm.oslog" },
         }) |entry| {
             const sign_helper = devCodesign(b, identity);
             sign_helper.addArgs(&.{ "--identifier", entry[2] });
@@ -543,9 +554,8 @@ pub fn build(b: *std.Build) !void {
         .optimize = optimize,
         .link_libc = true,
     });
-    logging_test_mod.addLibraryPath(oslog_dylib.dirname());
-    logging_test_mod.addRPath(oslog_dylib.dirname());
-    logging_test_mod.linkSystemLibrary("bobrwm-oslog", .{});
+    logging_test_mod.addCSourceFile(.{ .file = b.path("src/c/oslog.c"), .flags = &.{} });
+    logging_test_mod.addSystemIncludePath(.{ .cwd_relative = sdk_include });
 
     const logging_tests = b.addTest(.{
         .name = "logging-tests",
@@ -627,9 +637,9 @@ const AppModuleDependencies = struct {
     sdk_private_frameworks: []const u8,
 };
 
-/// Wire modules that compile the main application graph to the same platform
-/// imports and frameworks. Swift remains executable-only so Zig tests do not
-/// need to build or link the menu bar dylib.
+/// Wire modules that compile the Zig core to the same platform imports and
+/// frameworks. Swift remains in the final app link, so Zig tests do not need
+/// to compile the native application shell.
 fn configureAppModule(module: *std.Build.Module, dependencies: AppModuleDependencies) void {
     module.addImport("build_options", dependencies.build_options);
     module.addImport("objc", dependencies.objc);
