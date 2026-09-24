@@ -40,6 +40,12 @@ typedef struct {
   const char *next_workspace;
 } BWActionShortcuts;
 
+// Swift owns NSApplication. It starts and stops the embedded Zig core from
+// its application delegate, while Zig can request normal AppKit termination.
+int bw_core_start(const char *config_path);
+void bw_core_stop(void);
+void bw_app_terminate(void);
+
 void bw_menubar_init(BWMenuBarCallbacks callbacks);
 void bw_menubar_deinit(void);
 void bw_menubar_set_workspaces(const BWWorkspace *workspaces, size_t count,

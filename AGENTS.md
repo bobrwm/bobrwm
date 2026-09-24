@@ -89,7 +89,7 @@ const foo = Type{ .field = value };     // Avoid
 
 Use zig-objc (`@import("objc")`) for all Objective-C runtime calls from Zig. There is no clang-compiled shim: custom ObjC classes (`BWObserver`, `BWLaunchGate`) are defined at runtime in `src/objc_classes.zig` via `allocateClassPair` / `addMethod`. New BW* classes go there.
 
-Message sends, class lookups, and NSApp lifecycle use zig-objc. AX, CoreFoundation, CoreGraphics, dispatch, and WindowServer/SkyLight interop live in Zig through translated C declarations plus hand-written declarations in `src/c/cg_extra.zig` when Aro cannot translate an API cleanly.
+Message sends and class lookups in the core use zig-objc. The Swift app owns NSApplication lifecycle. AX, CoreFoundation, CoreGraphics, dispatch, and WindowServer/SkyLight interop live in Zig through translated C declarations plus hand-written declarations in `src/c/cg_extra.zig` when Aro cannot translate an API cleanly.
 
 **Message sends:**
 ```zig
@@ -99,13 +99,13 @@ const app = NSApplication.msgSend(objc.Object, "sharedApplication", .{});
 _ = app.msgSend(bool, "setActivationPolicy:", .{@as(i64, 1)});
 ```
 
-**Architecture:** The main thread runs `[NSApp run]` via zig-objc and owns Bobrwm state mutation, layout, workspace state, IPC, status bar, and event draining. AX observer callbacks run on a dedicated background observer thread so slow or hung app AX servers cannot stall the main CFRunLoop. Background AX callbacks must only enqueue events or update observer bookkeeping protected by the AX lock; Bobrwm state mutations happen on the main thread during event drain.
+**Architecture:** Swift runs NSApplication and starts/stops the embedded Zig core through `bobrwm_ui.h`. The AppKit main thread owns Bobrwm state mutation, layout, workspace state, IPC, status bar, and event draining. AX observer callbacks run on a dedicated background observer thread so slow or hung app AX servers cannot stall the main CFRunLoop. Background AX callbacks must only enqueue events or update observer bookkeeping protected by the AX lock; Bobrwm state mutations happen on the main thread during event drain.
 
 ## Menu Bar UI (Swift)
 
-The status item and its menu live in `packages/bobrwm-ui/`, built by `build.zig` with `swiftc` from the Command Line Tools into `Contents/Frameworks/libbobrwm-ui.dylib`. No Xcode project, and the Swift runtime is OS-provided (`/usr/lib/swift`), so nothing ships alongside the dylib. Zig keeps `[NSApp run]` and the main-thread event drain; SwiftUI only renders.
+The native app, status item, and menu live in `packages/bobrwm-ui/`. `build.zig` builds Zig as a static core, then uses `swiftc` and Apple's linker to produce the app executable. No Xcode project or bundled dylib is needed; the Swift runtime is OS-provided (`/usr/lib/swift`). Swift owns AppKit lifecycle while Zig keeps the main-thread event drain and window-manager state.
 
-**ABI:** `packages/bobrwm-ui/include/bobrwm_ui.h` is the single source of truth. Swift imports it through `module.modulemap` so its structs get guaranteed C layout; `src/statusbar.zig` mirrors it with `extern struct`. Changing a declaration means changing both sides. Strings are borrowed for the duration of the call, so `statusbar.zig` keeps names and shortcuts in static storage — a whole row array crosses at once and every pointer in it must be live simultaneously.
+**ABI:** `packages/bobrwm-ui/include/bobrwm_ui.h` is the single source of truth for core lifecycle and menu calls. Swift imports it through `module.modulemap` so its structs get guaranteed C layout; `src/statusbar.zig` mirrors the menu structs with `extern struct`. Changing a declaration means changing both sides. Strings are borrowed for the duration of the call, so `statusbar.zig` keeps names and shortcuts in static storage — a whole row array crosses at once and every pointer in it must be live simultaneously.
 
 **Split:** `bw_menubar_set_workspaces` rebuilds the menu and is for identity (names, keybinds). `bw_menubar_set_state` updates counts and active/focused in place and is safe while the menu is open. Focus moves while the menu is open, so never route it through the rebuild path.
 
