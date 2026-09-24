@@ -743,6 +743,38 @@ fn assertDisplayCoverage() void {
 fn updateStatusBar() void {
     const workspace_count = workspaceCount();
     const summaries = g_state.workspaceSummaries(workspace_count);
+    var process_id_storage: [state_mod.max_managed_windows + max_workspace_application_inventory]i32 = undefined;
+    var workspace_process_id_storage: [state_mod.max_managed_windows]i32 = undefined;
+    var workspace_processes: [workspace_mod.max_workspaces]statusbar.WorkspaceProcesses = undefined;
+    var process_id_count: usize = 0;
+    for (0..workspace_count) |index| {
+        const workspace_id: u8 = @intCast(index + 1);
+        const process_ids = g_state.workspaceProcessIds(
+            workspace_id,
+            &workspace_process_id_storage,
+        );
+        const process_id_start = process_id_count;
+        process_id_count += process_ids.len;
+        std.debug.assert(process_id_count <= process_id_storage.len);
+        @memcpy(process_id_storage[process_id_start..process_id_count], process_ids);
+        for (g_workspace_application_inventory[0..g_workspace_application_inventory_count]) |application| {
+            if (application.workspace_id != workspace_id) continue;
+            if (processManaged(application.process_id)) continue;
+            if (std.mem.findScalar(
+                i32,
+                process_id_storage[process_id_start..process_id_count],
+                application.process_id,
+            ) != null) continue;
+            if (process_id_count == process_id_storage.len) break;
+            process_id_storage[process_id_count] = application.process_id;
+            process_id_count += 1;
+        }
+        workspace_processes[index] = .{
+            .workspace_id = workspace_id,
+            .process_ids = process_id_storage[process_id_start..process_id_count],
+        };
+    }
+
     var active_workspaces: [workspace_mod.max_displays]statusbar.ActiveWorkspace = undefined;
     var active_count: usize = 0;
     for (g_displays[0..g_display_count]) |display| {
@@ -755,7 +787,11 @@ fn updateStatusBar() void {
         };
         active_count += 1;
     }
-    statusbar.updateState(summaries[0..workspace_count], active_workspaces[0..active_count]);
+    statusbar.updateState(
+        summaries[0..workspace_count],
+        active_workspaces[0..active_count],
+        workspace_processes[0..workspace_count],
+    );
 }
 
 /// Rebuilds the current display snapshot from `NSScreen`.
@@ -967,6 +1003,13 @@ var g_ring_lock: c.os_unfair_lock_s = .{ ._os_unfair_lock_opaque = 0 };
 var g_sky: ?skylight.SkyLight = null;
 var g_allocator: std.mem.Allocator = undefined;
 var g_state: state_mod.Model = .{};
+const max_workspace_application_inventory = 128;
+const WorkspaceApplication = struct {
+    workspace_id: u8,
+    process_id: i32,
+};
+var g_workspace_application_inventory: [max_workspace_application_inventory]WorkspaceApplication = undefined;
+var g_workspace_application_inventory_count: usize = 0;
 var g_state_effect_queue: StateEffectQueue = .{};
 var g_state_effect_drain_active = false;
 var g_displays: [workspace_mod.max_displays]DisplayInfo = undefined;
@@ -1239,10 +1282,18 @@ fn axPrompt() void {
 /// Get the focused window ID for a given application PID.
 /// Returns 0 when no focused AX window is available.
 fn bw_ax_get_focused_window(pid: i32) u32 {
+    return axFocusedWindow(pid, null);
+}
+
+fn axFocusedWindow(pid: i32, messaging_timeout_seconds: ?f32) u32 {
     std.debug.assert(pid > 0);
 
     const app = c.AXUIElementCreateApplication(pid) orelse return 0;
     defer c.CFRelease(@ptrCast(app));
+    if (messaging_timeout_seconds) |seconds| {
+        std.debug.assert(seconds > 0);
+        _ = c.AXUIElementSetMessagingTimeout(app, seconds);
+    }
 
     const ax = ensureAxStrings() orelse return 0;
     const focused_attr = ax.focused_window_attr;
@@ -1630,19 +1681,28 @@ fn bw_window_manage_state(pid: i32, wid: u32) u8 {
     return manageStateForWindow(pid, wid);
 }
 
-/// Enumerate on-screen layer-0 windows for regular applications.
+/// Enumerate layer-0 windows for regular applications.
 ///
+/// Runtime discovery stays on-screen-only; startup can request all Spaces and
+/// then validate inactive candidates through AX and SkyLight before adoption.
 /// Uses a per-call PID cache to avoid redundant isRegularActivationApp calls.
 /// Electron apps spawn many XPC helper processes (renderers, GPU process) that
 /// share the CGWindowList but have Prohibited activation policy. Caching the
 /// accept/reject decision per PID avoids an ObjC message send for every window
 /// belonging to the same rejected process.
-fn bw_discover_windows(out: []shim.bw_window_info, on_screen: ?*OnScreenWindows) BoundedSnapshotResult {
+fn bw_discover_windows(
+    out: []shim.bw_window_info,
+    on_screen: ?*OnScreenWindows,
+    on_screen_only: bool,
+) BoundedSnapshotResult {
     if (out.len == 0) return .{ .count = 0, .truncated = true };
     const out_buf = out;
 
-    const options: cg_extra.CGWindowListOption =
-        cg_extra.kCGWindowListOptionOnScreenOnly | cg_extra.kCGWindowListExcludeDesktopElements;
+    const scope = if (on_screen_only)
+        cg_extra.kCGWindowListOptionOnScreenOnly
+    else
+        cg_extra.kCGWindowListOptionAll;
+    const options: cg_extra.CGWindowListOption = scope | cg_extra.kCGWindowListExcludeDesktopElements;
     trace.countWindowList();
     const window_list = cg_extra.CGWindowListCopyWindowInfo(options, cg_extra.kCGNullWindowID) orelse
         return .{ .count = 0, .truncated = false };
@@ -1851,6 +1911,7 @@ fn applyReloadedConfig(next: ConfigRuntime) void {
     // Only changing the layout algorithm requires reconstructing state.
     if (layout_changed) rebuildTilingStatesForConfig();
     statusbar.updateWorkspaceMenu(workspaceCount(), &g_config);
+    statusbar.updateSettings(&g_config);
     updateStatusBar();
     retile();
     if (dim.enabled) pushDimSnapshot();
@@ -1866,8 +1927,9 @@ fn restoreStatusBarAfterConfigError(context: ?*anyopaque) callconv(.c) void {
     if (generation == g_config_error_generation) updateStatusBar();
 }
 
-fn notifyConfigReloadFailed() void {
+fn notifyConfigReloadFailed(message: [*:0]const u8) void {
     statusbar.setMessage("⚠ Config reload failed");
+    statusbar.setConfigStatus(false, message);
     g_config_error_generation +%= 1;
     if (g_config_error_generation == 0) g_config_error_generation = 1;
     c.dispatch_after_f(
@@ -1882,7 +1944,7 @@ fn reloadConfig() bool {
     const path = g_config_path orelse return false;
     var next = ConfigRuntime.init(g_allocator, path, false) catch |err| {
         log.err("config reload failed, keeping current config: {}", .{err});
-        notifyConfigReloadFailed();
+        notifyConfigReloadFailed("Configuration is invalid; previous settings kept");
         return false;
     };
     const configured_count = config_mod.workspaceCount(&next.config);
@@ -1892,10 +1954,11 @@ fn reloadConfig() bool {
             configured_count,
         });
         next.deinit();
-        notifyConfigReloadFailed();
+        notifyConfigReloadFailed("Workspace count changed; restart Bobrwm to apply it");
         return false;
     }
     applyReloadedConfig(next);
+    statusbar.setConfigStatus(true, "Configuration reloaded successfully");
     return true;
 }
 
@@ -2267,6 +2330,7 @@ fn startCore(config_path_arg: ?[]const u8) !void {
     g_core_stage = .signal_transport;
 
     // -- Discover existing windows and tile --
+    captureWorkspaceApplicationInventory();
     discoverWindows();
     log.info("discovered {} windows", .{g_state.windows.count});
     retileAllDisplays();
@@ -2298,9 +2362,12 @@ fn startCore(config_path_arg: ?[]const u8) !void {
     statusbar.init(
         workspaceCount(),
         &g_config,
+        if (g_config_path) |path| path.ptr else null,
         .{
             .retile = statusBarRetile,
             .open_config = statusBarOpenConfig,
+            .reload_config = statusBarReloadConfig,
+            .set_settings = statusBarSetSettings,
             .previous_workspace = statusBarPreviousWorkspace,
             .next_workspace = statusBarNextWorkspace,
             .switch_to_workspace = statusBarSwitchToWorkspace,
@@ -2608,6 +2675,54 @@ fn statusBarRetile() callconv(.c) void {
 
 fn statusBarOpenConfig() callconv(.c) void {
     openConfigFile();
+}
+
+fn statusBarReloadConfig() callconv(.c) bool {
+    return reloadConfig();
+}
+
+fn statusBarSetSettings(settings: *const statusbar.Settings) callconv(.c) bool {
+    const path = g_config_path orelse {
+        notifyConfigReloadFailed("Configuration path is unavailable");
+        return false;
+    };
+    var next = g_config;
+    next.layout = std.enums.fromInt(tiling.LayoutKind, settings.layout) orelse return invalidAppSettings();
+    next.bsp_split = std.enums.fromInt(tiling.SplitMode, settings.bsp_split) orelse return invalidAppSettings();
+    next.bsp_insert_point = std.enums.fromInt(tiling.InsertionPointPolicy, settings.bsp_insert_point) orelse return invalidAppSettings();
+    next.bsp_split_ratio = settings.bsp_split_ratio;
+    next.new_window_split = std.enums.fromInt(tiling.InsertChild, settings.new_window_split) orelse return invalidAppSettings();
+    next.dimmed_inactive = .{
+        .enabled = settings.dimming_enabled,
+        .level = settings.dimming_level,
+    };
+    next.gaps = .{
+        .inner = settings.inner_gap,
+        .outer = .{
+            .left = settings.outer_gap_left,
+            .right = settings.outer_gap_right,
+            .top = settings.outer_gap_top,
+            .bottom = settings.outer_gap_bottom,
+        },
+    };
+    next.animation = .{
+        .enabled = settings.animation_enabled,
+        .duration_ms = settings.animation_duration_ms,
+        .easing = std.enums.fromInt(animation_mod.Easing, settings.animation_easing) orelse return invalidAppSettings(),
+    };
+    next.start_at_login = settings.start_at_login;
+
+    config_mod.saveEditableSettings(g_allocator, path, &g_config, &next) catch |err| {
+        log.err("settings save failed: {}", .{err});
+        notifyConfigReloadFailed("Could not save settings; previous settings kept");
+        return false;
+    };
+    return reloadConfig();
+}
+
+fn invalidAppSettings() bool {
+    notifyConfigReloadFailed("Settings contain an unsupported value");
+    return false;
 }
 
 fn statusBarPreviousWorkspace() callconv(.c) void {
@@ -3009,6 +3124,7 @@ fn handleEvent(ev: *const event_mod.Event) void {
         },
         .app_terminated => {
             log.debug("app terminated pid={}", .{ev.pid});
+            removeWorkspaceApplication(ev.pid);
             untrackAppLaunchRetry(ev.pid);
             untrackFocusRetry(ev.pid);
             ax_mod.invalidateApp(ev.pid);
@@ -4605,6 +4721,88 @@ fn processDeferredWindowCandidates() void {
     }
 }
 
+/// Capture one trustworthy app-to-workspace association per process before
+/// discovery. AX does not enumerate windows on inactive native Spaces, but it
+/// still exposes each app's focused window. Matching that ID to the all-Space
+/// CG snapshot avoids claiming unvalidated windows while letting Settings show
+/// applications on workspaces that have not yet been visited.
+fn captureWorkspaceApplicationInventory() void {
+    g_workspace_application_inventory_count = 0;
+
+    var candidates: [256]shim.bw_window_info = undefined;
+    const discovery = bw_discover_windows(&candidates, null, false);
+    if (discovery.truncated) {
+        log.debug("startup application inventory truncated limit={d}", .{candidates.len});
+    }
+
+    const started_ns = nanoTimestamp();
+    const budget_ns = 500 * std.time.ns_per_ms;
+    var queried_pids: [max_workspace_application_inventory]i32 = undefined;
+    var queried_pid_count: usize = 0;
+
+    for (candidates[0..discovery.count]) |candidate| {
+        if (std.mem.findScalar(i32, queried_pids[0..queried_pid_count], candidate.pid) != null) continue;
+        if (queried_pid_count == queried_pids.len) break;
+        if (nanoTimestamp() - started_ns >= budget_ns) break;
+        queried_pids[queried_pid_count] = candidate.pid;
+        queried_pid_count += 1;
+
+        const focused_window_id = axFocusedWindow(candidate.pid, 0.025);
+        if (focused_window_id == 0) continue;
+        const focused = findDiscoveredWindow(candidates[0..discovery.count], candidate.pid, focused_window_id) orelse continue;
+        const display_id = displayIdForFrame(.{
+            .x = focused.x,
+            .y = focused.y,
+            .width = focused.w,
+            .height = focused.h,
+        });
+        const space = resolveWorkspaceForWindow(candidate.pid, focused_window_id, display_id) orelse continue;
+        if (g_workspace_application_inventory_count == g_workspace_application_inventory.len) break;
+        g_workspace_application_inventory[g_workspace_application_inventory_count] = .{
+            .workspace_id = space.workspace_id,
+            .process_id = candidate.pid,
+        };
+        g_workspace_application_inventory_count += 1;
+    }
+
+    log.debug("captured startup application inventory apps={d} queried={d}", .{
+        g_workspace_application_inventory_count,
+        queried_pid_count,
+    });
+}
+
+fn findDiscoveredWindow(
+    candidates: []const shim.bw_window_info,
+    process_id: i32,
+    window_id: u32,
+) ?shim.bw_window_info {
+    std.debug.assert(process_id > 0);
+    std.debug.assert(window_id > 0);
+    for (candidates) |candidate| {
+        if (candidate.pid == process_id and candidate.wid == window_id) return candidate;
+    }
+    return null;
+}
+
+fn processManaged(process_id: i32) bool {
+    std.debug.assert(process_id > 0);
+    for (g_state.windows.items()) |managed_window| {
+        if (managed_window.process_id == process_id) return true;
+    }
+    return false;
+}
+
+fn removeWorkspaceApplication(process_id: i32) void {
+    std.debug.assert(process_id > 0);
+    var write_index: usize = 0;
+    for (g_workspace_application_inventory[0..g_workspace_application_inventory_count]) |application| {
+        if (application.process_id == process_id) continue;
+        g_workspace_application_inventory[write_index] = application;
+        write_index += 1;
+    }
+    g_workspace_application_inventory_count = write_index;
+}
+
 fn discoverWindows() void {
     _ = discoverWindowsImpl(false);
 }
@@ -4622,7 +4820,7 @@ fn discoverWindowsImpl(should_refresh_tabs: bool) usize {
     const span = trace.begin("discover");
     var buf: [256]shim.bw_window_info = undefined;
     var on_screen: OnScreenWindows = .{};
-    const discovery = bw_discover_windows(&buf, if (should_refresh_tabs) &on_screen else null);
+    const discovery = bw_discover_windows(&buf, if (should_refresh_tabs) &on_screen else null, true);
     const enumerated_ns = nanoTimestamp();
     if (discovery.truncated) {
         log.warn("window discovery truncated limit={d}; excess windows remain unmanaged", .{buf.len});

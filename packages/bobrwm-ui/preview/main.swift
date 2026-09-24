@@ -7,6 +7,7 @@
 // cannot reproduce AppKit's vibrancy.
 
 import AppKit
+import BobrwmUIABI
 import SwiftUI
 
 struct Sample {
@@ -27,6 +28,15 @@ let samples: [Sample] = [
     .init(id: 5, name: "mail", shortcut: "⌥A", count: 1),
     .init(id: 6, name: "music", shortcut: "⌥S", count: 2),
     .init(id: 7, name: "7", shortcut: "⌥D", count: 12),
+]
+
+let sampleApplications: [UInt8: [String]] = [
+    1: ["Ghostty", "Neovim"],
+    2: ["Safari"],
+    3: ["Messages"],
+    5: ["Mail"],
+    6: ["Music"],
+    7: ["Finder", "Preview", "Xcode"],
 ]
 
 func rowState(_ sample: Sample) -> RowState {
@@ -58,7 +68,7 @@ func makeStatusModel() -> StatusModel {
     return model
 }
 
-struct Preview: View {
+struct MenuPreview: View {
     let statusModel: StatusModel
     let scheme: ColorScheme
 
@@ -85,7 +95,11 @@ struct Preview: View {
 
                 divider
                 ActionRow(state: actionState(), title: "Retile")
+                ActionRow(state: actionState(), title: "Reload Config")
                 ActionRow(state: actionState(highlighted: true), title: "Open Config File")
+
+                divider
+                ActionRow(state: actionState(), title: "Settings…", shortcut: "⌘,")
 
                 divider
                 ActionRow(state: actionState(), title: "Quit bobrwm")
@@ -105,6 +119,103 @@ struct Preview: View {
     }
 }
 
+func makeSettingsModel(accessibilityGranted: Bool) -> SettingsModel {
+    let model = SettingsModel(
+        configPath: "/Users/example/.config/bobrwm/config.zon",
+        accessibilityGranted: accessibilityGranted
+    )
+    model.setWorkspaces(samples.map {
+        WorkspaceInfo(id: $0.id, name: $0.name, shortcut: $0.shortcut)
+    })
+    model.setWorkspaceStates(Dictionary(uniqueKeysWithValues: samples.map {
+        ($0.id, WorkspaceRuntimeState(
+            applicationNames: sampleApplications[$0.id] ?? [],
+            windowCount: $0.count,
+            isActive: $0.isActive,
+            isFocused: $0.isFocused,
+            displayOrder: $0.isActive ? $0.id : UInt8.max
+        ))
+    }))
+    return model
+}
+
+@MainActor
+func render<ViewContent: View>(
+    _ content: ViewContent,
+    path: String,
+    appearance: NSAppearance.Name
+) -> Bool {
+    let renderer = ImageRenderer(content: content)
+    renderer.scale = 2
+
+    var image: NSImage?
+    NSAppearance(named: appearance)?.performAsCurrentDrawingAppearance {
+        image = renderer.nsImage
+    }
+
+    guard let image,
+        let tiff = image.tiffRepresentation,
+        let rep = NSBitmapImageRep(data: tiff),
+        let png = rep.representation(using: .png, properties: [:])
+    else {
+        FileHandle.standardError.write(Data("render failed: \(path)\n".utf8))
+        return false
+    }
+
+    do {
+        try png.write(to: URL(fileURLWithPath: path))
+        print(path)
+        return true
+    } catch {
+        FileHandle.standardError.write(Data("write failed: \(path): \(error)\n".utf8))
+        return false
+    }
+}
+
+@MainActor
+func renderHosted<ViewContent: View>(
+    _ content: ViewContent,
+    size: NSSize,
+    path: String,
+    appearance: NSAppearance.Name
+) -> Bool {
+    let hostingController = NSHostingController(rootView: content)
+    let window = NSWindow(
+        contentRect: NSRect(origin: .zero, size: size),
+        styleMask: [.borderless],
+        backing: .buffered,
+        defer: false
+    )
+    window.appearance = NSAppearance(named: appearance)
+    window.contentViewController = hostingController
+    window.setContentSize(size)
+    hostingController.view.frame = NSRect(origin: .zero, size: size)
+    hostingController.view.layoutSubtreeIfNeeded()
+    window.displayIfNeeded()
+
+    guard let rep = hostingController.view.bitmapImageRepForCachingDisplay(
+        in: hostingController.view.bounds
+    ) else {
+        FileHandle.standardError.write(Data("render failed: \(path)\n".utf8))
+        return false
+    }
+    hostingController.view.cacheDisplay(in: hostingController.view.bounds, to: rep)
+
+    guard let png = rep.representation(using: .png, properties: [:]) else {
+        FileHandle.standardError.write(Data("encode failed: \(path)\n".utf8))
+        return false
+    }
+
+    do {
+        try png.write(to: URL(fileURLWithPath: path))
+        print(path)
+        return true
+    } catch {
+        FileHandle.standardError.write(Data("write failed: \(path): \(error)\n".utf8))
+        return false
+    }
+}
+
 @MainActor
 func renderAll(into directory: String) -> Bool {
     var ok = true
@@ -118,37 +229,45 @@ func renderAll(into directory: String) -> Bool {
         ("light", ColorScheme.light, NSAppearance.Name.aqua),
         ("dark", ColorScheme.dark, NSAppearance.Name.darkAqua),
     ] {
-        let content = Preview(statusModel: makeStatusModel(), scheme: scheme)
+        let menu = MenuPreview(statusModel: makeStatusModel(), scheme: scheme)
             .environment(\.colorScheme, scheme)
-        let renderer = ImageRenderer(content: content)
-        renderer.scale = 2
+        // SwiftUI's colorScheme drives Color.background and friends, while
+        // NSColor-backed styles resolve against the drawing appearance.
+        ok = render(
+            menu,
+            path: "\(directory)/menu-\(suffix).png",
+            appearance: appearance
+        ) && ok
+        for section in SettingsSection.allCases {
+            let settings = SettingsView(
+                model: makeSettingsModel(accessibilityGranted: true),
+                actions: .preview,
+                initialSection: section
+            )
+            .frame(width: 780, height: 560)
+            .environment(\.colorScheme, scheme)
 
-        // SwiftUI's colorScheme drives Color.background and friends, but
-        // .primary and .secondary are NSColor-backed and resolve against the
-        // drawing appearance, which a command-line tool does not otherwise set.
-        var image: NSImage?
-        NSAppearance(named: appearance)?.performAsCurrentDrawingAppearance {
-            image = renderer.nsImage
+            ok = renderHosted(
+                settings,
+                size: NSSize(width: 780, height: 560),
+                path: "\(directory)/settings-\(section.rawValue)-\(suffix).png",
+                appearance: appearance
+            ) && ok
         }
 
-        guard let image,
-            let tiff = image.tiffRepresentation,
-            let rep = NSBitmapImageRep(data: tiff),
-            let png = rep.representation(using: .png, properties: [:])
-        else {
-            FileHandle.standardError.write(Data("render failed: \(suffix)\n".utf8))
-            ok = false
-            continue
-        }
-
-        let path = "\(directory)/menu-\(suffix).png"
-        do {
-            try png.write(to: URL(fileURLWithPath: path))
-            print(path)
-        } catch {
-            FileHandle.standardError.write(Data("write failed: \(path): \(error)\n".utf8))
-            ok = false
-        }
+        let permissionRequired = SettingsView(
+            model: makeSettingsModel(accessibilityGranted: false),
+            actions: .preview,
+            initialSection: .general
+        )
+        .frame(width: 780, height: 560)
+        .environment(\.colorScheme, scheme)
+        ok = renderHosted(
+            permissionRequired,
+            size: NSSize(width: 780, height: 560),
+            path: "\(directory)/settings-permission-required-\(suffix).png",
+            appearance: appearance
+        ) && ok
     }
 
     return ok

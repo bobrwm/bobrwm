@@ -485,6 +485,43 @@ test "workspace summaries preserve globally unique active workspaces" {
     try testing.expect(summaries[1].is_focused);
 }
 
+test "workspace process ids are deduplicated and exclude suppressed windows" {
+    const testing = std.testing;
+    var catalog: SpaceCatalog = .{};
+    catalog.add(.{ .key = .{ .id = 101 }, .workspace_id = 1, .display_id = 11 });
+    catalog.add(.{ .key = .{ .id = 102 }, .workspace_id = 2, .display_id = 11 });
+
+    var model: Model = .{ .spaces = catalog };
+    try testing.expect(model.windows.put(.{
+        .window_id = 1,
+        .process_id = 1001,
+        .space_key = .{ .id = 101 },
+    }));
+    try testing.expect(model.windows.put(.{
+        .window_id = 2,
+        .process_id = 1001,
+        .space_key = .{ .id = 101 },
+    }));
+    try testing.expect(model.windows.put(.{
+        .window_id = 3,
+        .process_id = 2002,
+        .space_key = .{ .id = 101 },
+        .is_suppressed = true,
+    }));
+    try testing.expect(model.windows.put(.{
+        .window_id = 4,
+        .process_id = 3003,
+        .space_key = .{ .id = 102 },
+    }));
+
+    var process_ids: [max_managed_windows]i32 = undefined;
+    const first = model.workspaceProcessIds(1, &process_ids);
+    try testing.expectEqualSlices(i32, &.{1001}, first);
+
+    const second = model.workspaceProcessIds(2, &process_ids);
+    try testing.expectEqualSlices(i32, &.{3003}, second);
+}
+
 test "window catalog owns identity and Space membership" {
     const testing = std.testing;
     var catalog: SpaceCatalog = .{};

@@ -838,6 +838,35 @@ pub const Model = struct {
         return window_ids[0..count];
     }
 
+    /// Return each process with a managed window in the logical workspace once.
+    pub fn workspaceProcessIds(
+        self: *const Model,
+        workspace_id: WorkspaceId,
+        process_ids: *[max_managed_windows]i32,
+    ) []const i32 {
+        std.debug.assert(workspace_id > 0 and workspace_id <= max_spaces_per_display);
+
+        var count: usize = 0;
+        for (self.windows.items()) |managed_window| {
+            if (managed_window.is_suppressed) continue;
+            const space_ref = self.space(managed_window.space_key) orelse continue;
+            if (space_ref.workspace_id != workspace_id) continue;
+
+            var already_present = false;
+            for (process_ids[0..count]) |process_id| {
+                if (process_id == managed_window.process_id) {
+                    already_present = true;
+                    break;
+                }
+            }
+            if (already_present) continue;
+
+            process_ids[count] = managed_window.process_id;
+            count += 1;
+        }
+        return process_ids[0..count];
+    }
+
     pub fn desiredWorkspace(self: *const Model, display_id: DisplayId) ?WorkspaceId {
         if (self.queued_switch) |queued| {
             if (queued.target.display_id == display_id) return queued.target.workspace_id;

@@ -14,6 +14,8 @@ const std = @import("std");
 // available via std.c.* directly (open, read, write, fopen, etc.).
 extern "c" fn fseek(stream: *std.c.FILE, offset: c_long, whence: c_int) c_int;
 extern "c" fn ftell(stream: *std.c.FILE) c_long;
+extern "c" fn fileno(stream: *std.c.FILE) c_int;
+extern "c" fn fflush(stream: *std.c.FILE) c_int;
 const SEEK_SET: c_int = 0;
 const SEEK_END: c_int = 2;
 
@@ -85,6 +87,34 @@ pub fn writeFile(path_z: [*:0]const u8, bytes: []const u8) bool {
     defer _ = std.c.fclose(file);
     const n = std.c.fwrite(bytes.ptr, 1, bytes.len, file);
     return n == bytes.len;
+}
+
+/// Durably replace a file without exposing a partially-written destination.
+/// The temporary file lives beside the destination so rename stays atomic.
+pub fn writeFileAtomically(allocator: std.mem.Allocator, path: []const u8, bytes: []const u8) bool {
+    std.debug.assert(path.len > 0);
+    const path_z = allocator.dupeZ(u8, path) catch return false;
+    defer allocator.free(path_z);
+    const temporary_path = std.fmt.allocPrintSentinel(
+        allocator,
+        "{s}.tmp-{d}",
+        .{ path, std.c.getpid() },
+        0,
+    ) catch return false;
+    defer allocator.free(temporary_path);
+    defer deleteFile(temporary_path.ptr);
+
+    const file = std.c.fopen(temporary_path.ptr, "wb") orelse return false;
+    var open = true;
+    defer {
+        if (open) _ = std.c.fclose(file);
+    }
+    if (std.c.fwrite(bytes.ptr, 1, bytes.len, file) != bytes.len) return false;
+    if (fflush(file) != 0) return false;
+    if (std.c.fsync(fileno(file)) != 0) return false;
+    if (std.c.fclose(file) != 0) return false;
+    open = false;
+    return std.c.rename(temporary_path.ptr, path_z.ptr) == 0;
 }
 
 /// Returns true if `path` exists and is accessible.

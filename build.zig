@@ -233,6 +233,7 @@ pub fn build(b: *std.Build) !void {
     swift_app.addPrefixedDirectoryArg("-I", b.path("packages/bobrwm-ui/include"));
     const app_exe = swift_app.addPrefixedOutputFileArg("-o", server_exe_name);
     swift_app.addFileArg(b.path("packages/bobrwm-ui/src/main.swift"));
+    swift_app.addFileArg(b.path("packages/bobrwm-ui/src/Settings.swift"));
     swift_app.addFileArg(b.path("packages/bobrwm-ui/src/MenuBar.swift"));
     swift_app.addFileArg(b.path("packages/bobrwm-ui/src/MenuRow.swift"));
     swift_app.addFileArg(linked_archive);
@@ -375,7 +376,9 @@ pub fn build(b: *std.Build) !void {
         sdk_root,
     });
     const preview_exe = preview_build.addPrefixedOutputFileArg("-o", "bobrwm-ui-preview");
+    preview_build.addPrefixedDirectoryArg("-I", b.path("packages/bobrwm-ui/include"));
     preview_build.addFileArg(b.path("packages/bobrwm-ui/src/MenuRow.swift"));
+    preview_build.addFileArg(b.path("packages/bobrwm-ui/src/Settings.swift"));
     preview_build.addFileArg(b.path("packages/bobrwm-ui/preview/main.swift"));
 
     const preview_run = std.Build.Step.Run.create(b, "render ui preview");

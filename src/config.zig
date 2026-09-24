@@ -1223,6 +1223,293 @@ pub fn loadFromPath(allocator: std.mem.Allocator, path: []const u8) ?Config {
     return parsed;
 }
 
+/// Persist the settings exposed by the native app without rewriting unrelated
+/// configuration. Existing top-level values are replaced in place; omitted
+/// values are appended to the root struct. Comments and formatting outside a
+/// changed value remain byte-for-byte intact.
+pub fn saveEditableSettings(
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    previous: *const Config,
+    next: *const Config,
+) !void {
+    std.debug.assert(path.len > 0);
+    try validate(next);
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const temporary_allocator = arena.allocator();
+    const path_z = try temporary_allocator.dupeZ(u8, path);
+    var source: [:0]const u8 = osutil.readFileAllocSentinel(
+        temporary_allocator,
+        path_z,
+        1024 * 1024,
+    ) orelse ".{\n}\n";
+
+    if (previous.layout != next.layout) {
+        source = try replaceRootField(temporary_allocator, source, "layout", try enumValue(temporary_allocator, next.layout));
+    }
+    if (previous.bsp_split != next.bsp_split) {
+        source = try replaceRootField(temporary_allocator, source, "bsp_split", try enumValue(temporary_allocator, next.bsp_split));
+    }
+    if (previous.bsp_insert_point != next.bsp_insert_point) {
+        source = try replaceRootField(temporary_allocator, source, "bsp_insert_point", try enumValue(temporary_allocator, next.bsp_insert_point));
+    }
+    if (previous.bsp_split_ratio != next.bsp_split_ratio) {
+        source = try replaceRootField(temporary_allocator, source, "bsp_split_ratio", try numberValue(temporary_allocator, next.bsp_split_ratio));
+    }
+    if (previous.new_window_split != next.new_window_split) {
+        source = try replaceRootField(temporary_allocator, source, "new_window_split", try enumValue(temporary_allocator, next.new_window_split));
+    }
+    if (!std.meta.eql(previous.dimmed_inactive, next.dimmed_inactive)) {
+        source = try replaceRootField(temporary_allocator, source, "dimmed_inactive", try std.fmt.allocPrintSentinel(
+            temporary_allocator,
+            ".{{ .enabled = {}, .level = {d} }}",
+            .{ next.dimmed_inactive.enabled, next.dimmed_inactive.level },
+            0,
+        ));
+    }
+    if (!std.meta.eql(previous.gaps, next.gaps)) {
+        source = try replaceRootField(temporary_allocator, source, "gaps", try std.fmt.allocPrintSentinel(
+            temporary_allocator,
+            ".{{ .inner = {d}, .outer = .{{ .left = {d}, .right = {d}, .top = {d}, .bottom = {d} }} }}",
+            .{
+                next.gaps.inner,
+                next.gaps.outer.left,
+                next.gaps.outer.right,
+                next.gaps.outer.top,
+                next.gaps.outer.bottom,
+            },
+            0,
+        ));
+    }
+    if (!std.meta.eql(previous.animation, next.animation)) {
+        source = try replaceRootField(temporary_allocator, source, "animation", try std.fmt.allocPrintSentinel(
+            temporary_allocator,
+            ".{{ .enabled = {}, .duration_ms = {d}, .easing = .{s} }}",
+            .{ next.animation.enabled, next.animation.duration_ms, @tagName(next.animation.easing) },
+            0,
+        ));
+    }
+    if (previous.start_at_login != next.start_at_login) {
+        source = try replaceRootField(
+            temporary_allocator,
+            source,
+            "start_at_login",
+            if (next.start_at_login) "true" else "false",
+        );
+    }
+
+    // Parse the exact candidate before replacing the last known-good file.
+    const parsed = try std.zon.parse.fromSliceAlloc(Config, temporary_allocator, source, null, .{});
+    try validate(&parsed);
+    if (std.fs.path.dirname(path)) |parent| {
+        if (!osutil.makePath(temporary_allocator, parent)) return error.CreateConfigDirectoryFailed;
+    }
+    if (!osutil.writeFileAtomically(temporary_allocator, path, source)) return error.WriteConfigFailed;
+}
+
+fn enumValue(allocator: std.mem.Allocator, value: anytype) ![:0]const u8 {
+    return std.fmt.allocPrintSentinel(allocator, ".{s}", .{@tagName(value)}, 0);
+}
+
+fn numberValue(allocator: std.mem.Allocator, value: anytype) ![:0]const u8 {
+    return std.fmt.allocPrintSentinel(allocator, "{d}", .{value}, 0);
+}
+
+fn replaceRootField(
+    allocator: std.mem.Allocator,
+    source: [:0]const u8,
+    field_name: []const u8,
+    replacement: []const u8,
+) ![:0]const u8 {
+    std.debug.assert(field_name.len > 0);
+    std.debug.assert(replacement.len > 0);
+    const range = try rootFieldValueRange(source, field_name);
+    if (range.value_start) |value_start| {
+        return std.fmt.allocPrintSentinel(
+            allocator,
+            "{s}{s}{s}",
+            .{ source[0..value_start], replacement, source[range.value_end..] },
+            0,
+        );
+    }
+
+    const line_prefix = if (range.root_close > 0 and source[range.root_close - 1] == '\n') "" else "\n";
+    return std.fmt.allocPrintSentinel(
+        allocator,
+        "{s}{s}    .{s} = {s},\n{s}",
+        .{ source[0..range.root_close], line_prefix, field_name, replacement, source[range.root_close..] },
+        0,
+    );
+}
+
+fn rootFieldValueRange(source: [:0]const u8, field_name: []const u8) !struct {
+    value_start: ?usize,
+    value_end: usize,
+    root_close: usize,
+} {
+    var tokenizer = std.zig.Tokenizer.init(source);
+    var brace_depth: usize = 0;
+    var bracket_depth: usize = 0;
+    var paren_depth: usize = 0;
+    var root_opened = false;
+    var root_close: ?usize = null;
+
+    while (true) {
+        const token = tokenizer.next();
+        if (token.tag == .eof) break;
+        switch (token.tag) {
+            .l_brace => {
+                brace_depth += 1;
+                root_opened = true;
+            },
+            .r_brace => {
+                if (brace_depth == 0) return error.InvalidConfigSyntax;
+                if (brace_depth == 1 and bracket_depth == 0 and paren_depth == 0) {
+                    root_close = token.loc.start;
+                    break;
+                }
+                brace_depth -= 1;
+            },
+            .l_bracket => bracket_depth += 1,
+            .r_bracket => if (bracket_depth > 0) {
+                bracket_depth -= 1;
+            },
+            .l_paren => paren_depth += 1,
+            .r_paren => if (paren_depth > 0) {
+                paren_depth -= 1;
+            },
+            .period => {
+                if (!root_opened or brace_depth != 1 or bracket_depth != 0 or paren_depth != 0) continue;
+                const name = tokenizer.next();
+                if (name.tag != .identifier) {
+                    updateDepths(name.tag, &brace_depth, &bracket_depth, &paren_depth);
+                    continue;
+                }
+                if (!std.mem.eql(u8, source[name.loc.start..name.loc.end], field_name)) continue;
+                const equal = tokenizer.next();
+                if (equal.tag != .equal) continue;
+                const value = tokenizer.next();
+                if (value.tag == .eof) return error.InvalidConfigSyntax;
+                var value_end = value.loc.end;
+                var value_braces: usize = 0;
+                var value_brackets: usize = 0;
+                var value_parens: usize = 0;
+                updateDepths(value.tag, &value_braces, &value_brackets, &value_parens);
+                while (true) {
+                    const next = tokenizer.next();
+                    if (next.tag == .eof) return error.InvalidConfigSyntax;
+                    if (next.tag == .comma and value_braces == 0 and value_brackets == 0 and value_parens == 0) {
+                        return .{ .value_start = value.loc.start, .value_end = value_end, .root_close = 0 };
+                    }
+                    if (next.tag == .r_brace and value_braces == 0 and value_brackets == 0 and value_parens == 0) {
+                        return .{ .value_start = value.loc.start, .value_end = value_end, .root_close = next.loc.start };
+                    }
+                    updateDepths(next.tag, &value_braces, &value_brackets, &value_parens);
+                    value_end = next.loc.end;
+                }
+            },
+            else => {},
+        }
+    }
+    return .{ .value_start = null, .value_end = 0, .root_close = root_close orelse return error.InvalidConfigSyntax };
+}
+
+fn updateDepths(
+    tag: std.zig.Token.Tag,
+    braces: *usize,
+    brackets: *usize,
+    parens: *usize,
+) void {
+    switch (tag) {
+        .l_brace => braces.* += 1,
+        .r_brace => if (braces.* > 0) {
+            braces.* -= 1;
+        },
+        .l_bracket => brackets.* += 1,
+        .r_bracket => if (brackets.* > 0) {
+            brackets.* -= 1;
+        },
+        .l_paren => parens.* += 1,
+        .r_paren => if (parens.* > 0) {
+            parens.* -= 1;
+        },
+        else => {},
+    }
+}
+
+test "replaceRootField preserves unrelated source and nested commas" {
+    const source: [:0]const u8 =
+        \\.{
+        \\    // keep this comment
+        \\    .gaps = .{ .inner = 4, .outer = .{ .left = 2 } },
+        \\    .layout = .bsp,
+        \\}
+    ;
+    const replaced = try replaceRootField(std.testing.allocator, source, "gaps", ".{ .inner = 8 }");
+    defer std.testing.allocator.free(replaced);
+    try std.testing.expectEqualStrings(
+        \\.{
+        \\    // keep this comment
+        \\    .gaps = .{ .inner = 8 },
+        \\    .layout = .bsp,
+        \\}
+    , replaced);
+}
+
+test "replaceRootField appends an omitted setting" {
+    const source: [:0]const u8 =
+        \\.{
+        \\    .layout = .bsp,
+        \\}
+    ;
+    const replaced = try replaceRootField(std.testing.allocator, source, "start_at_login", "true");
+    defer std.testing.allocator.free(replaced);
+    try std.testing.expectEqualStrings(
+        \\.{
+        \\    .layout = .bsp,
+        \\    .start_at_login = true,
+        \\}
+    , replaced);
+}
+
+test "saveEditableSettings preserves unrelated configuration and writes valid ZON" {
+    const path: [:0]const u8 = "/tmp/bobrwm_test_editable_settings.zon";
+    defer osutil.deleteFile(path.ptr);
+    const original =
+        \\.{
+        \\    // This user-authored section must survive app edits.
+        \\    .keybinds = .{
+        \\        .{ .key = "f", .mods = .{ .alt = true }, .action = .toggle_fullscreen },
+        \\    },
+        \\    .layout = .bsp,
+        \\}
+    ;
+    if (!osutil.writeFile(path.ptr, original)) return error.TestUnexpectedResult;
+
+    const previous: Config = .{};
+    var next = previous;
+    next.layout = .monocle;
+    next.gaps.inner = 9;
+    next.start_at_login = true;
+    try saveEditableSettings(t.allocator, path, &previous, &next);
+
+    const written = osutil.readFileAllocSentinel(t.allocator, path.ptr, 1024 * 1024) orelse
+        return error.TestUnexpectedResult;
+    defer t.allocator.free(written);
+    try t.expect(std.mem.indexOf(u8, written, "// This user-authored section must survive app edits.") != null);
+
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const parsed = try std.zon.parse.fromSliceAlloc(Config, arena.allocator(), written, null, .{});
+    try validate(&parsed);
+    try t.expectEqual(tiling.LayoutKind.monocle, parsed.layout);
+    try t.expectEqual(@as(u16, 9), parsed.gaps.inner);
+    try t.expect(parsed.start_at_login);
+    try t.expectEqual(@as(usize, 1), parsed.keybinds.len);
+}
+
 // Bundle ID helper
 
 pub fn getAppBundleId(pid: i32, buf: *[256]u8) ?[]const u8 {
