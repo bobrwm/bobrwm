@@ -320,6 +320,7 @@ pub fn build(b: *std.Build) !void {
             .{ bundle_macos, cli_exe_name, "com.bobrwm.cli" },
             .{ bundle_macos, "bobrwm-swipe", "com.bobrwm.swipe" },
             .{ bundle_contents ++ "/Frameworks", ui_dylib_name, "com.bobrwm.ui" },
+            .{ bundle_contents ++ "/Frameworks", oslog_dylib_name, "com.bobrwm.oslog" },
         }) |entry| {
             const sign_helper = devCodesign(b, identity);
             sign_helper.addArgs(&.{ "--identifier", entry[2] });
