@@ -14,6 +14,7 @@ const log = std.log.scoped(.config);
 // Config types
 
 pub const Config = struct {
+    disable_default_keybinds: bool = false,
     keybinds: []const Keybind = &default_keybinds,
     app_rules: []const AppRule = &.{},
     /// Deprecated alias for the workspace part of `app_rules`. Entries here are
@@ -63,10 +64,12 @@ pub const Config = struct {
     }
 
     /// Build the effective keybind table without allocating. Defaults are
-    /// applied first; config entries with the same trigger replace them.
+    /// applied first unless disabled; config entries with the same trigger replace them.
     fn buildKeybinds(self: *const Config, table: *KeybindTable) []const shim.bw_keybind {
         var count: usize = 0;
-        mergeKeybinds(default_keybinds[0..], table.storage, &count);
+        if (!self.disable_default_keybinds) {
+            mergeKeybinds(default_keybinds[0..], table.storage, &count);
+        }
         if (!isDefaultKeybindSlice(self.keybinds)) {
             mergeKeybinds(self.keybinds, table.storage, &count);
         }
@@ -89,6 +92,7 @@ pub const Config = struct {
             }
         }
 
+        if (self.disable_default_keybinds) return null;
         for (default_keybinds) |keybind| {
             if (keybind.action != action or keybind.arg != arg) continue;
             if (has_overrides and self.isTriggerReassigned(keybind)) continue;
@@ -128,8 +132,9 @@ pub const KeybindTable = struct {
 
     pub fn init(allocator: std.mem.Allocator, config: *const Config) !KeybindTable {
         const configured_count: usize = if (isDefaultKeybindSlice(config.keybinds)) 0 else config.keybinds.len;
+        const defaults_count: usize = if (config.disable_default_keybinds) 0 else default_keybind_count;
         return .{
-            .storage = try allocator.alloc(shim.bw_keybind, default_keybind_count + configured_count),
+            .storage = try allocator.alloc(shim.bw_keybind, defaults_count + configured_count),
         };
     }
 
@@ -1657,6 +1662,49 @@ test "default_keybinds" {
     try t.expectEqual(Action.reload_config, default_keybinds[29].action);
     try t.expect(std.mem.eql(u8, "r", default_keybinds[29].key));
     try t.expect(default_keybinds[29].mods.alt and default_keybinds[29].mods.shift);
+}
+
+test "disabled default keybinds leave omitted and empty keybinds unbound" {
+    for ([_]Config{
+        .{ .disable_default_keybinds = true },
+        .{ .disable_default_keybinds = true, .keybinds = &.{} },
+    }) |cfg| {
+        var table = try KeybindTable.init(t.allocator, &cfg);
+        defer table.deinit(t.allocator);
+
+        try t.expectEqual(@as(usize, 0), cfg.buildKeybinds(&table).len);
+        try t.expectEqual(@as(?Keybind, null), cfg.findKeybind(.focus_workspace, 1));
+    }
+}
+
+test "disabled default keybinds retain only explicit bindings parsed from ZON" {
+    const source =
+        \\.{
+        \\    .disable_default_keybinds = true,
+        \\    .keybinds = .{
+        \\        .{ .key = "1", .mods = .{ .alt = true }, .action = .focus_workspace, .arg = 3 },
+        \\        .{ .key = "f", .mods = .{ .ctrl = true }, .action = .toggle_float },
+        \\    },
+        \\}
+    ;
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const cfg = try std.zon.parse.fromSliceAlloc(Config, arena.allocator(), source, null, .{});
+    var table = try KeybindTable.init(t.allocator, &cfg);
+    defer table.deinit(t.allocator);
+
+    const binds = cfg.buildKeybinds(&table);
+    try t.expectEqual(@as(usize, 2), binds.len);
+    try t.expectEqual(keyNameToCode("1").?, binds[0].keycode);
+    try t.expectEqual(shim.BW_MOD_ALT, binds[0].mods);
+    try t.expectEqual(@intFromEnum(Action.focus_workspace), binds[0].action);
+    try t.expectEqual(@as(u32, 3), binds[0].arg);
+    try t.expectEqual(keyNameToCode("f").?, binds[1].keycode);
+    try t.expectEqual(shim.BW_MOD_CTRL, binds[1].mods);
+    try t.expectEqual(@intFromEnum(Action.toggle_float), binds[1].action);
+    try t.expectEqualStrings("1", cfg.findKeybind(.focus_workspace, 3).?.key);
+    try t.expectEqualStrings("f", cfg.findKeybind(.toggle_float, 0).?.key);
+    try t.expectEqual(@as(?Keybind, null), cfg.findKeybind(.focus_workspace, 2));
 }
 
 test "buildKeybinds merges custom keybinds with defaults" {
