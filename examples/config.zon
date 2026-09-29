@@ -77,6 +77,9 @@
     //     "code",
     //     "chat",
     // },
+    // Set true to use only the explicit keybinds below (reloads live).
+    .disable_default_keybinds = false,
+
     // Keybinds merge with built-in defaults. Use the same key + modifiers to
     // override a default binding, or add new entries for additional shortcuts.
     .keybinds = .{

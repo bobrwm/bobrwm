@@ -153,6 +153,12 @@ including keybinds, rules, layouts, gaps, animation, and dimming, reload live.
 Map a key + modifiers to an action. Configured keybinds are merged with the
 built-in defaults; use the same key + modifiers to override a default binding.
 
+Set `.disable_default_keybinds = true` at the top level of `config.zon` to use
+only your explicit `.keybinds` entries. If `.keybinds` is omitted or empty,
+no shortcuts are registered. The option defaults to `false` and reloads live.
+It also disables the default reload shortcut, so use `bobrwm reload-config` unless
+you configure your own `.reload_config` binding.
+
 ```zon
 .keybinds = .{
     .{ .key = "1", .mods = .{ .alt = true }, .action = .focus_workspace, .arg = 1 },
