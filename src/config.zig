@@ -14,25 +14,97 @@ const log = std.log.scoped(.config);
 // Config types
 
 pub const Config = struct {
+    /// Use only the explicit `keybinds` entries instead of merging them with
+    /// the built-in defaults. If `keybinds` is omitted or empty, no shortcuts
+    /// are registered.
+    ///
+    /// This also drops the default `reload_config` shortcut, so use
+    /// `bobrwm reload-config` unless you bind `reload_config` yourself.
     disable_default_keybinds: bool = false,
+    /// Map a key and modifiers to an action.
+    ///
+    /// Entries are merged with the built-in defaults. An entry with the same
+    /// key and modifiers as a default replaces it; any other entry adds a new
+    /// shortcut. See `disable_default_keybinds` to drop the defaults entirely.
+    ///
+    ///     .keybinds = .{
+    ///         .{ .key = "1", .mods = .{ .alt = true }, .action = .focus_workspace, .arg = 1 },
+    ///         .{ .key = "h", .mods = .{ .alt = true }, .action = .focus_left },
+    ///         .{ .key = "return", .mods = .{ .alt = true }, .action = .toggle_split },
+    ///     },
     keybinds: []const Keybind = &default_keybinds,
+    /// Per-app behavior keyed by bundle identifier. Each rule sets only what
+    /// it needs: a workspace, floating, or both. At most one rule per app.
+    ///
+    ///     .app_rules = .{
+    ///         .{ .app_id = "com.apple.Safari", .workspace = 2 },
+    ///         .{ .app_id = "com.apple.systempreferences", .float = true },
+    ///     },
     app_rules: []const AppRule = &.{},
     /// Deprecated alias for the workspace part of `app_rules`. Entries here are
     /// merged into the app-rule lookups after `app_rules`, so a matching
     /// `app_rules` entry wins.
     workspace_assignments: []const WorkspaceAssignment = &.{},
+    /// Names for the managed workspaces. The number of names is the workspace
+    /// count; when omitted, bobrwm manages 10 unnamed workspaces. At most 10.
+    ///
+    /// Workspace IDs stay 1-based, so four names create workspaces 1 through
+    /// 4, and keybinds and app rules must reference workspaces in that range.
+    ///
+    ///     .workspace_names = .{ "term", "web", "code", "chat" },
+    ///
+    /// Note: changing the number of workspaces requires a restart. Other
+    /// settings reload live.
     workspace_names: []const []const u8 = &.{},
+    /// Trackpad swipe settings for the optional `bobrwm-swipe` companion.
+    /// bobrwm itself only parses these; they take effect when `bobrwm-swipe`
+    /// is running.
+    ///
+    /// Note: macOS grants Accessibility per executable, so `bobrwm-swipe`
+    /// needs its own grant even when bobrwm is already trusted.
     swipe: SwipeConfig = .{},
+    /// Dim every visible window except the focused one with a click-through
+    /// black overlay. Works without disabling SIP. The `toggle_dimming`
+    /// keybind action flips it at runtime.
+    ///
+    /// Warning: alpha.
     dimmed_inactive: DimConfig = .{},
+    /// Spacing in pixels between and around tiled windows.
+    ///
+    ///     .gaps = .{
+    ///         .inner = 4,
+    ///         .outer = .{ .left = 4, .right = 4, .top = 4, .bottom = 4 },
+    ///     },
     gaps: Gaps = .{},
+    /// Tiling algorithm: `.bsp` for binary space partitioning, or `.monocle`
+    /// to show each window fullscreen.
     layout: tiling.LayoutKind = .bsp,
+    /// Axis used when a BSP tile splits. `.auto` picks the axis from the
+    /// target tile's shape, `.horizontal` always splits left/right, and
+    /// `.vertical` always splits top/bottom.
     bsp_split: tiling.SplitMode = .auto,
+    /// Which tile a new window splits: `.focused`, `.first`, `.last`, or
+    /// `.min_depth` (the shallowest leaf).
     bsp_insert_point: tiling.InsertionPointPolicy = .focused,
+    /// Ratio for newly created BSP splits. Must be a finite value from 0.1
+    /// through 0.9.
     bsp_split_ratio: f64 = 0.5,
+    /// Side a new window takes when it splits a tile: `.second` is
+    /// right/bottom, `.first` is left/top.
     new_window_split: tiling.InsertChild = .second,
+    /// Animate window movement during layout changes.
+    ///
+    /// Warning: alpha. Animations run on the window manager's main thread,
+    /// so a slow or unresponsive app can make animations, and bobrwm itself,
+    /// stutter.
     animation: animation.AnimationConfig = .{},
     /// Register Bobrwm.app as a login item. Reconciled against
     /// ServiceManagement on startup and on every reload.
+    ///
+    /// macOS may hold the first registration for approval in System Settings
+    /// under General > Login Items; bobrwm logs a warning while it waits.
+    /// While registered, launchd restarts bobrwm if it crashes, but not after
+    /// you quit it from the menu bar.
     start_at_login: bool = false,
 
     /// Look up the assigned workspace for a given bundle identifier. `app_rules`
@@ -145,31 +217,60 @@ pub const KeybindTable = struct {
 };
 
 pub const Mods = struct {
+    /// Option (⌥).
     alt: bool = false,
+    /// Shift (⇧).
     shift: bool = false,
+    /// Command (⌘).
     cmd: bool = false,
+    /// Control (⌃).
     ctrl: bool = false,
 };
 
 pub const Action = enum(u8) {
+    /// Switch to the workspace numbered `arg`.
     focus_workspace = 20,
+    /// Move the focused window to the workspace numbered `arg`.
     move_to_workspace = 21,
+    /// Focus the window to the left.
     focus_left = 22,
+    /// Focus the window to the right.
     focus_right = 23,
+    /// Focus the window above.
     focus_up = 24,
+    /// Focus the window below.
     focus_down = 25,
+    /// Cycle the BSP split mode used for the next split: auto, horizontal,
+    /// vertical.
     toggle_split = 26,
+    /// Toggle the focused window fullscreen.
     toggle_fullscreen = 27,
+    /// Toggle the focused window between tiled and floating.
     toggle_float = 28,
+    /// Move the active workspace to display `arg` (1 through 8). `arg = 0`
+    /// moves it to the next display and `arg = 255` to the previous one.
     move_workspace_to_display = 29,
+    /// Switch to the previous workspace. At the first workspace, the key
+    /// passes through so native Spaces can handle it.
     focus_previous_workspace = 30,
+    /// Switch to the next workspace. At the last workspace, the key passes
+    /// through so native Spaces can handle it.
     focus_next_workspace = 31,
+    /// Toggle inactive-window dimming, regardless of `dimmed_inactive.enabled`.
     toggle_dimming = 32,
+    /// Swap the focused tiled window with its neighbor to the left.
     swap_left = 33,
+    /// Swap the focused tiled window with its neighbor to the right.
     swap_right = 34,
+    /// Swap the focused tiled window with its neighbor above.
     swap_up = 35,
+    /// Swap the focused tiled window with its neighbor below.
     swap_down = 36,
+    /// Center the focused floating window on its display. No effect on tiled
+    /// or fullscreen windows.
     center_float = 37,
+    /// Reload the config file, keeping the current config if the new one is
+    /// invalid.
     reload_config = 38,
 
     // Every Action must map 1:1 to an EventKind (hk_ prefixed).
@@ -193,9 +294,15 @@ pub const next_display_arg: u8 = 0;
 pub const previous_display_arg: u8 = std.math.maxInt(u8);
 
 pub const Keybind = struct {
+    /// Key name: a lowercase letter, a digit, `return`, `tab`, `space`,
+    /// `delete`, `escape`, `left`, `right`, `up`, or `down`.
     key: []const u8,
+    /// Modifiers that must be held with `key`.
     mods: Mods = .{},
+    /// Action to run.
     action: Action,
+    /// Argument for actions that take one, such as a workspace or display
+    /// number. Ignored by other actions.
     arg: u8 = 0,
 
     /// Render the bind the way macOS menus write it: ⌃⌥⇧⌘ in that order, then
@@ -309,22 +416,34 @@ test "findKeybind omits a default whose trigger was reassigned" {
 }
 
 pub const WorkspaceAssignment = struct {
+    /// Bundle identifier of the app.
     app_id: []const u8,
+    /// Workspace number the app's windows open on.
     workspace: u8,
 };
 
 /// Per-app behavior keyed by bundle identifier. Fields are optional so a rule
 /// can set only what it cares about (float-only, workspace-only, or both).
 pub const AppRule = struct {
+    /// Bundle identifier of the app. Find one with
+    /// `osascript -e 'id of app "Safari"'`.
     app_id: []const u8,
+    /// Workspace number the app's windows open on.
     workspace: ?u8 = null,
+    /// Open the app's windows floating instead of tiled.
     float: bool = false,
 };
 
 pub const SwipeConfig = struct {
+    /// Let `bobrwm-swipe` switch workspaces on horizontal swipes. At the
+    /// first or last workspace the gesture passes through to native Spaces.
     enabled: bool = false,
+    /// Number of fingers in the swipe, from 1 through 16.
     fingers: u8 = 3,
+    /// Average horizontal travel before a swipe fires, as a fraction of the
+    /// trackpad width: `0.08` is roughly 8%. Greater than 0 and at most 1.
     distance_pct: f64 = 0.08,
+    /// Reverse the swipe direction.
     reverse: bool = false,
 };
 
@@ -335,20 +454,27 @@ pub const max_swipe_fingers: u8 = 16;
 /// overlay at `level` opacity, giving a clean multiplicative darken with no
 /// color shift. Works without SIP disabled.
 pub const DimConfig = struct {
+    /// Dim inactive windows at startup. `toggle_dimming` flips it at runtime.
     enabled: bool = false,
-    /// Overlay opacity in [0, 1] (0 = none, 1 = fully black).
+    /// Overlay opacity from 0 through 1 (0 = none, 1 = fully black).
     level: f32 = 0.35,
 };
 
 pub const OuterGaps = struct {
+    /// Gap in pixels at the display's left edge.
     left: u16 = 0,
+    /// Gap in pixels at the display's right edge.
     right: u16 = 0,
+    /// Gap in pixels at the display's top edge.
     top: u16 = 0,
+    /// Gap in pixels at the display's bottom edge.
     bottom: u16 = 0,
 };
 
 pub const Gaps = struct {
+    /// Gap in pixels between adjacent tiled windows.
     inner: u16 = 0,
+    /// Gaps in pixels between tiled windows and the display edges.
     outer: OuterGaps = .{},
 };
 
