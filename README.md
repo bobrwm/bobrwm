@@ -103,14 +103,15 @@ without `start_at_login` runs unsupervised.
 
 ### Logging
 
-The window manager writes to `~/Library/Caches/bobrwm/bobrwm.log` as well as stderr, so
-logs are there however it was started — from Finder there is no terminal to
-read. The file is appended across restarts, which keeps the tail that explains
-a crash, and is truncated at startup once it passes 8 MiB.
+The window manager sends logs to macOS unified logging and stderr. Debug-level
+stderr is suppressed outside Debug builds. Stream all Bobrwm records with:
 
 ```bash
-tail -f ~/Library/Caches/bobrwm/bobrwm.log
+log stream --level debug --predicate 'subsystem == "com.bobrwm.bobrwm"'
 ```
+
+`BOBRWM_LOG` controls destinations with `stderr`, `macos`, `no-stderr`, and
+`no-macos`; `true` enables both and `false` disables both.
 
 Log level is compile-time configurable and applies to both binaries. Default
 follows build mode (`debug` in Debug, `info` otherwise).

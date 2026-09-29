@@ -172,9 +172,25 @@ pub fn build(b: *std.Build) !void {
     };
     configureAppModule(exe_mod, app_module_dependencies);
 
-    // BW* Objective-C classes (BWStatusBarDelegate, BWObserver, BWLaunchGate)
-    // are registered at runtime by src/objc_classes.zig via zig-objc's
-    // allocateClassPair. No clang-compiled translation unit is required.
+    // Ghostty statically links this bridge into an XCFramework and lets Xcode
+    // perform the final link. Zig 0.16's Mach-O linker folds __oslogstring into
+    // __cstring, which makes logd drop the records, so keep the same bridge
+    // behind a tiny clang-linked dylib until the linker preserves the section.
+    const oslog_dylib_name = "libbobrwm-oslog.dylib";
+    const oslog_build = b.addSystemCommand(&.{
+        "clang",
+        "-dynamiclib",
+        "-target",
+        "arm64-apple-macos13.0",
+        "-isysroot",
+        sdk_root,
+        "-install_name",
+        "@rpath/" ++ oslog_dylib_name,
+    });
+    const oslog_dylib = oslog_build.addPrefixedOutputFileArg("-o", oslog_dylib_name);
+    oslog_build.addFileArg(b.path("src/c/oslog.c"));
+    exe_mod.addLibraryPath(oslog_dylib.dirname());
+    exe_mod.linkSystemLibrary("bobrwm-oslog", .{});
 
     // SwiftUI menu bar. `swiftc` ships with the Command Line Tools, so no
     // Xcode project is involved, and the Swift runtime is part of the OS
@@ -278,6 +294,7 @@ pub fn build(b: *std.Build) !void {
     installBundleArtifact(b, swipe_exe);
 
     installBundleFile(b, ui_dylib, "Contents/Frameworks", ui_dylib_name);
+    installBundleFile(b, oslog_dylib, "Contents/Frameworks", oslog_dylib_name);
 
     installBundleFile(b, bundleInfoPlist(b, app_version), "Contents", "Info.plist");
     // Classic-era type/creator record. LaunchServices no longer needs it, but
@@ -519,6 +536,23 @@ pub fn build(b: *std.Build) !void {
 
     const run_dim_tests = b.addRunArtifact(dim_tests);
 
+    const logging_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/logging.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    logging_test_mod.addLibraryPath(oslog_dylib.dirname());
+    logging_test_mod.addRPath(oslog_dylib.dirname());
+    logging_test_mod.linkSystemLibrary("bobrwm-oslog", .{});
+
+    const logging_tests = b.addTest(.{
+        .name = "logging-tests",
+        .root_module = logging_test_mod,
+    });
+
+    const run_logging_tests = b.addRunArtifact(logging_tests);
+
     const swipe_test_mod = b.createModule(.{
         .root_source_file = b.path("packages/bobrwm-swipe/src/main.zig"),
         .target = target,
@@ -561,6 +595,7 @@ pub fn build(b: *std.Build) !void {
     test_step.dependOn(&run_state_tests.step);
     test_step.dependOn(&run_statusbar_tests.step);
     test_step.dependOn(&run_dim_tests.step);
+    test_step.dependOn(&run_logging_tests.step);
     test_step.dependOn(&run_swipe_tests.step);
 }
 
