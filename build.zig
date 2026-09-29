@@ -340,6 +340,22 @@ pub fn build(b: *std.Build) !void {
     const preview_step = b.step("ui-preview", "Render the menu bar UI to PNGs");
     preview_step.dependOn(&preview_run.step);
 
+    // Doc comments on config fields and keybind actions are the source of
+    // truth for user-facing docs. helpgen extracts them into a generated Zig
+    // module; docgen exports that module as JSON for the website.
+    const help_strings = helpStrings(b);
+    const docgen = b.addExecutable(.{
+        .name = "docgen",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/build/docgen.zig"),
+            .target = b.graph.host,
+        }),
+    });
+    docgen.root_module.addImport("help_strings", help_strings.module);
+    const docgen_out = b.addRunArtifact(docgen).captureStdOut(.{});
+    const docs_step = b.step("docs", "Export config and keybind docs to share/bobrwm/docs.json");
+    docs_step.dependOn(&b.addInstallFile(docgen_out, "share/bobrwm/docs.json").step);
+
     // config.zig imports only Zig declarations, so the test module needs
     // no SDK or include wiring.
     const test_mod = b.createModule(.{
@@ -535,6 +551,17 @@ pub fn build(b: *std.Build) !void {
 
     const run_swipe_tests = b.addRunArtifact(swipe_tests);
 
+    const helpgen_tests = b.addTest(.{
+        .name = "helpgen-tests",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/helpgen.zig"),
+            .target = b.graph.host,
+            .link_libc = true,
+        }),
+    });
+
+    const run_helpgen_tests = b.addRunArtifact(helpgen_tests);
+
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_tests.step);
     test_step.dependOn(&run_ipc_tests.step);
@@ -549,7 +576,42 @@ pub fn build(b: *std.Build) !void {
     test_step.dependOn(&run_logging_tests.step);
     test_step.dependOn(&run_trace_tests.step);
     test_step.dependOn(&run_swipe_tests.step);
+    test_step.dependOn(&run_helpgen_tests.step);
+    // Running the generator itself catches doc lookups broken by renamed
+    // containers or fields, which the unit tests cannot see.
+    test_step.dependOn(&help_strings.run.step);
 }
+
+/// Run helpgen and expose its output as the `help_strings` module.
+///
+/// Adapted from ghostty-org/ghostty `src/build/HelpStrings.zig` @ b1c264163.
+/// Copyright (c) 2024 Mitchell Hashimoto, Ghostty contributors.
+/// MIT License, see LICENSES/ghostty.txt.
+fn helpStrings(b: *std.Build) HelpStrings {
+    const exe = b.addExecutable(.{
+        .name = "helpgen",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/helpgen.zig"),
+            .target = b.graph.host,
+            // config.zig links against libc through its osutil import.
+            .link_libc = true,
+        }),
+    });
+    const help_run = b.addRunArtifact(exe);
+
+    // Generated Zig files have to end with .zig
+    const wf = b.addWriteFiles();
+    const output = wf.addCopyFile(help_run.captureStdOut(.{}), "help_strings.zig");
+    return .{
+        .module = b.createModule(.{ .root_source_file = output }),
+        .run = help_run,
+    };
+}
+
+const HelpStrings = struct {
+    module: *std.Build.Module,
+    run: *std.Build.Step.Run,
+};
 
 const AppModuleDependencies = struct {
     build_options: *std.Build.Module,
