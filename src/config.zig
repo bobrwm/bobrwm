@@ -171,6 +171,8 @@ pub const Action = enum(u8) {
     swap_down = 36,
     center_float = 37,
     reload_config = 38,
+    resize_grow = 39,
+    resize_shrink = 40,
 
     // Every Action must map 1:1 to an EventKind (hk_ prefixed).
     comptime {
@@ -383,6 +385,9 @@ const default_keybinds = blk: {
         .{ .key = "l", .mods = .{ .alt = true, .shift = true }, .action = .swap_right },
         // alt+shift+r → reload config
         .{ .key = "r", .mods = .{ .alt = true, .shift = true }, .action = .reload_config },
+        // alt+=/- → grow/shrink the focused tiled window
+        .{ .key = "=", .mods = .{ .alt = true }, .action = .resize_grow },
+        .{ .key = "-", .mods = .{ .alt = true }, .action = .resize_shrink },
     };
 
     break :blk binds[0..binds.len].*;
@@ -1244,6 +1249,7 @@ fn keyNameToCode(name: []const u8) ?u16 {
         .{ "return", 0x24 }, .{ "tab", 0x30 },    .{ "space", 0x31 },
         .{ "delete", 0x33 }, .{ "escape", 0x35 }, .{ "left", 0x7B },
         .{ "right", 0x7C },  .{ "down", 0x7D },   .{ "up", 0x7E },
+        .{ "=", 0x18 },      .{ "-", 0x1B },
     };
     for (table) |entry| {
         if (std.mem.eql(u8, name, entry[0])) return entry[1];
@@ -1662,6 +1668,14 @@ test "default_keybinds" {
     try t.expectEqual(Action.reload_config, default_keybinds[29].action);
     try t.expect(std.mem.eql(u8, "r", default_keybinds[29].key));
     try t.expect(default_keybinds[29].mods.alt and default_keybinds[29].mods.shift);
+
+    const cfg: Config = .{};
+    const grow = cfg.findKeybind(.resize_grow, 0).?;
+    const shrink = cfg.findKeybind(.resize_shrink, 0).?;
+    try t.expectEqual(@as(u16, 0x18), keybindToShim(grow).?.keycode);
+    try t.expectEqual(@as(u16, 0x1B), keybindToShim(shrink).?.keycode);
+    try t.expectEqual(shim.BW_MOD_ALT, keybindToShim(grow).?.mods);
+    try t.expectEqual(shim.BW_MOD_ALT, keybindToShim(shrink).?.mods);
 }
 
 test "disabled default keybinds leave omitted and empty keybinds unbound" {

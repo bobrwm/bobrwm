@@ -3126,6 +3126,15 @@ fn handleEvent(ev: *const event_mod.Event) void {
         .hk_swap_right => swapDirection(.right),
         .hk_swap_up => swapDirection(.up),
         .hk_swap_down => swapDirection(.down),
+        .hk_resize_grow, .hk_resize_shrink => {
+            const ctx = focusedLayoutContext() orelse return;
+            if (ctx.layout_kind != .bsp) return;
+            dispatchLayoutCommand(.{ .resize_window = .{
+                .space_key = ctx.workspace.key,
+                .window_id = g_state.windowTabLeader(ctx.focused_wid),
+                .delta = if (ev.kind == .hk_resize_grow) 0.05 else -0.05,
+            } }, ctx.workspace.display_id);
+        },
         .hk_toggle_split => {
             dispatchStateEvent(.toggle_split_mode);
             log.debug("split mode: {s}", .{@tagName(g_state.bsp_split_mode)});

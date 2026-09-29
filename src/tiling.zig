@@ -67,6 +67,7 @@ pub const Event = union(enum) {
     },
     adjust_parent_ratio: struct { space_key: SpaceKey, window_id: WindowId, delta: f64 },
     set_parent_ratio: struct { space_key: SpaceKey, window_id: WindowId, ratio: f64 },
+    resize_window: struct { space_key: SpaceKey, window_id: WindowId, delta: f64 },
     mirror: struct { space_key: SpaceKey, axis: Direction },
     equalize: struct { space_key: SpaceKey, ratio: f64 },
     balance: SpaceKey,
@@ -177,6 +178,9 @@ pub fn reduce(model: Self, event: Event) Transition {
         },
         .set_parent_ratio => |adjustment| {
             _ = transition.model.setParentRatio(adjustment.space_key, adjustment.window_id, adjustment.ratio);
+        },
+        .resize_window => |resize| {
+            transition.model.resizeWindow(resize.space_key, resize.window_id, resize.delta);
         },
         .mirror => |operation| transition.model.mirror(operation.space_key, operation.axis),
         .equalize => |operation| transition.model.equalize(operation.space_key, operation.ratio),
@@ -423,6 +427,16 @@ fn setParentRatio(self: *Self, space_key: SpaceKey, window_id: WindowId, ratio: 
     const split_id = self.findParentSplit(state.root orelse return false, window_id) orelse return false;
     self.nodes[split_id].split.ratio = clampedRatio(ratio);
     return true;
+}
+
+fn resizeWindow(self: *Self, space_key: SpaceKey, window_id: WindowId, delta: f64) void {
+    const state = self.layoutState(space_key) orelse return;
+    if (state.kind != .bsp) return;
+    const split_id = self.findParentSplit(state.root orelse return, window_id) orelse return;
+    const split = &self.nodes[split_id].split;
+    // Ratios describe the first child; growing the second child must subtract.
+    const signed_delta = if (self.findBspLeaf(split.first, window_id) != null) delta else -delta;
+    split.ratio = clampedRatio(split.ratio + signed_delta);
 }
 
 fn mirror(self: *Self, space_key: SpaceKey, axis: Direction) void {
@@ -943,6 +957,60 @@ test "bsp reducer projects, swaps, and collapses deterministic slots" {
     model = reduce(model, .{ .remove = .{ .space_key = first_space, .window_id = 3 } }).model;
     try testing.expectEqual(@as(usize, 2), model.windowCount(first_space));
     try testing.expectEqual(@as(u16, 3), model.node_count);
+}
+
+test "resize grows either child at its nearest split and clamps both limits" {
+    var model = reduce(.{}, insertEvent(first_space, .bsp, 1)).model;
+    model = reduce(model, insertEvent(first_space, .bsp, 2)).model;
+    var insertion = insertEvent(first_space, .bsp, 3);
+    insertion.insert.options.anchor_wid = 2;
+    insertion.insert.options.split_mode = .vertical;
+    insertion.insert.options.split_ratio = 0.3;
+    model = reduce(model, insertion).model;
+
+    var entries: std.ArrayList(LayoutEntry) = .empty;
+    defer entries.deinit(testing.allocator);
+    try entries.ensureTotalCapacity(testing.allocator, 3);
+    const cases = .{
+        .{ @as(WindowId, 2), 0.05, 280.0, 520.0 },
+        .{ @as(WindowId, 3), 0.05, 240.0, 560.0 },
+        .{ @as(WindowId, 3), -0.05, 280.0, 520.0 },
+        .{ @as(WindowId, 2), 1.0, 720.0, 80.0 },
+        .{ @as(WindowId, 2), -1.0, 80.0, 720.0 },
+    };
+    inline for (cases) |case| {
+        model = reduce(model, .{ .resize_window = .{
+            .space_key = first_space,
+            .window_id = case[0],
+            .delta = case[1],
+        } }).model;
+        entries.clearRetainingCapacity();
+        model.computeLayout(first_space, test_frame, 0, &entries);
+        for (entries.items) |entry| {
+            try testing.expectApproxEqAbs(@as(f64, 500), entry.frame.width, 0.001);
+            const height: f64 = switch (entry.wid) {
+                1 => 800,
+                2 => case[2],
+                3 => case[3],
+                else => unreachable,
+            };
+            try testing.expectApproxEqAbs(height, entry.frame.height, 0.001);
+        }
+    }
+}
+
+test "resize ignores missing windows, singleton BSP and monocle layouts" {
+    inline for (.{ LayoutKind.bsp, LayoutKind.monocle }) |kind| {
+        const original = reduce(.{}, insertEvent(first_space, kind, 1)).model;
+        inline for (.{ @as(WindowId, 1), @as(WindowId, 99) }) |window_id| {
+            const resized = reduce(original, .{ .resize_window = .{
+                .space_key = first_space,
+                .window_id = window_id,
+                .delta = 0.05,
+            } }).model;
+            try testing.expectEqualDeep(original, resized);
+        }
+    }
 }
 
 test "monocle reducer maintains focus order" {

@@ -159,11 +159,21 @@ no shortcuts are registered. The option defaults to `false` and reloads live.
 It also disables the default reload shortcut, so use `bobrwm reload-config` unless
 you configure your own `.reload_config` binding.
 
+By default, move tiled windows within a workspace with **Alt+Shift+H/J/K/L** (swap
+left/down/up/right). **Alt+=** grows the focused tiled window and **Alt+−**
+shrinks it. Resizing adjusts its nearest BSP split by 5 percentage points,
+within the existing 10–90% limits; it has no effect on floating/fullscreen
+windows, monocle layouts, or a workspace with only one tiled window.
+All of these actions can be assigned custom bindings, for example:
+
 ```zon
 .keybinds = .{
     .{ .key = "1", .mods = .{ .alt = true }, .action = .focus_workspace, .arg = 1 },
     .{ .key = "h", .mods = .{ .alt = true }, .action = .focus_left },
     .{ .key = "return", .mods = .{ .alt = true }, .action = .toggle_split },
+    .{ .key = "left", .mods = .{ .alt = true, .shift = true }, .action = .swap_left },
+    .{ .key = "=", .mods = .{ .alt = true }, .action = .resize_grow },
+    .{ .key = "-", .mods = .{ .alt = true }, .action = .resize_shrink },
 },
 ```
 
@@ -189,6 +199,8 @@ you configure your own `.reload_config` binding.
 | `swap_right` | Swap the focused tiled window right | — |
 | `swap_up` | Swap the focused tiled window up | — |
 | `swap_down` | Swap the focused tiled window down | — |
+| `resize_grow` | Grow the focused tiled window at its nearest BSP split | — |
+| `resize_shrink` | Shrink the focused tiled window at its nearest BSP split | — |
 | `center_float` | Center the focused floating window | — |
 | `toggle_dimming` | Toggle inactive-window dimming | — |
 | `reload_config` | Reload the config file, keeping the current config if parsing fails | — |
