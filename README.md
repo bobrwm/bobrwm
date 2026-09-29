@@ -84,22 +84,8 @@ bobrwm-swipe                          # optional trackpad swipe companion
 ### Starting and stopping
 
 Launch `Bobrwm.app` from Finder or Spotlight, or with `open -a Bobrwm`. Quit
-from the menu-bar item. There is no launchd agent to install by hand: to run it
-at login, set
-
-```zon
-.start_at_login = true,
-```
-
-which the app reconciles against ServiceManagement on startup and on every
-config reload. macOS may hold the first registration pending your approval in
-System Settings under General > Login Items; bobrwm logs a warning when it is
-waiting on that.
-
-That registers a LaunchAgent bundled inside the app, so launchd supervises the
-process and restarts it if it crashes — but not when you quit from the menu bar.
-Supervision only exists while the agent is registered: an app launched by hand
-without `start_at_login` runs unsupervised.
+from the menu-bar item. To run it at login, set `.start_at_login = true` in
+your config; there is no launchd agent to install by hand.
 
 ### Logging
 
@@ -130,100 +116,33 @@ Config is loaded from (in order):
 2. `$XDG_CONFIG_HOME/bobrwm/config.zon`
 3. `~/.config/bobrwm/config.zon`
 
-If no config file is found, built-in defaults are used. See [`examples/config.zon`](examples/config.zon) for a full example.
-
-Press `Alt+Shift+R` (the default `reload_config` binding) to apply changes
-without restarting. If the file contains invalid ZON or values outside the
-documented bounds, bobrwm keeps the last valid configuration and shows a
-temporary error in its menu-bar item; details remain in the error log.
-
-The same reload is available from the command line:
-
-```bash
-bobrwm reload-config
-```
-
-The command is silent on success and exits non-zero with an error message when
-the new config cannot be loaded.
-Changing the number of workspaces still requires a restart; other settings,
-including keybinds, rules, layouts, gaps, animation, and dimming, reload live.
-
-### Keybinds
-
-Map a key + modifiers to an action. Configured keybinds are merged with the
-built-in defaults; use the same key + modifiers to override a default binding.
-
-Set `.disable_default_keybinds = true` at the top level of `config.zon` to use
-only your explicit `.keybinds` entries. If `.keybinds` is omitted or empty,
-no shortcuts are registered. The option defaults to `false` and reloads live.
-It also disables the default reload shortcut, so use `bobrwm reload-config` unless
-you configure your own `.reload_config` binding.
-
-By default, move tiled windows within a workspace with **Alt+Shift+H/J/K/L** (swap
-left/down/up/right). **Alt+=** grows the focused tiled window and **Alt+−**
-shrinks it. Resizing adjusts its nearest BSP split by 5 percentage points,
-within the existing 10–90% limits; it has no effect on floating/fullscreen
-windows, monocle layouts, or a workspace with only one tiled window.
-All of these actions can be assigned custom bindings, for example:
+If no config file is found, built-in defaults are used.
 
 ```zon
-.keybinds = .{
-    .{ .key = "1", .mods = .{ .alt = true }, .action = .focus_workspace, .arg = 1 },
-    .{ .key = "h", .mods = .{ .alt = true }, .action = .focus_left },
-    .{ .key = "return", .mods = .{ .alt = true }, .action = .toggle_split },
-    .{ .key = "left", .mods = .{ .alt = true, .shift = true }, .action = .swap_left },
-    .{ .key = "=", .mods = .{ .alt = true }, .action = .resize_grow },
-    .{ .key = "-", .mods = .{ .alt = true }, .action = .resize_shrink },
-},
+.{
+    .workspace_names = .{ "term", "web", "code", "chat" },
+    .gaps = .{ .inner = 4, .outer = .{ .left = 4, .right = 4, .top = 4, .bottom = 4 } },
+    .keybinds = .{
+        .{ .key = "h", .mods = .{ .alt = true }, .action = .focus_left },
+    },
+    .app_rules = .{
+        .{ .app_id = "com.apple.Safari", .workspace = 2 },
+    },
+}
 ```
 
-**Available modifiers:** `alt`, `shift`, `cmd`, `ctrl`
+Every option and keybind action is documented in the doc comments on
+[`src/config.zig`](src/config.zig), which are the source for the generated
+reference; `zig build docs` writes it to `zig-out/share/bobrwm/docs.json`. See
+[`examples/config.zon`](examples/config.zon) for a full example with the
+default keybinds.
 
-**Available actions:**
-
-| Action | Description | `arg` |
-| --- | --- | --- |
-| `focus_workspace` | Switch to workspace N | workspace number |
-| `focus_previous_workspace` | Switch to the previous workspace; if already at the first workspace, pass the key through | — |
-| `focus_next_workspace` | Switch to the next workspace; if already at the last workspace, pass the key through | — |
-| `move_to_workspace` | Move focused window to workspace N | workspace number |
-| `move_workspace_to_display` | Move the active workspace to display N, next, or previous | display number; `0` = next, `255` = previous |
-| `focus_left` | Focus window to the left | — |
-| `focus_right` | Focus window to the right | — |
-| `focus_up` | Focus window above | — |
-| `focus_down` | Focus window below | — |
-| `toggle_split` | Toggle next split direction | — |
-| `toggle_fullscreen` | Toggle focused window fullscreen | — |
-| `toggle_float` | Toggle focused window floating | — |
-| `swap_left` | Swap the focused tiled window left | — |
-| `swap_right` | Swap the focused tiled window right | — |
-| `swap_up` | Swap the focused tiled window up | — |
-| `swap_down` | Swap the focused tiled window down | — |
-| `resize_grow` | Grow the focused tiled window at its nearest BSP split | — |
-| `resize_shrink` | Shrink the focused tiled window at its nearest BSP split | — |
-| `center_float` | Center the focused floating window | — |
-| `toggle_dimming` | Toggle inactive-window dimming | — |
-| `reload_config` | Reload the config file, keeping the current config if parsing fails | — |
-
-### Gaps
-
-Pixel spacing between and around windows:
-
-```zon
-.gaps = .{
-    .inner = 4,
-    .outer = .{ .left = 4, .right = 4, .top = 4, .bottom = 4 },
-},
-```
-
-### Layout
-
-Choose the tiling algorithm:
-
-```zon
-.layout = .bsp, // .bsp | .monocle
-.bsp_split_ratio = 0.5, // finite value from 0.1 through 0.9
-```
+Press `Alt+Shift+R` (the default `reload_config` binding) or run
+`bobrwm reload-config` to apply changes without restarting. If the file
+contains invalid ZON or values outside the documented bounds, bobrwm keeps the
+last valid configuration and shows a temporary error in its menu-bar item;
+details remain in the error log. `bobrwm reload-config` is silent on success and
+exits non-zero with an error message when the new config cannot be loaded.
 
 ### Workspaces
 
@@ -254,48 +173,11 @@ Rapid switch requests are serialized at native Space-change confirmations;
 while one is in flight, the newest requested workspace replaces older queued
 requests.
 
-By default, bobrwm creates 10 workspaces. To configure a smaller count, provide `.workspace_names`; the number of names is the workspace count:
-
-```zon
-.workspace_names = .{
-    "term",
-    "web",
-    "code",
-    "chat",
-},
-```
-
-Workspace IDs are still 1-based, so the example above creates workspaces 1 through 4. Keybinds and app assignments must reference workspaces in that range. The current maximum is 10 workspaces; invalid references reject the entire config.
-
-### Workspace Assignments
-
-Pin apps to specific workspaces by bundle ID:
-
-```zon
-.workspace_assignments = .{
-    .{ .app_id = "com.mitchellh.ghostty", .workspace = 1 },
-    .{ .app_id = "com.brave.Browser", .workspace = 2 },
-},
-```
-
 ### Swipe companion
 
-The optional `bobrwm-swipe` companion reads its opt-in flag from the main bobrwm config:
-
-```zon
-.swipe = .{
-    .enabled = true,
-    .fingers = 3,
-    .distance_pct = 0.08,
-    .reverse = false,
-},
-```
-
-`distance_pct` is the average horizontal movement threshold as a normalized fraction of the trackpad width; `0.08` means roughly 8% of the trackpad.
-
-Core bobrwm does not start a gesture listener from this flag. It only defines the shared config shape and exposes `focus-workspace next|prev` over IPC. Run `bobrwm-swipe` as the companion process after enabling the field. macOS grants Accessibility permissions per executable, so `bobrwm-swipe` needs its own grant even if bobrwm is already trusted.
-
-When bobrwm has an adjacent workspace, the swipe listener consumes the matching macOS gesture. At the first or last bobrwm workspace, it passes the gesture through so native Spaces can handle it.
+The optional `bobrwm-swipe` companion switches workspaces on trackpad swipes.
+Enable it with `.swipe = .{ .enabled = true }` and run `bobrwm-swipe` alongside
+the app. It needs its own Accessibility grant.
 
 ## Development
 
