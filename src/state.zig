@@ -2485,6 +2485,50 @@ test "directional commands resolve focus and layout in the reducer" {
     try testing.expectEqual(std.meta.Tag(Effect).windows_swapped, std.meta.activeTag(transition.effects[0]));
 }
 
+test "resize command leaves fullscreen layout unchanged and resumes after exit" {
+    const testing = std.testing;
+    const space_key: SpaceKey = .{ .id = 1 };
+    var catalog: SpaceCatalog = .{};
+    catalog.add(.{ .key = space_key, .workspace_id = 1, .display_id = 11 });
+    var topology: WorkspaceTopology = .{};
+    topology.addDisplay(.{ .display_id = 11, .active_workspace_id = 1 });
+    var model = reduce(.{}, .{ .replace_space_catalog = catalog }).model;
+    model = reduce(model, .{ .replace_workspace_topology = topology }).model;
+    for ([_]WindowId{ 100, 200 }) |window_id| {
+        model = reduce(model, .{ .adopt_window = .{
+            .window_id = window_id,
+            .process_id = 42,
+            .space_key = space_key,
+            .frame = .{ .x = 0, .y = 0, .width = 500, .height = 500 },
+            .layout = testLayoutInsertion(.bsp),
+        } }).model;
+    }
+    model = reduce(model, .{ .toggle_window_fullscreen = .{
+        .window_id = 100,
+        .observed_frame = null,
+    } }).model;
+    model = reduce(model, .flush_retile_requests).model;
+    try testing.expect(model.window(100).?.is_fullscreen);
+    try testing.expectEqual(window_mod.WindowMode.tiled, model.window(100).?.mode);
+
+    for ([_]f64{ 0.05, -0.05 }) |delta| {
+        const command: Event = .{ .layout_command = .{
+            .event = .{ .resize_window = .{ .space_key = space_key, .window_id = 100, .delta = delta } },
+            .display_id = 11,
+        } };
+        const blocked = reduce(model, command);
+        try testing.expectEqualDeep(model.layout, blocked.model.layout);
+        try testing.expectEqual(@as(u8, 0), blocked.model.retile_request.display_count);
+
+        const restored = reduce(model, .{ .toggle_window_fullscreen = .{
+            .window_id = 100,
+            .observed_frame = null,
+        } }).model;
+        const resized = reduce(restored, command);
+        try testing.expect(!std.meta.eql(restored.layout, resized.model.layout));
+    }
+}
+
 test "window presentation commands reduce intent before platform effects" {
     const testing = std.testing;
     const space_key: SpaceKey = .{ .id = 1 };

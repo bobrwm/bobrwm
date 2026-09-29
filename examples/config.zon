@@ -117,6 +117,10 @@
         .{ .key = "k", .mods = .{ .alt = true, .shift = true }, .action = .swap_up },
         .{ .key = "l", .mods = .{ .alt = true, .shift = true }, .action = .swap_right },
 
+        // alt+=/- → grow/shrink the focused tiled window's nearest BSP split
+        .{ .key = "=", .mods = .{ .alt = true }, .action = .resize_grow },
+        .{ .key = "-", .mods = .{ .alt = true }, .action = .resize_shrink },
+
         // alt+return → toggle split direction
         .{ .key = "return", .mods = .{ .alt = true }, .action = .toggle_split },
 

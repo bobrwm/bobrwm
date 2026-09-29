@@ -38,6 +38,8 @@ pub const EventKind = enum(u8) {
     hk_swap_down = 36,
     hk_center_float = 37,
     hk_reload_config = 38,
+    hk_resize_grow = 39,
+    hk_resize_shrink = 40,
 };
 
 pub const Event = extern struct {
