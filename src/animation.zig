@@ -24,8 +24,12 @@ pub const Easing = enum {
 };
 
 pub const AnimationConfig = struct {
+    /// Animate window movement during layout changes.
     enabled: bool = false,
+    /// Animation length in milliseconds.
     duration_ms: u64 = 200,
+    /// Easing curve: `.linear`, `.ease_in`, `.ease_out`, `.ease_in_out`, or
+    /// `.spring`.
     easing: Easing = .ease_out,
 };
 
