@@ -14,6 +14,7 @@ const log_options = @import("log_options.zig");
 const osutil = @import("osutil.zig");
 const runtime_paths = @import("runtime_paths.zig");
 const config = @import("config.zig");
+const config_file = @import("config_file.zig");
 const config_format = @import("config_format.zig");
 const help_strings = @import("help_strings");
 const Command = @import("command.zig").Command;
@@ -34,6 +35,7 @@ pub const Result = union(enum) {
     help: ?Command,
     version,
     show_config: ShowConfigOptions,
+    migrate_config,
     list_actions: ListActionsOptions,
     /// A flag a local command does not accept.
     invalid_flag: struct { command: Command, flag: []const u8 },
@@ -66,6 +68,7 @@ fn parseCommand(command: Command, args: anytype) Result {
         .help => .{ .help = null },
         .version => .version,
         .@"show-config" => .{ .show_config = .{} },
+        .@"migrate-config" => .migrate_config,
         .@"list-actions" => .{ .list_actions = .{} },
     };
     while (args.next()) |arg| {
@@ -129,6 +132,7 @@ pub fn run(result: Result) u8 {
             return 0;
         },
         .show_config => |opts| return showConfig(opts),
+        .migrate_config => return migrateConfig(),
         .list_actions => |opts| return listActions(opts),
         .invalid_flag => |invalid| {
             var buf: [256]u8 = undefined;
@@ -174,6 +178,21 @@ fn writeStderr(bytes: []const u8) void {
     writeFd(std.posix.STDERR_FILENO, bytes);
 }
 
+fn printStdout(comptime format: []const u8, args: anytype) void {
+    printFd(std.posix.STDOUT_FILENO, format, args);
+}
+
+fn printStderr(comptime format: []const u8, args: anytype) void {
+    printFd(std.posix.STDERR_FILENO, format, args);
+}
+
+fn printFd(fd: c_int, comptime format: []const u8, args: anytype) void {
+    var buffer: [4096]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buffer);
+    writer.print(format, args) catch {};
+    writeFd(fd, writer.buffered());
+}
+
 fn printHelp() void {
     writeStdout(help_text);
 }
@@ -193,7 +212,8 @@ const help_text =
     \\  help                      Show this help message
     \\  version                   Show version information
     \\  show-config [--default] [--docs]
-    \\                            Print the config, or the defaults, as config.zon
+    \\                            Print your config changes, or every default
+    \\  migrate-config            Convert an old config.zon to the current format
     \\  list-actions [--docs]     List keybind actions
     \\
     \\Window Commands (IPC):
@@ -227,14 +247,14 @@ const help_text =
     \\  -h, --help                Show this help message
     \\  --version                 Show version information
     \\
-    \\Configuration is read from $XDG_CONFIG_HOME/bobrwm/config.zon
-    \\or ~/.config/bobrwm/config.zon by default. To start one with every
-    \\option documented, run:
+    \\Configuration is read from $XDG_CONFIG_HOME/bobrwm/config or
+    \\~/.config/bobrwm/config, one `key = value` per line. To see every
+    \\option with its documentation, run:
     \\
-    \\  bobrwm show-config --default --docs > ~/.config/bobrwm/config.zon
+    \\  bobrwm show-config --default --docs
     \\
     \\Run `bobrwm <command> --help` for details on show-config,
-    \\list-actions, help, or version.
+    \\migrate-config, list-actions, help, or version.
     \\
 ;
 
@@ -247,10 +267,11 @@ fn showConfig(opts: ShowConfigOptions) u8 {
 
     const cfg: config.Config = if (opts.default) .{} else loadUserConfig(alloc) orelse return 1;
     var out: std.Io.Writer.Allocating = .init(alloc);
+    const format: config_format.Options = .{ .changes_only = !opts.default };
     const written = if (opts.docs)
-        config_format.write(&out.writer, &cfg, help_strings.Config)
+        config_format.write(&out.writer, &cfg, help_strings.Config, format)
     else
-        config_format.write(&out.writer, &cfg, null);
+        config_format.write(&out.writer, &cfg, null, format);
     written catch {
         writeStderr("error: out of memory\n");
         return 1;
@@ -267,11 +288,65 @@ fn loadUserConfig(alloc: std.mem.Allocator) ?config.Config {
         writeStderr("error: cannot resolve config path: HOME is not set\n");
         return null;
     };
-    if (!osutil.pathExists(path)) return .{};
+    if (!osutil.pathExists(path)) {
+        config.warnIfOnlyLegacyExists(alloc, path);
+        return .{};
+    }
     return config.loadFromPath(alloc, path) orelse {
         writeStderr("error: config file is invalid; see the errors above\n");
         return null;
     };
+}
+
+fn migrateConfig() u8 {
+    var arena: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const path = config.resolvePath(alloc, null) catch {
+        writeStderr("error: cannot resolve config path: HOME is not set\n");
+        return 1;
+    };
+    const legacy = config.legacyPath(alloc, path) catch return outOfMemory();
+    if (osutil.pathExists(path)) {
+        printStderr("error: {s} already exists; not overwriting it\n", .{path});
+        return 1;
+    }
+    const source = osutil.readFileAllocSentinel(alloc, legacy.ptr, 1024 * 1024) orelse {
+        printStderr("error: no config to migrate at {s}\n", .{legacy});
+        return 1;
+    };
+
+    var zon_diagnostics: std.zon.parse.Diagnostics = undefined;
+    const cfg = config_file.fromLegacyZon(alloc, source, &zon_diagnostics) catch |err| {
+        if (err == error.OutOfMemory) return outOfMemory();
+        printStderr("error: cannot read {s}:\n{f}\n", .{ legacy, zon_diagnostics.fmt(legacy) });
+        return 1;
+    };
+
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    out.writer.print("# Converted from {s} by `bobrwm migrate-config`.\n" ++
+        "# Run `bobrwm show-config --default --docs` to see every option.\n\n", .{legacy}) catch return outOfMemory();
+    config_format.write(&out.writer, &cfg, null, .{ .changes_only = true }) catch return outOfMemory();
+    const path_z = alloc.dupeSentinel(u8, path, 0) catch return outOfMemory();
+    if (!osutil.writeFile(path_z.ptr, out.written())) {
+        printStderr("error: cannot write {s}\n", .{path});
+        return 1;
+    }
+
+    // Load what was written so any value the old format accepted but the
+    // new checks reject shows up now, with its line, rather than at startup.
+    if (config.loadFromPath(alloc, path) == null) {
+        printStderr("Wrote {s}, but it has the errors above; fix them before reloading bobrwm.\n", .{path});
+        return 1;
+    }
+    printStdout("Wrote {s}. bobrwm no longer reads {s}; delete it once the new config looks right.\n", .{ path, legacy });
+    return 0;
+}
+
+fn outOfMemory() u8 {
+    writeStderr("error: out of memory\n");
+    return 1;
 }
 
 fn listActions(opts: ListActionsOptions) u8 {
