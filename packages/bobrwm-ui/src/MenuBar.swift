@@ -215,12 +215,15 @@ final class MenuBarController: NSObject, NSMenuDelegate {
         addAction("Open Config File", #selector(openConfig), nil)
         menu.addItem(.separator())
 
+        addAction("About Bobrwm", #selector(showAbout), nil)
         let settingsItem = addAction("Settings…", #selector(showSettings), "⌘,")
         settingsItem.keyEquivalent = ","
         settingsItem.keyEquivalentModifierMask = [.command]
         menu.addItem(.separator())
 
-        addAction("Quit bobrwm", #selector(quit), nil)
+        let quitItem = addAction("Quit Bobrwm", #selector(quit), "⌘Q")
+        quitItem.keyEquivalent = "q"
+        quitItem.keyEquivalentModifierMask = [.command]
     }
 
     // Not a RowItem, so menu(_:willHighlight:) skips it and it never lights up.
@@ -267,6 +270,13 @@ final class MenuBarController: NSObject, NSMenuDelegate {
     @objc private func reloadConfig() { _ = callbacks.reload_config() }
     @objc private func openConfig() { callbacks.open_config() }
     @objc private func showSettings() { settingsWindow.show() }
+
+    // An accessory app is never frontmost, so the panel would open behind
+    // the current app without activating first.
+    @objc private func showAbout() {
+        NSApplication.shared.activate(ignoringOtherApps: true)
+        NSApplication.shared.orderFrontStandardAboutPanel(nil)
+    }
     @objc private func previousWorkspace() { callbacks.previous_workspace() }
     @objc private func nextWorkspace() { callbacks.next_workspace() }
     @objc private func quit() { callbacks.quit() }
