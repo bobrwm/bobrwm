@@ -15,10 +15,12 @@ enum Metrics {
     /// ~17pt leading edge macOS uses for menu item titles.
     static let textInset: CGFloat = 12
     static let rowHeight: CGFloat = 20
-    static let badgeWidth: CGFloat = 19
+    /// Leading column for the focused/visible mark, matching the gutter AppKit
+    /// reserves for an item's state image.
+    static let stateWidth: CGFloat = 18
     /// Wide enough for a two-digit count; narrower truncates "12" to an ellipsis.
     static let countWidth: CGFloat = 20
-    static let shortcutWidth: CGFloat = 26
+    static let shortcutWidth: CGFloat = 30
 }
 
 func shortcutKeyLabel(_ shortcut: String) -> String {
@@ -65,7 +67,8 @@ struct SectionHeader: View {
     var body: some View {
         Text(title)
             .font(.system(size: 11, weight: .semibold))
-            .foregroundStyle(.tertiary)
+            .foregroundStyle(.secondary)
+            .padding(.leading, Metrics.stateWidth)
             .padding(.horizontal, Metrics.highlightInset + Metrics.textInset)
             .frame(height: 16, alignment: .leading)
             .frame(maxWidth: .infinity, alignment: .leading)
@@ -82,7 +85,9 @@ struct ActionRow: View {
     var body: some View {
         MenuRow(state: state) {
             HStack(spacing: 0) {
-                Text(title)
+                // Shares the state gutter with workspace rows so every title
+                // starts on the same edge, as in an AppKit menu.
+                Text(title).padding(.leading, Metrics.stateWidth)
                 Spacer(minLength: 20)
                 ShortcutHint(state: state, shortcut: shortcut)
             }
@@ -98,11 +103,10 @@ struct WorkspaceRow: View {
 
     var body: some View {
         MenuRow(state: state) {
-            HStack(spacing: 9) {
-                WorkspaceBadge(state: state, id: id, shortcut: shortcut)
+            HStack(spacing: 0) {
+                WorkspaceStateMark(state: state)
 
-                Text(label)
-                    .foregroundStyle(nameStyle)
+                Text(name.isEmpty || name == "\(id)" ? "Workspace \(id)" : name)
 
                 Spacer(minLength: 20)
 
@@ -113,63 +117,34 @@ struct WorkspaceRow: View {
                             ? AnyShapeStyle(.white.opacity(0.7)) : AnyShapeStyle(.tertiary)
                     )
                     .frame(width: Metrics.countWidth, alignment: .trailing)
+                    .padding(.trailing, 9)
 
                 ShortcutHint(state: state, shortcut: shortcut)
             }
         }
     }
-
-    private var label: String {
-        name.isEmpty || name == "\(id)" ? "Workspace \(id)" : name
-    }
-
-    private var isFallbackLabel: Bool {
-        name.isEmpty || name == "\(id)"
-    }
-
-    private var nameStyle: AnyShapeStyle {
-        if state.isHighlighted { return AnyShapeStyle(.white.opacity(isFallbackLabel ? 0.7 : 1)) }
-        return isFallbackLabel ? AnyShapeStyle(.secondary) : AnyShapeStyle(.primary)
-    }
 }
 
-private struct WorkspaceBadge: View {
+/// Uses AppKit's menu state vocabulary instead of a bespoke badge: a checkmark
+/// marks the focused workspace and a dot marks one visible on another display,
+/// the same way NSMenuItem shows on and mixed states.
+private struct WorkspaceStateMark: View {
     @ObservedObject var state: RowState
-    let id: UInt8
-    let shortcut: String?
 
     var body: some View {
-        Text(shortcut.map(shortcutKeyLabel) ?? "\(id)")
-            .font(.system(size: 11, weight: state.isFocused ? .semibold : .medium))
-            .monospacedDigit()
-            .foregroundStyle(foreground)
-            .frame(width: Metrics.badgeWidth, height: 16)
-            .background {
-                RoundedRectangle(cornerRadius: 4, style: .continuous)
-                    .fill(fill)
-                    .overlay {
-                        RoundedRectangle(cornerRadius: 4, style: .continuous)
-                            .strokeBorder(stroke, lineWidth: 1)
-                    }
+        // The clear base keeps the gutter's width when there is no mark; an
+        // empty conditional would collapse and shift the title left.
+        ZStack(alignment: .leading) {
+            Color.clear.frame(width: Metrics.stateWidth, height: 1)
+            if state.isFocused {
+                Image(systemName: "checkmark")
+                    .font(.system(size: 11, weight: .semibold))
+            } else if state.isActive {
+                Circle()
+                    .frame(width: 5, height: 5)
+                    .padding(.leading, 3)
             }
-    }
-
-    private var fill: Color {
-        if state.isHighlighted { return .white.opacity(0.22) }
-        if state.isFocused { return .primary.opacity(0.18) }
-        if state.isActive { return .clear }
-        return .primary.opacity(0.06)
-    }
-
-    private var stroke: Color {
-        guard state.isActive, !state.isFocused, !state.isHighlighted else { return .clear }
-        return .primary.opacity(0.35)
-    }
-
-    private var foreground: AnyShapeStyle {
-        if state.isHighlighted { return AnyShapeStyle(.white) }
-        if state.isFocused || state.isActive { return AnyShapeStyle(.primary) }
-        return AnyShapeStyle(.secondary)
+        }
     }
 }
 

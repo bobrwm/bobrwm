@@ -99,10 +99,11 @@ struct MenuPreview: View {
                 ActionRow(state: actionState(highlighted: true), title: "Open Config File")
 
                 divider
+                ActionRow(state: actionState(), title: "About Bobrwm")
                 ActionRow(state: actionState(), title: "Settings…", shortcut: "⌘,")
 
                 divider
-                ActionRow(state: actionState(), title: "Quit bobrwm")
+                ActionRow(state: actionState(), title: "Quit Bobrwm", shortcut: "⌘Q")
             }
             .padding(.vertical, 5)
             .frame(width: 250)
