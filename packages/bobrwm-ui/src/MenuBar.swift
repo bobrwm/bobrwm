@@ -141,7 +141,7 @@ final class MenuBarController: NSObject, NSMenuDelegate {
     func showSettingsIfPermissionRequired() {
         settingsModel.refreshAccessibility()
         if !settingsModel.accessibilityGranted {
-            settingsWindow.show()
+            settingsWindow.show(pane: .general)
         }
     }
 

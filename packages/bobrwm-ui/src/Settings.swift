@@ -1,6 +1,7 @@
 import AppKit
 import ApplicationServices
 import BobrwmUIABI
+import Combine
 import SwiftUI
 
 struct WorkspaceInfo: Identifiable {
@@ -87,7 +88,7 @@ enum EasingSetting: UInt8, CaseIterable, Identifiable {
     }
 }
 
-struct EditableSettings {
+struct EditableSettings: Equatable {
     var layout: LayoutSetting = .bsp
     var split: SplitSetting = .automatic
     var insertionPoint: InsertionPointSetting = .focused
@@ -158,6 +159,9 @@ final class SettingsModel: ObservableObject {
     @Published private(set) var workspaces: [WorkspaceInfo] = []
     @Published private(set) var accessibilityGranted = AXIsProcessTrusted()
     @Published var settings = EditableSettings()
+    /// The values the core last confirmed. `settings` differs from this only
+    /// while an edit is waiting to be applied or after an apply failed.
+    @Published private(set) var appliedSettings = EditableSettings()
     @Published private(set) var configStatus = ConfigStatus(
         succeeded: true,
         message: "Configuration loaded",
@@ -204,8 +208,12 @@ final class SettingsModel: ObservableObject {
         configStatus = .init(succeeded: succeeded, message: message, date: Date())
     }
 
+    /// Updates `appliedSettings` first so the settings observer sees the new
+    /// value as already applied and does not write it back to the core.
     func setSettings(_ settings: BWSettings) {
-        self.settings = EditableSettings(settings)
+        let applied = EditableSettings(settings)
+        appliedSettings = applied
+        self.settings = applied
     }
 
     func refreshAccessibility() {
@@ -232,14 +240,12 @@ final class SettingsModel: ObservableObject {
 }
 
 struct SettingsActions {
-    private let retileAction: () -> Void
     private let openConfigAction: () -> Void
     private let reloadConfigAction: () -> Void
     private let saveSettingsAction: (EditableSettings) -> Bool
     private let focusWorkspaceAction: (UInt8) -> Void
 
     init(callbacks: BWMenuBarCallbacks) {
-        retileAction = { callbacks.retile() }
         openConfigAction = { callbacks.open_config() }
         reloadConfigAction = { _ = callbacks.reload_config() }
         saveSettingsAction = { settings in
@@ -250,13 +256,11 @@ struct SettingsActions {
     }
 
     private init(
-        retile: @escaping () -> Void,
         openConfig: @escaping () -> Void,
         reloadConfig: @escaping () -> Void,
         saveSettings: @escaping (EditableSettings) -> Bool,
         focusWorkspace: @escaping (UInt8) -> Void
     ) {
-        retileAction = retile
         openConfigAction = openConfig
         reloadConfigAction = reloadConfig
         saveSettingsAction = saveSettings
@@ -264,14 +268,12 @@ struct SettingsActions {
     }
 
     static let preview = SettingsActions(
-        retile: {},
         openConfig: {},
         reloadConfig: {},
         saveSettings: { _ in true },
         focusWorkspace: { _ in }
     )
 
-    func retile() { retileAction() }
     func openConfig() { openConfigAction() }
     func reloadConfig() { reloadConfigAction() }
     func saveSettings(_ settings: EditableSettings) -> Bool { saveSettingsAction(settings) }
@@ -300,26 +302,63 @@ struct SettingsActions {
     }
 }
 
+enum SettingsPane: String, CaseIterable, Identifiable {
+    case general
+    case tiling
+    case appearance
+    case workspaces
+
+    var id: Self { self }
+
+    var title: String {
+        switch self {
+        case .general: "General"
+        case .tiling: "Tiling"
+        case .appearance: "Appearance"
+        case .workspaces: "Workspaces"
+        }
+    }
+
+    var symbolName: String {
+        switch self {
+        case .general: "gearshape"
+        case .tiling: "rectangle.split.2x2"
+        case .appearance: "paintbrush"
+        case .workspaces: "rectangle.3.group"
+        }
+    }
+}
+
+/// Fixed so every pane lines up under the toolbar; only the height follows
+/// the selected pane, as in other macOS settings windows.
+let settingsPaneWidth: CGFloat = 500
+
 final class SettingsWindowController: NSWindowController, NSWindowDelegate {
     private let model: SettingsModel
+    private let tabs: SettingsTabViewController
+    private var applySubscription: AnyCancellable?
 
     init(model: SettingsModel, actions: SettingsActions) {
         self.model = model
-        let rootView = SettingsView(
-            model: model,
-            actions: actions,
-            initialSection: .general
-        )
-        let hostingController = NSHostingController(rootView: rootView)
-        let window = NSWindow(contentViewController: hostingController)
-        window.title = "Settings"
-        window.styleMask = [.titled, .closable, .miniaturizable, .resizable]
-        window.setContentSize(NSSize(width: 780, height: 560))
-        window.minSize = NSSize(width: 700, height: 500)
+        tabs = SettingsTabViewController(model: model, actions: actions)
+
+        // Settings open quickly with ⌘, and size themselves to the pane, so
+        // the HIG asks for minimize and zoom to stay disabled.
+        let window = NSWindow(contentViewController: tabs)
+        window.styleMask = [.titled, .closable]
+        window.toolbarStyle = .preference
         window.isReleasedWhenClosed = false
-        window.center()
         super.init(window: window)
         window.delegate = self
+
+        // Debounced so dragging a slider or holding a stepper rewrites
+        // config.zon once the value settles rather than on every step.
+        applySubscription = model.$settings
+            .debounce(for: .milliseconds(350), scheduler: RunLoop.main)
+            .sink { [weak model] settings in
+                guard let model, settings != model.appliedSettings else { return }
+                _ = actions.saveSettings(settings)
+            }
     }
 
     @available(*, unavailable)
@@ -327,8 +366,10 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         fatalError("SettingsWindowController is not archivable")
     }
 
-    func show() {
+    func show(pane: SettingsPane? = nil) {
         model.refreshAccessibility()
+        if let pane { tabs.select(pane) }
+        if window?.isVisible != true { window?.center() }
         showWindow(nil)
         NSApplication.shared.activate(ignoringOtherApps: true)
         window?.makeKeyAndOrderFront(nil)
@@ -339,446 +380,164 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
     }
 }
 
-enum SettingsSection: String, CaseIterable, Identifiable {
-    case general
-    case workspaces
-    case configuration
-    case diagnostics
+/// Toolbar-style tabs give the standard settings chrome: a fixed toolbar that
+/// always shows the selected pane and a window title that follows it.
+final class SettingsTabViewController: NSTabViewController {
+    private static let selectedPaneKey = "SettingsSelectedPane"
 
-    var id: Self { self }
+    init(model: SettingsModel, actions: SettingsActions) {
+        super.init(nibName: nil, bundle: nil)
+        tabStyle = .toolbar
+        canPropagateSelectedChildViewControllerTitle = true
 
-    var title: String {
-        switch self {
-        case .general: "General"
-        case .workspaces: "Workspaces"
-        case .configuration: "Configuration"
-        case .diagnostics: "Diagnostics"
+        for pane in SettingsPane.allCases {
+            let host = NSHostingController(
+                rootView: SettingsPaneView(pane: pane, model: model, actions: actions)
+            )
+            host.sizingOptions = [.preferredContentSize]
+            host.title = pane.title
+
+            let item = NSTabViewItem(viewController: host)
+            item.identifier = pane.rawValue
+            item.label = pane.title
+            item.image = NSImage(
+                systemSymbolName: pane.symbolName,
+                accessibilityDescription: pane.title
+            )
+            addTabViewItem(item)
         }
+
+        // People tend to adjust related settings repeatedly, so reopen on the
+        // pane they used last.
+        let saved = UserDefaults.standard.string(forKey: Self.selectedPaneKey)
+        select(saved.flatMap(SettingsPane.init(rawValue:)) ?? .general)
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) {
+        fatalError("SettingsTabViewController is not archivable")
+    }
+
+    func select(_ pane: SettingsPane) {
+        guard let index = SettingsPane.allCases.firstIndex(of: pane) else { return }
+        selectedTabViewItemIndex = index
+    }
+
+    override func tabView(_ tabView: NSTabView, didSelect tabViewItem: NSTabViewItem?) {
+        super.tabView(tabView, didSelect: tabViewItem)
+        if let identifier = tabViewItem?.identifier as? String {
+            UserDefaults.standard.set(identifier, forKey: Self.selectedPaneKey)
+        }
+        fitWindow(to: tabViewItem?.viewController, animate: view.window?.isVisible == true)
+    }
+
+    override func preferredContentSizeDidChange(for viewController: NSViewController) {
+        super.preferredContentSizeDidChange(for: viewController)
+        guard selectedTabViewItemIndex >= 0,
+            tabViewItems[selectedTabViewItemIndex].viewController === viewController
+        else { return }
+        fitWindow(to: viewController, animate: view.window?.isVisible == true)
+    }
+
+    /// Resizes around the top edge so the toolbar stays put while the pane
+    /// below it grows or shrinks.
+    private func fitWindow(to viewController: NSViewController?, animate: Bool) {
+        guard let window = view.window, let viewController else { return }
+        let size = viewController.preferredContentSize
+        guard size.width > 0, size.height > 0 else { return }
+
+        let target = window.frameRect(forContentRect: NSRect(origin: .zero, size: size))
+        var frame = window.frame
+        frame.origin.y += frame.height - target.height
+        frame.size = target.size
+        window.setFrame(frame, display: true, animate: animate)
     }
 }
 
-struct SettingsView: View {
+struct SettingsPaneView: View {
+    let pane: SettingsPane
     @ObservedObject var model: SettingsModel
     let actions: SettingsActions
-    @State private var selectedSection: SettingsSection
-
-    init(
-        model: SettingsModel,
-        actions: SettingsActions,
-        initialSection: SettingsSection
-    ) {
-        self.model = model
-        self.actions = actions
-        _selectedSection = State(initialValue: initialSection)
-    }
 
     var body: some View {
-        NavigationSplitView {
-            VStack(spacing: 4) {
-                ForEach(SettingsSection.allCases) { section in
-                    Button { selectedSection = section } label: {
-                        Text(section.title)
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                            .padding(.horizontal, 10)
-                            .padding(.vertical, 7)
-                            .foregroundStyle(
-                                selectedSection == section
-                                    ? Color.white : Color(nsColor: .labelColor)
-                            )
-                            .background(
-                                selectedSection == section ? Color.accentColor : .clear,
-                                in: RoundedRectangle(cornerRadius: 6)
-                            )
-                            .contentShape(Rectangle())
-                    }
-                    .buttonStyle(.plain)
-                }
-                Spacer()
-            }
-            .padding(10)
-            .navigationSplitViewColumnWidth(min: 165, ideal: 175, max: 190)
-        } detail: {
-            sectionContent
-        }
-    }
-
-    @ViewBuilder
-    private var sectionContent: some View {
-        switch selectedSection {
-        case .general:
-            sectionPage(
-                title: "General",
-                subtitle: "Status, permissions, and quick actions."
-            ) {
-                generalContent
-            }
-        case .workspaces:
-            sectionPage(
-                title: "Workspaces",
-                subtitle: "Live workspace status from your running Bobrwm session.",
-                trailing: "\(model.workspaces.count) total"
-            ) {
-                workspacesContent
-            }
-        case .configuration:
-            sectionPage(
-                title: "Configuration",
-                subtitle: "Window management and application behavior."
-            ) {
-                configurationContent
-            }
-        case .diagnostics:
-            sectionPage(
-                title: "Diagnostics",
-                subtitle: "Runtime information for troubleshooting."
-            ) {
-                diagnosticsContent
+        Group {
+            switch pane {
+            case .general: GeneralPane(model: model, actions: actions)
+            case .tiling: TilingPane(settings: $model.settings)
+            case .appearance: AppearancePane(settings: $model.settings)
+            case .workspaces: WorkspacesPane(workspaces: model.workspaces)
             }
         }
+        .formStyle(.grouped)
+        // The pane reports its full height so the window can fit it; scrolling
+        // inside a window that already fits would only add a stray scroller.
+        .scrollDisabled(true)
+        .fixedSize(horizontal: false, vertical: true)
+        .frame(width: settingsPaneWidth)
     }
+}
 
-    private func sectionPage<Content: View>(
-        title: String,
-        subtitle: String,
-        trailing: String? = nil,
-        @ViewBuilder content: () -> Content
-    ) -> some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 16) {
-                HStack(alignment: .firstTextBaseline) {
-                    VStack(alignment: .leading, spacing: 3) {
-                        Text(title).font(.system(size: 24, weight: .semibold))
-                        Text(subtitle).foregroundStyle(.secondary)
-                    }
-                    Spacer()
-                    if let trailing {
-                        Text(trailing).foregroundStyle(.secondary)
-                    }
-                }
-                content()
-                sourceOfTruthNote
-            }
-            .padding(20)
-            .frame(maxWidth: .infinity, minHeight: 500, alignment: .topLeading)
-        }
-        .background(Color(nsColor: .windowBackgroundColor))
-    }
+private struct GeneralPane: View {
+    @ObservedObject var model: SettingsModel
+    let actions: SettingsActions
 
-    private var generalContent: some View {
-        VStack(spacing: 10) {
-            StatusCard(
-                title: "Bobrwm is running",
-                detail: "Managing windows with your config.zon",
-                color: .green
-            ) {
-                Button("Retile") { actions.retile() }
-            }
-
-            StatusCard(
-                title: "Accessibility",
-                detail: model.accessibilityGranted
-                    ? "Granted · Bobrwm can control your windows"
-                    : "Required · Grant access to control your windows",
-                color: model.accessibilityGranted ? .green : .orange
-            ) {
-                Button("Open Settings…") { actions.openAccessibilitySettings() }
-            }
-
-            DashboardCard {
-                HStack(spacing: 12) {
-                    VStack(alignment: .leading, spacing: 3) {
-                        Text("Version").fontWeight(.semibold)
-                        Text("Keyboard-driven tiling window manager")
-                            .font(.callout)
-                            .foregroundStyle(.secondary)
-                    }
-                    Spacer()
-                    Text(displayVersion).foregroundStyle(.secondary)
-                }
-            }
-        }
-    }
-
-    private var workspacesContent: some View {
-        DashboardCard {
-            HStack {
-                Text("Key").frame(width: 34, alignment: .leading)
-                Text("Workspace").frame(width: 92, alignment: .leading)
-                Text("Apps").frame(maxWidth: .infinity, alignment: .leading)
-                Text("Windows").frame(width: 58, alignment: .leading)
-                Text("Status").frame(width: 72, alignment: .leading)
-            }
-            .font(.caption)
-            .foregroundStyle(.secondary)
-
-            ForEach(model.workspaces) { workspace in
-                Divider()
-                Button { actions.focusWorkspace(workspace.id) } label: {
-                    HStack {
-                        Text(workspace.shortcut.map(shortcutKeyLabel) ?? "\(workspace.id)")
-                            .font(.system(.caption, design: .monospaced, weight: .semibold))
-                            .frame(width: 34, alignment: .leading)
-                        Text(workspace.label)
-                            .fontWeight(workspace.isFocused ? .semibold : .regular)
-                            .frame(width: 92, alignment: .leading)
-                        Text(applicationSummary(workspace.applicationNames))
-                            .foregroundStyle(.secondary)
-                            .lineLimit(1)
-                            .help(applicationSummary(workspace.applicationNames))
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                        Text("\(workspace.windowCount)")
-                            .frame(width: 58, alignment: .leading)
-                        HStack(spacing: 6) {
-                            Circle()
-                                .fill(workspace.isActive ? Color.accentColor : .secondary)
-                                .frame(width: 7, height: 7)
-                            Text(workspace.isActive ? "active" : "inactive")
-                        }
-                        .frame(width: 72, alignment: .leading)
-                    }
-                    .contentShape(Rectangle())
-                }
-                .buttonStyle(.plain)
-            }
-        }
-    }
-
-    private var configurationContent: some View {
-        VStack(spacing: 10) {
-            DashboardCard {
-                HStack {
-                    VStack(alignment: .leading, spacing: 3) {
-                        Text("Editable settings").fontWeight(.semibold)
-                        Text("Changes are validated, saved to config.zon, and applied immediately.")
-                            .font(.callout)
-                            .foregroundStyle(.secondary)
-                    }
-                    Spacer()
-                    Button("Save Settings") { _ = actions.saveSettings(model.settings) }
-                        .keyboardShortcut("s", modifiers: .command)
-                }
-            }
-
-            DashboardCard {
-                settingHeader("Layout")
-                settingRow("Algorithm") {
-                    Picker("Algorithm", selection: $model.settings.layout) {
-                        ForEach(LayoutSetting.allCases) { Text($0.title).tag($0) }
-                    }
-                    .labelsHidden()
-                    .frame(width: 180)
-                }
-                Divider()
-                settingRow("Split direction") {
-                    Picker("Split direction", selection: $model.settings.split) {
-                        ForEach(SplitSetting.allCases) { Text($0.title).tag($0) }
-                    }
-                    .labelsHidden()
-                    .frame(width: 180)
-                }
-                .disabled(model.settings.layout != .bsp)
-                settingRow("Insertion point") {
-                    Picker("Insertion point", selection: $model.settings.insertionPoint) {
-                        ForEach(InsertionPointSetting.allCases) { Text($0.title).tag($0) }
-                    }
-                    .labelsHidden()
-                    .frame(width: 180)
-                }
-                .disabled(model.settings.layout != .bsp)
-                settingRow("New window position") {
-                    Picker("New window position", selection: $model.settings.newWindowPosition) {
-                        ForEach(NewWindowPositionSetting.allCases) { Text($0.title).tag($0) }
-                    }
-                    .labelsHidden()
-                    .frame(width: 180)
-                }
-                .disabled(model.settings.layout != .bsp)
-                settingRow("Default split ratio") {
-                    HStack(spacing: 10) {
-                        Slider(value: $model.settings.splitRatio, in: 0.1...0.9, step: 0.05)
-                            .frame(width: 120)
-                        Text(model.settings.splitRatio, format: .percent.precision(.fractionLength(0)))
-                            .monospacedDigit()
-                            .frame(width: 40, alignment: .trailing)
-                    }
-                }
-                .disabled(model.settings.layout != .bsp)
-            }
-
-            DashboardCard {
-                settingHeader("Gaps")
-                gapStepper("Inner", value: $model.settings.innerGap)
-                Divider()
-                gapStepper("Left", value: $model.settings.outerGapLeft)
-                gapStepper("Right", value: $model.settings.outerGapRight)
-                gapStepper("Top", value: $model.settings.outerGapTop)
-                gapStepper("Bottom", value: $model.settings.outerGapBottom)
-            }
-
-            DashboardCard {
-                settingHeader("Appearance")
-                Toggle("Dim inactive windows", isOn: $model.settings.dimmingEnabled)
-                settingRow("Dimming level") {
-                    HStack(spacing: 10) {
-                        Slider(value: $model.settings.dimmingLevel, in: 0...1, step: 0.05)
-                            .frame(width: 120)
-                        Text(model.settings.dimmingLevel, format: .percent.precision(.fractionLength(0)))
-                            .monospacedDigit()
-                            .frame(width: 40, alignment: .trailing)
-                    }
-                }
-                .disabled(!model.settings.dimmingEnabled)
-                Divider()
-                Toggle("Animate window movement", isOn: $model.settings.animationEnabled)
-                settingRow("Duration") {
-                    Stepper(
-                        "\(model.settings.animationDurationMilliseconds) ms",
-                        value: $model.settings.animationDurationMilliseconds,
-                        in: 50...2_000,
-                        step: 50
-                    )
-                    .monospacedDigit()
-                }
-                .disabled(!model.settings.animationEnabled)
-                settingRow("Easing") {
-                    Picker("Easing", selection: $model.settings.easing) {
-                        ForEach(EasingSetting.allCases) { Text($0.title).tag($0) }
-                    }
-                    .labelsHidden()
-                    .frame(width: 180)
-                }
-                .disabled(!model.settings.animationEnabled)
-            }
-
-            DashboardCard {
-                settingHeader("Application")
+    var body: some View {
+        Form {
+            Section {
                 Toggle("Start Bobrwm at login", isOn: $model.settings.startAtLogin)
             }
 
-            DashboardCard {
-                HStack(spacing: 12) {
-                    VStack(alignment: .leading, spacing: 3) {
-                        Text("Config file").fontWeight(.medium)
-                        Text(displayPath)
-                            .font(.system(.callout, design: .monospaced))
-                            .foregroundStyle(.secondary)
-                            .textSelection(.enabled)
+            Section {
+                LabeledContent("Accessibility") {
+                    if model.accessibilityGranted {
+                        StatusLabel("Granted", succeeded: true)
+                    } else {
+                        Button("Open System Settings…") { actions.openAccessibilitySettings() }
                     }
                 }
-                Divider()
+            } header: {
+                Text("Permissions")
+            } footer: {
+                if !model.accessibilityGranted {
+                    Text("Bobrwm needs Accessibility access to move and resize windows.")
+                        .foregroundStyle(.secondary)
+                }
+            }
+
+            Section {
+                LabeledContent("Config file") {
+                    Text(displayPath)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                        .textSelection(.enabled)
+                }
+                LabeledContent("Last reload") {
+                    StatusLabel(model.configStatus.message, succeeded: model.configStatus.succeeded)
+                        .help(model.configStatus.date.formatted(date: .abbreviated, time: .standard))
+                }
                 HStack {
+                    Spacer()
+                    Button("Reveal in Finder") { actions.revealConfig(path: model.configPath) }
+                        .disabled(model.configPath == nil)
                     Button("Open") { actions.openConfig() }
-                    Button("Reveal in Finder") {
-                        actions.revealConfig(path: model.configPath)
-                    }
-                    .disabled(model.configPath == nil)
-                    Button("Reload Config") {
-                        actions.reloadConfig()
-                    }
+                    Button("Reload") { actions.reloadConfig() }
+                }
+            } header: {
+                Text("Configuration")
+            } footer: {
+                Text("Changes made here are written to config.zon. Everything else in the file is left as is.")
+                    .foregroundStyle(.secondary)
+            }
+
+            Section("Troubleshooting") {
+                LabeledContent("Version", value: displayVersion)
+                LabeledContent {
+                    Button("Copy") { actions.copyDiagnostics(model.diagnostics) }
+                } label: {
+                    Text("Diagnostics")
+                    Text("Version, permissions, and workspace state. No window titles or file contents.")
                 }
             }
-
-            DashboardCard {
-                HStack(spacing: 12) {
-                    VStack(alignment: .leading, spacing: 3) {
-                        Text("Last reload").fontWeight(.medium)
-                        Text(model.configStatus.date, style: .time)
-                            .font(.callout)
-                            .foregroundStyle(.secondary)
-                    }
-                    Spacer()
-                    Circle()
-                        .fill(model.configStatus.succeeded ? Color.green : .orange)
-                        .frame(width: 8, height: 8)
-                    Text(model.configStatus.message)
-                }
-            }
-        }
-    }
-
-    private var diagnosticsContent: some View {
-        VStack(spacing: 10) {
-            DashboardCard {
-                HStack(spacing: 12) {
-                    VStack(alignment: .leading, spacing: 3) {
-                        Text("Diagnostics snapshot").fontWeight(.semibold)
-                        Text("Captures version, permission status, workspace list, and runtime state. Does not include window titles, file paths, or personal content.")
-                            .font(.callout)
-                            .foregroundStyle(.secondary)
-                            .fixedSize(horizontal: false, vertical: true)
-                    }
-                    Spacer()
-                    Button("Copy Diagnostics") { actions.copyDiagnostics(model.diagnostics) }
-                }
-            }
-
-            DashboardCard {
-                diagnosticRow(
-                    title: "Version",
-                    status: displayVersion,
-                    detail: "Keyboard-driven tiling window manager",
-                    color: nil
-                )
-                Divider()
-                diagnosticRow(
-                    title: "Accessibility",
-                    status: model.accessibilityGranted ? "Granted" : "Required",
-                    detail: model.accessibilityGranted
-                        ? "Bobrwm can control your windows"
-                        : "Grant access in System Settings",
-                    color: model.accessibilityGranted ? .green : .orange
-                )
-            }
-        }
-    }
-
-    private func diagnosticRow(
-        title: String,
-        status: String,
-        detail: String,
-        color: Color?
-    ) -> some View {
-        HStack(spacing: 12) {
-            VStack(alignment: .leading, spacing: 3) {
-                Text(title).fontWeight(.medium)
-                Text(detail).font(.callout).foregroundStyle(.secondary)
-            }
-            Spacer()
-            if let color {
-                Circle().fill(color).frame(width: 8, height: 8)
-            }
-            Text(status).foregroundStyle(.secondary)
-        }
-    }
-
-    private var sourceOfTruthNote: some View {
-        Text("config.zon remains the source of truth. Settings changed here are written through the Zig core without rewriting unrelated configuration.")
-        .font(.caption)
-        .foregroundStyle(.secondary)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .padding(12)
-        .background(Color.secondary.opacity(0.08), in: RoundedRectangle(cornerRadius: 8))
-    }
-
-    private func settingHeader(_ title: String) -> some View {
-        Text(title).font(.headline)
-    }
-
-    private func settingRow<Content: View>(
-        _ title: String,
-        @ViewBuilder content: () -> Content
-    ) -> some View {
-        HStack {
-            Text(title)
-            Spacer()
-            content()
-        }
-    }
-
-    private func gapStepper(_ title: String, value: Binding<UInt16>) -> some View {
-        settingRow(title) {
-            Stepper("\(value.wrappedValue) px", value: value, in: 0...128)
-                .monospacedDigit()
         }
     }
 
@@ -789,48 +548,196 @@ struct SettingsView: View {
     }
 
     private var displayVersion: String {
-        model.appVersion == "development" ? "Development" : model.appVersion
-    }
-
-    private func applicationSummary(_ names: [String]) -> String {
-        names.isEmpty ? "—" : names.joined(separator: ", ")
+        model.appVersion == "development" ? "Development build" : model.appVersion
     }
 }
 
-private struct StatusCard<Actions: View>: View {
-    let title: String
-    let detail: String
-    let color: Color
-    @ViewBuilder let actions: Actions
+private struct TilingPane: View {
+    @Binding var settings: EditableSettings
 
     var body: some View {
-        DashboardCard {
-            HStack(spacing: 12) {
-                VStack(alignment: .leading, spacing: 3) {
-                    HStack(spacing: 7) {
-                        Circle().fill(color).frame(width: 8, height: 8)
-                        Text(title).fontWeight(.semibold)
-                    }
-                    Text(detail).font(.callout).foregroundStyle(.secondary)
+        Form {
+            Section {
+                Picker("Layout", selection: $settings.layout) {
+                    ForEach(LayoutSetting.allCases) { Text($0.title).tag($0) }
                 }
-                Spacer(minLength: 8)
-                actions
+                Group {
+                    Picker("Split direction", selection: $settings.split) {
+                        ForEach(SplitSetting.allCases) { Text($0.title).tag($0) }
+                    }
+                    Picker("Insert new windows at", selection: $settings.insertionPoint) {
+                        ForEach(InsertionPointSetting.allCases) { Text($0.title).tag($0) }
+                    }
+                    Picker("Place new window", selection: $settings.newWindowPosition) {
+                        ForEach(NewWindowPositionSetting.allCases) { Text($0.title).tag($0) }
+                    }
+                    PercentSlider("Split ratio", value: $settings.splitRatio, in: 0.1...0.9)
+                }
+                .disabled(settings.layout != .bsp)
+            } footer: {
+                if settings.layout != .bsp {
+                    Text("Split options apply to the BSP layout.")
+                        .foregroundStyle(.secondary)
+                }
+            }
+
+            Section("Gaps") {
+                GapStepper("Between windows", value: $settings.innerGap)
+                GapStepper("Top", value: $settings.outerGapTop)
+                GapStepper("Bottom", value: $settings.outerGapBottom)
+                GapStepper("Left", value: $settings.outerGapLeft)
+                GapStepper("Right", value: $settings.outerGapRight)
             }
         }
-        .frame(maxWidth: .infinity)
     }
 }
 
-private struct DashboardCard<Content: View>: View {
-    @ViewBuilder let content: Content
+private struct AppearancePane: View {
+    @Binding var settings: EditableSettings
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 12) { content }
-            .padding(14)
-            .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 10))
-            .overlay {
-                RoundedRectangle(cornerRadius: 10)
-                    .strokeBorder(Color(nsColor: .separatorColor), lineWidth: 1)
+        Form {
+            Section {
+                Toggle("Dim inactive windows", isOn: $settings.dimmingEnabled)
+                PercentSlider("Dimming", value: $settings.dimmingLevel, in: 0...1)
+                    .disabled(!settings.dimmingEnabled)
             }
+
+            Section {
+                Toggle("Animate window movement", isOn: $settings.animationEnabled)
+                Group {
+                    LabeledContent("Duration") {
+                        Stepper(
+                            value: $settings.animationDurationMilliseconds,
+                            in: 50...2_000,
+                            step: 50
+                        ) {
+                            Text("\(settings.animationDurationMilliseconds) ms").monospacedDigit()
+                        }
+                    }
+                    Picker("Easing", selection: $settings.easing) {
+                        ForEach(EasingSetting.allCases) { Text($0.title).tag($0) }
+                    }
+                }
+                .disabled(!settings.animationEnabled)
+            }
+        }
+    }
+}
+
+private struct WorkspacesPane: View {
+    let workspaces: [WorkspaceInfo]
+
+    var body: some View {
+        Form {
+            Section {
+                ForEach(workspaces) { workspace in
+                    WorkspaceSettingsRow(workspace: workspace)
+                }
+            } footer: {
+                Text("Names and shortcuts are defined in config.zon.")
+                    .foregroundStyle(.secondary)
+            }
+        }
+    }
+}
+
+private struct WorkspaceSettingsRow: View {
+    let workspace: WorkspaceInfo
+
+    var body: some View {
+        LabeledContent {
+            HStack(spacing: 12) {
+                if workspace.isFocused {
+                    Text("Focused")
+                } else if workspace.isActive {
+                    Text("Visible")
+                }
+                Text(windowSummary).monospacedDigit()
+            }
+            .foregroundStyle(.secondary)
+        } label: {
+            HStack(spacing: 6) {
+                Text(workspace.label)
+                if let shortcut = workspace.shortcut {
+                    Text(shortcut).foregroundStyle(.tertiary)
+                }
+            }
+            Text(workspace.applicationNames.isEmpty
+                ? "No apps"
+                : workspace.applicationNames.joined(separator: ", "))
+        }
+    }
+
+    private var windowSummary: String {
+        switch workspace.windowCount {
+        case 0: "—"
+        case 1: "1 window"
+        default: "\(workspace.windowCount) windows"
+        }
+    }
+}
+
+/// Pairs the status color with a symbol so success and failure stay
+/// distinguishable without relying on color alone.
+private struct StatusLabel: View {
+    let title: String
+    let succeeded: Bool
+
+    init(_ title: String, succeeded: Bool) {
+        self.title = title
+        self.succeeded = succeeded
+    }
+
+    var body: some View {
+        Label {
+            Text(title)
+        } icon: {
+            Image(systemName: succeeded ? "checkmark.circle.fill" : "exclamationmark.triangle.fill")
+                .foregroundStyle(succeeded ? Color.green : Color.orange)
+        }
+    }
+}
+
+private struct PercentSlider: View {
+    let title: String
+    @Binding var value: Double
+    let range: ClosedRange<Double>
+
+    init(_ title: String, value: Binding<Double>, in range: ClosedRange<Double>) {
+        self.title = title
+        _value = value
+        self.range = range
+    }
+
+    var body: some View {
+        LabeledContent(title) {
+            HStack(spacing: 8) {
+                Slider(value: $value, in: range, step: 0.05)
+                    .labelsHidden()
+                    .frame(width: 140)
+                Text(value, format: .percent.precision(.fractionLength(0)))
+                    .monospacedDigit()
+                    .frame(width: 36, alignment: .trailing)
+            }
+        }
+    }
+}
+
+private struct GapStepper: View {
+    let title: String
+    @Binding var value: UInt16
+
+    init(_ title: String, value: Binding<UInt16>) {
+        self.title = title
+        _value = value
+    }
+
+    var body: some View {
+        LabeledContent(title) {
+            Stepper(value: $value, in: 0...128) {
+                Text("\(value) px").monospacedDigit()
+            }
+        }
     }
 }
