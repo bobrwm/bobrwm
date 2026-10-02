@@ -1,8 +1,8 @@
 //! macOS status bar (menu bar icon).
 //!
-//! The status item and its menu live in the Swift application under
-//! packages/bobrwm-ui. This module owns the Zig half of the C ABI declared in
-//! packages/bobrwm-ui/include/bobrwm_ui.h and the conversion from workspace
+//! The status item and its menu live in the Swift application in macos/.
+//! This module owns the Zig half of the C ABI declared in
+//! macos/include/bobrwm_ui.h and the conversion from workspace
 //! and keybind state into rows. The ABI structs below mirror that header;
 //! changing one means changing both.
 
