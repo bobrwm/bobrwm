@@ -241,6 +241,11 @@ pub fn build(b: *std.Build) !void {
 
     installBundleArtifact(b, exe);
 
+    // Doc comments on config fields, keybind actions, and client commands are
+    // the source of truth for user-facing docs. helpgen extracts them into a
+    // generated Zig module that the client prints and docgen exports.
+    const help_strings = helpStrings(b);
+
     // The client links no frameworks at all: it only parses arguments and
     // talks to the daemon over a unix socket. Loading AppKit and friends here
     // would cost every `bobrwm query ...` invocation for nothing.
@@ -251,6 +256,7 @@ pub fn build(b: *std.Build) !void {
         .link_libc = true,
     });
     cli_mod.addImport("build_options", build_options_mod);
+    cli_mod.addImport("help_strings", help_strings.module);
 
     const cli_exe = b.addExecutable(.{
         .name = cli_exe_name,
@@ -340,10 +346,7 @@ pub fn build(b: *std.Build) !void {
     const preview_step = b.step("ui-preview", "Render the menu bar UI to PNGs");
     preview_step.dependOn(&preview_run.step);
 
-    // Doc comments on config fields and keybind actions are the source of
-    // truth for user-facing docs. helpgen extracts them into a generated Zig
-    // module; docgen exports that module as JSON for the website.
-    const help_strings = helpStrings(b);
+    // docgen exports the generated help strings as JSON for the website.
     const docgen = b.addExecutable(.{
         .name = "docgen",
         .root_module = b.createModule(.{
@@ -562,6 +565,37 @@ pub fn build(b: *std.Build) !void {
 
     const run_helpgen_tests = b.addRunArtifact(helpgen_tests);
 
+    const cli_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/cli.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    cli_test_mod.addImport("build_options", build_options_mod);
+    cli_test_mod.addImport("help_strings", help_strings.module);
+
+    const cli_tests = b.addTest(.{
+        .name = "cli-tests",
+        .root_module = cli_test_mod,
+    });
+
+    const run_cli_tests = b.addRunArtifact(cli_tests);
+
+    const config_format_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/config_format.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    config_format_test_mod.addImport("help_strings", help_strings.module);
+
+    const config_format_tests = b.addTest(.{
+        .name = "config-format-tests",
+        .root_module = config_format_test_mod,
+    });
+
+    const run_config_format_tests = b.addRunArtifact(config_format_tests);
+
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_tests.step);
     test_step.dependOn(&run_ipc_tests.step);
@@ -577,6 +611,8 @@ pub fn build(b: *std.Build) !void {
     test_step.dependOn(&run_trace_tests.step);
     test_step.dependOn(&run_swipe_tests.step);
     test_step.dependOn(&run_helpgen_tests.step);
+    test_step.dependOn(&run_cli_tests.step);
+    test_step.dependOn(&run_config_format_tests.step);
     // Running the generator itself catches doc lookups broken by renamed
     // containers or fields, which the unit tests cannot see.
     test_step.dependOn(&help_strings.run.step);
