@@ -308,6 +308,16 @@ func renderAll(into directory: String) -> Bool {
             scheme: scheme,
             appearance: appearance
         ) && ok
+        let failedApply = makeSettingsModel(accessibilityGranted: true)
+        failedApply.settings.innerGap = 12
+        failedApply.setConfigStatus(succeeded: false, message: "Could not save settings; previous settings kept")
+        ok = renderPane(
+            .tiling,
+            model: failedApply,
+            path: "\(directory)/settings-apply-failed-\(suffix).png",
+            scheme: scheme,
+            appearance: appearance
+        ) && ok
         ok = renderWindow(
             path: "\(directory)/settings-window-\(suffix).png",
             appearance: appearance

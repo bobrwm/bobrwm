@@ -216,6 +216,16 @@ final class SettingsModel: ObservableObject {
         self.settings = applied
     }
 
+    /// True when the last apply was rejected and the shown values no longer
+    /// match what is running.
+    var applyFailed: Bool {
+        !configStatus.succeeded && settings != appliedSettings
+    }
+
+    func revertSettings() {
+        settings = appliedSettings
+    }
+
     func refreshAccessibility() {
         accessibilityGranted = AXIsProcessTrusted()
     }
@@ -463,8 +473,8 @@ struct SettingsPaneView: View {
         Group {
             switch pane {
             case .general: GeneralPane(model: model, actions: actions)
-            case .tiling: TilingPane(settings: $model.settings)
-            case .appearance: AppearancePane(settings: $model.settings)
+            case .tiling: TilingPane(model: model)
+            case .appearance: AppearancePane(model: model)
             case .workspaces: WorkspacesPane(workspaces: model.workspaces)
             }
         }
@@ -483,6 +493,7 @@ private struct GeneralPane: View {
 
     var body: some View {
         Form {
+            ApplyFailureSection(model: model)
             Section {
                 Toggle("Start Bobrwm at login", isOn: $model.settings.startAtLogin)
             }
@@ -553,69 +564,91 @@ private struct GeneralPane: View {
 }
 
 private struct TilingPane: View {
-    @Binding var settings: EditableSettings
+    @ObservedObject var model: SettingsModel
+
+    private var settings: EditableSettings { model.settings }
 
     var body: some View {
         Form {
+            ApplyFailureSection(model: model)
             Section {
-                Picker("Layout", selection: $settings.layout) {
+                Picker("Layout", selection: $model.settings.layout) {
                     ForEach(LayoutSetting.allCases) { Text($0.title).tag($0) }
                 }
                 Group {
-                    Picker("Split direction", selection: $settings.split) {
+                    Picker("Split direction", selection: $model.settings.split) {
                         ForEach(SplitSetting.allCases) { Text($0.title).tag($0) }
                     }
-                    Picker("Insert new windows at", selection: $settings.insertionPoint) {
+                    Picker("Insert new windows at", selection: $model.settings.insertionPoint) {
                         ForEach(InsertionPointSetting.allCases) { Text($0.title).tag($0) }
                     }
-                    Picker("Place new window", selection: $settings.newWindowPosition) {
+                    Picker("Place new window", selection: $model.settings.newWindowPosition) {
                         ForEach(NewWindowPositionSetting.allCases) { Text($0.title).tag($0) }
                     }
-                    PercentSlider("Split ratio", value: $settings.splitRatio, in: 0.1...0.9)
+                    PercentSlider("Split ratio", value: $model.settings.splitRatio, in: 0.1...0.9)
                 }
                 .disabled(settings.layout != .bsp)
             } footer: {
-                if settings.layout != .bsp {
-                    Text("Split options apply to the BSP layout.")
-                        .foregroundStyle(.secondary)
-                }
+                Text(layoutFooter).foregroundStyle(.secondary)
             }
 
-            Section("Gaps") {
-                GapStepper("Between windows", value: $settings.innerGap)
-                GapStepper("Top", value: $settings.outerGapTop)
-                GapStepper("Bottom", value: $settings.outerGapBottom)
-                GapStepper("Left", value: $settings.outerGapLeft)
-                GapStepper("Right", value: $settings.outerGapRight)
+            Section {
+                NumberStepper("Between windows", value: $model.settings.innerGap, in: 0...128, unit: "px")
+            } header: {
+                Text("Gaps")
             }
+
+            Section {
+                NumberStepper("Top", value: $model.settings.outerGapTop, in: 0...128, unit: "px")
+                NumberStepper("Bottom", value: $model.settings.outerGapBottom, in: 0...128, unit: "px")
+                NumberStepper("Left", value: $model.settings.outerGapLeft, in: 0...128, unit: "px")
+                NumberStepper("Right", value: $model.settings.outerGapRight, in: 0...128, unit: "px")
+            } header: {
+                Text("Screen Edges")
+            }
+        }
+    }
+
+    private var layoutFooter: String {
+        guard settings.layout == .bsp else {
+            return "Monocle shows one window at a time. Split options apply to the BSP layout."
+        }
+        return switch settings.insertionPoint {
+        case .focused: "New windows split the focused window."
+        case .first: "New windows split the first window in the layout."
+        case .last: "New windows split the last window in the layout."
+        case .minimumDepth: "New windows split the largest window, keeping the layout balanced."
         }
     }
 }
 
 private struct AppearancePane: View {
-    @Binding var settings: EditableSettings
+    @ObservedObject var model: SettingsModel
+
+    private var settings: EditableSettings { model.settings }
 
     var body: some View {
         Form {
+            ApplyFailureSection(model: model)
             Section {
-                Toggle("Dim inactive windows", isOn: $settings.dimmingEnabled)
-                PercentSlider("Dimming", value: $settings.dimmingLevel, in: 0...1)
+                Toggle("Dim inactive windows", isOn: $model.settings.dimmingEnabled)
+                // The extremes do nothing useful: 0% dims nothing and 100%
+                // blacks windows out entirely.
+                PercentSlider("Dimming", value: $model.settings.dimmingLevel, in: 0.05...0.9)
                     .disabled(!settings.dimmingEnabled)
             }
 
             Section {
-                Toggle("Animate window movement", isOn: $settings.animationEnabled)
+                Toggle("Animate window movement", isOn: $model.settings.animationEnabled)
                 Group {
-                    LabeledContent("Duration") {
-                        Stepper(
-                            value: $settings.animationDurationMilliseconds,
-                            in: 50...2_000,
-                            step: 50
-                        ) {
-                            Text("\(settings.animationDurationMilliseconds) ms").monospacedDigit()
-                        }
-                    }
-                    Picker("Easing", selection: $settings.easing) {
+                    NumberStepper(
+                        "Duration",
+                        value: $model.settings.animationDurationMilliseconds,
+                        in: 50...2_000,
+                        step: 50,
+                        unit: "ms"
+                    )
+                    Picker("Easing", selection: $model.settings.easing) {
                         ForEach(EasingSetting.allCases) { Text($0.title).tag($0) }
                     }
                 }
@@ -699,6 +732,28 @@ private struct StatusLabel: View {
     }
 }
 
+private struct ApplyFailureSection: View {
+    @ObservedObject var model: SettingsModel
+
+    var body: some View {
+        if model.applyFailed {
+            Section {
+                LabeledContent {
+                    Button("Revert") { model.revertSettings() }
+                } label: {
+                    Label {
+                        Text("Changes weren't applied")
+                        Text(model.configStatus.message)
+                    } icon: {
+                        Image(systemName: "exclamationmark.triangle.fill")
+                            .foregroundStyle(.orange)
+                    }
+                }
+            }
+        }
+    }
+}
+
 private struct PercentSlider: View {
     let title: String
     @Binding var value: Double
@@ -713,31 +768,77 @@ private struct PercentSlider: View {
     var body: some View {
         LabeledContent(title) {
             HStack(spacing: 8) {
-                Slider(value: $value, in: range, step: 0.05)
+                // Rounded through the binding rather than with `step:`, which
+                // draws a tick for every step and crowds the track.
+                Slider(value: rounded, in: range)
                     .labelsHidden()
-                    .frame(width: 140)
+                    .frame(width: 160)
                 Text(value, format: .percent.precision(.fractionLength(0)))
                     .monospacedDigit()
-                    .frame(width: 36, alignment: .trailing)
+                    .foregroundStyle(.secondary)
+                    .frame(width: 38, alignment: .trailing)
             }
         }
     }
+
+    private var rounded: Binding<Double> {
+        Binding(
+            get: { value },
+            set: { value = ($0 * 100).rounded() / 100 }
+        )
+    }
 }
 
-private struct GapStepper: View {
+/// A typed field next to a stepper, the standard macOS pairing: arrows for
+/// small nudges, typing for anything further than a few steps away.
+private struct NumberStepper<Value: BinaryInteger>: View {
     let title: String
-    @Binding var value: UInt16
+    @Binding var value: Value
+    let range: ClosedRange<Value>
+    let step: Value
+    let unit: String
 
-    init(_ title: String, value: Binding<UInt16>) {
+    init(
+        _ title: String,
+        value: Binding<Value>,
+        in range: ClosedRange<Value>,
+        step: Value = 1,
+        unit: String
+    ) {
         self.title = title
         _value = value
+        self.range = range
+        self.step = step
+        self.unit = unit
     }
 
     var body: some View {
         LabeledContent(title) {
-            Stepper(value: $value, in: 0...128) {
-                Text("\(value) px").monospacedDigit()
+            HStack(spacing: 4) {
+                TextField(title, value: clamped, format: .number)
+                    .textFieldStyle(.roundedBorder)
+                    .labelsHidden()
+                    .multilineTextAlignment(.trailing)
+                    .monospacedDigit()
+                    .frame(width: 56)
+                Text(unit).foregroundStyle(.secondary)
+                Stepper(
+                    title,
+                    value: clamped,
+                    in: Int(range.lowerBound)...Int(range.upperBound),
+                    step: Int(step)
+                )
+                    .labelsHidden()
             }
         }
+    }
+
+    /// Typed values outside the range snap to the nearest bound instead of
+    /// reaching the core, which would reject the whole settings write.
+    private var clamped: Binding<Int> {
+        Binding(
+            get: { Int(value) },
+            set: { value = Value(min(max($0, Int(range.lowerBound)), Int(range.upperBound))) }
+        )
     }
 }
