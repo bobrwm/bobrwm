@@ -616,7 +616,7 @@ fn keybindIndex(bindings: []const shim.bw_keybind, target: shim.bw_keybind) ?usi
     return null;
 }
 
-fn isDefaultKeybindSlice(keybinds: []const Keybind) bool {
+pub fn isDefaultKeybindSlice(keybinds: []const Keybind) bool {
     const defaults = default_keybinds[0..];
     return keybinds.len == defaults.len and keybinds.ptr == defaults.ptr;
 }
@@ -1928,13 +1928,6 @@ test "buildKeybinds: unknown key name is skipped without consuming a slot" {
 
 test "loadFromPath: missing file" {
     try t.expectEqual(@as(?Config, null), loadFromPath(t.allocator, "/tmp/bobrwm_no_such_file.zon"));
-}
-
-test "loadFromPath: examples/config.zon" {
-    var arena = std.heap.ArenaAllocator.init(t.allocator);
-    defer arena.deinit();
-
-    try t.expect(loadFromPath(arena.allocator(), "examples/config.zon") != null);
 }
 
 test "loadFromPath: custom zon" {

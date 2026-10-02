@@ -131,11 +131,14 @@ If no config file is found, built-in defaults are used.
 }
 ```
 
-Every option and keybind action is documented in the doc comments on
-[`src/config.zig`](src/config.zig), which are the source for the generated
-reference; `zig build docs` writes it to `zig-out/share/bobrwm/docs.json`. See
-[`examples/config.zon`](examples/config.zon) for a full example with the
-default keybinds.
+To start from every option with its documentation and the default keybinds:
+
+```bash
+bobrwm show-config --default --docs > ~/.config/bobrwm/config.zon
+```
+
+`bobrwm show-config` prints the config bobrwm would load, and
+`bobrwm list-actions --docs` lists every keybind action.
 
 Press `Alt+Shift+R` (the default `reload_config` binding) or run
 `bobrwm reload-config` to apply changes without restarting. If the file
