@@ -217,6 +217,59 @@ func renderHosted<ViewContent: View>(
     }
 }
 
+/// Renders a pane at the size it reports to the settings window, so the
+/// PNG also shows whether the pane fits without scrolling.
+@MainActor
+func renderPane(
+    _ pane: SettingsPane,
+    model: SettingsModel,
+    path: String,
+    scheme: ColorScheme,
+    appearance: NSAppearance.Name
+) -> Bool {
+    let view = SettingsPaneView(pane: pane, model: model, actions: .preview)
+        .environment(\.colorScheme, scheme)
+    let probe = NSHostingController(rootView: view)
+    let size = probe.sizeThatFits(in: NSSize(width: settingsPaneWidth, height: 10_000))
+    return renderHosted(view, size: size, path: path, appearance: appearance)
+}
+
+/// Captures the real settings window, toolbar included, to check the chrome
+/// and the pane-driven sizing that per-pane renders cannot show.
+@MainActor
+func renderWindow(path: String, appearance: NSAppearance.Name) -> Bool {
+    let controller = SettingsWindowController(
+        model: makeSettingsModel(accessibilityGranted: true),
+        actions: .preview
+    )
+    guard let window = controller.window, let frameView = window.contentView?.superview else {
+        FileHandle.standardError.write(Data("window unavailable: \(path)\n".utf8))
+        return false
+    }
+    window.appearance = NSAppearance(named: appearance)
+    window.orderFront(nil)
+    window.displayIfNeeded()
+    RunLoop.main.run(until: Date().addingTimeInterval(0.3))
+    window.display()
+
+    guard let rep = frameView.bitmapImageRepForCachingDisplay(in: frameView.bounds) else {
+        FileHandle.standardError.write(Data("render failed: \(path)\n".utf8))
+        return false
+    }
+    frameView.cacheDisplay(in: frameView.bounds, to: rep)
+    window.orderOut(nil)
+
+    guard let png = rep.representation(using: .png, properties: [:]) else { return false }
+    do {
+        try png.write(to: URL(fileURLWithPath: path))
+        print(path)
+        return true
+    } catch {
+        FileHandle.standardError.write(Data("write failed: \(path): \(error)\n".utf8))
+        return false
+    }
+}
+
 @MainActor
 func renderAll(into directory: String) -> Bool {
     var ok = true
@@ -239,34 +292,24 @@ func renderAll(into directory: String) -> Bool {
             path: "\(directory)/menu-\(suffix).png",
             appearance: appearance
         ) && ok
-        for section in SettingsSection.allCases {
-            let settings = SettingsView(
+        for pane in SettingsPane.allCases {
+            ok = renderPane(
+                pane,
                 model: makeSettingsModel(accessibilityGranted: true),
-                actions: .preview,
-                initialSection: section
-            )
-            .frame(width: 780, height: 560)
-            .environment(\.colorScheme, scheme)
-
-            ok = renderHosted(
-                settings,
-                size: NSSize(width: 780, height: 560),
-                path: "\(directory)/settings-\(section.rawValue)-\(suffix).png",
+                path: "\(directory)/settings-\(pane.rawValue)-\(suffix).png",
+                scheme: scheme,
                 appearance: appearance
             ) && ok
         }
-
-        let permissionRequired = SettingsView(
+        ok = renderPane(
+            .general,
             model: makeSettingsModel(accessibilityGranted: false),
-            actions: .preview,
-            initialSection: .general
-        )
-        .frame(width: 780, height: 560)
-        .environment(\.colorScheme, scheme)
-        ok = renderHosted(
-            permissionRequired,
-            size: NSSize(width: 780, height: 560),
             path: "\(directory)/settings-permission-required-\(suffix).png",
+            scheme: scheme,
+            appearance: appearance
+        ) && ok
+        ok = renderWindow(
+            path: "\(directory)/settings-window-\(suffix).png",
             appearance: appearance
         ) && ok
     }
