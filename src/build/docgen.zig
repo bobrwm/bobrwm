@@ -22,9 +22,11 @@ pub fn main(init: std.process.Init) !void {
 
     const config = comptime entries(help_strings.Config);
     const keybind_actions = comptime entries(help_strings.KeybindAction);
+    const commands = comptime entries(help_strings.Command);
     try std.json.Stringify.value(.{
         .config = &config,
         .keybind_actions = &keybind_actions,
+        .commands = &commands,
     }, .{ .whitespace = .indent_2 }, writer);
     try writer.writeAll("\n");
     try stdout.end();

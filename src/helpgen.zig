@@ -1,6 +1,6 @@
 //! Generates the `help_strings` module from the `///` doc comments on
-//! config fields and keybind actions, so the CLI, docs, and website can all
-//! render the same text instead of maintaining copies that drift.
+//! config fields, keybind actions, and client commands, so the CLI and the
+//! website render the same text instead of maintaining copies that drift.
 //!
 //! The field lists come from comptime reflection over the real types, so the
 //! output always covers exactly what `config.zon` parses. The doc text comes
@@ -13,6 +13,7 @@
 
 const std = @import("std");
 const config = @import("config.zig");
+const command = @import("command.zig");
 
 /// One documentable config key: the dotted path a user writes, and the
 /// container and field whose doc comment describes it.
@@ -36,6 +37,7 @@ pub fn main(init: std.process.Init) !void {
     var sources: SourceCache = .{ .alloc = alloc };
     try genEntries(alloc, &sources, writer, "Config", comptime configEntries(config.Config, ""));
     try genEntries(alloc, &sources, writer, "KeybindAction", comptime enumEntries(config.Action));
+    try genEntries(alloc, &sources, writer, "Command", comptime enumEntries(command.Command));
     try stdout.end();
 }
 
