@@ -2,8 +2,8 @@
 //! config fields, keybind actions, and client commands, so the CLI and the
 //! website render the same text instead of maintaining copies that drift.
 //!
-//! The field lists come from comptime reflection over the real types, so the
-//! output always covers exactly what `config.zon` parses. The doc text comes
+//! The key lists come from comptime reflection over the real types, so the
+//! output always covers exactly what the config file parses. The doc text comes
 //! from parsing each type's source file with `std.zig.Ast`, since doc comments
 //! are not available through `@typeInfo`.
 //!
@@ -16,6 +16,7 @@
 
 const std = @import("std");
 const config = @import("config.zig");
+const config_file = @import("config_file.zig");
 const command = @import("command.zig");
 
 /// One documentable config key: the dotted path a user writes, and the
@@ -39,7 +40,7 @@ pub fn main(init: std.process.Init) !void {
     const alloc = init.arena.allocator();
     var sources: SourceCache = .{ .alloc = alloc };
     var missing: std.ArrayList([]const u8) = .empty;
-    try genEntries(alloc, &sources, &missing, writer, "Config", comptime configEntries(config.Config, ""));
+    try genEntries(alloc, &sources, &missing, writer, "Config", comptime configEntries());
     try genEntries(alloc, &sources, &missing, writer, "KeybindAction", comptime enumEntries(config.Action));
     try genEntries(alloc, &sources, &missing, writer, "Command", comptime enumEntries(command.Command));
 
@@ -89,20 +90,13 @@ fn genEntries(
     try writer.writeAll("};\n\n");
 }
 
-/// Flatten a config struct into dotted keys, descending into nested structs
-/// and the element structs of slices (`keybinds[].key`) since users write
-/// those fields in `config.zon` too.
-fn configEntries(comptime T: type, comptime prefix: []const u8) []const KeyEntry {
+/// One entry per config file option, keyed the way users write it, so the
+/// docs and the parser cannot disagree on names.
+fn configEntries() []const KeyEntry {
     comptime {
-        @setEvalBranchQuota(50_000);
         var out: []const KeyEntry = &.{};
-        for (@typeInfo(T).@"struct".fields) |field| {
-            if (field.name[0] == '_') continue;
-            const key = prefix ++ field.name;
-            out = out ++ &[_]KeyEntry{.{ .key = key, .Container = T, .field = field.name }};
-            if (nestedStruct(field.type)) |nested| {
-                out = out ++ configEntries(nested.T, key ++ nested.separator);
-            }
+        for (config_file.options) |option| {
+            out = out ++ &[_]KeyEntry{.{ .key = option.key, .Container = option.Container, .field = option.field }};
         }
         return out;
     }
@@ -116,20 +110,6 @@ fn enumEntries(comptime T: type) []const KeyEntry {
         }
         return out;
     }
-}
-
-const Nested = struct { T: type, separator: []const u8 };
-
-fn nestedStruct(comptime T: type) ?Nested {
-    return switch (@typeInfo(T)) {
-        .@"struct" => .{ .T = T, .separator = "." },
-        .optional => |o| nestedStruct(o.child),
-        .pointer => |p| if (p.size == .slice and @typeInfo(p.child) == .@"struct")
-            .{ .T = p.child, .separator = "[]." }
-        else
-            null,
-        else => null,
-    };
 }
 
 /// Source path, relative to this file, of the file declaring `T`. Relies on
@@ -293,22 +273,4 @@ test "fieldDoc scopes lookup to the named container" {
     try std.testing.expectEqual(null, plain.doc);
     try std.testing.expectEqual(@as(usize, 5), plain.line);
     try std.testing.expectError(error.FieldNotFound, fieldDoc(alloc, ast, "A", "missing"));
-}
-
-test "configEntries flattens nested and slice-element structs" {
-    const Inner = struct { x: u8 = 0 };
-    const Outer = struct {
-        inner: Inner = .{},
-        list: []const Inner = &.{},
-        maybe: ?Inner = null,
-        _private: u8 = 0,
-    };
-    const keys = comptime blk: {
-        var out: []const []const u8 = &.{};
-        for (configEntries(Outer, "")) |entry| out = out ++ &[_][]const u8{entry.key};
-        break :blk out;
-    };
-    const expected = [_][]const u8{ "inner", "inner.x", "list", "list[].x", "maybe", "maybe.x" };
-    try std.testing.expectEqual(expected.len, keys.len);
-    for (expected, keys) |e, k| try std.testing.expectEqualStrings(e, k);
 }
