@@ -234,6 +234,11 @@ pub fn build(b: *std.Build) !void {
 
     installBundleArtifact(b, exe);
 
+    // Doc comments on config fields, keybind actions, and client commands are
+    // the source of truth for user-facing docs. helpgen extracts them into a
+    // generated Zig module that the client prints and docgen exports.
+    const help_strings = helpStrings(b);
+
     // The client links no frameworks at all: it only parses arguments and
     // talks to the daemon over a unix socket. Loading AppKit and friends here
     // would cost every `bobrwm query ...` invocation for nothing.
@@ -244,6 +249,7 @@ pub fn build(b: *std.Build) !void {
         .link_libc = true,
     });
     cli_mod.addImport("build_options", build_options_mod);
+    cli_mod.addImport("help_strings", help_strings.module);
 
     const cli_exe = b.addExecutable(.{
         .name = cli_exe_name,
@@ -386,6 +392,19 @@ pub fn build(b: *std.Build) !void {
 
     const run_swipe_step = b.step("run-swipe", "Run bobrwm-swipe");
     run_swipe_step.dependOn(&run_swipe_cmd.step);
+
+    // docgen exports the generated help strings as JSON for the website.
+    const docgen = b.addExecutable(.{
+        .name = "docgen",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/build/docgen.zig"),
+            .target = b.graph.host,
+        }),
+    });
+    docgen.root_module.addImport("help_strings", help_strings.module);
+    const docgen_out = b.addRunArtifact(docgen).captureStdOut(.{});
+    const docs_step = b.step("docs", "Export config and keybind docs to share/bobrwm/docs.json");
+    docs_step.dependOn(&b.addInstallFile(docgen_out, "share/bobrwm/docs.json").step);
 
     // config.zig imports only Zig declarations, so the test module needs
     // no SDK or include wiring.
@@ -600,6 +619,48 @@ pub fn build(b: *std.Build) !void {
 
     const run_swipe_tests = b.addRunArtifact(swipe_tests);
 
+    const helpgen_tests = b.addTest(.{
+        .name = "helpgen-tests",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/helpgen.zig"),
+            .target = b.graph.host,
+            .link_libc = true,
+        }),
+    });
+
+    const run_helpgen_tests = b.addRunArtifact(helpgen_tests);
+
+    const cli_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/cli.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    cli_test_mod.addImport("build_options", build_options_mod);
+    cli_test_mod.addImport("help_strings", help_strings.module);
+
+    const cli_tests = b.addTest(.{
+        .name = "cli-tests",
+        .root_module = cli_test_mod,
+    });
+
+    const run_cli_tests = b.addRunArtifact(cli_tests);
+
+    const config_format_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/config_format.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    config_format_test_mod.addImport("help_strings", help_strings.module);
+
+    const config_format_tests = b.addTest(.{
+        .name = "config-format-tests",
+        .root_module = config_format_test_mod,
+    });
+
+    const run_config_format_tests = b.addRunArtifact(config_format_tests);
+
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_tests.step);
     test_step.dependOn(&run_ipc_tests.step);
@@ -614,7 +675,44 @@ pub fn build(b: *std.Build) !void {
     test_step.dependOn(&run_logging_tests.step);
     test_step.dependOn(&run_trace_tests.step);
     test_step.dependOn(&run_swipe_tests.step);
+    test_step.dependOn(&run_helpgen_tests.step);
+    test_step.dependOn(&run_cli_tests.step);
+    test_step.dependOn(&run_config_format_tests.step);
+    // Running the generator itself catches doc lookups broken by renamed
+    // containers or fields, which the unit tests cannot see.
+    test_step.dependOn(&help_strings.run.step);
 }
+
+/// Run helpgen and expose its output as the `help_strings` module.
+///
+/// Adapted from ghostty-org/ghostty `src/build/HelpStrings.zig` @ b1c264163.
+/// Copyright (c) 2024 Mitchell Hashimoto, Ghostty contributors.
+/// MIT License, see LICENSES/ghostty.txt.
+fn helpStrings(b: *std.Build) HelpStrings {
+    const exe = b.addExecutable(.{
+        .name = "helpgen",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/helpgen.zig"),
+            .target = b.graph.host,
+            // config.zig links against libc through its osutil import.
+            .link_libc = true,
+        }),
+    });
+    const help_run = b.addRunArtifact(exe);
+
+    // Generated Zig files have to end with .zig
+    const wf = b.addWriteFiles();
+    const output = wf.addCopyFile(help_run.captureStdOut(.{}), "help_strings.zig");
+    return .{
+        .module = b.createModule(.{ .root_source_file = output }),
+        .run = help_run,
+    };
+}
+
+const HelpStrings = struct {
+    module: *std.Build.Module,
+    run: *std.Build.Step.Run,
+};
 
 const AppModuleDependencies = struct {
     build_options: *std.Build.Module,

@@ -13,9 +13,16 @@ const build_options = @import("build_options");
 const log_options = @import("log_options.zig");
 const osutil = @import("osutil.zig");
 const runtime_paths = @import("runtime_paths.zig");
+const config = @import("config.zig");
+const config_format = @import("config_format.zig");
+const help_strings = @import("help_strings");
+const Command = @import("command.zig").Command;
 
 pub const std_options = std.Options{
     .log_level = log_options.level,
+    // `show-config` loads the config in-process; keep its progress lines out
+    // of the terminal but still surface parse and validation errors.
+    .log_scope_levels = &.{.{ .scope = .config, .level = .warn }},
 };
 
 const log = std.log.scoped(.cli);
@@ -23,31 +30,74 @@ const log = std.log.scoped(.cli);
 // Parse result
 
 pub const Result = union(enum) {
-    help,
+    /// General help, or help for one command.
+    help: ?Command,
     version,
+    show_config: ShowConfigOptions,
+    list_actions: ListActionsOptions,
+    /// A flag a local command does not accept.
+    invalid_flag: struct { command: Command, flag: []const u8 },
     /// Forward an IPC command string to the running daemon.
     ipc: []const u8,
 };
 
-/// Parse process arguments into a CLI result.
-/// `cmd_buf` is scratch space for assembling the IPC command string from
-/// positional arguments.
-pub fn parse(process_args: std.process.Args, cmd_buf: []u8) Result {
-    var pos: usize = 0;
-    var args = process_args.iterate();
-    defer args.deinit();
-    _ = args.skip(); // program name
+pub const ShowConfigOptions = struct {
+    default: bool = false,
+    docs: bool = false,
+};
 
+pub const ListActionsOptions = struct {
+    docs: bool = false,
+};
+
+/// Parse arguments, without the program name, into a CLI result. `args` is
+/// anything with a `next() ?[]const u8`. `cmd_buf` is scratch space for
+/// assembling the IPC command string from positional arguments.
+pub fn parse(args: anytype, cmd_buf: []u8) Result {
+    const first = args.next() orelse return .{ .help = null };
+    if (isHelpFlag(first)) return .{ .help = null };
+    if (std.mem.eql(u8, first, "--version")) return .version;
+    if (Command.parse(first)) |command| return parseCommand(command, args);
+    return parseIpc(first, args, cmd_buf);
+}
+
+fn parseCommand(command: Command, args: anytype) Result {
+    var result: Result = switch (command) {
+        .help => .{ .help = null },
+        .version => .version,
+        .@"show-config" => .{ .show_config = .{} },
+        .@"list-actions" => .{ .list_actions = .{} },
+    };
     while (args.next()) |arg| {
-        // Flags: --help / -h
-        if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
-            return .help;
-        }
+        if (isHelpFlag(arg)) return .{ .help = command };
+        const known = switch (result) {
+            .show_config => |*opts| setFlag(ShowConfigOptions, opts, arg),
+            .list_actions => |*opts| setFlag(ListActionsOptions, opts, arg),
+            else => false,
+        };
+        if (!known) return .{ .invalid_flag = .{ .command = command, .flag = arg } };
+    }
+    return result;
+}
 
-        // Flags: --version
-        if (std.mem.eql(u8, arg, "--version")) {
-            return .version;
+/// Set the bool field named by a `--<field>` flag. Returns false for any
+/// other argument.
+fn setFlag(comptime Options: type, opts: *Options, arg: []const u8) bool {
+    if (!std.mem.startsWith(u8, arg, "--")) return false;
+    inline for (@typeInfo(Options).@"struct".fields) |field| {
+        if (std.mem.eql(u8, arg[2..], field.name)) {
+            @field(opts, field.name) = true;
+            return true;
         }
+    }
+    return false;
+}
+
+fn parseIpc(first: []const u8, args: anytype, cmd_buf: []u8) Result {
+    var pos: usize = 0;
+    var next: ?[]const u8 = first;
+    while (next) |arg| : (next = args.next()) {
+        if (isHelpFlag(arg)) return .{ .help = null };
 
         // Positional arg — accumulate into cmd_buf
         if (pos > 0 and pos < cmd_buf.len) {
@@ -58,23 +108,11 @@ pub fn parse(process_args: std.process.Args, cmd_buf: []u8) Result {
         @memcpy(cmd_buf[pos..][0..copy_len], arg[0..copy_len]);
         pos += copy_len;
     }
+    return .{ .ipc = cmd_buf[0..pos] };
+}
 
-    // A bare invocation no longer starts the window manager; that is the app
-    // bundle's job.
-    if (pos == 0) return .help;
-
-    const command = cmd_buf[0..pos];
-
-    // Check for known local commands
-    if (std.mem.eql(u8, command, "help")) {
-        return .help;
-    }
-    if (std.mem.eql(u8, command, "version")) {
-        return .version;
-    }
-
-    // Everything else is an IPC command
-    return .{ .ipc = command };
+fn isHelpFlag(arg: []const u8) bool {
+    return std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h");
 }
 
 // Action dispatch
@@ -82,13 +120,24 @@ pub fn parse(process_args: std.process.Args, cmd_buf: []u8) Result {
 /// Run a parsed CLI result and return the process exit code.
 pub fn run(result: Result) u8 {
     switch (result) {
-        .help => {
-            printHelp();
+        .help => |command| {
+            if (command) |c| printCommandHelp(c) else printHelp();
             return 0;
         },
         .version => {
             printVersion();
             return 0;
+        },
+        .show_config => |opts| return showConfig(opts),
+        .list_actions => |opts| return listActions(opts),
+        .invalid_flag => |invalid| {
+            var buf: [256]u8 = undefined;
+            writeStderr(std.fmt.bufPrint(&buf, "error: unknown flag {s} for {s}; see bobrwm {s} --help\n", .{
+                invalid.flag,
+                @tagName(invalid.command),
+                @tagName(invalid.command),
+            }) catch "error: unknown flag\n");
+            return 2;
         },
         .ipc => |cmd| return runClient(cmd),
     }
@@ -96,7 +145,10 @@ pub fn run(result: Result) u8 {
 
 pub fn main(init: std.process.Init.Minimal) !void {
     var cmd_buf: [512]u8 = undefined;
-    const exit_code = run(parse(init.args, &cmd_buf));
+    var args = init.args.iterate();
+    defer args.deinit();
+    _ = args.skip(); // program name
+    const exit_code = run(parse(&args, &cmd_buf));
     if (exit_code != 0) std.process.exit(exit_code);
 }
 
@@ -126,14 +178,23 @@ fn printHelp() void {
     writeStdout(help_text);
 }
 
+fn printCommandHelp(command: Command) void {
+    switch (command) {
+        inline else => |c| writeStdout(@field(help_strings.Command, @tagName(c)) ++ "\n"),
+    }
+}
+
 const help_text =
     \\Usage: bobrwm [command] [options]
     \\
     \\A tiling window manager for macOS.
     \\
     \\General Commands:
-    \\  help                     Show this help message
-    \\  version                  Show version information
+    \\  help                      Show this help message
+    \\  version                   Show version information
+    \\  show-config [--default] [--docs]
+    \\                            Print the config, or the defaults, as config.zon
+    \\  list-actions [--docs]     List keybind actions
     \\
     \\Window Commands (IPC):
     \\  retile                    Re-tile visible workspaces on all displays
@@ -167,9 +228,77 @@ const help_text =
     \\  --version                 Show version information
     \\
     \\Configuration is read from $XDG_CONFIG_HOME/bobrwm/config.zon
-    \\or ~/.config/bobrwm/config.zon by default.
+    \\or ~/.config/bobrwm/config.zon by default. To start one with every
+    \\option documented, run:
+    \\
+    \\  bobrwm show-config --default --docs > ~/.config/bobrwm/config.zon
+    \\
+    \\Run `bobrwm <command> --help` for details on show-config,
+    \\list-actions, help, or version.
     \\
 ;
+
+// Config and action reference
+
+fn showConfig(opts: ShowConfigOptions) u8 {
+    var arena: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const cfg: config.Config = if (opts.default) .{} else loadUserConfig(alloc) orelse return 1;
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    const written = if (opts.docs)
+        config_format.write(&out.writer, &cfg, help_strings.Config)
+    else
+        config_format.write(&out.writer, &cfg, null);
+    written catch {
+        writeStderr("error: out of memory\n");
+        return 1;
+    };
+    writeStdout(out.written());
+    return 0;
+}
+
+/// The config the window manager would load. A missing file means defaults,
+/// like the daemon; an invalid one is an error, since printing defaults then
+/// would misrepresent what is running. `loadFromPath` logs the diagnostics.
+fn loadUserConfig(alloc: std.mem.Allocator) ?config.Config {
+    const path = config.resolvePath(alloc, null) catch {
+        writeStderr("error: cannot resolve config path: HOME is not set\n");
+        return null;
+    };
+    if (!osutil.pathExists(path)) return .{};
+    return config.loadFromPath(alloc, path) orelse {
+        writeStderr("error: config file is invalid; see the errors above\n");
+        return null;
+    };
+}
+
+fn listActions(opts: ListActionsOptions) u8 {
+    var arena: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
+    defer arena.deinit();
+    var out: std.Io.Writer.Allocating = .init(arena.allocator());
+    writeActions(&out.writer, opts.docs) catch {
+        writeStderr("error: out of memory\n");
+        return 1;
+    };
+    writeStdout(out.written());
+    return 0;
+}
+
+fn writeActions(writer: *std.Io.Writer, docs: bool) std.Io.Writer.Error!void {
+    const Actions = help_strings.KeybindAction;
+    inline for (Actions.keys) |key| {
+        try writer.writeAll(key ++ "\n");
+        if (docs) {
+            var lines = std.mem.splitScalar(u8, @field(Actions, key), '\n');
+            while (lines.next()) |line| {
+                if (line.len == 0) try writer.writeAll("\n") else try writer.print("  {s}\n", .{line});
+            }
+            try writer.writeAll("\n");
+        }
+    }
+}
 
 // Version
 
@@ -264,4 +393,54 @@ fn runClient(cmd: []const u8) u8 {
     const elapsed_ms = @divTrunc(osutil.nanoTimestamp() - started_ns, std.time.ns_per_ms);
     log.debug("[trace] ipc client completed bytes={} elapsed_ms={}", .{ response_bytes, elapsed_ms });
     return if (transport_failed or response_is_error) 1 else 0;
+}
+
+const SliceArgs = struct {
+    items: []const []const u8,
+    index: usize = 0,
+
+    fn next(self: *SliceArgs) ?[]const u8 {
+        if (self.index == self.items.len) return null;
+        defer self.index += 1;
+        return self.items[self.index];
+    }
+};
+
+fn testParse(items: []const []const u8, cmd_buf: []u8) Result {
+    var args: SliceArgs = .{ .items = items };
+    return parse(&args, cmd_buf);
+}
+
+test "parse local commands and their flags" {
+    var buf: [64]u8 = undefined;
+    try std.testing.expectEqual(Result{ .help = null }, testParse(&.{}, &buf));
+    try std.testing.expectEqual(Result{ .help = null }, testParse(&.{"help"}, &buf));
+    try std.testing.expectEqual(Result.version, testParse(&.{"--version"}, &buf));
+    try std.testing.expectEqual(
+        Result{ .show_config = .{ .default = true, .docs = true } },
+        testParse(&.{ "show-config", "--docs", "--default" }, &buf),
+    );
+    try std.testing.expectEqual(
+        Result{ .list_actions = .{ .docs = true } },
+        testParse(&.{ "list-actions", "--docs" }, &buf),
+    );
+}
+
+test "parse --help after a command asks for that command's help" {
+    var buf: [64]u8 = undefined;
+    try std.testing.expectEqual(Result{ .help = .@"show-config" }, testParse(&.{ "show-config", "--default", "-h" }, &buf));
+    try std.testing.expectEqual(Result{ .help = .version }, testParse(&.{ "version", "--help" }, &buf));
+}
+
+test "parse rejects unknown flags on local commands" {
+    var buf: [64]u8 = undefined;
+    const result = testParse(&.{ "list-actions", "--default" }, &buf);
+    try std.testing.expectEqual(Command.@"list-actions", result.invalid_flag.command);
+    try std.testing.expectEqualStrings("--default", result.invalid_flag.flag);
+}
+
+test "parse forwards everything else to the daemon" {
+    var buf: [64]u8 = undefined;
+    try std.testing.expectEqualStrings("query windows --json", testParse(&.{ "query", "windows", "--json" }, &buf).ipc);
+    try std.testing.expectEqual(Result{ .help = null }, testParse(&.{ "query", "--help" }, &buf));
 }
