@@ -30,6 +30,7 @@ const ax_mod = @import("ax.zig");
 const geometry_mod = @import("geometry.zig");
 const spsc_queue = @import("spsc_queue.zig");
 const trace = @import("trace.zig");
+const focus_follows_mouse = @import("focus_follows_mouse.zig");
 
 extern fn _AXUIElementGetWindow(element: c.AXUIElementRef, wid: *u32) c.AXError;
 
@@ -641,6 +642,8 @@ fn syncFocusStateForWindowId(focused_wid: u32, source: FocusEventSource) bool {
 
     const win = managedWindow(leader) orelse return false;
     std.debug.assert(win.wid == leader);
+    g_last_focused_pid = win.pid;
+    g_last_focused_window_id = focused_wid;
 
     // Window ID is the canonical identity. PID-only notifications are resolved
     // before this point so same-process windows do not overwrite each other.
@@ -667,6 +670,131 @@ fn syncFocusStateForWindowId(focused_wid: u32, source: FocusEventSource) bool {
     switchToWindowWorkspaceIfHidden(win, focused_wid, source);
 
     return true;
+}
+
+/// Focus the latest managed window entered by the pointer. Mouse moves are
+/// coalesced by the event tap, then hit-tested against WindowServer z-order.
+fn focusWindowUnderMouse() void {
+    const now_ns = nanoTimestamp();
+    const blocked = !g_config.focus_follows_mouse or
+        g_state.isWorkspaceTransitionActive() or
+        g_state.pointer_drag.is_down;
+    if (blocked) {
+        _ = g_focus_follows_mouse.shouldAttempt(0, now_ns, true);
+        return;
+    }
+    var hovered_wid = g_focus_follows_mouse.eventWindowId();
+    if (hovered_wid == 0) {
+        if (g_focus_follows_mouse.noteFallback()) {
+            log.debug("focus follows mouse: event has no window id; using SLSFindWindowAndOwner fallback", .{});
+        }
+        hovered_wid = g_sky.?.windowAtPoint(g_mouse_move_location) orelse 0;
+    }
+    if (!g_focus_follows_mouse.shouldAttempt(hovered_wid, now_ns, false)) return;
+    cancelPendingMouseFocus();
+
+    const hovered = managedWindow(hovered_wid) orelse return;
+    const leader = managedWindow(g_state.windowTabLeader(hovered_wid)) orelse return;
+    const space = managedWindowSpace(leader.wid) orelse return;
+    if (!spaceVisible(space)) return;
+
+    if (g_last_focused_pid == hovered.pid and g_last_focused_window_id == hovered_wid) {
+        g_focus_follows_mouse.focusSucceeded(hovered_wid);
+        return;
+    }
+
+    var psn: skylight.ProcessSerialNumber = .{ .high = 0, .low = 0 };
+    if (GetProcessForPID(hovered.pid, &psn) != 0) {
+        mouseFocusFailed(hovered_wid, "GetProcessForPID");
+        return;
+    }
+
+    if (g_last_focused_pid == hovered.pid and g_last_focused_window_id != 0) {
+        if (!postSameProcessFocusEvent(&psn, g_last_focused_window_id, 0x02)) {
+            mouseFocusFailed(hovered_wid, "previous-window event");
+            return;
+        }
+        scheduleMouseFocus(hovered.pid, hovered_wid, g_last_focused_window_id, psn);
+        return;
+    }
+
+    completeMouseFocus(hovered.pid, hovered_wid, &psn, false);
+}
+
+fn cancelPendingMouseFocus() void {
+    if (g_pending_mouse_focus) |pending_value| {
+        var pending = pending_value;
+        if (!postSameProcessFocusEvent(&pending.psn, pending.previous_window_id, 0x01)) {
+            log.debug("focus follows mouse failed to restore canceled wid={d}", .{pending.previous_window_id});
+        }
+    }
+    g_pending_mouse_focus = null;
+}
+
+fn scheduleMouseFocus(pid: i32, wid: u32, previous_wid: u32, psn: skylight.ProcessSerialNumber) void {
+    g_mouse_focus_generation +%= 1;
+    if (g_mouse_focus_generation == 0) g_mouse_focus_generation = 1;
+    g_pending_mouse_focus = .{
+        .generation = g_mouse_focus_generation,
+        .process_id = pid,
+        .window_id = wid,
+        .previous_window_id = previous_wid,
+        .psn = psn,
+    };
+    c.dispatch_after_f(
+        c.dispatch_time(c.DISPATCH_TIME_NOW, 40 * c.NSEC_PER_MSEC),
+        cg_extra.dispatch_get_main_queue(),
+        @ptrFromInt(g_mouse_focus_generation),
+        completeScheduledMouseFocus,
+    );
+}
+
+fn completeScheduledMouseFocus(context: ?*anyopaque) callconv(.c) void {
+    const generation = @intFromPtr(context orelse return);
+    var pending = g_pending_mouse_focus orelse return;
+    if (pending.generation != generation) return;
+    const blocked = !g_config.focus_follows_mouse or
+        g_state.isWorkspaceTransitionActive() or
+        g_state.pointer_drag.is_down;
+    if (blocked or !g_focus_follows_mouse.isHovered(pending.window_id)) {
+        cancelPendingMouseFocus();
+        if (g_focus_follows_mouse.isHovered(pending.window_id)) {
+            g_focus_follows_mouse.focusFailed(pending.window_id, nanoTimestamp());
+        }
+        return;
+    }
+    g_pending_mouse_focus = null;
+    completeMouseFocus(pending.process_id, pending.window_id, &pending.psn, true);
+}
+
+fn completeMouseFocus(
+    pid: i32,
+    wid: u32,
+    psn: *skylight.ProcessSerialNumber,
+    same_process: bool,
+) void {
+    if (same_process and !postSameProcessFocusEvent(psn, wid, 0x01)) {
+        mouseFocusFailed(wid, "target-window event");
+        return;
+    }
+    if (!setFrontProcessViaSkylightPsn(psn, wid)) {
+        mouseFocusFailed(wid, "SkyLight activation");
+        return;
+    }
+    const window = managedWindow(wid) orelse {
+        mouseFocusFailed(wid, "window disappeared");
+        return;
+    };
+    if (window.pid != pid or !syncFocusStateForWindowId(wid, .mouse)) {
+        mouseFocusFailed(wid, "state reconciliation");
+        return;
+    }
+    g_focus_follows_mouse.focusSucceeded(wid);
+}
+
+fn mouseFocusFailed(wid: u32, operation: []const u8) void {
+    g_focus_follows_mouse.focusFailed(wid, nanoTimestamp());
+    log.debug("focus follows mouse failed wid={d} operation={s}", .{ wid, operation });
 }
 
 /// Refresh accepted frames of visible managed windows from WindowServer bounds.
@@ -978,7 +1106,18 @@ var g_config: config_mod.Config = .{};
 var g_config_runtime: ?ConfigRuntime = null;
 var g_config_path: ?[:0]const u8 = null;
 var g_mouse_down_location: c.CGPoint = .{ .x = 0, .y = 0 };
+var g_mouse_move_location: c.CGPoint = .{ .x = 0, .y = 0 };
 var g_mouse_drag_event_emitted = false;
+var g_focus_follows_mouse: focus_follows_mouse.State = .{};
+const PendingMouseFocus = struct {
+    generation: usize,
+    process_id: i32,
+    window_id: u32,
+    previous_window_id: u32,
+    psn: skylight.ProcessSerialNumber,
+};
+var g_pending_mouse_focus: ?PendingMouseFocus = null;
+var g_mouse_focus_generation: usize = 0;
 
 fn workspaceCount() u8 {
     const count = config_mod.workspaceCount(&g_config);
@@ -1023,9 +1162,10 @@ fn nativeTabGroupMoveConfirmed(wid: u32, pending: state_mod.PendingNativeWindowM
     return sky.nativeWindowMoveConfirmed(wid, target_space_id, source_space_id);
 }
 
-/// PID of the last window we focused via bw_ax_focus_window. Used to detect
-/// same-process focus switches that need a delay for Electron compatibility.
+/// Last focus accepted from either AX or a bobrwm focus request. Window ID is
+/// needed because same-process switches require an Electron-compatible delay.
 var g_last_focused_pid: i32 = 0;
+var g_last_focused_window_id: u32 = 0;
 /// Compiled keybind table referenced (not copied) by the hotkey event tap.
 /// The caller of bw_set_keybinds owns the storage and must keep it alive for
 /// as long as the event tap can fire; main's KeybindTable guarantees this.
@@ -1034,6 +1174,7 @@ var g_waker_source: c.CFRunLoopSourceRef = null;
 var g_role_poll_source: c.dispatch_source_t = null;
 var g_native_space_topology_poll_source: c.dispatch_source_t = null;
 var g_tap_port: c.CFMachPortRef = null;
+var g_mouse_tap_port: c.CFMachPortRef = null;
 var g_layout_entries: std.ArrayList(tiling.LayoutEntry) = .empty;
 var g_event_drain_active = false;
 var g_event_overflow_recovery_pending = false;
@@ -1417,7 +1558,6 @@ fn bw_ax_focus_window(pid: i32, wid: u32) bool {
     const main_attr = ax.main_attr;
 
     const is_same_process = (g_last_focused_pid == pid);
-    g_last_focused_pid = pid;
 
     _ = c.AXUIElementPerformAction(win, raise_action);
     _ = c.AXUIElementSetAttributeValue(win, main_attr, c.kCFBooleanTrue);
@@ -1429,7 +1569,12 @@ fn bw_ax_focus_window(pid: i32, wid: u32) bool {
         _ = c.usleep(same_process_focus_delay_us);
     }
 
-    return setFrontProcessViaSkylight(pid, wid);
+    const focused = setFrontProcessViaSkylight(pid, wid);
+    if (focused) {
+        g_last_focused_pid = pid;
+        g_last_focused_window_id = wid;
+    }
+    return focused;
 }
 
 /// Carbon PSN lookup. Deprecated since 10.9 but still exported and functional;
@@ -1445,38 +1590,39 @@ const kCPSUserGenerated: u32 = 0x200;
 /// moves input focus, unlike NSRunningApplication.activate on modern macOS.
 /// Returns false if the SkyLight symbols or the process's PSN are unavailable.
 fn setFrontProcessViaSkylight(pid: i32, wid: u32) bool {
-    const sky = g_sky orelse return false;
-    const set_front = sky.setFrontProcessWithOptions orelse return false;
-    const post_event = sky.postEventRecordTo orelse return false;
-
     var psn: skylight.ProcessSerialNumber = .{ .high = 0, .low = 0 };
     if (GetProcessForPID(pid, &psn) != 0) {
         log.debug("focus activation: GetProcessForPID failed pid={d}", .{pid});
         return false;
     }
+    return setFrontProcessViaSkylightPsn(&psn, wid);
+}
 
-    if (set_front(&psn, wid, kCPSUserGenerated) != 0) {
-        log.debug("focus activation: SLPSSetFrontProcessWithOptions failed pid={d} wid={d}", .{ pid, wid });
+fn setFrontProcessViaSkylightPsn(psn: *skylight.ProcessSerialNumber, wid: u32) bool {
+    const sky = g_sky orelse return false;
+    const set_front = sky.setFrontProcessWithOptions orelse return false;
+    const post_event = sky.postEventRecordTo orelse return false;
+
+    if (set_front(psn, wid, kCPSUserGenerated) != 0) {
+        log.debug("focus activation: SLPSSetFrontProcessWithOptions failed wid={d}", .{wid});
         return false;
     }
 
-    var focus_event = focusEventRecord(wid, 0x01);
-    _ = post_event(&psn, &focus_event);
-    var raise_event = focusEventRecord(wid, 0x02);
-    _ = post_event(&psn, &raise_event);
-    return true;
+    var focus_event = focus_follows_mouse.keyWindowEventRecord(wid, 0x01);
+    if (post_event(psn, &focus_event) != 0) return false;
+    var raise_event = focus_follows_mouse.keyWindowEventRecord(wid, 0x02);
+    return post_event(psn, &raise_event) == 0;
 }
 
-/// One 0xF8-byte SkyLight event record targeting `wid`. `kind` is 0x01 for the
-/// focus record and 0x02 for the raise record. Byte offsets are SkyLight's.
-fn focusEventRecord(wid: u32, kind: u8) [0xf8]u8 {
-    var bytes = [_]u8{0} ** 0xf8;
-    bytes[0x04] = 0xf8;
-    bytes[0x08] = kind;
-    bytes[0x3a] = 0x10;
-    @memset(bytes[0x20..0x30], 0xFF);
-    std.mem.writeInt(u32, bytes[0x3c..0x40], wid, .little);
-    return bytes;
+fn postSameProcessFocusEvent(
+    psn: *skylight.ProcessSerialNumber,
+    wid: u32,
+    subtype: u8,
+) bool {
+    const sky = g_sky orelse return false;
+    const post_event = sky.postEventRecordTo orelse return false;
+    var event = focus_follows_mouse.sameProcessEventRecord(wid, subtype);
+    return post_event(psn, &event) == 0;
 }
 
 fn manageStateForWindow(pid: i32, wid: u32) u8 {
@@ -1811,6 +1957,10 @@ fn applyReloadedConfig(next: ConfigRuntime) void {
     const layout_changed = previous.config.layout != replacement.config.layout;
     g_config_runtime = replacement;
     g_config = replacement.config;
+    setMouseEventTapEnabled(g_config.focus_follows_mouse);
+    if (g_config.focus_follows_mouse and !g_sky.?.supportsWindowHitTesting()) {
+        log.warn("focus follows mouse: SLSFindWindowAndOwner fallback unavailable; event window IDs are required", .{});
+    }
     dispatchStateEvent(.{ .configure_layout_interaction = .{
         .split_mode = g_config.bsp_split,
         .insert_point = g_config.bsp_insert_point,
@@ -1953,6 +2103,9 @@ fn hotkeyTapCallback(
 
     if (event_type == c.kCGEventTapDisabledByTimeout or event_type == c.kCGEventTapDisabledByUserInput) {
         if (g_tap_port) |tap| cg_extra.CGEventTapEnable(tap, true);
+        if (g_config.focus_follows_mouse) {
+            if (g_mouse_tap_port) |tap| cg_extra.CGEventTapEnable(tap, true);
+        }
         return event;
     }
 
@@ -1972,6 +2125,14 @@ fn hotkeyTapCallback(
     if (event_type == c.kCGEventLeftMouseUp) {
         g_mouse_drag_event_emitted = false;
         bw_hotkey_mouse_up();
+        return event;
+    }
+    if (event_type == c.kCGEventMouseMoved) {
+        if (!g_config.focus_follows_mouse) return event;
+        g_mouse_move_location = cg_extra.CGEventGetLocation(event);
+        const window_id = eventWindowIdUnderPointer(event);
+        if (!g_focus_follows_mouse.queueMouseMove(window_id)) return event;
+        bw_emit_event(shim.BW_EVENT_MOUSE_MOVED, 0, 0);
         return event;
     }
     if (event_type == 29 or event_type == 30) {
@@ -1998,21 +2159,75 @@ fn setupHotkeyEventTap() void {
         (@as(c.CGEventMask, 1) << 29) |
         (@as(c.CGEventMask, 1) << 30);
 
-    g_tap_port = cg_extra.CGEventTapCreate(
-        c.kCGSessionEventTap,
+    g_tap_port = createEventTap(c.kCGSessionEventTap, mask, c.kCGEventTapOptionDefault);
+}
+
+fn eventWindowIdUnderPointer(event: c.CGEventRef) u32 {
+    const routed = cg_extra.CGEventGetIntegerValueField(
+        event,
+        c.kCGMouseEventWindowUnderMousePointerThatCanHandleThisEvent,
+    );
+    if (focus_follows_mouse.normalizeEventWindowId(routed)) |window_id| return window_id;
+
+    const direct = cg_extra.CGEventGetIntegerValueField(
+        event,
+        c.kCGMouseEventWindowUnderMousePointer,
+    );
+    return focus_follows_mouse.normalizeEventWindowId(direct) orelse 0;
+}
+
+fn setMouseEventTapEnabled(enabled: bool) void {
+    g_focus_follows_mouse.reset();
+    cancelPendingMouseFocus();
+
+    if (g_mouse_tap_port) |tap| {
+        cg_extra.CGEventTapEnable(tap, enabled);
+        return;
+    }
+    if (!enabled) return;
+
+    const mask = @as(c.CGEventMask, 1) << @intCast(c.kCGEventMouseMoved);
+    g_mouse_tap_port = createEventTap(
+        c.kCGAnnotatedSessionEventTap,
+        mask,
+        c.kCGEventTapOptionListenOnly,
+    );
+    if (g_mouse_tap_port == null) {
+        log.warn("focus follows mouse: annotated event tap unavailable; using session event tap fallback", .{});
+        g_mouse_tap_port = createEventTap(
+            c.kCGSessionEventTap,
+            mask,
+            c.kCGEventTapOptionListenOnly,
+        );
+    }
+    if (g_mouse_tap_port == null) {
+        log.warn("focus follows mouse unavailable: all mouse event tap creation failed", .{});
+    }
+}
+
+fn createEventTap(
+    location: c.CGEventTapLocation,
+    mask: c.CGEventMask,
+    options: c.CGEventTapOptions,
+) c.CFMachPortRef {
+    const tap = cg_extra.CGEventTapCreate(
+        location,
         c.kCGHeadInsertEventTap,
-        c.kCGEventTapOptionDefault,
+        options,
         mask,
         hotkeyTapCallback,
         null,
-    );
-    const tap = g_tap_port orelse return;
+    ) orelse return null;
 
-    const tap_source = c.CFMachPortCreateRunLoopSource(null, tap, 0) orelse return;
+    const tap_source = c.CFMachPortCreateRunLoopSource(null, tap, 0) orelse {
+        c.CFRelease(@ptrCast(tap));
+        return null;
+    };
     defer c.CFRelease(@ptrCast(tap_source));
 
     c.CFRunLoopAddSource(c.CFRunLoopGetMain(), tap_source, c.kCFRunLoopCommonModes);
     cg_extra.CGEventTapEnable(tap, true);
+    return tap;
 }
 
 // Event bridge (called from ObjC shim)
@@ -2191,6 +2406,9 @@ pub fn main(init: std.process.Init.Minimal) !void {
         log.err("required native Space APIs are unavailable", .{});
         return error.NativeSpacesUnavailable;
     }
+    if (g_config.focus_follows_mouse and !g_sky.?.supportsWindowHitTesting()) {
+        log.warn("focus follows mouse: SLSFindWindowAndOwner fallback unavailable; event window IDs are required", .{});
+    }
 
     // -- Core state --
     defer {
@@ -2251,6 +2469,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     ax_observer.init();
     defer ax_observer.deinit();
     setupHotkeyEventTap();
+    setMouseEventTapEnabled(g_config.focus_follows_mouse);
     initWakerSource();
     setNativeSpaceTopologyPolling(true);
     try g_ipc_transport.start(g_ipc.fd, signalWaker);
@@ -2387,6 +2606,8 @@ fn recoverFromEventOverflow() void {
     // leaving every later AX move classified as a user drag indefinitely.
     dispatchStateEvent(.pointer_up);
     g_logged_drag_window_id = 0;
+    g_focus_follows_mouse.reset();
+    cancelPendingMouseFocus();
     dispatchStateEvent(.{ .geometry = .clear_intents });
 
     _ = removeStoppedAppWindows();
@@ -3073,6 +3294,7 @@ fn handleEvent(ev: *const event_mod.Event) void {
             // Processing them here avoids waiting for the next role_poll_tick.
             processDeferredWindowCandidates();
         },
+        .mouse_moved => focusWindowUnderMouse(),
         .window_moved, .window_resized => {
             // Every animation tick sets the AX frame, which echoes back here
             // as moved/resized notifications (~60/sec per window). Ignore

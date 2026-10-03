@@ -5,6 +5,9 @@
     // General > Login Items.
     // .start_at_login = true,
 
+    // Focus a managed window without raising it when the pointer enters it.
+    // .focus_follows_mouse = true,
+
     // Layout algorithm.
     // .layout = .bsp,
     // Or fullscreen-per-window tiling:
