@@ -35,24 +35,25 @@ fn writeFields(
     comptime Docs: ?type,
     depth: u8,
 ) Writer.Error!void {
-    inline for (@typeInfo(T).@"struct".fields, 0..) |field, i| {
-        if (field.name[0] == '_') continue;
-        const key = prefix ++ field.name;
-        const field_value = @field(value, field.name);
+    const info = @typeInfo(T).@"struct";
+    inline for (info.field_names, info.field_types, 0..) |name, Field, i| {
+        if (name[0] == '_') continue;
+        const key = prefix ++ name;
+        const field_value = @field(value, name);
         if (Docs) |D| {
             if (i > 0) try s.writer.writeAll("\n");
             try writeDocs(s.writer, D, key, depth);
         }
         try indent(s.writer, depth);
-        try s.writer.print(".{f} = ", .{std.zig.fmtId(field.name)});
-        if (@typeInfo(field.type) == .@"struct") {
+        try s.writer.print(".{f} = ", .{std.zig.fmtId(name)});
+        if (@typeInfo(Field) == .@"struct") {
             try s.writer.writeAll(".{\n");
-            try writeFields(s, field.type, field_value, key ++ ".", Docs, depth + 1);
+            try writeFields(s, Field, field_value, key ++ ".", Docs, depth + 1);
             try indent(s.writer, depth);
             try s.writer.writeAll("}");
         } else if (comptime std.mem.eql(u8, key, "keybinds")) {
             try writeKeybinds(s, field_value, depth);
-        } else if (comptime isStructSlice(field.type)) {
+        } else if (comptime isStructSlice(Field)) {
             try writeStructSlice(s, field_value, depth);
         } else {
             try writeCompact(s, field_value);
@@ -102,14 +103,14 @@ fn writeCompact(s: *Serializer, value: anytype) Writer.Error!void {
     switch (@typeInfo(T)) {
         .@"struct" => |info| {
             var container = try s.beginStruct(.{ .whitespace_style = .{ .wrap = false } });
-            inline for (info.fields) |field| {
-                const field_value = @field(value, field.name);
-                const is_default = if (field.defaultValue()) |default|
+            inline for (info.field_names, info.field_types, info.field_attrs) |name, Field, attrs| {
+                const field_value = @field(value, name);
+                const is_default = if (attrs.defaultValue(Field)) |default|
                     std.meta.eql(field_value, default)
                 else
                     false;
                 if (!is_default) {
-                    try container.fieldPrefix(field.name);
+                    try container.fieldPrefix(name);
                     try writeCompact(s, field_value);
                 }
             }
@@ -183,7 +184,8 @@ test "default config round-trips through ZON" {
 
     const defaults: config.Config = .{};
     const source = try render(alloc, &defaults, null);
-    var parsed = try std.zon.parse.fromSliceAlloc(config.Config, alloc, source, null, .{});
+    var diagnostics: std.zon.parse.Diagnostics = undefined;
+    var parsed = try std.zon.parse.fromSlice(config.Config, .{ .gpa = alloc, .arena = alloc, .source = source, .diagnostics = &diagnostics });
     try config.validate(&parsed);
 
     // Built-in keybinds are listed as comments and still apply through the
@@ -217,7 +219,8 @@ test "user values round-trip, including strings and optionals" {
     const source = try render(alloc, &cfg, null);
     try std.testing.expect(std.mem.indexOf(u8, source, ".{ .app_id = \"com.apple.Safari\", .workspace = 2 },") != null);
 
-    const parsed = try std.zon.parse.fromSliceAlloc(config.Config, alloc, source, null, .{});
+    var diagnostics: std.zon.parse.Diagnostics = undefined;
+    const parsed = try std.zon.parse.fromSlice(config.Config, .{ .gpa = alloc, .arena = alloc, .source = source, .diagnostics = &diagnostics });
     try std.testing.expectEqualStrings("we\"b", parsed.workspace_names[1]);
     try std.testing.expectEqual(@as(usize, 1), parsed.keybinds.len);
     try std.testing.expectEqual(cfg.keybinds[0].mods, parsed.keybinds[0].mods);
@@ -243,7 +246,8 @@ test "docs are written as comments and the output still parses" {
     try std.testing.expect(std.mem.indexOf(u8, source, "    // Gap docs.\n    //\n    // Second paragraph.\n    .gaps = .{\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, source, "        // Inner docs.\n        .inner = 0,\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, source, "    //\n    // .key\n    //   Key docs.\n    .keybinds = .{\n") != null);
-    _ = try std.zon.parse.fromSliceAlloc(config.Config, alloc, source, null, .{});
+    var diagnostics: std.zon.parse.Diagnostics = undefined;
+    _ = try std.zon.parse.fromSlice(config.Config, .{ .gpa = alloc, .arena = alloc, .source = source, .diagnostics = &diagnostics });
 }
 
 test "generated docs produce a parseable config" {
@@ -254,5 +258,6 @@ test "generated docs produce a parseable config" {
 
     const defaults: config.Config = .{};
     const source = try render(alloc, &defaults, help_strings.Config);
-    _ = try std.zon.parse.fromSliceAlloc(config.Config, alloc, source, null, .{});
+    var diagnostics: std.zon.parse.Diagnostics = undefined;
+    _ = try std.zon.parse.fromSlice(config.Config, .{ .gpa = alloc, .arena = alloc, .source = source, .diagnostics = &diagnostics });
 }
