@@ -7,6 +7,9 @@
 //! from parsing each type's source file with `std.zig.Ast`, since doc comments
 //! are not available through `@typeInfo`.
 //!
+//! Every key must be documented. A missing doc comment fails the build, with
+//! every gap listed by file and line, so options never ship without docs.
+//!
 //! Adapted from ghostty-org/ghostty `src/helpgen.zig` @ b1c264163.
 //! Copyright (c) 2024 Mitchell Hashimoto, Ghostty contributors.
 //! MIT License, see LICENSES/ghostty.txt.
@@ -35,18 +38,26 @@ pub fn main(init: std.process.Init) !void {
 
     const alloc = init.arena.allocator();
     var sources: SourceCache = .{ .alloc = alloc };
-    try genEntries(alloc, &sources, writer, "Config", comptime configEntries(config.Config, ""));
-    try genEntries(alloc, &sources, writer, "KeybindAction", comptime enumEntries(config.Action));
-    try genEntries(alloc, &sources, writer, "Command", comptime enumEntries(command.Command));
+    var missing: std.ArrayList([]const u8) = .empty;
+    try genEntries(alloc, &sources, &missing, writer, "Config", comptime configEntries(config.Config, ""));
+    try genEntries(alloc, &sources, &missing, writer, "KeybindAction", comptime enumEntries(config.Action));
+    try genEntries(alloc, &sources, &missing, writer, "Command", comptime enumEntries(command.Command));
+
+    if (missing.items.len > 0) {
+        for (missing.items) |line| std.debug.print("{s}\n", .{line});
+        std.debug.print("helpgen: {d} user-facing keys have no /// doc comment\n", .{missing.items.len});
+        std.process.exit(1);
+    }
     try stdout.end();
 }
 
-/// Emit one namespace with a decl per documented key, plus the full ordered
-/// key list. Undocumented keys are still listed so consumers can render every
-/// option before its docs are written.
+/// Emit one namespace with a decl per key, plus the ordered key list. A key
+/// without a doc comment is recorded in `missing` instead, so the caller can
+/// report every gap at once rather than failing on the first.
 fn genEntries(
     alloc: std.mem.Allocator,
     sources: *SourceCache,
+    missing: *std.ArrayList([]const u8),
     writer: *std.Io.Writer,
     comptime namespace: []const u8,
     comptime entries: []const KeyEntry,
@@ -59,12 +70,20 @@ fn genEntries(
     try writer.writeAll("    };\n\n");
 
     inline for (entries) |entry| {
-        const ast = try sources.get(comptime sourceFile(entry.Container));
+        const path = comptime sourceFile(entry.Container);
+        const ast = try sources.get(path);
         const container = comptime containerName(entry.Container);
-        if (try fieldDoc(alloc, ast, container, entry.field)) |comment| {
+        const field = try fieldDoc(alloc, ast, container, entry.field);
+        if (field.doc) |comment| {
             try writer.writeAll("    pub const @\"" ++ entry.key ++ "\": [:0]const u8 =\n");
             try writer.writeAll(comment);
             try writer.writeAll("\n");
+        } else {
+            try missing.append(alloc, try std.fmt.allocPrint(
+                alloc,
+                "src/{s}:{d}: " ++ namespace ++ " key `" ++ entry.key ++ "` has no /// doc comment",
+                .{ path, field.line },
+            ));
         }
     }
     try writer.writeAll("};\n\n");
@@ -77,11 +96,12 @@ fn configEntries(comptime T: type, comptime prefix: []const u8) []const KeyEntry
     comptime {
         @setEvalBranchQuota(50_000);
         var out: []const KeyEntry = &.{};
-        for (@typeInfo(T).@"struct".fields) |field| {
-            if (field.name[0] == '_') continue;
-            const key = prefix ++ field.name;
-            out = out ++ &[_]KeyEntry{.{ .key = key, .Container = T, .field = field.name }};
-            if (nestedStruct(field.type)) |nested| {
+        const info = @typeInfo(T).@"struct";
+        for (info.field_names, info.field_types) |name, Field| {
+            if (name[0] == '_') continue;
+            const key = prefix ++ name;
+            out = out ++ &[_]KeyEntry{.{ .key = key, .Container = T, .field = name }};
+            if (nestedStruct(Field)) |nested| {
                 out = out ++ configEntries(nested.T, key ++ nested.separator);
             }
         }
@@ -92,8 +112,8 @@ fn configEntries(comptime T: type, comptime prefix: []const u8) []const KeyEntry
 fn enumEntries(comptime T: type) []const KeyEntry {
     comptime {
         var out: []const KeyEntry = &.{};
-        for (@typeInfo(T).@"enum".fields) |field| {
-            out = out ++ &[_]KeyEntry{.{ .key = field.name, .Container = T, .field = field.name }};
+        for (@typeInfo(T).@"enum".field_names) |name| {
+            out = out ++ &[_]KeyEntry{.{ .key = name, .Container = T, .field = name }};
         }
         return out;
     }
@@ -141,21 +161,27 @@ const SourceCache = struct {
     fn get(self: *SourceCache, comptime path: []const u8) !std.zig.Ast {
         const gop = try self.asts.getOrPut(self.alloc, path);
         if (!gop.found_existing) {
-            gop.value_ptr.* = try std.zig.Ast.parse(self.alloc, @embedFile(path), .zig);
+            gop.value_ptr.* = try std.zig.Ast.parse(self.alloc, @embedFile(path), .{ .mode = .zig });
         }
         return gop.value_ptr.*;
     }
 };
 
-/// Doc comment on `container.field` as a multiline string literal body, or
-/// null when the field is undocumented. Scoping the lookup to the container
+const FieldDoc = struct {
+    /// Multiline string literal body, or null when undocumented.
+    doc: ?[]const u8,
+    /// 1-based line of the field, for reporting a missing doc.
+    line: usize,
+};
+
+/// Doc comment on `container.field`. Scoping the lookup to the container
 /// matters: field names like `enabled` repeat across config structs.
 fn fieldDoc(
     alloc: std.mem.Allocator,
     ast: std.zig.Ast,
     container: []const u8,
     field: []const u8,
-) !?[]const u8 {
+) !FieldDoc {
     const init_node = findContainer(ast, container) orelse return error.ContainerNotFound;
     var buffer: [2]std.zig.Ast.Node.Index = undefined;
     const decl = ast.fullContainerDecl(&buffer, init_node) orelse return error.ContainerNotFound;
@@ -169,8 +195,9 @@ fn fieldDoc(
         const key = if (name[0] == '@') name[2 .. name.len - 1] else name;
         if (!std.mem.eql(u8, key, field)) continue;
 
-        if (name_token == 0 or tokens[name_token - 1] != .doc_comment) return null;
-        return try extractDocComments(alloc, ast, name_token - 1, tokens);
+        const line = ast.tokenLocation(0, name_token).line + 1;
+        if (name_token == 0 or tokens[name_token - 1] != .doc_comment) return .{ .doc = null, .line = line };
+        return .{ .doc = try extractDocComments(alloc, ast, name_token - 1, tokens), .line = line };
     }
     return error.FieldNotFound;
 }
@@ -253,17 +280,19 @@ test "fieldDoc scopes lookup to the named container" {
     var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer arena.deinit();
     const alloc = arena.allocator();
-    const ast = try std.zig.Ast.parse(alloc, source, .zig);
+    const ast = try std.zig.Ast.parse(alloc, source, .{ .mode = .zig });
 
     try std.testing.expectEqualStrings(
         "    \\\\A's flag.\n    \\\\  Indented detail.\n;\n",
-        (try fieldDoc(alloc, ast, "A", "enabled")).?,
+        (try fieldDoc(alloc, ast, "A", "enabled")).doc.?,
     );
     try std.testing.expectEqualStrings(
         "    \\\\B's flag.\n;\n",
-        (try fieldDoc(alloc, ast, "B", "enabled")).?,
+        (try fieldDoc(alloc, ast, "B", "enabled")).doc.?,
     );
-    try std.testing.expectEqual(null, try fieldDoc(alloc, ast, "A", "plain"));
+    const plain = try fieldDoc(alloc, ast, "A", "plain");
+    try std.testing.expectEqual(null, plain.doc);
+    try std.testing.expectEqual(@as(usize, 5), plain.line);
     try std.testing.expectError(error.FieldNotFound, fieldDoc(alloc, ast, "A", "missing"));
 }
 

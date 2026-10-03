@@ -84,9 +84,9 @@ fn parseCommand(command: Command, args: anytype) Result {
 /// other argument.
 fn setFlag(comptime Options: type, opts: *Options, arg: []const u8) bool {
     if (!std.mem.startsWith(u8, arg, "--")) return false;
-    inline for (@typeInfo(Options).@"struct".fields) |field| {
-        if (std.mem.eql(u8, arg[2..], field.name)) {
-            @field(opts, field.name) = true;
+    inline for (@typeInfo(Options).@"struct".field_names) |name| {
+        if (std.mem.eql(u8, arg[2..], name)) {
+            @field(opts, name) = true;
             return true;
         }
     }
@@ -290,7 +290,7 @@ fn writeActions(writer: *std.Io.Writer, docs: bool) std.Io.Writer.Error!void {
     const Actions = help_strings.KeybindAction;
     inline for (Actions.keys) |key| {
         try writer.writeAll(key ++ "\n");
-        if (docs and @hasDecl(Actions, key)) {
+        if (docs) {
             var lines = std.mem.splitScalar(u8, @field(Actions, key), '\n');
             while (lines.next()) |line| {
                 if (line.len == 0) try writer.writeAll("\n") else try writer.print("  {s}\n", .{line});

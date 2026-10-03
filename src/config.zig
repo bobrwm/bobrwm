@@ -56,12 +56,11 @@ pub const Config = struct {
     /// Note: changing the number of workspaces requires a restart. Other
     /// settings reload live.
     workspace_names: []const []const u8 = &.{},
-    /// Trackpad swipe settings for the optional `bobrwm-swipe` companion.
-    /// bobrwm itself only parses these; they take effect when `bobrwm-swipe`
-    /// is running.
-    ///
-    /// Note: macOS grants Accessibility per executable, so `bobrwm-swipe`
-    /// needs its own grant even when bobrwm is already trusted.
+    /// Trackpad workspace switching handled directly by bobrwm using its
+    /// existing Accessibility grant. The finger count comes from macOS
+    /// System Settings → Trackpad → More Gestures → Swipe between full-screen
+    /// applications. Vertical Mission Control and App Exposé gestures pass
+    /// through unchanged.
     swipe: SwipeConfig = .{},
     /// Dim every visible window except the focused one with a click-through
     /// black overlay. Works without disabling SIP. The `toggle_dimming`
