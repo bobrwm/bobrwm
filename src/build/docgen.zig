@@ -1,7 +1,6 @@
 //! Exports the generated `help_strings` as JSON for the website and other
-//! tooling that cannot import Zig. Every key is listed in declaration order,
-//! with `doc: null` for undocumented keys, so consumers can render the full
-//! option set before all docs are written.
+//! tooling that cannot import Zig. Every key is listed in declaration order;
+//! helpgen fails the build on an undocumented key, so `doc` is always set.
 //!
 //! Adapted from ghostty-org/ghostty `src/build/webgen/` @ b1c264163.
 //! Copyright (c) 2024 Mitchell Hashimoto, Ghostty contributors.
@@ -12,7 +11,7 @@ const help_strings = @import("help_strings");
 
 const Entry = struct {
     key: []const u8,
-    doc: ?[]const u8,
+    doc: []const u8,
 };
 
 pub fn main(init: std.process.Init) !void {
@@ -37,7 +36,7 @@ fn entries(comptime Namespace: type) [Namespace.keys.len]Entry {
     for (Namespace.keys, &out) |key, *entry| {
         entry.* = .{
             .key = key,
-            .doc = if (@hasDecl(Namespace, key)) @field(Namespace, key) else null,
+            .doc = @field(Namespace, key),
         };
     }
     return out;

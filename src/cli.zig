@@ -290,7 +290,7 @@ fn writeActions(writer: *std.Io.Writer, docs: bool) std.Io.Writer.Error!void {
     const Actions = help_strings.KeybindAction;
     inline for (Actions.keys) |key| {
         try writer.writeAll(key ++ "\n");
-        if (docs and @hasDecl(Actions, key)) {
+        if (docs) {
             var lines = std.mem.splitScalar(u8, @field(Actions, key), '\n');
             while (lines.next()) |line| {
                 if (line.len == 0) try writer.writeAll("\n") else try writer.print("  {s}\n", .{line});
