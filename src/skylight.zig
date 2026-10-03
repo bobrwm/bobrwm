@@ -14,6 +14,16 @@ const CopyManagedDisplaySpacesFn = *const fn (c_int) callconv(.c) ?CFArrayRef;
 const CopySpacesForWindowsFn = *const fn (c_int, c_int, CFArrayRef) callconv(.c) ?CFArrayRef;
 const MoveWindowsToManagedSpaceFn = *const fn (c_int, CFArrayRef, u64) callconv(.c) void;
 const PerformBridgedMoveFn = *const fn (?*anyopaque) callconv(.c) i64;
+const FindWindowAndOwnerFn = *const fn (
+    c_int,
+    c_int,
+    c_int,
+    c_int,
+    *c.CGPoint,
+    *c.CGPoint,
+    *u32,
+    *c_int,
+) callconv(.c) c_int;
 
 const DockSwipeDirection = native_gesture.Direction;
 const DockSwipePhase = native_gesture.Phase;
@@ -62,6 +72,7 @@ pub const SkyLight = struct {
     handle: *anyopaque,
     mainConnectionID: *const fn () callconv(.c) c_int,
     getWindowBounds: *const fn (c_int, u32, *CGRect) callconv(.c) c_int,
+    findWindowAndOwner: ?FindWindowAndOwnerFn,
     /// Private focus-activation symbols (yabai's path). Optional: if either is
     /// missing the caller falls back to Cocoa activation.
     setFrontProcessWithOptions: ?SetFrontProcessFn,
@@ -140,6 +151,7 @@ pub const SkyLight = struct {
             .handle = lib.inner.handle,
             .mainConnectionID = conn_id,
             .getWindowBounds = get_bounds,
+            .findWindowAndOwner = lib.lookup(FindWindowAndOwnerFn, "SLSFindWindowAndOwner"),
             .setFrontProcessWithOptions = set_front,
             .postEventRecordTo = post_event,
             .copyManagedDisplaySpaces = copy_managed_display_spaces,
@@ -159,6 +171,49 @@ pub const SkyLight = struct {
 
     pub fn supportsNativeSpaces(self: *const SkyLight) bool {
         return self.nativeSpacesSupported;
+    }
+
+    pub fn supportsWindowHitTesting(self: *const SkyLight) bool {
+        return self.findWindowAndOwner != null;
+    }
+
+    /// Return the frontmost WindowServer window at a global screen point.
+    /// Bobrwm-owned overlay panels are skipped so dimming and drag previews do
+    /// not hide the managed window beneath them from pointer hit-testing.
+    pub fn windowAtPoint(self: *const SkyLight, point: c.CGPoint) ?u32 {
+        const find = self.findWindowAndOwner orelse return null;
+        const connection_id = self.mainConnectionID();
+        var screen_point = point;
+        var window_point: c.CGPoint = undefined;
+        var window_id: u32 = 0;
+        var owner_connection_id: c_int = 0;
+
+        trace.countSkylight();
+        if (find(
+            connection_id,
+            0,
+            1,
+            0,
+            &screen_point,
+            &window_point,
+            &window_id,
+            &owner_connection_id,
+        ) != 0 or window_id == 0) return null;
+
+        if (owner_connection_id == connection_id) {
+            trace.countSkylight();
+            if (find(
+                connection_id,
+                @bitCast(window_id),
+                -1,
+                0,
+                &screen_point,
+                &window_point,
+                &window_id,
+                &owner_connection_id,
+            ) != 0 or window_id == 0) return null;
+        }
+        return window_id;
     }
 
     /// Copy the native Space topology for reuse across one reconciliation pass.

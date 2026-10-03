@@ -68,6 +68,7 @@ pub const SwipeReduction = struct {
 
 pub const FocusEventSource = enum {
     keyboard,
+    mouse,
     drag,
     ax,
 };

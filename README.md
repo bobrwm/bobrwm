@@ -146,7 +146,10 @@ bobrwm reload-config
 The command is silent on success and exits non-zero with an error message when
 the new config cannot be loaded.
 Changing the number of workspaces still requires a restart; other settings,
-including keybinds, rules, layouts, gaps, animation, and dimming, reload live.
+including keybinds, rules, layouts, gaps, animation, dimming, and
+`focus_follows_mouse` reload live. Set `.focus_follows_mouse = true` to focus
+a managed window without raising it when the pointer enters. It defaults to
+`false`.
 
 ### Keybinds
 

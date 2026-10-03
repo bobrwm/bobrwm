@@ -383,6 +383,19 @@ pub fn build(b: *std.Build) !void {
 
     const run_queue_tests = b.addRunArtifact(queue_tests);
 
+    const focus_follows_mouse_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/focus_follows_mouse.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    const focus_follows_mouse_tests = b.addTest(.{
+        .name = "focus-follows-mouse-tests",
+        .root_module = focus_follows_mouse_test_mod,
+    });
+
+    const run_focus_follows_mouse_tests = b.addRunArtifact(focus_follows_mouse_tests);
+
     const geometry_test_mod = b.createModule(.{
         .root_source_file = b.path("src/geometry.zig"),
         .target = target,
@@ -539,6 +552,7 @@ pub fn build(b: *std.Build) !void {
     test_step.dependOn(&run_tests.step);
     test_step.dependOn(&run_ipc_tests.step);
     test_step.dependOn(&run_queue_tests.step);
+    test_step.dependOn(&run_focus_follows_mouse_tests.step);
     test_step.dependOn(&run_geometry_tests.step);
     test_step.dependOn(&run_tabgroup_tests.step);
     test_step.dependOn(&run_tiling_tests.step);
