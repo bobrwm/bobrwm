@@ -15,6 +15,8 @@ const log = std.log.scoped(.config);
 
 pub const Config = struct {
     disable_default_keybinds: bool = false,
+    /// Focus a managed window without raising it when the pointer enters it.
+    focus_follows_mouse: bool = false,
     keybinds: []const Keybind = &default_keybinds,
     app_rules: []const AppRule = &.{},
     /// Deprecated alias for the workspace part of `app_rules`. Entries here are
@@ -1321,6 +1323,7 @@ test "app_rules take precedence over workspace_assignments alias" {
 test "default config" {
     const cfg: Config = .{};
     try t.expectEqual(@as(usize, default_keybind_count), cfg.keybinds.len);
+    try t.expect(!cfg.focus_follows_mouse);
     try t.expectEqual(@as(usize, 0), cfg.workspace_assignments.len);
     try t.expectEqual(@as(usize, 0), cfg.workspace_names.len);
     try t.expect(!cfg.swipe.enabled);
@@ -1335,6 +1338,19 @@ test "default config" {
     try t.expect(!cfg.animation.enabled);
     try t.expectEqual(@as(u64, 200), cfg.animation.duration_ms);
     try t.expectEqual(animation.Easing.ease_out, cfg.animation.easing);
+}
+
+test "focus follows mouse can be enabled from ZON" {
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    var diagnostics: std.zon.parse.Diagnostics = undefined;
+    const cfg = try std.zon.parse.fromSlice(Config, .{
+        .gpa = t.allocator,
+        .arena = arena.allocator(),
+        .source = ".{ .focus_follows_mouse = true }",
+        .diagnostics = &diagnostics,
+    });
+    try t.expect(cfg.focus_follows_mouse);
 }
 
 test "validate accepts defaults and a reduced workspace set" {
