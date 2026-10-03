@@ -56,6 +56,7 @@ pub const WindowId = window_mod.WindowId;
 
 pub const FocusEventSource = enum {
     keyboard,
+    mouse,
     drag,
     ax,
 };
