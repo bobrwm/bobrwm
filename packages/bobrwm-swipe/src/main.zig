@@ -49,9 +49,9 @@ const GestureState = struct {
     fired: bool = false,
     consuming: bool = false,
     count: usize = 0,
-    ids: [max_touches]usize = [_]usize{0} ** max_touches,
-    start_x: [max_touches]f64 = [_]f64{0} ** max_touches,
-    start_y: [max_touches]f64 = [_]f64{0} ** max_touches,
+    ids: [max_touches]usize = @splat(0),
+    start_x: [max_touches]f64 = @splat(0),
+    start_y: [max_touches]f64 = @splat(0),
 
     fn reset(self: *GestureState) void {
         self.active = false;

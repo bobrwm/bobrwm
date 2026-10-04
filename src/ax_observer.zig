@@ -28,7 +28,7 @@ const AppObserverEntry = struct {
     pid: i32 = 0,
     observer: c.AXObserverRef = null,
     known_window_count: u32 = 0,
-    known_windows: [max_known_windows_per_app]u32 = [_]u32{0} ** max_known_windows_per_app,
+    known_windows: [max_known_windows_per_app]u32 = @splat(0),
 };
 
 const ObserveRetryEntry = struct {
@@ -81,12 +81,12 @@ var g_ax_thread_ready: std.atomic.Value(bool) = std.atomic.Value(bool).init(fals
 
 var g_observe_retry_source: c.dispatch_source_t = null;
 var g_window_scan_source: c.dispatch_source_t = null;
-var g_app_observers: [max_observed_apps]AppObserverEntry = [_]AppObserverEntry{.{}} ** max_observed_apps;
+var g_app_observers: [max_observed_apps]AppObserverEntry = @splat(.{});
 var g_app_observer_count: u32 = 0;
-var g_observe_retry_entries: [max_observed_apps]ObserveRetryEntry = [_]ObserveRetryEntry{.{}} ** max_observed_apps;
+var g_observe_retry_entries: [max_observed_apps]ObserveRetryEntry = @splat(.{});
 var g_observe_retry_count: u32 = 0;
 var g_window_scan_idle_ticks: u32 = 0;
-var g_wid_retry_contexts: [max_wid_retry_contexts]WidRetryContext = [_]WidRetryContext{.{}} ** max_wid_retry_contexts;
+var g_wid_retry_contexts: [max_wid_retry_contexts]WidRetryContext = @splat(.{});
 var g_ax_observer_strings: ?AxObserverStrings = null;
 
 fn createAxObserverString(raw: [*:0]const u8) ?c.CFStringRef {
@@ -261,7 +261,7 @@ pub fn deinit() void {
 
     c.os_unfair_lock_lock(&g_ax_lock);
     g_app_observer_count = 0;
-    g_app_observers = [_]AppObserverEntry{.{}} ** max_observed_apps;
+    g_app_observers = @splat(.{});
     c.os_unfair_lock_unlock(&g_ax_lock);
 
     g_observe_retry_count = 0;

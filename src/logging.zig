@@ -81,7 +81,7 @@ fn logStderr(
     comptime format: []const u8,
     args: anytype,
 ) void {
-    if (comptime builtin.mode != .Debug and level == .debug) return;
+    if (comptime builtin.mode != .debug and level == .debug) return;
     if (!destinations.stderr) return;
 
     var buffer: [64]u8 = undefined;
@@ -107,9 +107,9 @@ fn parseDestinations(value: []const u8) !Destinations {
         const enable = !std.mem.startsWith(u8, token, "no-");
         const name = if (enable) token else token["no-".len..];
         var recognized = false;
-        inline for (@typeInfo(Destinations).@"struct".fields) |field| {
-            if (std.mem.eql(u8, name, field.name)) {
-                @field(parsed, field.name) = enable;
+        inline for (@typeInfo(Destinations).@"struct".field_names) |field_name| {
+            if (std.mem.eql(u8, name, field_name)) {
+                @field(parsed, field_name) = enable;
                 recognized = true;
             }
         }
