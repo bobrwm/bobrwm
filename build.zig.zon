@@ -1,12 +1,12 @@
 .{
     .name = .bobrwm,
     .version = "0.1.0",
-    .minimum_zig_version = "0.16.0",
+    .minimum_zig_version = "0.17.0",
     .fingerprint = 0x7abb9e0caf1b4364,
     .dependencies = .{
         .zig_objc = .{
-            .url = "https://github.com/mitchellh/zig-objc/archive/c8de82ff80281215ad92900866dab7103a8efa8b.tar.gz",
-            .hash = "zig_objc-0.0.0-Ir_Sp9gsAQCPAJc0oF5xoWePHWP6Y6tCphDeyNUThJoi",
+            .url = "git+https://github.com/loftafi/zig-objc.git#3352c12a868f8787ab71bf2ca6eab9fcfb635c52",
+            .hash = "zig_objc-0.0.0-Ir_Sp_4tAQDXtPi51nW_jD9LOEzBvU9lofwO9Pzi6IB4",
         },
     },
     .paths = .{
