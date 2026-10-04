@@ -34,7 +34,7 @@ pub const Status = enum(i64) {
 
 pub fn status() Status {
     const service = agentService() orelse return .not_found;
-    return @enumFromInt(service.msgSend(i64, "status", .{}));
+    return @fromBackingInt(@intCast(service.msgSend(i64, "status", .{})));
 }
 
 /// Bring the registration in line with `enabled`.

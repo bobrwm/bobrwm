@@ -651,11 +651,11 @@ pub fn postDockSwipe(phase: DockSwipePhase, direction: DockSwipeDirection, veloc
     cg_extra.CGEventSetIntegerValueField(event, 55, 30);
     cg_extra.CGEventSetIntegerValueField(event, 110, 23);
     cg_extra.CGEventSetIntegerValueField(event, 123, 1);
-    cg_extra.CGEventSetIntegerValueField(event, 132, @intFromEnum(phase));
+    cg_extra.CGEventSetIntegerValueField(event, 132, @backingInt(phase));
     cg_extra.CGEventSetDoubleValueField(event, 124, event_sign * progress);
 
     if (is_augmented) {
-        cg_extra.CGEventSetIntegerValueField(event, 134, @intFromEnum(phase));
+        cg_extra.CGEventSetIntegerValueField(event, 134, @backingInt(phase));
         cg_extra.CGEventSetDoubleValueField(event, 138, 3.0);
         cg_extra.CGEventSetDoubleValueField(event, 169, @floatFromInt(cg_extra.mach_absolute_time()));
         cg_extra.CGEventSetDoubleValueField(event, 125, 0.1);
@@ -763,7 +763,7 @@ fn makeDockSwipePayload(output: *[96]u8, event: c.CGEventRef, phase: DockSwipePh
 
     writeU32Little(output[28..32], 40);
     writeU32Little(output[32..36], 23);
-    writeU32Little(output[36..40], @as(u32, @intCast(@intFromEnum(phase))) << 24);
+    writeU32Little(output[36..40], @as(u32, @intCast(@backingInt(phase))) << 24);
     writeI32Little(output[44..48], fixed1616(0.1));
     writeU16Little(output[60..62], 1);
     writeU16Little(output[62..64], 3);
