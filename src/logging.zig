@@ -2,7 +2,6 @@
 //! `BOBRWM_LOG` toggles the `macos` and `stderr` destinations.
 
 const std = @import("std");
-const builtin = @import("builtin");
 const os_log = @import("os_log.zig");
 const osutil = @import("osutil.zig");
 
@@ -81,7 +80,8 @@ fn logStderr(
     comptime format: []const u8,
     args: anytype,
 ) void {
-    if (comptime builtin.mode != .debug and level == .debug) return;
+    // std.log already applies the configured level, including explicit debug
+    // logging in optimized builds used for gesture timing investigations.
     if (!destinations.stderr) return;
 
     var buffer: [64]u8 = undefined;

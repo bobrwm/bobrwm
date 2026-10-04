@@ -4,6 +4,7 @@ const std = @import("std");
 const geometry_mod = @import("../geometry.zig");
 const topology_mod = @import("topology.zig");
 const window_catalog_mod = @import("window_catalog.zig");
+pub const swipe = @import("../swipe.zig");
 const tiling_mod = @import("../tiling.zig");
 const window_mod = @import("../window.zig");
 pub const native_gesture = @import("../native_gesture.zig");
@@ -53,6 +54,17 @@ pub const WindowCatalog = window_catalog_mod.WindowCatalog;
 pub const Epoch = u64;
 pub const TimestampMs = u64;
 pub const WindowId = window_mod.WindowId;
+
+pub const SwipeInput = struct {
+    event: swipe.Input,
+    settings: swipe.Settings,
+};
+
+pub const SwipeReduction = struct {
+    state: swipe.State,
+    result: swipe.Result,
+    workspace_target: ?SpaceRef = null,
+};
 
 pub const FocusEventSource = enum {
     keyboard,
@@ -652,6 +664,7 @@ pub const Model = struct {
     bsp_insert_point: tiling_mod.InsertionPointPolicy = .focused,
     pointer_drag: PointerDragState = .{},
     drag_preview: DragPreviewState = .{},
+    swipe: swipe.State = .{},
     retile_request: RetileRequest = .{},
     cleanup_request: CleanupRequest = .{},
     last_display_change_at_ms: ?TimestampMs = null,

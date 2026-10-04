@@ -78,7 +78,6 @@ bobrwm bsp mirror horizontal          # IPC: horizontal | vertical
 bobrwm bsp equalize                   # IPC: set all split ratios to config ratio
 bobrwm bsp balance                    # IPC: proportional balance by subtree size
 bobrwm bsp rotate 90                  # IPC: 90 | 180 | 270
-bobrwm-swipe                          # optional trackpad swipe companion
 ```
 
 ### Starting and stopping
@@ -103,8 +102,9 @@ without `start_at_login` runs unsupervised.
 
 ### Logging
 
-The window manager sends logs to macOS unified logging and stderr. Debug-level
-stderr is suppressed outside Debug builds. Stream all Bobrwm records with:
+The window manager sends logs to macOS unified logging and stderr. Both
+destinations honor the configured log level, including debug in optimized
+builds. Stream all Bobrwm records with:
 
 ```bash
 log stream --level debug --predicate 'subsystem == "com.bobrwm.bobrwm"'
@@ -278,24 +278,43 @@ Pin apps to specific workspaces by bundle ID:
 },
 ```
 
-### Swipe companion
+### Trackpad swipes
 
-The optional `bobrwm-swipe` companion reads its opt-in flag from the main bobrwm config:
+Enable trackpad workspace switching in the main bobrwm config:
 
 ```zon
 .swipe = .{
     .enabled = true,
-    .fingers = 3,
-    .distance_pct = 0.08,
     .reverse = false,
 },
 ```
 
-`distance_pct` is the average horizontal movement threshold as a normalized fraction of the trackpad width; `0.08` means roughly 8% of the trackpad.
+Bobrwm intercepts macOS's native horizontal Spaces gesture and immediately
+requests the adjacent bobrwm workspace. The finger count comes from **System
+Settings → Trackpad → More Gestures → Swipe between full-screen applications**;
+it is not duplicated in bobrwm's config. Vertical Mission Control and App
+Exposé gestures pass through unchanged.
 
-Core bobrwm does not start a gesture listener from this flag. It only defines the shared config shape and exposes `focus-workspace next|prev` over IPC. Run `bobrwm-swipe` as the companion process after enabling the field. macOS grants Accessibility permissions per executable, so `bobrwm-swipe` needs its own grant even if bobrwm is already trusted.
+Bobrwm starts the listener itself and uses its existing Accessibility grant.
+Horizontal gestures are consumed for their complete lifetime. At the first or
+last bobrwm workspace no switch occurs; that boundary gesture cannot safely be
+handed back to the Dock after its opening events were already suppressed.
 
-When bobrwm has an adjacent workspace, the swipe listener consumes the matching macOS gesture. At the first or last bobrwm workspace, it passes the gesture through so native Spaces can handle it.
+To diagnose swipe/keyboard switching, run:
+
+```bash
+zig build run -Doptimize=ReleaseFast -Dlog_level=debug
+```
+
+Debug logs include gesture phases and raw progress/velocity, source PID and
+synthetic marker, recognition state before/after, event disposition, and
+observed/desired/target workspaces with pending switch epochs. Synthetic posting
+logs include phase, direction, and marker to compare with tap delivery; a
+pre-post event timestamp may be zero until macOS stamps it. Look for
+`orphan=true`, ignored-event reasons, boundary decisions, and tap resets/timeouts.
+Routine in-progress motion and gesture companions are omitted to limit callback
+logging overhead. Debug logs also appear in stderr for optimized builds;
+normal release builds compile these diagnostics out.
 
 ## Development
 
@@ -308,7 +327,6 @@ the terminal while still giving the process its bundle identity.
 Bobrwm.app/Contents/MacOS/
   Bobrwm         # the window manager; links AppKit, AX, SkyLight
   bobrwm-cli     # the client; links libSystem only
-  bobrwm-swipe   # optional trackpad companion
 ```
 
 The two binaries share nothing at runtime but the socket, so the client starts

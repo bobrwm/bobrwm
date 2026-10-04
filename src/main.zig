@@ -306,7 +306,18 @@ fn switchAdjacentWorkspaceHandled(direction: WorkspaceTraversalDirection) bool {
 
 fn dispatchForHotkeyBinding(binding: shim.bw_keybind) HotkeyDispatch {
     if (workspaceTraversalDirectionFromAction(binding.action)) |direction| {
-        _ = adjacentWorkspaceId(direction) orelse return .pass_through;
+        _ = adjacentWorkspaceId(direction) orelse {
+            const display_id = focusedDisplayId();
+            log.debug("workspace traversal keyboard boundary direction={s} disposition=pass_through display={d} observed={?d} desired={?d} pending_epoch={?d} queued={?d}", .{
+                @tagName(direction),
+                display_id,
+                g_state.observedWorkspace(display_id),
+                g_state.desiredWorkspace(display_id),
+                if (g_state.pending_switch) |pending| pending.epoch else null,
+                if (g_state.queued_switch) |queued| queued.target.workspace_id else null,
+            });
+            return .pass_through;
+        };
         return .{ .emit = .{ .kind = binding.action, .arg = 0 } };
     }
 
@@ -1039,6 +1050,7 @@ var g_waker_source: c.CFRunLoopSourceRef = null;
 var g_role_poll_source: c.dispatch_source_t = null;
 var g_native_space_topology_poll_source: c.dispatch_source_t = null;
 var g_tap_port: c.CFMachPortRef = null;
+var g_swipe_tap_port: c.CFMachPortRef = null;
 var g_layout_entries: std.ArrayList(tiling.LayoutEntry) = .empty;
 var g_event_drain_active = false;
 var g_event_overflow_recovery_pending = false;
@@ -1824,6 +1836,7 @@ fn applyReloadedConfig(next: ConfigRuntime) void {
     g_animator.init(g_config.animation);
     dim.configure(g_config.dimmed_inactive);
     loginitem.reconcile(g_config.start_at_login);
+    configureSwipeEventTap(g_config.swipe.enabled);
 
     // Preserve BSP topology and runtime split edits for ordinary config saves.
     // Only changing the layout algorithm requires reconstructing state.
@@ -1979,9 +1992,6 @@ fn hotkeyTapCallback(
         bw_hotkey_mouse_up();
         return event;
     }
-    if (event_type == 29 or event_type == 30) {
-        return event;
-    }
 
     const flags = cg_extra.CGEventGetFlags(event);
     const keycode_raw = cg_extra.CGEventGetIntegerValueField(event, c.kCGKeyboardEventKeycode);
@@ -1999,9 +2009,7 @@ fn setupHotkeyEventTap() void {
         (@as(c.CGEventMask, 1) << @intCast(c.kCGEventKeyDown)) |
         (@as(c.CGEventMask, 1) << @intCast(c.kCGEventLeftMouseDown)) |
         (@as(c.CGEventMask, 1) << @intCast(c.kCGEventLeftMouseDragged)) |
-        (@as(c.CGEventMask, 1) << @intCast(c.kCGEventLeftMouseUp)) |
-        (@as(c.CGEventMask, 1) << 29) |
-        (@as(c.CGEventMask, 1) << 30);
+        (@as(c.CGEventMask, 1) << @intCast(c.kCGEventLeftMouseUp));
 
     g_tap_port = cg_extra.CGEventTapCreate(
         c.kCGSessionEventTap,
@@ -2018,6 +2026,196 @@ fn setupHotkeyEventTap() void {
 
     c.CFRunLoopAddSource(c.CFRunLoopGetMain(), tap_source, c.kCFRunLoopCommonModes);
     cg_extra.CGEventTapEnable(tap, true);
+}
+
+fn configureSwipeEventTap(enabled: bool) void {
+    log.debug("swipe tap configure enabled={} reverse={} tracking={} fired={}", .{
+        enabled, g_config.swipe.reverse, g_state.swipe.tracking, g_state.swipe.fired,
+    });
+    _ = reduceSwipeInput(.reset);
+    if (g_swipe_tap_port) |tap| {
+        cg_extra.CGEventTapEnable(tap, enabled);
+        log.info("trackpad workspace swipes {s}", .{if (enabled) "enabled" else "disabled"});
+        return;
+    }
+    if (!enabled) return;
+
+    const mask: c.CGEventMask =
+        (@as(c.CGEventMask, 1) << @intCast(state_mod.swipe.event_type_gesture)) |
+        (@as(c.CGEventMask, 1) << @intCast(state_mod.swipe.event_type_dock_control));
+    g_swipe_tap_port = cg_extra.CGEventTapCreate(
+        c.kCGSessionEventTap,
+        c.kCGHeadInsertEventTap,
+        c.kCGEventTapOptionDefault,
+        mask,
+        swipeTapCallback,
+        null,
+    );
+    const tap = g_swipe_tap_port orelse {
+        log.warn("trackpad workspace swipes unavailable: session event tap creation failed", .{});
+        return;
+    };
+    const tap_source = c.CFMachPortCreateRunLoopSource(null, tap, 0) orelse {
+        c.CFRelease(@ptrCast(tap));
+        g_swipe_tap_port = null;
+        log.warn("trackpad workspace swipes unavailable: event tap source creation failed", .{});
+        return;
+    };
+    defer c.CFRelease(@ptrCast(tap_source));
+
+    c.CFRunLoopAddSource(c.CFRunLoopGetMain(), tap_source, c.kCFRunLoopCommonModes);
+    cg_extra.CGEventTapEnable(tap, true);
+    log.info("trackpad workspace swipes enabled macos={d}", .{skylight.macOSMajorVersion()});
+}
+
+fn reduceSwipeInput(event: state_mod.swipe.Input) state_mod.SwipeReduction {
+    const reduction = state_mod.reduceSwipeInput(&g_state, .{
+        .event = event,
+        .settings = .{
+            .reverse = g_config.swipe.reverse,
+            .macos_major = skylight.macOSMajorVersion(),
+        },
+    });
+    g_state.swipe = reduction.state;
+    return reduction;
+}
+
+fn swipeTapCallback(
+    proxy: c.CGEventTapProxy,
+    event_type: c.CGEventType,
+    event: c.CGEventRef,
+    refcon: ?*anyopaque,
+) callconv(.c) c.CGEventRef {
+    _ = proxy;
+    _ = refcon;
+
+    if (event_type == c.kCGEventTapDisabledByTimeout or event_type == c.kCGEventTapDisabledByUserInput) {
+        log.warn("swipe tap disabled reason={s} enabled={} tracking={} fired={}", .{
+            if (event_type == c.kCGEventTapDisabledByTimeout) "timeout" else "user_input",
+            g_config.swipe.enabled,
+            g_state.swipe.tracking,
+            g_state.swipe.fired,
+        });
+        _ = reduceSwipeInput(.reset);
+        if (g_config.swipe.enabled) {
+            if (g_swipe_tap_port) |tap| cg_extra.CGEventTapEnable(tap, true);
+            log.debug("swipe tap re-enabled", .{});
+        }
+        return event;
+    }
+
+    const protocol = state_mod.swipe;
+    const before = g_state.swipe;
+    const outer_type = cg_extra.CGEventGetIntegerValueField(event, protocol.Field.event_type);
+    if (outer_type != protocol.event_type_gesture and outer_type != protocol.event_type_dock_control) {
+        logSwipeEvent(event_type, event, before, null, "unsupported_outer_type");
+        return event;
+    }
+
+    const is_our_synthetic = cg_extra.CGEventGetIntegerValueField(event, protocol.Field.source_user_data) ==
+        skylight.dock_swipe_event_marker;
+    if (!is_our_synthetic and cg_extra.CGEventGetIntegerValueField(event, protocol.Field.source_pid) != 0) {
+        logSwipeEvent(event_type, event, before, null, "foreign_process_event");
+        return event;
+    }
+
+    const input: state_mod.swipe.Input = if (is_our_synthetic)
+        .synthetic_dock
+    else if (outer_type == protocol.event_type_gesture)
+        .gesture_companion
+    else blk: {
+        if (cg_extra.CGEventGetIntegerValueField(event, protocol.Field.hid_type) != protocol.hid_type_dock_swipe or
+            cg_extra.CGEventGetIntegerValueField(event, protocol.Field.motion) != protocol.motion_horizontal)
+        {
+            logSwipeEvent(event_type, event, before, null, "not_horizontal_dock_swipe");
+            return event;
+        }
+        break :blk .{ .dock = .{
+            .phase = @fromBackingInt(@intCast(cg_extra.CGEventGetIntegerValueField(event, protocol.Field.phase))),
+            .progress = cg_extra.CGEventGetDoubleValueField(event, protocol.Field.progress),
+            .velocity_x = cg_extra.CGEventGetDoubleValueField(event, protocol.Field.velocity_x),
+        } };
+    };
+
+    const reduction = reduceSwipeInput(input);
+    if (reduction.workspace_target) |target| {
+        bw_emit_event(shim.BW_HK_FOCUS_WORKSPACE, 0, target.workspace_id);
+    }
+    logSwipeEvent(event_type, event, before, reduction, "processed");
+    return switch (reduction.result.disposition) {
+        .pass_through => event,
+        .consume => null,
+        .sanitize_terminal => blk: {
+            cg_extra.CGEventSetDoubleValueField(event, protocol.Field.progress, 0);
+            cg_extra.CGEventSetDoubleValueField(event, protocol.Field.velocity_x, 0);
+            cg_extra.CGEventSetDoubleValueField(event, protocol.Field.velocity_y, 0);
+            break :blk event;
+        },
+    };
+}
+
+fn logSwipeEvent(
+    event_type: c.CGEventType,
+    event: c.CGEventRef,
+    before: state_mod.swipe.State,
+    reduction: ?state_mod.SwipeReduction,
+    reason: []const u8,
+) void {
+    if (comptime !std.log.logEnabled(.debug, .bobrwm)) return;
+    const protocol = state_mod.swipe;
+    const phase = cg_extra.CGEventGetIntegerValueField(event, protocol.Field.phase);
+    const outer_type = cg_extra.CGEventGetIntegerValueField(event, protocol.Field.event_type);
+    const result: protocol.Result = if (reduction) |value| value.result else .{};
+    const after = if (reduction) |value| value.state else before;
+    // Ordinary motion and companion samples add no decisions. Retain orphaned
+    // physical samples: they reveal a missed beginning or premature reset.
+    if (result.lifecycle == .none) {
+        if (outer_type == protocol.event_type_gesture and
+            phase != @backingInt(protocol.Phase.began) and
+            phase != @backingInt(protocol.Phase.ended) and
+            phase != @backingInt(protocol.Phase.cancelled)) return;
+        if (phase == @backingInt(protocol.Phase.changed) and (before.tracking or reduction == null)) return;
+    }
+    const target = if (reduction) |value| value.workspace_target else null;
+    const display_id = g_state.focusedDisplay();
+    log.debug("swipe event ts_ns={d} type={d} outer={d} pid={d} tag={x} hid={d} motion={d} phase={d} progress={d} vx={d} vy={d} reason={s} lifecycle={s} disposition={s} tracking={}->{} fired={}->{} direction={?s} source={?s} orphan={} boundary={} display={?d} observed={?d} desired={?d} target={?d} target_display={?d} pending_epoch={?d} pending_phase={?s} queued={?d} reverse={} macos={d}", .{
+        cg_extra.CGEventGetTimestamp(event),
+        event_type,
+        outer_type,
+        cg_extra.CGEventGetIntegerValueField(event, protocol.Field.source_pid),
+        cg_extra.CGEventGetIntegerValueField(event, protocol.Field.source_user_data),
+        cg_extra.CGEventGetIntegerValueField(event, protocol.Field.hid_type),
+        cg_extra.CGEventGetIntegerValueField(event, protocol.Field.motion),
+        phase,
+        cg_extra.CGEventGetDoubleValueField(event, protocol.Field.progress),
+        cg_extra.CGEventGetDoubleValueField(event, protocol.Field.velocity_x),
+        cg_extra.CGEventGetDoubleValueField(event, protocol.Field.velocity_y),
+        reason,
+        @tagName(result.lifecycle),
+        @tagName(result.disposition),
+        before.tracking,
+        after.tracking,
+        before.fired,
+        after.fired,
+        if (result.direction) |value| @tagName(value) else null,
+        if (result.detection_source) |value| @tagName(value) else null,
+        reduction != null and outer_type == protocol.event_type_dock_control and !before.tracking and
+            result.lifecycle == .none and
+            (phase == @backingInt(protocol.Phase.changed) or phase == @backingInt(protocol.Phase.ended) or
+                phase == @backingInt(protocol.Phase.cancelled)),
+        result.direction != null and target == null and display_id != null and
+            g_state.desiredWorkspace(display_id.?) != null,
+        display_id,
+        if (display_id) |id| g_state.observedWorkspace(id) else null,
+        if (display_id) |id| g_state.desiredWorkspace(id) else null,
+        if (target) |value| value.workspace_id else null,
+        if (target) |value| value.display_id else null,
+        if (g_state.pending_switch) |pending| pending.epoch else null,
+        if (g_state.pending_switch) |pending| @tagName(pending.phase) else null,
+        if (g_state.queued_switch) |queued| queued.target.workspace_id else null,
+        g_config.swipe.reverse,
+        skylight.macOSMajorVersion(),
+    });
 }
 
 // Event bridge (called from ObjC shim)
@@ -2257,6 +2455,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     defer ax_observer.deinit();
     setupHotkeyEventTap();
     initWakerSource();
+    configureSwipeEventTap(g_config.swipe.enabled);
     setNativeSpaceTopologyPolling(true);
     try g_ipc_transport.start(g_ipc.fd, signalWaker);
     defer g_ipc_transport.stop();
@@ -4252,6 +4451,10 @@ fn executeNativeGesture(effect: @FieldType(state_mod.Effect, "post_native_gestur
     if (gesture.phase != effect.phase or gesture.due_at_ms != null) return;
 
     const succeeded = skylight.postDockSwipe(effect.phase, effect.direction, effect.velocity);
+    log.debug("native gesture delivery epoch={d} workspace={d} phase={s} direction={s} velocity={d} posted={}", .{
+        effect.epoch,               pending.request.target.workspace_id, @tagName(effect.phase),
+        @tagName(effect.direction), effect.velocity,                     succeeded,
+    });
     dispatchStateEvent(.{ .native_gesture_posted = .{
         .epoch = effect.epoch,
         .phase = effect.phase,

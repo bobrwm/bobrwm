@@ -202,6 +202,7 @@ pub fn assertModel(model: *const Model) void {
         std.debug.assert(model.drag_preview.source_window_id != null);
     }
     if (model.drag_preview.is_visible) std.debug.assert(model.drag_preview.target_window_id != null);
+    model.swipe.assertValid();
     std.debug.assert(model.retile_request.display_count <= model.retile_request.display_ids.len);
     if (model.retile_request.all_displays) std.debug.assert(model.retile_request.display_count == 0);
     for (model.retile_request.display_ids[0..model.retile_request.display_count], 0..) |display_id, index| {

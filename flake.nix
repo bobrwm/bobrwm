@@ -33,7 +33,7 @@
       default = pkgs.stdenv.mkDerivation {
         name = "bobrwm";
         src = ./.;
-        nativeBuildInputs = [zig];
+        nativeBuildInputs = [zig pkgs.swift];
         SDKROOT = pkgs.apple-sdk.sdkroot;
 
         buildPhase = ''
@@ -42,14 +42,13 @@
           zig build -Doptimize=ReleaseSafe --prefix $out
         '';
 
-        # The build installs Bobrwm.app; expose the client and the swipe
-        # companion on PATH the way the Homebrew cask's binary stanza does.
+        # The build installs Bobrwm.app; expose the client on PATH the way the
+        # Homebrew cask's binary stanza does.
         # Bobrwm itself is deliberately not linked: it needs to run from
         # inside the bundle to pick up its CFBundleIdentifier.
         installPhase = ''
           mkdir -p $out/bin
           ln -s $out/Bobrwm.app/Contents/MacOS/bobrwm-cli $out/bin/bobrwm
-          ln -s $out/Bobrwm.app/Contents/MacOS/bobrwm-swipe $out/bin/bobrwm-swipe
         '';
       };
     });
@@ -74,6 +73,12 @@
           ziglint
           pkgs.nushell
         ];
+        # Keep the Nix SDK for Zig/C, but pair Apple's swiftc with the SDK from
+        # the selected local Xcode or Command Line Tools installation.
+        shellHook = ''
+          export SWIFT_DEVELOPER_DIR="$(env -u DEVELOPER_DIR /usr/bin/xcode-select -p)"
+          export SWIFT_SDKROOT="$(env -u SDKROOT DEVELOPER_DIR="$SWIFT_DEVELOPER_DIR" /usr/bin/xcrun --sdk macosx --show-sdk-path)"
+        '';
       };
     });
   };

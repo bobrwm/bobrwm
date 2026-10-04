@@ -72,6 +72,10 @@ pub fn build(b: *std.Build) !void {
     const sdk_lib = b.fmt("{s}/usr/lib", .{sdk_root});
     const sdk_frameworks = b.fmt("{s}/System/Library/Frameworks", .{sdk_root});
     const sdk_private_frameworks = b.fmt("{s}/System/Library/PrivateFrameworks", .{sdk_root});
+    // Nix's SDK is sufficient for Zig and C, but Apple's swiftc needs the SDK
+    // from its own selected developer toolchain to locate Swift overlays.
+    const swift_sdk_root = env.get("SWIFT_SDKROOT") orelse sdk_root;
+    const swift_developer_dir = env.get("SWIFT_DEVELOPER_DIR");
 
     const exe_mod = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
@@ -212,8 +216,11 @@ pub fn build(b: *std.Build) !void {
         "-Xlinker",
         "@rpath/" ++ ui_dylib_name,
         "-sdk",
-        sdk_root,
+        swift_sdk_root,
     });
+    if (swift_developer_dir) |developer_dir| {
+        swift_ui.setEnvironmentVariable("DEVELOPER_DIR", developer_dir);
+    }
     if (optimize != .debug) swift_ui.addArg("-O");
     // Carries both bobrwm_ui.h and the modulemap that makes it importable.
     swift_ui.addPrefixedDirectoryArg("-I", b.path("packages/bobrwm-ui/include"));
@@ -252,47 +259,6 @@ pub fn build(b: *std.Build) !void {
 
     installBundleArtifact(b, cli_exe);
 
-    const swipe_config_mod = b.createModule(.{
-        .root_source_file = b.path("src/config.zig"),
-        .target = target,
-        .optimize = optimize,
-        .link_libc = true,
-    });
-    // config.zig reaches osutil.appBundleId, which uses the objc module.
-    swipe_config_mod.addImport("objc", objc_mod);
-
-    const swipe_mod = b.createModule(.{
-        .root_source_file = b.path("packages/bobrwm-swipe/src/main.zig"),
-        .target = target,
-        .optimize = optimize,
-        .link_libc = true,
-    });
-    swipe_mod.addImport("objc", objc_mod);
-    swipe_mod.addImport("c", c_mod);
-    swipe_mod.addImport("cg_extra", cg_extra_mod);
-    swipe_mod.addImport("bobrwm_config", swipe_config_mod);
-    swipe_mod.addImport("runtime_paths", b.createModule(.{
-        .root_source_file = b.path("src/runtime_paths.zig"),
-        .target = target,
-        .optimize = optimize,
-        .link_libc = true,
-    }));
-    swipe_mod.addAssemblyFile(b.path("packages/bobrwm-swipe/src/info_plist.s"));
-    swipe_mod.linkFramework("ApplicationServices", .{});
-    swipe_mod.linkFramework("CoreGraphics", .{});
-    swipe_mod.linkFramework("AppKit", .{});
-    swipe_mod.linkFramework("CoreFoundation", .{});
-    swipe_mod.addSystemFrameworkPath(.{ .cwd_relative = sdk_frameworks });
-    swipe_mod.addSystemIncludePath(.{ .cwd_relative = sdk_include });
-    swipe_mod.addLibraryPath(.{ .cwd_relative = sdk_lib });
-
-    const swipe_exe = b.addExecutable(.{
-        .name = "bobrwm-swipe",
-        .root_module = swipe_mod,
-    });
-
-    installBundleArtifact(b, swipe_exe);
-
     installBundleFile(b, ui_dylib, "Contents/Frameworks", ui_dylib_name);
     installBundleFile(b, oslog_dylib, "Contents/Frameworks", oslog_dylib_name);
 
@@ -318,7 +284,6 @@ pub fn build(b: *std.Build) !void {
         // the outer signature covers a helper that is about to change.
         for ([_][3][]const u8{
             .{ bundle_macos, cli_exe_name, "com.bobrwm.cli" },
-            .{ bundle_macos, "bobrwm-swipe", "com.bobrwm.swipe" },
             .{ bundle_contents ++ "/Frameworks", ui_dylib_name, "com.bobrwm.ui" },
             .{ bundle_contents ++ "/Frameworks", oslog_dylib_name, "com.bobrwm.oslog" },
         }) |entry| {
@@ -358,8 +323,11 @@ pub fn build(b: *std.Build) !void {
         "-target",
         "arm64-apple-macos13.0",
         "-sdk",
-        sdk_root,
+        swift_sdk_root,
     });
+    if (swift_developer_dir) |developer_dir| {
+        preview_build.setEnvironmentVariable("DEVELOPER_DIR", developer_dir);
+    }
     const preview_exe = preview_build.addPrefixedOutputFileArg("-o", "bobrwm-ui-preview");
     preview_build.addFileArg(b.path("packages/bobrwm-ui/src/MenuRow.swift"));
     preview_build.addFileArg(b.path("packages/bobrwm-ui/preview/main.swift"));
@@ -371,15 +339,6 @@ pub fn build(b: *std.Build) !void {
 
     const preview_step = b.step("ui-preview", "Render the menu bar UI to PNGs");
     preview_step.dependOn(&preview_run.step);
-
-    const run_swipe_cmd = std.Build.Step.Run.create(b, "run bobrwm-swipe");
-    run_swipe_cmd.addFileArg(installBundlePath(b, bundle_macos ++ "/bobrwm-swipe"));
-    run_swipe_cmd.addPassthruArgs();
-    run_swipe_cmd.has_side_effects = true;
-    run_swipe_cmd.step.dependOn(sign_step orelse b.getInstallStep());
-
-    const run_swipe_step = b.step("run-swipe", "Run bobrwm-swipe");
-    run_swipe_step.dependOn(&run_swipe_cmd.step);
 
     // config.zig imports only Zig declarations, so the test module needs
     // no SDK or include wiring.
@@ -564,31 +523,13 @@ pub fn build(b: *std.Build) !void {
     const run_trace_tests = b.addRunArtifact(trace_tests);
 
     const swipe_test_mod = b.createModule(.{
-        .root_source_file = b.path("packages/bobrwm-swipe/src/main.zig"),
+        .root_source_file = b.path("src/swipe.zig"),
         .target = target,
         .optimize = optimize,
-        .link_libc = true,
     });
-    swipe_test_mod.addImport("objc", objc_mod);
-    swipe_test_mod.addImport("c", c_mod);
-    swipe_test_mod.addImport("cg_extra", cg_extra_mod);
-    swipe_test_mod.addImport("bobrwm_config", swipe_config_mod);
-    swipe_test_mod.addImport("runtime_paths", b.createModule(.{
-        .root_source_file = b.path("src/runtime_paths.zig"),
-        .target = target,
-        .optimize = optimize,
-        .link_libc = true,
-    }));
-    swipe_test_mod.linkFramework("ApplicationServices", .{});
-    swipe_test_mod.linkFramework("CoreGraphics", .{});
-    swipe_test_mod.linkFramework("AppKit", .{});
-    swipe_test_mod.linkFramework("CoreFoundation", .{});
-    swipe_test_mod.addSystemFrameworkPath(.{ .cwd_relative = sdk_frameworks });
-    swipe_test_mod.addSystemIncludePath(.{ .cwd_relative = sdk_include });
-    swipe_test_mod.addLibraryPath(.{ .cwd_relative = sdk_lib });
 
     const swipe_tests = b.addTest(.{
-        .name = "bobrwm-swipe-tests",
+        .name = "swipe-tests",
         .root_module = swipe_test_mod,
     });
 

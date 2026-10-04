@@ -30,7 +30,10 @@ const dock_swipe_modern_progress: f64 = 0.000016;
 const serialized_event_capacity: usize = 4096;
 const native_window_batch_capacity: usize = 256;
 
-var g_requires_event_augmentation: ?bool = null;
+/// Identifies our synthetic gestures without relying on event arrival order.
+pub const dock_swipe_event_marker: i64 = 0x424f425253574950;
+
+var g_macos_major_version: ?u32 = null;
 
 pub const CGRect = extern struct {
     origin: CGPoint,
@@ -640,7 +643,10 @@ fn makeSwitchPlan(current_position: usize, target_position: usize) NativeSpaceSw
 
 /// Post one reducer-owned native Space gesture phase.
 pub fn postDockSwipe(phase: DockSwipePhase, direction: DockSwipeDirection, velocity: f64) bool {
-    const event = cg_extra.CGEventCreate(null) orelse return false;
+    const event = cg_extra.CGEventCreate(null) orelse {
+        log.debug("swipe synthetic post failed stage=create phase={s} direction={s}", .{ @tagName(phase), @tagName(direction) });
+        return false;
+    };
     defer c.CFRelease(event);
 
     const sign = direction.sign();
@@ -663,14 +669,35 @@ pub fn postDockSwipe(phase: DockSwipePhase, direction: DockSwipeDirection, veloc
             cg_extra.CGEventSetDoubleValueField(event, 129, event_sign * velocity);
         }
 
-        const augmented = augmentDockSwipeEvent(event, phase, event_sign * progress, event_sign * velocity) orelse return false;
+        const augmented = augmentDockSwipeEvent(event, phase, event_sign * progress, event_sign * velocity) orelse {
+            log.debug("swipe synthetic post failed stage=augment phase={s} direction={s}", .{ @tagName(phase), @tagName(direction) });
+            return false;
+        };
         defer c.CFRelease(augmented);
+        // CGEventCreateFromData drops source user data. Tag the reconstructed
+        // event, not the input to augmentation, so our tap sees its identity.
+        cg_extra.CGEventSetIntegerValueField(augmented, c.kCGEventSourceUserData, dock_swipe_event_marker);
+        if (comptime std.log.logEnabled(.debug, .skylight)) {
+            log.debug("swipe synthetic post pre_post_ts_ns={d} phase={s} direction={s} progress={d} vx={d} vy={d} augmented=true tag={x}", .{
+                cg_extra.CGEventGetTimestamp(augmented),                                   @tagName(phase),                                     @tagName(direction),
+                cg_extra.CGEventGetDoubleValueField(augmented, 124),                       cg_extra.CGEventGetDoubleValueField(augmented, 129), cg_extra.CGEventGetDoubleValueField(augmented, 130),
+                cg_extra.CGEventGetIntegerValueField(augmented, c.kCGEventSourceUserData),
+            });
+        }
         cg_extra.CGEventPost(c.kCGSessionEventTap, augmented);
         return true;
     }
 
     cg_extra.CGEventSetDoubleValueField(event, 129, sign * velocity);
     cg_extra.CGEventSetDoubleValueField(event, 130, sign * velocity);
+    cg_extra.CGEventSetIntegerValueField(event, c.kCGEventSourceUserData, dock_swipe_event_marker);
+    if (comptime std.log.logEnabled(.debug, .skylight)) {
+        log.debug("swipe synthetic post pre_post_ts_ns={d} phase={s} direction={s} progress={d} vx={d} vy={d} augmented=false tag={x}", .{
+            cg_extra.CGEventGetTimestamp(event),                                   @tagName(phase),                                 @tagName(direction),
+            cg_extra.CGEventGetDoubleValueField(event, 124),                       cg_extra.CGEventGetDoubleValueField(event, 129), cg_extra.CGEventGetDoubleValueField(event, 130),
+            cg_extra.CGEventGetIntegerValueField(event, c.kCGEventSourceUserData),
+        });
+    }
     cg_extra.CGEventPost(c.kCGSessionEventTap, event);
     return true;
 }
@@ -778,14 +805,14 @@ fn makeDockSwipePayload(output: *[96]u8, event: c.CGEventRef, phase: DockSwipePh
     return payload_length;
 }
 
-fn requiresEventAugmentation() bool {
-    if (g_requires_event_augmentation) |is_required| return is_required;
+pub fn macOSMajorVersion() u32 {
+    if (g_macos_major_version) |major| return major;
 
     var version: [32]u8 = @splat(0);
     var version_length = version.len;
     if (cg_extra.sysctlbyname("kern.osproductversion", @ptrCast(&version), &version_length, null, 0) != 0) {
-        g_requires_event_augmentation = false;
-        return false;
+        g_macos_major_version = 0;
+        return 0;
     }
 
     var major: u32 = 0;
@@ -794,9 +821,12 @@ fn requiresEventAugmentation() bool {
         major = major * 10 + byte - '0';
     }
 
-    const is_required = major >= 27;
-    g_requires_event_augmentation = is_required;
-    return is_required;
+    g_macos_major_version = major;
+    return major;
+}
+
+pub fn requiresEventAugmentation() bool {
+    return macOSMajorVersion() >= 27;
 }
 
 fn fixed1616(value: f64) i32 {
