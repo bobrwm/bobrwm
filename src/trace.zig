@@ -5,7 +5,7 @@ const builtin = @import("builtin");
 const osutil = @import("osutil.zig");
 
 const log = std.log.scoped(.trace);
-const enabled = builtin.mode == .Debug;
+const enabled = builtin.mode == .debug;
 
 pub const frame_budget_us: u64 = 16_000;
 

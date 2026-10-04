@@ -730,7 +730,7 @@ fn tickWorkspaceTransitionState() void {
 }
 
 fn assertDisplayCoverage() void {
-    if (@import("builtin").mode != .Debug) return;
+    if (@import("builtin").mode != .debug) return;
     for (0..g_display_count) |slot| {
         const ws_id = activeWorkspaceIdForDisplay(g_displays[slot].id);
         std.debug.assert(spaceForWorkspace(g_displays[slot].id, ws_id) != null);
@@ -767,8 +767,13 @@ fn updateStatusBar() void {
 fn displayUuidBytes(display_id: u32) ?[16]u8 {
     const uuid_ref = cg_extra.CGDisplayCreateUUIDFromDisplayID(display_id) orelse return null;
     defer c.CFRelease(@ptrCast(uuid_ref));
-    const bytes: [16]u8 = @bitCast(c.CFUUIDGetUUIDBytes(uuid_ref));
-    return bytes;
+    const raw = c.CFUUIDGetUUIDBytes(uuid_ref);
+    return .{
+        raw.byte0,  raw.byte1,  raw.byte2,  raw.byte3,
+        raw.byte4,  raw.byte5,  raw.byte6,  raw.byte7,
+        raw.byte8,  raw.byte9,  raw.byte10, raw.byte11,
+        raw.byte12, raw.byte13, raw.byte14, raw.byte15,
+    };
 }
 
 fn refreshDisplays() void {
@@ -1470,7 +1475,7 @@ fn setFrontProcessViaSkylight(pid: i32, wid: u32) bool {
 /// One 0xF8-byte SkyLight event record targeting `wid`. `kind` is 0x01 for the
 /// focus record and 0x02 for the raise record. Byte offsets are SkyLight's.
 fn focusEventRecord(wid: u32, kind: u8) [0xf8]u8 {
-    var bytes = [_]u8{0} ** 0xf8;
+    var bytes: [0xf8]u8 = @splat(0);
     bytes[0x04] = 0xf8;
     bytes[0x08] = kind;
     bytes[0x3a] = 0x10;
@@ -2022,7 +2027,7 @@ fn setupHotkeyEventTap() void {
 // while the main-thread consumer (pop) is wait-free.
 export fn bw_emit_event(kind: u8, pid: i32, wid: u32) void {
     var event: event_mod.Event = .{
-        .kind = @enumFromInt(kind),
+        .kind = @fromBackingInt(@intCast(kind)),
         .pid = pid,
         .wid = wid,
     };
@@ -2136,8 +2141,8 @@ pub fn main(init: std.process.Init.Minimal) !void {
     log.info("bobrwm starting (log_level={s})...", .{@tagName(std_options.log_level)});
 
     var debug_allocator: ?std.heap.DebugAllocator(.{}) = switch (builtin.mode) {
-        .Debug => .init,
-        .ReleaseSafe, .ReleaseFast, .ReleaseSmall => null,
+        .debug => .init,
+        .safe, .fast, .small => null,
     };
     defer {
         if (debug_allocator) |*value| _ = value.deinit();

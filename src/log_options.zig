@@ -9,8 +9,8 @@ const std = @import("std");
 const build_options = @import("build_options");
 
 pub const level: std.log.Level = if (build_options.log_level_int) |l|
-    @enumFromInt(l)
+    @fromBackingInt(@intCast(l))
 else switch (@import("builtin").mode) {
-    .Debug => .debug,
+    .debug => .debug,
     else => .info,
 };
