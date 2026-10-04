@@ -9,7 +9,7 @@ branch: []const u8,
 /// Detect version metadata from the repository containing the build root.
 /// Returned strings use the build allocator and live for the build's duration.
 pub fn detect(b: *std.Build) !GitVersion {
-    const root = b.build_root.path orelse ".";
+    const root = b.fmt("{f}", .{b.root});
     var exit_code: u8 = 0;
 
     const branch_output = b.runAllowFail(
