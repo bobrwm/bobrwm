@@ -3,7 +3,6 @@
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
-    zig-overlay.url = "github:mitchellh/zig-overlay";
     zls-overlay.url = "github:zigtools/zls";
     zigdoc-nix.url = "github:uzaaft/zigdoc-nix";
     ziglint-nix.url = "github:uzaaft/ziglint-nix";
@@ -12,7 +11,6 @@
   outputs = {
     self,
     nixpkgs,
-    zig-overlay,
     zls-overlay,
     zigdoc-nix,
     ziglint-nix,
@@ -30,7 +28,7 @@
       pkgs,
       system,
     }: let
-      zig = zig-overlay.packages.${system}."0.17.0";
+      zig = pkgs.zig_0_17;
     in {
       default = pkgs.stdenv.mkDerivation {
         name = "bobrwm";
@@ -60,7 +58,7 @@
       pkgs,
       system,
     }: let
-      zig = zig-overlay.packages.${system}."0.17.0";
+      zig = pkgs.zig_0_17;
       zls = zls-overlay.packages.${system}.zls;
       zigdoc = zigdoc-nix.packages.${system}.default;
       ziglint = ziglint-nix.packages.${system}.default;
