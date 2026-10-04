@@ -80,7 +80,7 @@ fn configurePipeFd(fd: c_int) !void {
 }
 
 fn gracefulSignalHandler(sig: posix.SIG) callconv(.c) void {
-    const byte: u8 = @intCast(@intFromEnum(sig));
+    const byte: u8 = @intCast(@backingInt(sig));
     _ = c.write(g_write_fd, &byte, 1);
 }
 
