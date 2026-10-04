@@ -27,9 +27,9 @@ fn parseLogLevelEnv(raw: []const u8) ?std.log.Level {
     if (trimmed.len == 0) return null;
     if (std.ascii.eqlIgnoreCase(trimmed, "trace")) return .debug;
 
-    inline for (comptime std.meta.fields(std.log.Level)) |field| {
-        if (std.ascii.eqlIgnoreCase(trimmed, field.name)) {
-            return @enumFromInt(field.value);
+    inline for (comptime std.enums.values(std.log.Level)) |level| {
+        if (std.ascii.eqlIgnoreCase(trimmed, @tagName(level))) {
+            return level;
         }
     }
     return null;
@@ -102,7 +102,7 @@ pub fn build(b: *std.Build) !void {
 
     const build_options = b.addOptions();
     // std.log.Level can't be serialized directly; pass as backing int.
-    const log_level_int: ?u3 = if (log_level) |l| @intFromEnum(l) else null;
+    const log_level_int: ?u3 = if (log_level) |l| @backingInt(l) else null;
     build_options.addOption(?u3, "log_level_int", log_level_int);
     build_options.addOption([]const u8, "version", version_string);
     const build_options_mod = build_options.createModule();
@@ -214,7 +214,7 @@ pub fn build(b: *std.Build) !void {
         "-sdk",
         sdk_root,
     });
-    if (optimize != .Debug) swift_ui.addArg("-O");
+    if (optimize != .debug) swift_ui.addArg("-O");
     // Carries both bobrwm_ui.h and the modulemap that makes it importable.
     swift_ui.addPrefixedDirectoryArg("-I", b.path("packages/bobrwm-ui/include"));
     const ui_dylib = swift_ui.addPrefixedOutputFileArg("-o", ui_dylib_name);
@@ -312,7 +312,7 @@ pub fn build(b: *std.Build) !void {
 
         // The app takes its identifier from CFBundleIdentifier.
         const sign_app = devCodesign(b, identity);
-        sign_app.addArg(b.getInstallPath(.prefix, bundle_name));
+        sign_app.addFileArg(installBundlePath(b, bundle_name));
 
         // Nested code must be sealed before the enclosing bundle, otherwise
         // the outer signature covers a helper that is about to change.
@@ -324,7 +324,7 @@ pub fn build(b: *std.Build) !void {
         }) |entry| {
             const sign_helper = devCodesign(b, identity);
             sign_helper.addArgs(&.{ "--identifier", entry[2] });
-            sign_helper.addArg(b.getInstallPath(.prefix, b.fmt("{s}/{s}", .{ entry[0], entry[1] })));
+            sign_helper.addFileArg(installBundlePath(b, b.fmt("{s}/{s}", .{ entry[0], entry[1] })));
             sign_helper.step.dependOn(b.getInstallStep());
             sign_app.step.dependOn(&sign_helper.step);
         }
@@ -339,14 +339,11 @@ pub fn build(b: *std.Build) !void {
     // surrounding bundle that gives the process its identity. Exec'ing the
     // binary directly instead of `open`ing the app keeps stdio on the
     // terminal, which the log-driven debugging workflow depends on.
-    const run_cmd = b.addSystemCommand(&.{
-        b.getInstallPath(.prefix, bundle_macos ++ "/" ++ server_exe_name),
-    });
+    const run_cmd = std.Build.Step.Run.create(b, "run bobrwm");
+    run_cmd.addFileArg(installBundlePath(b, bundle_macos ++ "/" ++ server_exe_name));
+    run_cmd.addPassthruArgs();
     run_cmd.has_side_effects = true;
     run_cmd.step.dependOn(sign_step orelse b.getInstallStep());
-    if (b.args) |args| {
-        run_cmd.addArgs(args);
-    }
 
     const run_step = b.step("run", "Run bobrwm");
     run_step.dependOn(&run_cmd.step);
@@ -370,19 +367,16 @@ pub fn build(b: *std.Build) !void {
     const preview_run = std.Build.Step.Run.create(b, "render ui preview");
     preview_run.has_side_effects = true;
     preview_run.addFileArg(preview_exe);
-    preview_run.addArg(b.pathFromRoot("zig-out/ui-preview"));
+    preview_run.addDirectoryArg(b.path("zig-out/ui-preview"));
 
     const preview_step = b.step("ui-preview", "Render the menu bar UI to PNGs");
     preview_step.dependOn(&preview_run.step);
 
-    const run_swipe_cmd = b.addSystemCommand(&.{
-        b.getInstallPath(.prefix, bundle_macos ++ "/bobrwm-swipe"),
-    });
+    const run_swipe_cmd = std.Build.Step.Run.create(b, "run bobrwm-swipe");
+    run_swipe_cmd.addFileArg(installBundlePath(b, bundle_macos ++ "/bobrwm-swipe"));
+    run_swipe_cmd.addPassthruArgs();
     run_swipe_cmd.has_side_effects = true;
     run_swipe_cmd.step.dependOn(sign_step orelse b.getInstallStep());
-    if (b.args) |args| {
-        run_swipe_cmd.addArgs(args);
-    }
 
     const run_swipe_step = b.step("run-swipe", "Run bobrwm-swipe");
     run_swipe_step.dependOn(&run_swipe_cmd.step);
@@ -663,6 +657,13 @@ fn installBundleFile(
 ) void {
     const dir: std.Build.InstallDir = .{ .custom = b.fmt("{s}/{s}", .{ bundle_name, sub_dir }) };
     b.getInstallStep().dependOn(&b.addInstallFileWithDir(source, dir, dest_name).step);
+}
+
+fn installBundlePath(b: *std.Build, sub_path: []const u8) std.Build.LazyPath {
+    const install_prefix: std.Build.LazyPath = .{
+        .relative = .{ .base = .install_prefix },
+    };
+    return install_prefix.path(b, sub_path);
 }
 
 fn bundleInfoPlist(b: *std.Build, version: std.SemanticVersion) std.Build.LazyPath {
