@@ -180,11 +180,11 @@ pub const Action = enum(u8) {
         // the default branch quota when the enum has many fields.
         @setEvalBranchQuota(40_000);
         const event = @import("event.zig").EventKind;
-        for (@typeInfo(Action).@"enum".fields) |f| {
+        for (@typeInfo(Action).@"enum".field_names) |name| {
             // Verify each Action.<name> has a matching EventKind.hk_<name>;
             // a missing tag triggers a clear comptime error.
-            if (std.meta.stringToEnum(event, "hk_" ++ f.name) == null) {
-                @compileError("missing EventKind.hk_" ++ f.name ++ " for Action." ++ f.name);
+            if (std.meta.stringToEnum(event, "hk_" ++ name) == null) {
+                @compileError("missing EventKind.hk_" ++ name ++ " for Action." ++ name);
             }
         }
     }
@@ -458,7 +458,7 @@ fn keybindToShim(keybind: Keybind) ?shim.bw_keybind {
     return .{
         .keycode = keycode,
         .mods = mods,
-        .action = @intFromEnum(keybind.action),
+        .action = @backingInt(keybind.action),
         .arg = keybind.arg,
     };
 }
@@ -883,26 +883,24 @@ const ConfigDiagnostics = struct {
         writer: *std.Io.Writer,
         path: []const u8,
         source: []const u8,
-        diagnostics: *const std.zon.parse.Diagnostics,
-        parse_error: std.zon.parse.Error,
+        _: *const std.zon.parse.Diagnostics,
+        parse_error: std.zon.parse.Diagnostics.Error,
     ) !void {
-        const location = parse_error.getLocation(diagnostics);
         switch (parseDiagnosticKind(parse_error)) {
             .invalid_field => try writer.writeAll("warning: invalid field ignored\n"),
             .invalid_value => try writer.writeAll("error: invalid value\n"),
             .invalid_syntax => try writer.writeAll("error: invalid ZON syntax\n"),
         }
         try writeSourceExcerpt(writer, path, source, .{
-            .line = location.line,
-            .column = location.column,
-            .line_start = location.line_start,
-            .line_end = location.line_end,
+            .line = parse_error.loc.line,
+            .column = parse_error.loc.column,
+            .line_start = parse_error.loc.line_start,
+            .line_end = parse_error.loc.line_end,
         }, 1);
-        try writer.print("   = {f}\n", .{parse_error.fmtMessage(diagnostics)});
+        try writer.print("   = {s}\n", .{parse_error.msg});
 
-        var notes = parse_error.iterateNotes(diagnostics);
-        while (notes.next()) |note| {
-            try writer.print("   = note: {f}\n", .{note.fmtMessage(diagnostics)});
+        for (parse_error.notes) |note| {
+            try writer.print("   = note: {s}\n", .{note.msg});
         }
     }
 
@@ -912,18 +910,14 @@ const ConfigDiagnostics = struct {
         invalid_syntax,
     };
 
-    fn parseDiagnosticKind(parse_error: std.zon.parse.Error) ParseDiagnosticKind {
-        return switch (parse_error) {
-            .zoir => .invalid_syntax,
-            .type_check => if (isUnexpectedField(parse_error)) .invalid_field else .invalid_value,
-        };
+    fn parseDiagnosticKind(parse_error: std.zon.parse.Diagnostics.Error) ParseDiagnosticKind {
+        if (isUnexpectedField(parse_error)) return .invalid_field;
+        if (std.mem.indexOf(u8, parse_error.msg, "after initializer") != null) return .invalid_syntax;
+        return .invalid_value;
     }
 
-    fn isUnexpectedField(parse_error: std.zon.parse.Error) bool {
-        return switch (parse_error) {
-            .type_check => |failure| std.mem.startsWith(u8, failure.message, "unexpected field '"),
-            .zoir => false,
-        };
+    fn isUnexpectedField(parse_error: std.zon.parse.Diagnostics.Error) bool {
+        return std.mem.startsWith(u8, parse_error.msg, "unexpected field '");
     }
 
     fn blankSourceRange(source: []u8, start: usize, end: usize) void {
@@ -987,12 +981,12 @@ const ConfigDiagnostics = struct {
 
     const ParseDiagnosticSink = struct {
         context: *anyopaque,
-        emitFn: *const fn (*anyopaque, *const std.zon.parse.Diagnostics, std.zon.parse.Error) bool,
+        emitFn: *const fn (*anyopaque, *const std.zon.parse.Diagnostics, std.zon.parse.Diagnostics.Error) bool,
 
         fn emit(
             self: ParseDiagnosticSink,
             diagnostics: *const std.zon.parse.Diagnostics,
-            parse_error: std.zon.parse.Error,
+            parse_error: std.zon.parse.Diagnostics.Error,
         ) bool {
             return self.emitFn(self.context, diagnostics, parse_error);
         }
@@ -1003,7 +997,7 @@ const ConfigDiagnostics = struct {
         sink: *const ParseDiagnosticSink,
     ) !ParseRecovery {
         const allocator = std.heap.c_allocator;
-        const recovery_source = try allocator.dupeZ(u8, source);
+        const recovery_source = try allocator.dupeSentinel(u8, source, 0);
         defer allocator.free(recovery_source);
         var arena = std.heap.ArenaAllocator.init(allocator);
         defer arena.deinit();
@@ -1012,32 +1006,31 @@ const ConfigDiagnostics = struct {
         while (true) {
             _ = arena.reset(.retain_capacity);
             const parse_allocator = arena.allocator();
-            var diagnostics: std.zon.parse.Diagnostics = .{};
-            _ = std.zon.parse.fromSliceAlloc(Config, parse_allocator, recovery_source, &diagnostics, .{}) catch |err| {
+            var diagnostics: std.zon.parse.Diagnostics = undefined;
+            _ = std.zon.parse.fromSlice(Config, .{
+                .gpa = parse_allocator,
+                .arena = parse_allocator,
+                .source = recovery_source,
+                .diagnostics = &diagnostics,
+            }) catch |err| {
                 if (err != error.ParseZon) {
-                    diagnostics.deinit(parse_allocator);
                     return err;
                 }
-                var errors = diagnostics.iterateErrors();
                 var unknown_field_offset: ?usize = null;
                 var error_count: usize = 0;
-                while (errors.next()) |parse_error| {
+                for (diagnostics.errors) |parse_error| {
                     error_count += 1;
-                    const location = parse_error.getLocation(&diagnostics);
-                    const offset = location.line_start + location.column;
+                    const offset = parse_error.loc.line_start + parse_error.loc.column;
                     if (error_count == 1 and isUnexpectedField(parse_error)) {
                         unknown_field_offset = offset;
                     }
                     if (!sink.emit(&diagnostics, parse_error)) {
-                        diagnostics.deinit(parse_allocator);
                         return error.DiagnosticAborted;
                     }
                 }
                 if (error_count == 0) {
-                    diagnostics.deinit(parse_allocator);
                     return error.ParseZon;
                 }
-                diagnostics.deinit(parse_allocator);
                 if (error_count == 1) {
                     if (unknown_field_offset) |offset| {
                         if (maskUnknownField(recovery_source, offset)) {
@@ -1048,7 +1041,6 @@ const ConfigDiagnostics = struct {
                 }
                 return .fatal;
             };
-            diagnostics.deinit(parse_allocator);
             return if (ignored_unknown_fields) .ignored_unknown_fields else .valid;
         }
     }
@@ -1062,7 +1054,7 @@ const ConfigDiagnostics = struct {
         fn emit(
             context: *anyopaque,
             diagnostics: *const std.zon.parse.Diagnostics,
-            parse_error: std.zon.parse.Error,
+            parse_error: std.zon.parse.Diagnostics.Error,
         ) bool {
             const self: *@This() = @ptrCast(@alignCast(context));
             writeParseDiagnostic(self.writer, self.path, self.source, diagnostics, parse_error) catch |err| {
@@ -1124,7 +1116,7 @@ const ConfigDiagnostics = struct {
         fn emit(
             context: *anyopaque,
             diagnostics: *const std.zon.parse.Diagnostics,
-            parse_error: std.zon.parse.Error,
+            parse_error: std.zon.parse.Diagnostics.Error,
         ) bool {
             const self: *const @This() = @ptrCast(@alignCast(context));
             var buffer: [4096]u8 = undefined;
@@ -1168,7 +1160,7 @@ pub fn load(allocator: std.mem.Allocator, explicit_path: ?[]const u8) Config {
 /// Resolve the configured path even when it does not exist yet, allowing the
 /// daemon to notice a config file created after startup.
 pub fn resolvePath(allocator: std.mem.Allocator, explicit_path: ?[]const u8) ![:0]u8 {
-    if (explicit_path) |path| return allocator.dupeZ(u8, path);
+    if (explicit_path) |path| return allocator.dupeSentinel(u8, path, 0);
 
     if (osutil.getenv("XDG_CONFIG_HOME")) |config_home| {
         return std.fmt.allocPrintSentinel(allocator, "{s}/bobrwm/config.zon", .{config_home}, 0);
@@ -1183,7 +1175,7 @@ pub fn loadFromPath(allocator: std.mem.Allocator, path: []const u8) ?Config {
 
     // libc-based read; std.fs.cwd was removed in Zig 0.16. Caller paths
     // come from CLI / env so they fit easily in PATH_MAX.
-    const path_z = allocator.dupeZ(u8, path) catch return null;
+    const path_z = allocator.dupeSentinel(u8, path, 0) catch return null;
     defer allocator.free(path_z);
 
     // Source is intentionally not freed here: zon.parse may retain references
@@ -1194,15 +1186,25 @@ pub fn loadFromPath(allocator: std.mem.Allocator, path: []const u8) ?Config {
     // Parse strictly first so unknown fields are diagnosed. Only that error
     // class gets a tolerant retry; invalid values and syntax remain fatal.
     // Config holds slices, so both passes require the allocating parser.
+    var diagnostics: std.zon.parse.Diagnostics = undefined;
     const parsed = parse: {
-        break :parse std.zon.parse.fromSliceAlloc(Config, allocator, source, null, .{}) catch |err| {
+        break :parse std.zon.parse.fromSlice(Config, .{
+            .gpa = allocator,
+            .arena = allocator,
+            .source = source,
+            .diagnostics = &diagnostics,
+        }) catch |err| {
             if (err != error.ParseZon) {
                 log.err("failed to parse config {s}: {}", .{ path, err });
                 return null;
             }
             if (ConfigDiagnostics.logParseDiagnostics(path, source) != .ignored_unknown_fields) return null;
 
-            break :parse std.zon.parse.fromSliceAlloc(Config, allocator, source, null, .{
+            break :parse std.zon.parse.fromSlice(Config, .{
+                .gpa = allocator,
+                .arena = allocator,
+                .source = source,
+                .diagnostics = &diagnostics,
                 .ignore_unknown_fields = true,
             }) catch |recovery_err| {
                 log.err("failed to recover config {s} after ignoring invalid fields: {}", .{ path, recovery_err });
@@ -1395,7 +1397,13 @@ test "semantic validation renders every invalid field" {
     ;
     var arena = std.heap.ArenaAllocator.init(t.allocator);
     defer arena.deinit();
-    const config = try std.zon.parse.fromSliceAlloc(Config, arena.allocator(), source, null, .{});
+    var diagnostics: std.zon.parse.Diagnostics = undefined;
+    const config = try std.zon.parse.fromSlice(Config, .{
+        .gpa = arena.allocator(),
+        .arena = arena.allocator(),
+        .source = source,
+        .diagnostics = &diagnostics,
+    });
     const RenderContext = struct {
         writer: *std.Io.Writer,
         source: [:0]const u8,
@@ -1703,7 +1711,13 @@ test "disabled default keybinds retain only explicit bindings parsed from ZON" {
     ;
     var arena = std.heap.ArenaAllocator.init(t.allocator);
     defer arena.deinit();
-    const cfg = try std.zon.parse.fromSliceAlloc(Config, arena.allocator(), source, null, .{});
+    var diagnostics: std.zon.parse.Diagnostics = undefined;
+    const cfg = try std.zon.parse.fromSlice(Config, .{
+        .gpa = arena.allocator(),
+        .arena = arena.allocator(),
+        .source = source,
+        .diagnostics = &diagnostics,
+    });
     var table = try KeybindTable.init(t.allocator, &cfg);
     defer table.deinit(t.allocator);
 
@@ -1711,11 +1725,11 @@ test "disabled default keybinds retain only explicit bindings parsed from ZON" {
     try t.expectEqual(@as(usize, 2), binds.len);
     try t.expectEqual(keyNameToCode("1").?, binds[0].keycode);
     try t.expectEqual(shim.BW_MOD_ALT, binds[0].mods);
-    try t.expectEqual(@intFromEnum(Action.focus_workspace), binds[0].action);
+    try t.expectEqual(@backingInt(Action.focus_workspace), binds[0].action);
     try t.expectEqual(@as(u32, 3), binds[0].arg);
     try t.expectEqual(keyNameToCode("f").?, binds[1].keycode);
     try t.expectEqual(shim.BW_MOD_CTRL, binds[1].mods);
-    try t.expectEqual(@intFromEnum(Action.toggle_float), binds[1].action);
+    try t.expectEqual(@backingInt(Action.toggle_float), binds[1].action);
     try t.expectEqualStrings("1", cfg.findKeybind(.focus_workspace, 3).?.key);
     try t.expectEqualStrings("f", cfg.findKeybind(.toggle_float, 0).?.key);
     try t.expectEqual(@as(?Keybind, null), cfg.findKeybind(.focus_workspace, 2));
@@ -1735,10 +1749,10 @@ test "buildKeybinds merges custom keybinds with defaults" {
     try t.expectEqual(@as(usize, default_keybind_count + 1), merged.len);
     try t.expectEqual(keyNameToCode("1").?, merged[0].keycode);
     try t.expectEqual(shim.BW_MOD_ALT, merged[0].mods);
-    try t.expectEqual(@intFromEnum(Action.focus_workspace), merged[0].action);
+    try t.expectEqual(@backingInt(Action.focus_workspace), merged[0].action);
     try t.expectEqual(@as(u32, 9), merged[0].arg);
     try t.expectEqual(keyNameToCode("f").?, merged[default_keybind_count].keycode);
-    try t.expectEqual(@intFromEnum(Action.toggle_fullscreen), merged[default_keybind_count].action);
+    try t.expectEqual(@backingInt(Action.toggle_fullscreen), merged[default_keybind_count].action);
 }
 
 test "buildKeybinds: override matches on mods, not just key" {
@@ -1754,10 +1768,10 @@ test "buildKeybinds: override matches on mods, not just key" {
     const merged = cfg.buildKeybinds(&table);
 
     try t.expectEqual(@as(usize, default_keybind_count), merged.len);
-    try t.expectEqual(@intFromEnum(Action.focus_workspace), merged[0].action);
+    try t.expectEqual(@backingInt(Action.focus_workspace), merged[0].action);
     try t.expectEqual(@as(u32, 1), merged[0].arg);
     try t.expectEqual(shim.BW_MOD_ALT | shim.BW_MOD_SHIFT, merged[9].mods);
-    try t.expectEqual(@intFromEnum(Action.toggle_fullscreen), merged[9].action);
+    try t.expectEqual(@backingInt(Action.toggle_fullscreen), merged[9].action);
 }
 
 test "buildKeybinds: duplicate config triggers collapse, last wins" {
@@ -1773,7 +1787,7 @@ test "buildKeybinds: duplicate config triggers collapse, last wins" {
 
     try t.expectEqual(@as(usize, default_keybind_count + 1), merged.len);
     try t.expectEqual(keyNameToCode("f").?, merged[default_keybind_count].keycode);
-    try t.expectEqual(@intFromEnum(Action.toggle_split), merged[default_keybind_count].action);
+    try t.expectEqual(@backingInt(Action.toggle_split), merged[default_keybind_count].action);
 }
 
 test "buildKeybinds: unknown key name is skipped without consuming a slot" {
