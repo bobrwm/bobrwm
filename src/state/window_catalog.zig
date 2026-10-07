@@ -201,7 +201,7 @@ pub const WindowCatalog = struct {
         return true;
     }
 
-    pub fn observeTabGroup(self: *WindowCatalog, observation: WindowTabGroupObservation) void {
+    pub fn observeTabGroup(self: *WindowCatalog, observation: *const WindowTabGroupObservation) void {
         self.dissolveTabGroupByLeader(observation.leader_window_id);
         for (observation.members()) |window_id| {
             const index = self.findIndex(window_id).?;

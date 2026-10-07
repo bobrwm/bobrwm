@@ -1815,7 +1815,7 @@ fn rebuildTilingStatesForConfig() void {
             return;
         }
     }
-    dispatchStateEvent(.{ .rebuild_layout = rebuild });
+    dispatchStateEvent(.{ .rebuild_layout = &rebuild });
 }
 
 fn applyReloadedConfig(next: ConfigRuntime) void {
@@ -2423,7 +2423,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
         return error.NativeSpaceMappingUnavailable;
     }
     dispatchStateEvent(.{ .initialize_native_topology = .{
-        .topology = topology,
+        .topology = &topology,
         .focused_display_id = primary_id,
     } });
 
@@ -2831,7 +2831,7 @@ fn adoptWindowIdentity(
     win: window_mod.Window,
     space_key: state_mod.SpaceKey,
     layout: ?state_mod.LayoutInsertion,
-    tab_group: ?state_mod.WindowTabGroupObservation,
+    tab_group: ?*const state_mod.WindowTabGroupObservation,
 ) bool {
     if (g_state.window(win.wid) != null) return false;
 
@@ -2864,7 +2864,7 @@ fn replaceWindowIdentity(old_wid: u32, new_wid: u32) bool {
     return g_state.window(old_wid) == null and g_state.window(new_wid) != null;
 }
 
-fn observeWindowTabGroup(observation: state_mod.WindowTabGroupObservation) bool {
+fn observeWindowTabGroup(observation: *const state_mod.WindowTabGroupObservation) bool {
     dispatchStateEvent(.{ .observe_window_tab_group = observation });
     for (observation.members()) |member_wid| {
         const member = g_state.window(member_wid) orelse return false;
@@ -2876,7 +2876,7 @@ fn observeWindowTabGroup(observation: state_mod.WindowTabGroupObservation) bool 
 
 fn attachWindowToTabGroup(sibling_window_id: u32, window_id: u32, active_window_id: u32) bool {
     const observation = tabGroupObservation(sibling_window_id, window_id, active_window_id) orelse return false;
-    return observeWindowTabGroup(observation);
+    return observeWindowTabGroup(&observation);
 }
 
 fn tabGroupObservation(
@@ -2922,7 +2922,7 @@ fn setTabGroupActive(wid: u32) void {
     for (group.members()) |member_window_id| {
         if (!observation.addMember(member_window_id)) return;
     }
-    _ = observeWindowTabGroup(observation);
+    _ = observeWindowTabGroup(&observation);
 }
 
 fn assignManagedWindowSpace(wid: u32, space: state_mod.SpaceRef) bool {
@@ -4494,7 +4494,7 @@ fn observeNativeTopology(epoch: state_mod.Epoch) void {
         return;
     };
     dispatchStateEvent(.{ .native_topology_observed = .{
-        .topology = topology,
+        .topology = &topology,
         .epoch = epoch,
         .at_ms = at_ms,
         .is_animating = if (g_state.pending_switch) |pending|
@@ -5278,7 +5278,7 @@ fn refreshTabGroupActiveTabsFromSnapshot(on_screen: *const OnScreenWindows) void
                 move.selected_window_id,
                 move.selected_window_id,
             ) orelse continue;
-            if (!adoptWindowIdentity(discovered, leader_space.key, null, observation)) continue;
+            if (!adoptWindowIdentity(discovered, leader_space.key, null, &observation)) continue;
         }
 
         if (g_state.windowTabLeader(move.selected_window_id) != group.leader_window_id) continue;
@@ -5383,7 +5383,7 @@ fn joinTabGroup(pid: i32, sibling_wid: u32, new_wid: u32, new_frame: window_mod.
         .mode = sibling.mode,
     };
     const observation = tabGroupObservation(sibling_wid, new_wid, new_wid) orelse return false;
-    if (!adoptWindowIdentity(member, ws.key, null, observation)) return false;
+    if (!adoptWindowIdentity(member, ws.key, null, &observation)) return false;
 
     const leader = g_state.windowTabLeader(sibling_wid);
     const member_count = if (g_state.windowTabGroup(leader)) |group| group.member_count else 1;
@@ -5845,7 +5845,7 @@ fn reconcileDisplayChange(mapping: state_mod.NativeTopologyMapping) bool {
         return false;
     };
     dispatchStateEvent(.{ .initialize_native_topology = .{
-        .topology = native_topology,
+        .topology = &native_topology,
         .focused_display_id = restored_focused_display_id,
         .at_ms = nativeStateNowMs(),
     } });

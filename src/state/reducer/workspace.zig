@@ -138,8 +138,8 @@ pub fn reduceTopologyObserved(
     if (transition.model.pending_switch) |pending| {
         if (event.epoch != pending.epoch) return;
     }
-    const has_changed = !transition.model.native_topology.eql(&event.topology);
-    transition.model.native_topology = event.topology;
+    const has_changed = !transition.model.native_topology.eql(event.topology);
+    transition.model.native_topology = event.topology.*;
     syncNativeWorkspaceTopology(transition);
 
     const pending = transition.model.pending_switch orelse {

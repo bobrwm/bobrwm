@@ -215,7 +215,7 @@ pub const NativeTopology = struct {
 };
 
 pub const NativeTopologyInitialization = struct {
-    topology: NativeTopology,
+    topology: *const NativeTopology,
     focused_display_id: ?DisplayId = null,
     at_ms: u64 = 0,
 };

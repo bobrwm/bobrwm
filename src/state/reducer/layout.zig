@@ -24,7 +24,7 @@ pub fn applyEvent(transition: *Transition, event: tiling_mod.Event) bool {
     return true;
 }
 
-pub fn rebuild(transition: *Transition, request: LayoutRebuild) void {
+pub fn rebuild(transition: *Transition, request: *const LayoutRebuild) void {
     if (request.space_count > request.spaces.len) return;
     if (!std.math.isFinite(request.inner_gap) or !std.math.isFinite(request.split_ratio)) return;
 
