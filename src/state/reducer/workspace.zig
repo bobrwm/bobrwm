@@ -112,7 +112,7 @@ pub fn reduceSpaceChanged(transition: *Transition, at_ms: TimestampMs) void {
         return;
     }
 
-    const epoch = takeEpoch(&transition.model);
+    const epoch = takeEpoch(transition.model);
     transition.model.observation_timer = .{
         .epoch = epoch,
         .due_at_ms = at_ms +| native_observation_delay_ms,
@@ -152,7 +152,7 @@ pub fn reduceTopologyObserved(
     const actual_space_id = if (display) |value| value.observed_space_id else null;
     if (pending.phase == .preparing or pending.phase == .delivering or event.is_animating != false) {
         if (event.at_ms < pending.deadline_at_ms) {
-            schedulePendingObservation(&transition.model, pending, event.at_ms);
+            schedulePendingObservation(transition.model, pending, event.at_ms);
             return;
         }
         finishSwitch(transition, pending, event.at_ms, .{
@@ -173,7 +173,7 @@ pub fn reduceTopologyObserved(
     }
 
     if (event.at_ms < pending.deadline_at_ms) {
-        schedulePendingObservation(&transition.model, pending, event.at_ms);
+        schedulePendingObservation(transition.model, pending, event.at_ms);
         return;
     }
 
@@ -322,7 +322,7 @@ pub fn syncNativeWorkspaceTopology(transition: *Transition) void {
         }
     }
     refreshWorkspaceTransition(transition);
-    refreshPendingNativeWindowMoves(&transition.model);
+    refreshPendingNativeWindowMoves(transition.model);
 }
 
 pub fn reduceTopologyUnavailable(
@@ -333,7 +333,7 @@ pub fn reduceTopologyUnavailable(
     if (event.epoch != pending.epoch) return;
 
     if (event.at_ms < pending.deadline_at_ms) {
-        schedulePendingObservation(&transition.model, pending, event.at_ms);
+        schedulePendingObservation(transition.model, pending, event.at_ms);
         return;
     }
 
@@ -426,7 +426,7 @@ pub fn reduceNativeWindowMoveTracked(
         .window_id = request.window_id,
         .source = source,
         .target = target,
-        .epoch = takeEpoch(&transition.model),
+        .epoch = takeEpoch(transition.model),
     };
     if (!transition.model.pending_native_window_moves.put(pending)) {
         transition.addEffect(.{ .native_window_move_rejected = request });
@@ -489,7 +489,7 @@ pub fn reduceNativeWindowMoveRollbackResult(
         });
         const restored = transition.model.window(pending.window_id) orelse return;
         if (restored.space_key.eql(pending.source.key)) {
-            refreshWorkspaceFocus(&transition.model);
+            refreshWorkspaceFocus(transition.model);
             if (transition.model.focusedWorkspaceWindow(pending.source.workspace_id) == null) {
                 window_reducer.reduceWorkspaceFocusRecorded(transition, .{
                     .workspace_id = pending.source.workspace_id,
@@ -536,7 +536,7 @@ pub fn reduceNativeWorkspaceMoveRequest(
         return;
     }
 
-    const epoch = takeEpoch(&transition.model);
+    const epoch = takeEpoch(transition.model);
     const pending: PendingNativeWorkspaceMove = .{
         .source = source,
         .target = target,
@@ -608,7 +608,7 @@ pub fn reduceNativeWorkspaceMoveObserved(
     syncNativeWorkspaceTopology(transition);
     const moved = transition.model.space(pending.target.key).?;
     transition.model.workspace_topology.focused_display_id = moved.display_id;
-    completeWorkspaceTransition(&transition.model, pending.epoch, .native_space_changed, event.at_ms);
+    completeWorkspaceTransition(transition.model, pending.epoch, .native_space_changed, event.at_ms);
     transition.addEffect(.{ .native_workspace_move_completed = pending });
     resumeQueuedWorkspaceSwitch(transition, event.at_ms);
 }
@@ -665,7 +665,7 @@ pub fn reduceWindowFocusObserved(
             } });
             if (current.completion_reason == null) {
                 completeWorkspaceTransition(
-                    &transition.model,
+                    transition.model,
                     current.epoch,
                     .focus_accepted,
                     observation.at_ms,
@@ -809,7 +809,7 @@ pub fn finishSwitch(
         transition.model.deferred_follow_focus = null;
         transition.model.pending_focus.clear();
         completeWorkspaceTransition(
-            &transition.model,
+            transition.model,
             pending.epoch,
             .native_space_changed,
             at_ms,
@@ -866,7 +866,7 @@ pub fn startSwitch(
 
     transition.model.workspace_topology.focused_display_id = target.display_id;
 
-    const epoch = takeEpoch(&transition.model);
+    const epoch = takeEpoch(transition.model);
     const pending: PendingSwitch = .{
         .request = current_request,
         .epoch = epoch,
@@ -881,7 +881,7 @@ pub fn startSwitch(
         native_switch_timeout_ms,
         pending.epoch,
     );
-    schedulePendingObservation(&transition.model, pending, at_ms);
+    schedulePendingObservation(transition.model, pending, at_ms);
     transition.addEffect(.{ .observe_native_topology = epoch });
 }
 
@@ -896,7 +896,7 @@ pub fn startWorkspaceTransition(
     target.assertValid();
     std.debug.assert(timeout_ms > 0);
 
-    const transition_epoch = requested_epoch orelse takeEpoch(&transition.model);
+    const transition_epoch = requested_epoch orelse takeEpoch(transition.model);
     const workspace_transition: WorkspaceTransition = .{
         .kind = kind,
         .target = target,

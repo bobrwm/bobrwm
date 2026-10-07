@@ -15,9 +15,7 @@ pub fn applyEvent(transition: *Transition, event: tiling_mod.Event) bool {
         // Fullscreen retains its tiled mode and BSP slot for restoration.
         if (window.mode != .tiled or window.is_fullscreen) return false;
     }
-    const layout_transition = tiling_mod.reduce(transition.model.layout, event);
-    transition.model.layout = layout_transition.model;
-    if (layout_transition.effect) |effect| {
+    if (tiling_mod.reduce(&transition.model.layout, event)) |effect| {
         transition.addEffect(.{ .layout = effect });
         return false;
     }

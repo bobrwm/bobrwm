@@ -26,8 +26,8 @@ pub fn reduceFocusDirection(
     transition: *Transition,
     command: @FieldType(Event, "focus_direction"),
 ) void {
-    const action = resolveActionWindow(&transition.model, command.window_id) orelse return;
-    const target_window_id = windowInDirection(&transition.model, action, command.direction) orelse
+    const action = resolveActionWindow(transition.model, command.window_id) orelse return;
+    const target_window_id = windowInDirection(transition.model, action, command.direction) orelse
         transition.model.layout.cycleFocus(
             action.space.key,
             action.leader.window_id,
@@ -57,8 +57,8 @@ pub fn reduceSwapDirection(
     transition: *Transition,
     command: @FieldType(Event, "swap_direction"),
 ) void {
-    const action = resolveActionWindow(&transition.model, command.window_id) orelse return;
-    const target_window_id = windowInDirection(&transition.model, action, command.direction) orelse return;
+    const action = resolveActionWindow(transition.model, command.window_id) orelse return;
+    const target_window_id = windowInDirection(transition.model, action, command.direction) orelse return;
     if (!transition.model.layout.contains(action.space.key, action.leader.window_id)) return;
     if (!transition.model.layout.contains(action.space.key, target_window_id)) return;
     if (!layout_reducer.applyEvent(transition, .{ .swap_window_ids = .{
@@ -67,7 +67,7 @@ pub fn reduceSwapDirection(
         .second_window_id = target_window_id,
     } })) return;
 
-    workspace_reducer.reduceRetileDisplayRequested(&transition.model, action.space.display_id);
+    workspace_reducer.reduceRetileDisplayRequested(transition.model, action.space.display_id);
     transition.addEffect(.{ .windows_swapped = .{
         .first_window_id = action.leader.window_id,
         .second_window_id = target_window_id,
@@ -79,7 +79,7 @@ pub fn reduceWindowModeCommand(
     transition: *Transition,
     command: @FieldType(Event, "set_window_mode"),
 ) void {
-    const action = resolveActionWindow(&transition.model, command.window_id) orelse return;
+    const action = resolveActionWindow(transition.model, command.window_id) orelse return;
     if (action.leader.mode == command.mode) return;
 
     var window = action.leader.snapshot();
@@ -91,7 +91,7 @@ pub fn reduceWindowModeCommand(
     const updated = transition.model.window(action.leader.window_id) orelse return;
     if (updated.mode != command.mode) return;
 
-    workspace_reducer.reduceRetileDisplayRequested(&transition.model, action.space.display_id);
+    workspace_reducer.reduceRetileDisplayRequested(transition.model, action.space.display_id);
     transition.addEffect(.{ .window_mode_changed = .{
         .window_id = updated.window_id,
         .previous = action.leader.mode,
@@ -103,7 +103,7 @@ pub fn reduceFullscreenCommand(
     transition: *Transition,
     command: @FieldType(Event, "toggle_window_fullscreen"),
 ) void {
-    const action = resolveActionWindow(&transition.model, command.window_id) orelse return;
+    const action = resolveActionWindow(transition.model, command.window_id) orelse return;
     const active_window_id = transition.model.windowTabActive(action.leader.window_id);
     const active = transition.model.window(active_window_id) orelse return;
 
@@ -120,7 +120,7 @@ pub fn reduceFullscreenCommand(
     };
     window_reducer.reduceWindowUpdated(transition, .{ .window = leader });
 
-    workspace_reducer.reduceRetileDisplayRequested(&transition.model, action.space.display_id);
+    workspace_reducer.reduceRetileDisplayRequested(transition.model, action.space.display_id);
     transition.addEffect(.{ .fullscreen_changed = .{
         .leader_window_id = action.leader.window_id,
         .window_id = active.window_id,
@@ -135,7 +135,7 @@ pub fn reduceCenterWindowCommand(
     transition: *Transition,
     command: @FieldType(Event, "center_floating_window"),
 ) void {
-    const action = resolveActionWindow(&transition.model, command.window_id) orelse return;
+    const action = resolveActionWindow(transition.model, command.window_id) orelse return;
     if (action.leader.mode != .floating or action.leader.is_fullscreen) return;
     if (!invariants.frameIsFinite(command.observed_frame) or !invariants.frameIsFinite(command.display_frame)) return;
     if (command.observed_frame.width <= 0 or command.observed_frame.height <= 0) return;
@@ -184,7 +184,7 @@ pub fn reduceWindowFrameCommandResult(
 }
 
 pub fn reduceWindowMoveRequest(transition: *Transition, request: WindowMoveRequest) void {
-    const action = resolveActionWindow(&transition.model, request.window_id) orelse return;
+    const action = resolveActionWindow(transition.model, request.window_id) orelse return;
     const target = transition.model.space(request.target.key) orelse return;
     if (action.space.key.eql(target.key)) return;
     window_reducer.reduceWindowSpaceAssigned(transition, .{
@@ -194,7 +194,7 @@ pub fn reduceWindowMoveRequest(transition: *Transition, request: WindowMoveReque
     });
     const moved = transition.model.window(action.leader.window_id) orelse return;
     if (!moved.space_key.eql(target.key)) return;
-    workspace_reducer.refreshWorkspaceFocus(&transition.model);
+    workspace_reducer.refreshWorkspaceFocus(transition.model);
 
     if (transition.model.focusedWorkspaceWindow(target.workspace_id) == null) {
         window_reducer.reduceWorkspaceFocusRecorded(transition, .{

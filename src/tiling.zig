@@ -90,11 +90,6 @@ pub const Effect = union(enum) {
     },
 };
 
-pub const Transition = struct {
-    model: Self,
-    effect: ?Effect = null,
-};
-
 const min_split_ratio: f64 = 0.1;
 const max_split_ratio: f64 = 0.9;
 
@@ -131,64 +126,69 @@ nodes: [max_nodes]Node = undefined,
 node_occupied: [max_nodes]bool = @splat(false),
 node_count: u16 = 0,
 
-pub fn reduce(model: Self, event: Event) Transition {
-    var transition: Transition = .{ .model = model };
+/// Apply `event` to `model` in place and return a rejection, if any. Only
+/// insert, move and swap can fail partway, so only they snapshot the 50 KiB
+/// table to roll back; every other event mutates without copying.
+pub fn reduce(model: *Self, event: Event) ?Effect {
     switch (event) {
-        .clear => transition.model = .{},
+        .clear => model.* = .{},
         .insert => |insertion| {
-            transition.model.insert(insertion.space_key, insertion.kind, insertion.window_id, insertion.options) catch |err| {
-                transition.model = model;
-                transition.effect = rejectionEffect(insertion.space_key, insertion.window_id, err);
+            const original = model.*;
+            model.insert(insertion.space_key, insertion.kind, insertion.window_id, insertion.options) catch |err| {
+                model.* = original;
+                return rejectionEffect(insertion.space_key, insertion.window_id, err);
             };
         },
-        .remove => |removal| transition.model.remove(removal.space_key, removal.window_id),
+        .remove => |removal| model.remove(removal.space_key, removal.window_id),
         .move_window => |movement| {
-            transition.model.moveWindow(
+            const original = model.*;
+            model.moveWindow(
                 movement.source_key,
                 movement.target_key,
                 movement.kind,
                 movement.window_id,
                 movement.options,
             ) catch |err| {
-                transition.model = model;
-                transition.effect = rejectionEffect(movement.target_key, movement.window_id, err);
+                model.* = original;
+                return rejectionEffect(movement.target_key, movement.window_id, err);
             };
         },
         .swap_layouts => |swap| {
-            transition.model.swapLayouts(swap.first_key, swap.second_key) catch |err| {
-                transition.model = model;
-                transition.effect = rejectionEffect(swap.first_key, null, err);
+            const original = model.*;
+            model.swapLayouts(swap.first_key, swap.second_key) catch |err| {
+                model.* = original;
+                return rejectionEffect(swap.first_key, null, err);
             };
         },
         .rekey_layout => |replacement| {
-            std.debug.assert(replacement.source_key.eql(replacement.target_key) or transition.model.layoutKind(replacement.target_key) == null);
-            for (transition.model.layouts[0..transition.model.layout_count]) |*slot| {
+            std.debug.assert(replacement.source_key.eql(replacement.target_key) or model.layoutKind(replacement.target_key) == null);
+            for (model.layouts[0..model.layout_count]) |*slot| {
                 if (slot.space_key.eql(replacement.source_key)) slot.space_key = replacement.target_key;
             }
         },
-        .set_active => |active| transition.model.setActive(active.space_key, active.window_id),
+        .set_active => |active| model.setActive(active.space_key, active.window_id),
         .replace_window_id => |replacement| {
-            _ = transition.model.replaceWindowId(replacement.space_key, replacement.old_window_id, replacement.new_window_id);
+            _ = model.replaceWindowId(replacement.space_key, replacement.old_window_id, replacement.new_window_id);
         },
         .swap_window_ids => |swap| {
-            _ = transition.model.swapWindowIds(swap.space_key, swap.first_window_id, swap.second_window_id);
+            _ = model.swapWindowIds(swap.space_key, swap.first_window_id, swap.second_window_id);
         },
         .adjust_parent_ratio => |adjustment| {
-            _ = transition.model.adjustParentRatio(adjustment.space_key, adjustment.window_id, adjustment.delta);
+            _ = model.adjustParentRatio(adjustment.space_key, adjustment.window_id, adjustment.delta);
         },
         .set_parent_ratio => |adjustment| {
-            _ = transition.model.setParentRatio(adjustment.space_key, adjustment.window_id, adjustment.ratio);
+            _ = model.setParentRatio(adjustment.space_key, adjustment.window_id, adjustment.ratio);
         },
         .resize_window => |resize| {
-            transition.model.resizeWindow(resize.space_key, resize.window_id, resize.delta);
+            model.resizeWindow(resize.space_key, resize.window_id, resize.delta);
         },
-        .mirror => |operation| transition.model.mirror(operation.space_key, operation.axis),
-        .equalize => |operation| transition.model.equalize(operation.space_key, operation.ratio),
-        .balance => |space_key| transition.model.balance(space_key),
-        .rotate => |operation| transition.model.rotate(operation.space_key, operation.degrees),
+        .mirror => |operation| model.mirror(operation.space_key, operation.axis),
+        .equalize => |operation| model.equalize(operation.space_key, operation.ratio),
+        .balance => |space_key| model.balance(space_key),
+        .rotate => |operation| model.rotate(operation.space_key, operation.degrees),
     }
-    transition.model.assertValid();
-    return transition;
+    model.assertValid();
+    return null;
 }
 
 pub fn layoutKind(self: *const Self, space_key: SpaceKey) ?LayoutKind {
@@ -934,10 +934,22 @@ fn insertEvent(space_key: SpaceKey, kind: LayoutKind, window_id: WindowId) Event
     } };
 }
 
+// Value-in/value-out view of `reduce`, so tests can keep chaining models.
+const TestTransition = struct {
+    model: Self,
+    effect: ?Effect = null,
+};
+
+fn reduceCopy(model: Self, event: Event) TestTransition {
+    var next = model;
+    const effect = reduce(&next, event);
+    return .{ .model = next, .effect = effect };
+}
+
 test "bsp reducer projects, swaps, and collapses deterministic slots" {
-    var model = reduce(.{}, insertEvent(first_space, .bsp, 1)).model;
-    model = reduce(model, insertEvent(first_space, .bsp, 2)).model;
-    model = reduce(model, insertEvent(first_space, .bsp, 3)).model;
+    var model = reduceCopy(.{}, insertEvent(first_space, .bsp, 1)).model;
+    model = reduceCopy(model, insertEvent(first_space, .bsp, 2)).model;
+    model = reduceCopy(model, insertEvent(first_space, .bsp, 3)).model;
 
     var entries: std.ArrayList(LayoutEntry) = .empty;
     defer entries.deinit(testing.allocator);
@@ -948,25 +960,25 @@ test "bsp reducer projects, swaps, and collapses deterministic slots" {
     try testing.expectEqual(@as(WindowId, 3), entries.items[1].wid);
     try testing.expectEqual(@as(WindowId, 2), entries.items[2].wid);
 
-    model = reduce(model, .{ .swap_window_ids = .{
+    model = reduceCopy(model, .{ .swap_window_ids = .{
         .space_key = first_space,
         .first_window_id = 1,
         .second_window_id = 2,
     } }).model;
     try testing.expectEqual(@as(?WindowId, 2), model.firstWid(first_space));
-    model = reduce(model, .{ .remove = .{ .space_key = first_space, .window_id = 3 } }).model;
+    model = reduceCopy(model, .{ .remove = .{ .space_key = first_space, .window_id = 3 } }).model;
     try testing.expectEqual(@as(usize, 2), model.windowCount(first_space));
     try testing.expectEqual(@as(u16, 3), model.node_count);
 }
 
 test "resize grows either child at its nearest split and clamps both limits" {
-    var model = reduce(.{}, insertEvent(first_space, .bsp, 1)).model;
-    model = reduce(model, insertEvent(first_space, .bsp, 2)).model;
+    var model = reduceCopy(.{}, insertEvent(first_space, .bsp, 1)).model;
+    model = reduceCopy(model, insertEvent(first_space, .bsp, 2)).model;
     var insertion = insertEvent(first_space, .bsp, 3);
     insertion.insert.options.anchor_wid = 2;
     insertion.insert.options.split_mode = .vertical;
     insertion.insert.options.split_ratio = 0.3;
-    model = reduce(model, insertion).model;
+    model = reduceCopy(model, insertion).model;
 
     var entries: std.ArrayList(LayoutEntry) = .empty;
     defer entries.deinit(testing.allocator);
@@ -979,7 +991,7 @@ test "resize grows either child at its nearest split and clamps both limits" {
         .{ @as(WindowId, 2), -1.0, 80.0, 720.0 },
     };
     inline for (cases) |case| {
-        model = reduce(model, .{ .resize_window = .{
+        model = reduceCopy(model, .{ .resize_window = .{
             .space_key = first_space,
             .window_id = case[0],
             .delta = case[1],
@@ -1001,9 +1013,9 @@ test "resize grows either child at its nearest split and clamps both limits" {
 
 test "resize ignores missing windows, singleton BSP and monocle layouts" {
     inline for (.{ LayoutKind.bsp, LayoutKind.monocle }) |kind| {
-        const original = reduce(.{}, insertEvent(first_space, kind, 1)).model;
+        const original = reduceCopy(.{}, insertEvent(first_space, kind, 1)).model;
         inline for (.{ @as(WindowId, 1), @as(WindowId, 99) }) |window_id| {
-            const resized = reduce(original, .{ .resize_window = .{
+            const resized = reduceCopy(original, .{ .resize_window = .{
                 .space_key = first_space,
                 .window_id = window_id,
                 .delta = 0.05,
@@ -1014,27 +1026,27 @@ test "resize ignores missing windows, singleton BSP and monocle layouts" {
 }
 
 test "monocle reducer maintains focus order" {
-    var model = reduce(.{}, insertEvent(first_space, .monocle, 1)).model;
-    model = reduce(model, insertEvent(first_space, .monocle, 2)).model;
-    model = reduce(model, insertEvent(first_space, .monocle, 3)).model;
-    model = reduce(model, .{ .set_active = .{ .space_key = first_space, .window_id = 3 } }).model;
+    var model = reduceCopy(.{}, insertEvent(first_space, .monocle, 1)).model;
+    model = reduceCopy(model, insertEvent(first_space, .monocle, 2)).model;
+    model = reduceCopy(model, insertEvent(first_space, .monocle, 3)).model;
+    model = reduceCopy(model, .{ .set_active = .{ .space_key = first_space, .window_id = 3 } }).model;
     try testing.expectEqual(@as(?WindowId, 3), model.firstWid(first_space));
     try testing.expectEqual(@as(?WindowId, 1), model.cycleFocus(first_space, 3, true));
     try testing.expectEqual(@as(?WindowId, 2), model.cycleFocus(first_space, 3, false));
 }
 
 test "monocle removal preserves swap-remove focus order" {
-    var model = reduce(.{}, insertEvent(first_space, .monocle, 1)).model;
-    model = reduce(model, insertEvent(first_space, .monocle, 2)).model;
-    model = reduce(model, insertEvent(first_space, .monocle, 3)).model;
-    model = reduce(model, .{ .remove = .{ .space_key = first_space, .window_id = 1 } }).model;
+    var model = reduceCopy(.{}, insertEvent(first_space, .monocle, 1)).model;
+    model = reduceCopy(model, insertEvent(first_space, .monocle, 2)).model;
+    model = reduceCopy(model, insertEvent(first_space, .monocle, 3)).model;
+    model = reduceCopy(model, .{ .remove = .{ .space_key = first_space, .window_id = 1 } }).model;
     try testing.expectEqual(@as(?WindowId, 3), model.firstWid(first_space));
     try testing.expectEqual(@as(?WindowId, 2), model.lastWid(first_space));
 }
 
 test "rejected insertion leaves layout unchanged" {
-    const model = reduce(.{}, insertEvent(first_space, .bsp, 1)).model;
-    const transition = reduce(model, insertEvent(first_space, .monocle, 2));
+    const model = reduceCopy(.{}, insertEvent(first_space, .bsp, 1)).model;
+    const transition = reduceCopy(model, insertEvent(first_space, .monocle, 2));
     try testing.expect(transition.effect != null);
     try testing.expectEqual(LayoutKind.bsp, transition.model.layoutKind(first_space).?);
     try testing.expectEqual(@as(usize, 1), transition.model.windowCount(first_space));
@@ -1042,9 +1054,9 @@ test "rejected insertion leaves layout unchanged" {
 }
 
 test "window movement is atomic across layouts" {
-    var model = reduce(.{}, insertEvent(first_space, .bsp, 1)).model;
-    model = reduce(model, insertEvent(second_space, .bsp, 2)).model;
-    const transition = reduce(model, .{ .move_window = .{
+    var model = reduceCopy(.{}, insertEvent(first_space, .bsp, 1)).model;
+    model = reduceCopy(model, insertEvent(second_space, .bsp, 2)).model;
+    const transition = reduceCopy(model, .{ .move_window = .{
         .source_key = first_space,
         .target_key = second_space,
         .kind = .bsp,
@@ -1058,9 +1070,9 @@ test "window movement is atomic across layouts" {
 }
 
 test "layout model copies do not share nodes" {
-    const original = reduce(.{}, insertEvent(first_space, .bsp, 1)).model;
-    var copied = reduce(original, insertEvent(first_space, .bsp, 2)).model;
-    copied = reduce(copied, insertEvent(second_space, .monocle, 3)).model;
+    const original = reduceCopy(.{}, insertEvent(first_space, .bsp, 1)).model;
+    var copied = reduceCopy(original, insertEvent(first_space, .bsp, 2)).model;
+    copied = reduceCopy(copied, insertEvent(second_space, .monocle, 3)).model;
     try testing.expectEqual(@as(usize, 1), original.windowCount(first_space));
     try testing.expectEqual(@as(usize, 2), copied.windowCount(first_space));
     try testing.expectEqual(@as(usize, 1), copied.windowCount(second_space));

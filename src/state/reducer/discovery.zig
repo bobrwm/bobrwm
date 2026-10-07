@@ -12,7 +12,7 @@ const WindowCandidate = model_mod.WindowCandidate;
 const WindowId = model_mod.WindowId;
 
 pub fn reducePendingRoleTracked(transition: *Transition, candidate: WindowCandidate) void {
-    if (!workspace_reducer.windowCandidateIsValid(&transition.model, candidate) or candidate.attempts_remaining == 0) return;
+    if (!workspace_reducer.windowCandidateIsValid(transition.model, candidate) or candidate.attempts_remaining == 0) return;
     if (transition.model.window(candidate.window_id) != null) {
         _ = transition.model.pending_role_windows.remove(candidate.window_id);
         return;
@@ -50,7 +50,7 @@ pub fn reducePendingRoleObserved(
 }
 
 pub fn reduceDeferredWindowTracked(transition: *Transition, candidate: WindowCandidate) void {
-    if (!workspace_reducer.windowCandidateIsValid(&transition.model, candidate) or candidate.attempts_remaining == 0) return;
+    if (!workspace_reducer.windowCandidateIsValid(transition.model, candidate) or candidate.attempts_remaining == 0) return;
     if (transition.model.window(candidate.window_id) != null) {
         _ = transition.model.deferred_window_candidates.remove(candidate.window_id);
         return;
