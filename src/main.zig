@@ -325,8 +325,8 @@ fn dispatchForHotkeyBinding(binding: shim.bw_keybind) HotkeyDispatch {
 }
 
 fn spaceVisible(space: state_mod.SpaceRef) bool {
-    const active = g_state.spaceForWorkspace(space.display_id, activeWorkspaceIdForDisplay(space.display_id)) orelse return false;
-    return active.key.eql(space.key);
+    const display = g_state.native_topology.findDisplay(space.display_id) orelse return false;
+    return display.observed_space_id == space.key.id;
 }
 
 /// A managed window is "visible" for borders/dimming when it is on a visible
@@ -565,6 +565,8 @@ fn processPendingFocusQueue() void {
 
 fn observeWindowFocus(win: window_mod.Window, source: FocusEventSource, pending_transition_epoch: ?state_mod.Epoch) void {
     const space = managedWindowSpace(win.wid) orelse return;
+    // Native fullscreen focus must not follow the window back to its desktop.
+    if (g_state.native_topology.observedWorkspace(space.display_id) == null) return;
     dispatchStateEvent(.{ .window_focus_observed = .{
         .process_id = win.pid,
         .window_id = win.wid,
@@ -1426,6 +1428,9 @@ fn bw_ax_focus_window(pid: i32, wid: u32) bool {
     std.debug.assert(pid > 0);
     std.debug.assert(wid > 0);
 
+    if (managedWindowSpace(wid)) |space| {
+        if (g_state.native_topology.observedWorkspace(space.display_id) == null) return false;
+    }
     const win = ax_mod.retainWindow(pid, wid) orelse return false;
     defer c.CFRelease(@ptrCast(win));
 
@@ -2414,14 +2419,6 @@ pub fn main(init: std.process.Init.Minimal) !void {
         log.err("could not map configured workspaces to Mission Control Spaces", .{});
         return error.NativeSpaceMappingUnavailable;
     };
-    for (topology.displays[0..topology.display_count]) |display| {
-        if (display.workspaceForSpace(display.observed_space_id) != null) continue;
-        log.err("current Space {d} is not a configured ordinary workspace on display {d}", .{
-            display.observed_space_id,
-            display.display_id,
-        });
-        return error.NativeSpaceMappingUnavailable;
-    }
     dispatchStateEvent(.{ .initialize_native_topology = .{
         .topology = &topology,
         .focused_display_id = primary_id,
@@ -3838,7 +3835,8 @@ fn nativeTopologyFromSnapshot(snapshot: *const skylight.NativeSpaceTopology, map
                 return null;
             };
         }
-        if (std.mem.indexOfScalar(u64, observed_display.space_ids[0..captured_count], observed_space_id) == null) {
+        const current_is_ordinary = snapshot.currentSpaceIsOrdinary(display.id) orelse return null;
+        if (current_is_ordinary and std.mem.indexOfScalar(u64, observed_display.space_ids[0..captured_count], observed_space_id) == null) {
             log.warn("native topology: observed Space outside managed range display={d} space={d} ordinary_count={d} captured_count={d} limit={d} captured_space_ids={any}", .{
                 display.id,
                 observed_space_id,
@@ -6049,6 +6047,8 @@ fn applyFrameToTabGroup(leader_wid: u32, frame: window_mod.Window.Frame) void {
 }
 
 fn retileDisplay(display_id: u32) void {
+    // Fullscreen belongs to macOS; never resize the hidden desktop behind it.
+    if (g_state.native_topology.observedWorkspace(display_id) == null) return;
     const ws_id = activeWorkspaceIdForDisplay(display_id);
     const ws = spaceForWorkspace(display_id, ws_id) orelse return;
     const display_slot = displayIndexById(display_id) orelse return;
@@ -6261,6 +6261,9 @@ fn resolveWorkspaceForWindow(pid: i32, wid: u32, display_id: u32) ?state_mod.Spa
         if (g_state.space(.{ .id = space_id }) == null) return null;
     }
 
+    // A fullscreen window has no ordinary membership. Do not let app rules
+    // or active-workspace fallback adopt it into the hidden desktop.
+    if (native_space_id == null and g_state.native_topology.observedWorkspace(display_id) == null) return null;
     if (configuredWorkspace(pid, display_id)) |ws| return ws;
     if (native_space_id) |space_id| {
         if (g_state.space(.{ .id = space_id })) |ws| return ws;
@@ -6286,6 +6289,7 @@ fn switchWorkspace(target_id: u8) void {
 
 /// Focus the remembered (or first available) window on a workspace.
 fn focusWorkspaceWindow(ws: state_mod.SpaceRef) void {
+    if (g_state.native_topology.observedWorkspace(ws.display_id) == null) return;
     var focus_wid = focusedWorkspaceWindow(ws);
     if (focus_wid) |fwid| {
         if (managedWindow(fwid) == null) focus_wid = null;
