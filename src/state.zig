@@ -126,9 +126,9 @@ pub fn reduce(model: Model, event: Event) Transition {
 
     switch (event) {
         .replace_space_catalog => |catalog| {
-            transition.model.spaces = catalog;
-            workspace_reducer.pruneWindowCandidates(&transition.model.pending_role_windows, &catalog);
-            workspace_reducer.pruneWindowCandidates(&transition.model.deferred_window_candidates, &catalog);
+            transition.model.spaces = catalog.*;
+            workspace_reducer.pruneWindowCandidates(&transition.model.pending_role_windows, catalog);
+            workspace_reducer.pruneWindowCandidates(&transition.model.deferred_window_candidates, catalog);
             workspace_reducer.refreshWorkspaceTransition(&transition);
             workspace_reducer.refreshPendingNativeWindowMoves(&transition.model);
             should_refresh_workspace_focus = true;
@@ -172,7 +172,7 @@ pub fn reduce(model: Model, event: Event) Transition {
             const workspace_transition = transition.model.workspace_transition;
             const requested = transition.model.queued_switch orelse if (transition.model.pending_switch) |pending| pending.request else null;
             workspace_reducer.cancelGesture(&transition);
-            transition.model.native_topology = initialization.topology;
+            transition.model.native_topology = initialization.topology.*;
             transition.model.pending_switch = null;
             transition.model.queued_switch = null;
             transition.model.observation_timer = null;
@@ -377,7 +377,7 @@ fn testTopology(first_observed: NativeSpaceId, second_observed: ?NativeSpaceId) 
 }
 
 fn initializedModel(topology: NativeTopology) Model {
-    return reduce(.{}, .{ .initialize_native_topology = .{ .topology = topology } }).model;
+    return reduce(.{}, .{ .initialize_native_topology = .{ .topology = &topology } }).model;
 }
 
 fn switchRequest(model: *const Model, display_id: DisplayId, workspace_id: WorkspaceId, at_ms: TimestampMs) Event {
@@ -390,7 +390,7 @@ fn switchRequest(model: *const Model, display_id: DisplayId, workspace_id: Works
 fn deliverTestSwitch(initial: Model, at_ms: TimestampMs) Model {
     const epoch = initial.pending_switch.?.epoch;
     var model = reduce(initial, .{ .native_topology_observed = .{
-        .topology = initial.native_topology,
+        .topology = &initial.native_topology,
         .epoch = epoch,
         .at_ms = at_ms,
         .is_animating = false,
@@ -635,7 +635,7 @@ test "layout rebuild replaces every Space atomically" {
     const space_key: SpaceKey = .{ .id = 1 };
     var catalog: SpaceCatalog = .{};
     catalog.add(.{ .key = space_key, .workspace_id = 1, .display_id = 11 });
-    var model = reduce(.{}, .{ .replace_space_catalog = catalog }).model;
+    var model = reduce(.{}, .{ .replace_space_catalog = &catalog }).model;
 
     model = reduce(model, .{ .adopt_window = .{
         .window_id = 101,
@@ -659,14 +659,14 @@ test "layout rebuild replaces every Space atomically" {
         .split_ratio = 0.5,
     };
     try testing.expect(rebuild.addSpace(space_key, .{ .x = 0, .y = 0, .width = 1000, .height = 800 }));
-    var transition = reduce(model, .{ .rebuild_layout = rebuild });
+    var transition = reduce(model, .{ .rebuild_layout = &rebuild });
 
     try testing.expectEqual(tiling_mod.LayoutKind.monocle, transition.model.layout.layoutKind(space_key).?);
     try testing.expect(transition.model.layout.contains(space_key, 101));
     try testing.expect(transition.model.layout.contains(space_key, 102));
 
     try testing.expect(rebuild.addSpace(.{ .id = 2 }, null));
-    transition = reduce(model, .{ .rebuild_layout = rebuild });
+    transition = reduce(model, .{ .rebuild_layout = &rebuild });
     try testing.expectEqual(tiling_mod.LayoutKind.bsp, transition.model.layout.layoutKind(space_key).?);
     try testing.expect(transition.model.layout.contains(space_key, 101));
     try testing.expect(transition.model.layout.contains(space_key, 102));
@@ -749,7 +749,7 @@ test "cross-domain validation rejects ownership divergence" {
     };
     try testing.expect(group.addMember(101));
     try testing.expect(group.addMember(102));
-    model = reduce(model, .{ .observe_window_tab_group = group }).model;
+    model = reduce(model, .{ .observe_window_tab_group = &group }).model;
     try testing.expect(invariants.crossDomainStateIsValid(&model));
 
     invalid = model;
@@ -785,7 +785,7 @@ test "tab transitions transfer layout ownership atomically" {
         .window_id = 102,
         .process_id = 1001,
         .space_key = space_key,
-        .tab_group = group,
+        .tab_group = &group,
     } }).model;
 
     try testing.expectEqual(@as(usize, 1), model.layout.windowCount(space_key));
@@ -802,7 +802,7 @@ test "tab transitions transfer layout ownership atomically" {
     try testing.expect(model.layout.contains(space_key, 102));
     try testing.expectEqual(@as(WindowId, 102), model.windowTabLeader(102));
 
-    model = reduce(model, .{ .observe_window_tab_group = group }).model;
+    model = reduce(model, .{ .observe_window_tab_group = &group }).model;
     model = reduce(model, .{ .remove_window = 101 }).model;
     try testing.expectEqual(@as(usize, 1), model.layout.windowCount(space_key));
     try testing.expect(!model.layout.contains(space_key, 101));
@@ -837,7 +837,7 @@ test "tab grouping reconciles workspace and layout ownership atomically" {
     };
     try testing.expect(group.addMember(101));
     try testing.expect(group.addMember(102));
-    model = reduce(model, .{ .observe_window_tab_group = group }).model;
+    model = reduce(model, .{ .observe_window_tab_group = &group }).model;
 
     try testing.expect(model.window(102).?.space_key.eql(first_space));
     try testing.expectEqual(@as(WindowId, 101), model.windowTabLeader(102));
@@ -961,7 +961,7 @@ test "window catalog owns tab identity and group Space assignment" {
     try testing.expect(group.addMember(101));
     try testing.expect(group.addMember(102));
     try testing.expect(group.addMember(103));
-    model = reduce(model, .{ .observe_window_tab_group = group }).model;
+    model = reduce(model, .{ .observe_window_tab_group = &group }).model;
 
     try testing.expectEqual(@as(WindowId, 101), model.window(103).?.tab_leader_window_id);
     try testing.expect(model.window(101).?.is_suppressed);
@@ -980,7 +980,7 @@ test "window catalog owns tab identity and group Space assignment" {
     try testing.expectEqual(@as(WindowId, 101), workspace_windows[0]);
 
     group.active_window_id = 103;
-    model = reduce(model, .{ .observe_window_tab_group = group }).model;
+    model = reduce(model, .{ .observe_window_tab_group = &group }).model;
     try testing.expect(model.window(102).?.is_suppressed);
     try testing.expect(!model.window(103).?.is_suppressed);
 
@@ -1009,7 +1009,7 @@ test "removing a tab leader leaves valid standalone identities" {
     };
     try testing.expect(group.addMember(101));
     try testing.expect(group.addMember(102));
-    model = reduce(model, .{ .observe_window_tab_group = group }).model;
+    model = reduce(model, .{ .observe_window_tab_group = &group }).model;
 
     model = reduce(model, .{ .remove_window = 101 }).model;
 
@@ -1037,7 +1037,7 @@ test "removing a tab leader preserves a surviving group" {
     try testing.expect(group.addMember(101));
     try testing.expect(group.addMember(102));
     try testing.expect(group.addMember(103));
-    model = reduce(model, .{ .observe_window_tab_group = group }).model;
+    model = reduce(model, .{ .observe_window_tab_group = &group }).model;
 
     model = reduce(model, .{ .remove_window = 101 }).model;
 
@@ -1157,7 +1157,7 @@ test "observed target completes native switch" {
     const epoch = model.pending_switch.?.epoch;
 
     transition = reduce(model, .{ .native_topology_observed = .{
-        .topology = testTopology(102, null),
+        .topology = &testTopology(102, null),
         .epoch = epoch,
         .at_ms = 200,
         .is_animating = false,
@@ -1181,7 +1181,7 @@ test "unexpected landing retries once then commits observation and fails request
     var pending = model.pending_switch.?;
 
     transition = reduce(model, .{ .native_topology_observed = .{
-        .topology = testTopology(103, null),
+        .topology = &testTopology(103, null),
         .epoch = pending.epoch,
         .at_ms = pending.deadline_at_ms,
         .is_animating = false,
@@ -1195,7 +1195,7 @@ test "unexpected landing retries once then commits observation and fails request
     pending = model.pending_switch.?;
 
     transition = reduce(model, .{ .native_topology_observed = .{
-        .topology = testTopology(103, null),
+        .topology = &testTopology(103, null),
         .epoch = pending.epoch,
         .at_ms = pending.deadline_at_ms,
         .is_animating = false,
@@ -1217,7 +1217,7 @@ test "intermediate Space becomes observed while request remains pending" {
     const pending = model.pending_switch.?;
 
     transition = reduce(model, .{ .native_topology_observed = .{
-        .topology = testTopology(103, null),
+        .topology = &testTopology(103, null),
         .epoch = pending.epoch,
         .at_ms = 200,
         .is_animating = false,
@@ -1417,7 +1417,7 @@ test "switch effect preserves target Space identity across displays" {
     var model = initializedModel(testTopology(102, 201));
     model = reduce(model, switchRequest(&model, 2, 5, 100)).model;
     const transition = reduce(model, .{ .native_topology_observed = .{
-        .topology = model.native_topology,
+        .topology = &model.native_topology,
         .epoch = model.pending_switch.?.epoch,
         .at_ms = 110,
         .is_animating = false,
@@ -1528,9 +1528,9 @@ test "Space catalog preserves physical identity when placement changes" {
     catalog.add(.{ .key = .{ .id = 1 }, .workspace_id = 1, .display_id = 11 });
     catalog.add(.{ .key = .{ .id = 2 }, .workspace_id = 2, .display_id = 22 });
 
-    var model = reduce(.{}, .{ .replace_space_catalog = catalog }).model;
+    var model = reduce(.{}, .{ .replace_space_catalog = &catalog }).model;
     catalog.spaces[1].display_id = 11;
-    model = reduce(model, .{ .replace_space_catalog = catalog }).model;
+    model = reduce(model, .{ .replace_space_catalog = &catalog }).model;
 
     const moved = model.space(.{ .id = 2 }).?;
     try testing.expectEqual(@as(DisplayId, 11), moved.display_id);
@@ -1562,7 +1562,7 @@ test "workspace transition settles from explicit focus and time events" {
     catalog.add(.{ .key = .{ .id = 1 }, .workspace_id = 1, .display_id = 11 });
     catalog.add(.{ .key = .{ .id = 2 }, .workspace_id = 2, .display_id = 11 });
 
-    var model = reduce(.{}, .{ .replace_space_catalog = catalog }).model;
+    var model = reduce(.{}, .{ .replace_space_catalog = &catalog }).model;
     var transition = reduce(model, .{ .start_workspace_transition = .{
         .kind = .switch_workspace,
         .target = model.space(.{ .id = 2 }).?,
@@ -1606,7 +1606,7 @@ test "display move transition follows stable Space identity" {
     catalog.add(.{ .key = .{ .id = 1 }, .workspace_id = 1, .display_id = 11 });
     catalog.add(.{ .key = .{ .id = 2 }, .workspace_id = 2, .display_id = 22 });
 
-    var model = reduce(.{}, .{ .replace_space_catalog = catalog }).model;
+    var model = reduce(.{}, .{ .replace_space_catalog = &catalog }).model;
     model = reduce(model, .{ .start_workspace_transition = .{
         .kind = .move_workspace_to_display,
         .target = model.space(.{ .id = 2 }).?,
@@ -1614,7 +1614,7 @@ test "display move transition follows stable Space identity" {
     } }).model;
 
     catalog.spaces[1].display_id = 11;
-    model = reduce(model, .{ .replace_space_catalog = catalog }).model;
+    model = reduce(model, .{ .replace_space_catalog = &catalog }).model;
 
     try testing.expect(model.workspace_transition.?.target.key.eql(.{ .id = 2 }));
     try testing.expectEqual(@as(DisplayId, 11), model.workspace_transition.?.target.display_id);
@@ -1627,7 +1627,7 @@ test "stale workspace transition timer cannot settle newer intent" {
     catalog.add(.{ .key = .{ .id = 1 }, .workspace_id = 1, .display_id = 11 });
     catalog.add(.{ .key = .{ .id = 2 }, .workspace_id = 2, .display_id = 11 });
 
-    var model = reduce(.{}, .{ .replace_space_catalog = catalog }).model;
+    var model = reduce(.{}, .{ .replace_space_catalog = &catalog }).model;
     model = reduce(model, .{ .start_workspace_transition = .{
         .kind = .switch_workspace,
         .target = model.space(.{ .id = 1 }).?,
@@ -1684,7 +1684,7 @@ test "new workspace transition rejects stale pending focus observation" {
     catalog.add(.{ .key = .{ .id = 1 }, .workspace_id = 1, .display_id = 11 });
     catalog.add(.{ .key = .{ .id = 2 }, .workspace_id = 2, .display_id = 11 });
 
-    var model = reduce(.{}, .{ .replace_space_catalog = catalog }).model;
+    var model = reduce(.{}, .{ .replace_space_catalog = &catalog }).model;
     model = reduce(model, .{ .start_workspace_transition = .{
         .kind = .switch_workspace,
         .target = model.space(.{ .id = 1 }).?,
@@ -1716,7 +1716,7 @@ test "keyboard focus accepts a visible non-target and clears pending focus" {
     catalog.add(.{ .key = .{ .id = 1 }, .workspace_id = 1, .display_id = 11 });
     catalog.add(.{ .key = .{ .id = 2 }, .workspace_id = 2, .display_id = 11 });
 
-    var model = reduce(.{}, .{ .replace_space_catalog = catalog }).model;
+    var model = reduce(.{}, .{ .replace_space_catalog = &catalog }).model;
     model = reduce(model, .{ .start_workspace_transition = .{
         .kind = .switch_workspace,
         .target = model.space(.{ .id = 2 }).?,
@@ -1740,7 +1740,7 @@ test "deferred follow focus leaves the model with transition settlement" {
     catalog.add(.{ .key = .{ .id = 1 }, .workspace_id = 1, .display_id = 11 });
     catalog.add(.{ .key = .{ .id = 2 }, .workspace_id = 2, .display_id = 11 });
 
-    var model = reduce(.{}, .{ .replace_space_catalog = catalog }).model;
+    var model = reduce(.{}, .{ .replace_space_catalog = &catalog }).model;
     model = reduce(model, .{ .start_workspace_transition = .{
         .kind = .switch_workspace,
         .target = model.space(.{ .id = 2 }).?,
@@ -1899,7 +1899,7 @@ test "pending native window move follows Space identity across ordinal changes" 
     topology.addDisplay(display);
 
     const transition = reduce(model, .{ .native_topology_observed = .{
-        .topology = topology,
+        .topology = &topology,
         .epoch = 99,
         .at_ms = 100,
     } });
@@ -1976,7 +1976,7 @@ test "unexpected landing recovers toward latest queued target" {
     const pending = model.pending_switch.?;
     model = reduce(model, switchRequest(&model, 1, 3, 110)).model;
     var transition = reduce(model, .{ .native_topology_observed = .{
-        .topology = testTopology(101, null),
+        .topology = &testTopology(101, null),
         .epoch = pending.epoch,
         .at_ms = pending.deadline_at_ms,
         .is_animating = false,
@@ -1989,7 +1989,7 @@ test "unexpected landing recovers toward latest queued target" {
     model = deliverTestSwitch(model, pending.deadline_at_ms + 1);
     const recovered = model.pending_switch.?;
     transition = reduce(model, .{ .native_topology_observed = .{
-        .topology = testTopology(103, null),
+        .topology = &testTopology(103, null),
         .epoch = recovered.epoch,
         .at_ms = recovered.deadline_at_ms - 1,
         .is_animating = false,
@@ -2006,7 +2006,7 @@ test "native switch waits for idle before preparing gestures" {
     const epoch = model.pending_switch.?.epoch;
     for ([_]?bool{ true, null }) |is_animating| {
         const transition = reduce(model, .{ .native_topology_observed = .{
-            .topology = testTopology(101, null),
+            .topology = &testTopology(101, null),
             .epoch = epoch,
             .at_ms = 200,
             .is_animating = is_animating,
@@ -2016,7 +2016,7 @@ test "native switch waits for idle before preparing gestures" {
         try testing.expect(transition.model.hasScheduledObservation());
     }
     const transition = reduce(model, .{ .native_topology_observed = .{
-        .topology = testTopology(101, null),
+        .topology = &testTopology(101, null),
         .epoch = epoch,
         .at_ms = 250,
         .is_animating = false,
@@ -2042,7 +2042,7 @@ test "gesture delivery and animation settlement gate queued switches" {
     try expectTestEffect(&model, switchRequest(&model, 1, 2, 100), .workspace_transition_started);
     const epoch = model.pending_switch.?.epoch;
     try expectTestEffect(&model, .{ .native_topology_observed = .{
-        .topology = testTopology(101, null),
+        .topology = &testTopology(101, null),
         .epoch = epoch,
         .at_ms = 110,
         .is_animating = false,
@@ -2058,7 +2058,7 @@ test "gesture delivery and animation settlement gate queued switches" {
     for (0..2) |step| {
         for ([_]model_mod.native_gesture.Phase{ .began, .changed, .ended }) |phase| {
             try expectTestEffect(&model, .{ .native_topology_observed = .{
-                .topology = testTopology(102, null),
+                .topology = &testTopology(102, null),
                 .epoch = epoch,
                 .at_ms = at_ms,
                 .is_animating = false,
@@ -2080,7 +2080,7 @@ test "gesture delivery and animation settlement gate queued switches" {
     try testing.expectEqual(.observing, model.pending_switch.?.phase);
     for ([_]?bool{ true, null }) |is_animating| {
         try expectTestEffect(&model, .{ .native_topology_observed = .{
-            .topology = testTopology(102, null),
+            .topology = &testTopology(102, null),
             .epoch = epoch,
             .at_ms = 300,
             .is_animating = is_animating,
@@ -2088,7 +2088,7 @@ test "gesture delivery and animation settlement gate queued switches" {
         try testing.expectEqual(epoch, model.pending_switch.?.epoch);
     }
     try expectTestEffect(&model, .{ .native_topology_observed = .{
-        .topology = testTopology(102, null),
+        .topology = &testTopology(102, null),
         .epoch = epoch,
         .at_ms = 350,
         .is_animating = false,
@@ -2103,7 +2103,7 @@ test "unpaced multi-space delivery reaches the target before completing" {
     try expectTestEffect(&model, switchRequest(&model, 1, 3, 100), .workspace_transition_started);
     const epoch = model.pending_switch.?.epoch;
     try expectTestEffect(&model, .{ .native_topology_observed = .{
-        .topology = testTopology(101, null),
+        .topology = &testTopology(101, null),
         .epoch = epoch,
         .at_ms = 110,
         .is_animating = false,
@@ -2124,14 +2124,14 @@ test "unpaced multi-space delivery reaches the target before completing" {
         }
     }
     try expectTestEffect(&model, .{ .native_topology_observed = .{
-        .topology = testTopology(102, null),
+        .topology = &testTopology(102, null),
         .epoch = epoch,
         .at_ms = 130,
         .is_animating = false,
     } }, null);
     try std.testing.expectEqual(.observing, model.pending_switch.?.phase);
     try expectTestEffect(&model, .{ .native_topology_observed = .{
-        .topology = testTopology(103, null),
+        .topology = &testTopology(103, null),
         .epoch = epoch,
         .at_ms = 140,
         .is_animating = false,
@@ -2145,7 +2145,7 @@ test "late gesture failure cancels delivery and stale callbacks cannot affect it
     model = reduce(model, switchRequest(&model, 1, 2, 100)).model;
     const epoch = model.pending_switch.?.epoch;
     model = reduce(model, .{ .native_topology_observed = .{
-        .topology = testTopology(101, null),
+        .topology = &testTopology(101, null),
         .epoch = epoch,
         .at_ms = 110,
         .is_animating = false,
@@ -2175,7 +2175,7 @@ test "late gesture failure cancels delivery and stale callbacks cannot affect it
     for ([_]Event{
         .{ .native_gesture_timer_fired = .{ .epoch = epoch, .at_ms = 200 } },
         .{ .native_gesture_posted = .{ .epoch = epoch, .phase = .ended, .succeeded = true, .at_ms = 200 } },
-        .{ .native_topology_observed = .{ .topology = testTopology(102, null), .epoch = epoch, .at_ms = 200, .is_animating = false } },
+        .{ .native_topology_observed = .{ .topology = &testTopology(102, null), .epoch = epoch, .at_ms = 200, .is_animating = false } },
     }) |event| {
         transition = reduce(model, event);
         try testing.expectEqual(@as(u8, 0), transition.effect_count);
@@ -2197,7 +2197,7 @@ test "unknown or stuck animation fails without pretending settlement" {
     try testing.expect(timer.model.isWorkspaceTransitionActive());
     for ([_]?bool{ true, null }) |is_animating| {
         const transition = reduce(model, .{ .native_topology_observed = .{
-            .topology = testTopology(102, null),
+            .topology = &testTopology(102, null),
             .epoch = pending.epoch,
             .at_ms = pending.deadline_at_ms,
             .is_animating = is_animating,
@@ -2218,14 +2218,14 @@ test "queued observed target still waits for idle after a failed switch" {
     const next_epoch = model.pending_switch.?.epoch;
     try testing.expect(next_epoch != epoch);
     try expectTestEffect(&model, .{ .native_topology_observed = .{
-        .topology = testTopology(101, null),
+        .topology = &testTopology(101, null),
         .epoch = next_epoch,
         .at_ms = 130,
         .is_animating = true,
     } }, null);
     try testing.expect(model.isNativeSwitchPending());
     try expectTestEffect(&model, .{ .native_topology_observed = .{
-        .topology = testTopology(101, null),
+        .topology = &testTopology(101, null),
         .epoch = next_epoch,
         .at_ms = 140,
         .is_animating = false,
@@ -2322,7 +2322,7 @@ test "display reconnect renumbers surviving Spaces without moving their windows 
     const mapped = mapNativeTopology(observation, &model.native_topology, &model.workspace_topology, &model.spaces, 10, 2, .native_order).?;
     try testing.expectEqual(@as(?NativeSpaceId, 103), mapped.findDisplay(2).?.spaceForWorkspace(2));
     try testing.expectEqual(@as(?NativeSpaceId, 102), mapped.findDisplay(1).?.spaceForWorkspace(10));
-    model = reduce(model, .{ .initialize_native_topology = .{ .topology = mapped } }).model;
+    model = reduce(model, .{ .initialize_native_topology = .{ .topology = &mapped } }).model;
     try testing.expectEqual(@as(?WorkspaceId, 10), model.activeWorkspace(1));
     try testing.expectEqual(@as(?WorkspaceId, 1), model.activeWorkspace(2));
     try testing.expectEqual(@as(?WindowId, 42), model.focusedWorkspaceWindow(10));
@@ -2367,11 +2367,11 @@ test "replaced native Spaces retain window and layout ownership" {
     var second = DisplayTopology.init(2, 201);
     second.addSpace(.{ .id = 201, .workspace_id = 3 });
     topology.addDisplay(second);
-    model = reduce(model, .{ .initialize_native_topology = .{ .topology = topology } }).model;
+    model = reduce(model, .{ .initialize_native_topology = .{ .topology = &topology } }).model;
     try testing.expect(model.window(42).?.space_key.eql(.{ .id = 201 }));
     try testing.expect(model.layout.contains(.{ .id = 201 }, 42));
     try testing.expect(!model.layout.contains(.{ .id = 103 }, 42));
-    model = reduce(model, .{ .initialize_native_topology = .{ .topology = testTopology(101, null) } }).model;
+    model = reduce(model, .{ .initialize_native_topology = .{ .topology = &testTopology(101, null) } }).model;
     try testing.expect(model.window(42).?.space_key.eql(.{ .id = 103 }));
     try testing.expect(model.layout.contains(.{ .id = 103 }, 42));
 }
@@ -2395,7 +2395,7 @@ test "display reconnect preserves the latest requested workspace with a new epoc
     try expectTestEffect(&model, switchRequest(&model, 2, 5, 110), null);
     const topology = testTopology(101, 201);
     try expectTestEffect(&model, .{ .initialize_native_topology = .{
-        .topology = topology,
+        .topology = &topology,
         .at_ms = 500,
     } }, .workspace_transition_settled);
     try testing.expectEqual(@as(WorkspaceId, 5), model.pending_switch.?.request.target.workspace_id);
@@ -2421,7 +2421,7 @@ test "disconnect cancels a workspace move before its transition becomes invalid"
     }
     topology.addDisplay(display);
     try expectTestEffect(&model, .{ .native_topology_observed = .{
-        .topology = topology,
+        .topology = &topology,
         .epoch = epoch,
         .at_ms = 120,
         .is_animating = false,
@@ -2435,7 +2435,7 @@ test "window discovery retries are reducer owned" {
     const testing = std.testing;
     var catalog: SpaceCatalog = .{};
     catalog.add(.{ .key = .{ .id = 1 }, .workspace_id = 1, .display_id = 11 });
-    var model = reduce(.{}, .{ .replace_space_catalog = catalog }).model;
+    var model = reduce(.{}, .{ .replace_space_catalog = &catalog }).model;
     const candidate: WindowCandidate = .{
         .process_id = 42,
         .window_id = 100,
@@ -2511,7 +2511,7 @@ test "pointer drop swaps layout inside the reducer" {
     const testing = std.testing;
     var catalog: SpaceCatalog = .{};
     catalog.add(.{ .key = .{ .id = 1 }, .workspace_id = 1, .display_id = 11 });
-    var model = reduce(.{}, .{ .replace_space_catalog = catalog }).model;
+    var model = reduce(.{}, .{ .replace_space_catalog = &catalog }).model;
     model = reduce(model, .{ .adopt_window = .{
         .window_id = 100,
         .process_id = 42,
@@ -2550,7 +2550,7 @@ test "directional commands resolve focus and layout in the reducer" {
     catalog.add(.{ .key = space_key, .workspace_id = 1, .display_id = 11 });
     var topology: WorkspaceTopology = .{};
     topology.addDisplay(.{ .display_id = 11, .active_workspace_id = 1 });
-    var model = reduce(.{}, .{ .replace_space_catalog = catalog }).model;
+    var model = reduce(.{}, .{ .replace_space_catalog = &catalog }).model;
     model = reduce(model, .{ .replace_workspace_topology = topology }).model;
     model = reduce(model, .{ .adopt_window = .{
         .window_id = 100,
@@ -2591,7 +2591,7 @@ test "resize command leaves fullscreen layout unchanged and resumes after exit" 
     catalog.add(.{ .key = space_key, .workspace_id = 1, .display_id = 11 });
     var topology: WorkspaceTopology = .{};
     topology.addDisplay(.{ .display_id = 11, .active_workspace_id = 1 });
-    var model = reduce(.{}, .{ .replace_space_catalog = catalog }).model;
+    var model = reduce(.{}, .{ .replace_space_catalog = &catalog }).model;
     model = reduce(model, .{ .replace_workspace_topology = topology }).model;
     for ([_]WindowId{ 100, 200 }) |window_id| {
         model = reduce(model, .{ .adopt_window = .{
@@ -2635,7 +2635,7 @@ test "window presentation commands reduce intent before platform effects" {
     catalog.add(.{ .key = space_key, .workspace_id = 1, .display_id = 11 });
     var topology: WorkspaceTopology = .{};
     topology.addDisplay(.{ .display_id = 11, .active_workspace_id = 1 });
-    var model = reduce(.{}, .{ .replace_space_catalog = catalog }).model;
+    var model = reduce(.{}, .{ .replace_space_catalog = &catalog }).model;
     model = reduce(model, .{ .replace_workspace_topology = topology }).model;
     model = reduce(model, .{ .adopt_window = .{
         .window_id = 100,
@@ -2696,7 +2696,7 @@ test "window move command commits ownership layout and intent atomically" {
     catalog.add(.{ .key = target_key, .workspace_id = 2, .display_id = 11 });
     var topology: WorkspaceTopology = .{};
     topology.addDisplay(.{ .display_id = 11, .active_workspace_id = 1 });
-    var model = reduce(.{}, .{ .replace_space_catalog = catalog }).model;
+    var model = reduce(.{}, .{ .replace_space_catalog = &catalog }).model;
     model = reduce(model, .{ .replace_workspace_topology = topology }).model;
     model = reduce(model, .{ .adopt_window = .{
         .window_id = 100,

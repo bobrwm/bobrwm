@@ -607,7 +607,7 @@ pub const WindowAdoption = struct {
     mode: window_mod.WindowMode = .tiled,
     float_frame: ?window_mod.Window.Frame = null,
     layout: ?LayoutInsertion = null,
-    tab_group: ?WindowTabGroupObservation = null,
+    tab_group: ?*const WindowTabGroupObservation = null,
 
     pub fn managedWindow(self: WindowAdoption) ManagedWindow {
         return .{
@@ -896,8 +896,13 @@ pub const Model = struct {
     }
 };
 
+/// Input to `reduce`. A union is as large as its largest variant, so payloads
+/// backed by fixed-capacity arrays (tab members, Spaces, topology) are borrowed
+/// through `*const` instead of carried inline. The pointees belong to the
+/// dispatcher and only need to outlive the `reduce` call: events are reduced
+/// synchronously and never queued, and the reducer copies what it keeps.
 pub const Event = union(enum) {
-    replace_space_catalog: SpaceCatalog,
+    replace_space_catalog: *const SpaceCatalog,
     adopt_window: WindowAdoption,
     update_window: WindowUpdate,
     remove_window: WindowId,
@@ -906,7 +911,7 @@ pub const Event = union(enum) {
         new_window_id: WindowId,
     },
     assign_window_space: WindowSpaceAssignment,
-    observe_window_tab_group: WindowTabGroupObservation,
+    observe_window_tab_group: *const WindowTabGroupObservation,
     detach_window_tab: WindowTabDetachment,
     record_workspace_focus: struct {
         workspace_id: WorkspaceId,
@@ -933,7 +938,7 @@ pub const Event = union(enum) {
         at_ms: TimestampMs,
     },
     native_topology_observed: struct {
-        topology: NativeTopology,
+        topology: *const NativeTopology,
         epoch: Epoch,
         at_ms: TimestampMs,
         is_animating: ?bool = null,
@@ -1085,7 +1090,7 @@ pub const Event = union(enum) {
     request_offscreen_cleanup,
     clear_cleanup_requests,
     flush_cleanup_requests,
-    rebuild_layout: LayoutRebuild,
+    rebuild_layout: *const LayoutRebuild,
     layout_command: struct {
         event: tiling_mod.Event,
         display_id: DisplayId,

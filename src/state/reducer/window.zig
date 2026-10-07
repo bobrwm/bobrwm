@@ -249,7 +249,7 @@ pub fn reduceWindowSpaceAssigned(
 
 pub fn reduceWindowTabGroupObserved(
     transition: *Transition,
-    observation: WindowTabGroupObservation,
+    observation: *const WindowTabGroupObservation,
 ) void {
     if (observation.member_count > observation.member_window_ids.len) {
         rejectWindowTabGroup(transition, observation.leader_window_id);
