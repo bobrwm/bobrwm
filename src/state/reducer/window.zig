@@ -6,6 +6,8 @@ const layout_reducer = @import("layout.zig");
 const pointer_reducer = @import("pointer.zig");
 
 const Event = model_mod.Event;
+const ManagedWindow = model_mod.ManagedWindow;
+const Model = model_mod.Model;
 const Transition = model_mod.Transition;
 const WindowAdoption = model_mod.WindowAdoption;
 const WindowId = model_mod.WindowId;
@@ -15,7 +17,6 @@ const WindowTabGroupSnapshot = model_mod.WindowTabGroupSnapshot;
 const WindowUpdate = model_mod.WindowUpdate;
 
 pub fn reduceWindowAdopted(transition: *Transition, adoption: WindowAdoption) void {
-    const original_model = transition.model;
     const window = adoption.managedWindow();
     if (window.window_id == 0 or window.process_id <= 0) {
         transition.addEffect(.{ .window_catalog_rejected = .{
@@ -45,6 +46,21 @@ pub fn reduceWindowAdopted(transition: *Transition, adoption: WindowAdoption) vo
         } });
         return;
     }
+
+    var adopted = window;
+    adopted.tab_leader_window_id = adopted.window_id;
+    adopted.is_suppressed = false;
+
+    // Validate the tab group before mutating anything: the model is updated in
+    // place, so a group rejected after the window was cataloged and inserted
+    // into the layout could not be rolled back without snapshotting it.
+    if (adoption.tab_group) |observation| {
+        if (tabGroupRejection(transition.model, observation, adopted)) |window_id| {
+            rejectWindowTabGroup(transition, window_id);
+            return;
+        }
+    }
+
     if (adoption.layout) |layout| {
         if (window.mode != .tiled) {
             transition.addEffect(.{ .window_catalog_rejected = .{
@@ -61,19 +77,14 @@ pub fn reduceWindowAdopted(transition: *Transition, adoption: WindowAdoption) vo
         } })) return;
     }
 
-    var adopted = window;
-    adopted.tab_leader_window_id = adopted.window_id;
-    adopted.is_suppressed = false;
     std.debug.assert(transition.model.windows.put(adopted));
     transition.model.geometry.seedObserved(adopted.window_id, adopted.frame) catch unreachable;
 
     if (adoption.tab_group) |observation| {
         const effect_count = transition.effect_count;
         reduceWindowTabGroupObserved(transition, observation);
-        if (transition.effect_count != effect_count) {
-            transition.model = original_model;
-            return;
-        }
+        // Validated above against this model plus `adopted`, so it cannot reject now.
+        std.debug.assert(transition.effect_count == effect_count);
     }
 
     _ = transition.model.pending_role_windows.remove(adopted.window_id);
@@ -198,7 +209,7 @@ pub fn reduceWindowIdReplaced(
         updated.window_id = replacement.new_window_id;
         std.debug.assert(transition.model.pending_native_window_moves.put(updated));
     }
-    pointer_reducer.replacePointerWindowId(&transition.model, replacement.old_window_id, replacement.new_window_id);
+    pointer_reducer.replacePointerWindowId(transition.model, replacement.old_window_id, replacement.new_window_id);
     _ = transition.model.pending_role_windows.remove(replacement.new_window_id);
     _ = transition.model.deferred_window_candidates.remove(replacement.new_window_id);
     for (&transition.model.workspace_focus) |*focus| {
@@ -251,39 +262,11 @@ pub fn reduceWindowTabGroupObserved(
     transition: *Transition,
     observation: *const WindowTabGroupObservation,
 ) void {
-    if (observation.member_count > observation.member_window_ids.len) {
-        rejectWindowTabGroup(transition, observation.leader_window_id);
+    if (tabGroupRejection(transition.model, observation, null)) |window_id| {
+        rejectWindowTabGroup(transition, window_id);
         return;
     }
-    const leader = transition.model.window(observation.leader_window_id) orelse {
-        rejectWindowTabGroup(transition, observation.leader_window_id);
-        return;
-    };
-    if (observation.member_count < 2 or
-        !observation.contains(observation.leader_window_id) or
-        !observation.contains(observation.active_window_id))
-    {
-        rejectWindowTabGroup(transition, observation.leader_window_id);
-        return;
-    }
-    for (observation.members(), 0..) |window_id, index| {
-        for (observation.members()[0..index]) |prior_window_id| {
-            if (prior_window_id != window_id) continue;
-            rejectWindowTabGroup(transition, window_id);
-            return;
-        }
-        const member = transition.model.window(window_id) orelse {
-            rejectWindowTabGroup(transition, window_id);
-            return;
-        };
-        if (member.process_id != leader.process_id or
-            (member.tab_leader_window_id != member.window_id and
-                member.tab_leader_window_id != observation.leader_window_id))
-        {
-            rejectWindowTabGroup(transition, window_id);
-            return;
-        }
-    }
+    const leader = transition.model.window(observation.leader_window_id).?;
 
     for (observation.members()) |window_id| {
         if (window_id == observation.leader_window_id) continue;
@@ -364,6 +347,45 @@ pub fn reduceWorkspaceFocusRecorded(
     if (!leader.space_key.eql(space.key)) return;
 
     transition.model.workspace_focus[focus.workspace_id - 1].record(leader.window_id);
+}
+
+/// The window that makes `observation` invalid, or null if it can be applied.
+/// `pending` is treated as already cataloged so adoption can validate a group
+/// that includes the window it is about to add, before mutating the model.
+fn tabGroupRejection(
+    model: *const Model,
+    observation: *const WindowTabGroupObservation,
+    pending: ?ManagedWindow,
+) ?WindowId {
+    if (observation.member_count > observation.member_window_ids.len) return observation.leader_window_id;
+    const leader = windowOrPending(model, pending, observation.leader_window_id) orelse
+        return observation.leader_window_id;
+    if (observation.member_count < 2 or
+        !observation.contains(observation.leader_window_id) or
+        !observation.contains(observation.active_window_id))
+    {
+        return observation.leader_window_id;
+    }
+    for (observation.members(), 0..) |window_id, index| {
+        for (observation.members()[0..index]) |prior_window_id| {
+            if (prior_window_id == window_id) return window_id;
+        }
+        const member = windowOrPending(model, pending, window_id) orelse return window_id;
+        if (member.process_id != leader.process_id or
+            (member.tab_leader_window_id != member.window_id and
+                member.tab_leader_window_id != observation.leader_window_id))
+        {
+            return window_id;
+        }
+    }
+    return null;
+}
+
+fn windowOrPending(model: *const Model, pending: ?ManagedWindow, window_id: WindowId) ?ManagedWindow {
+    if (pending) |window| {
+        if (window.window_id == window_id) return window;
+    }
+    return model.window(window_id);
 }
 
 fn rejectWindowTabGroup(transition: *Transition, window_id: WindowId) void {

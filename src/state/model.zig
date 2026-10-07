@@ -1214,8 +1214,10 @@ pub const Effect = union(enum) {
 
 pub const max_effects = 6;
 
+/// Reducer context. `model` is mutated in place: it is several hundred KiB, and
+/// copying it in and out of every reduce dominated dispatch cost.
 pub const Transition = struct {
-    model: Model,
+    model: *Model,
     effects: [max_effects]Effect = undefined,
     effect_count: u8 = 0,
 

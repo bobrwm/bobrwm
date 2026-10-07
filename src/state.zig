@@ -120,7 +120,9 @@ pub fn reduceSwipeInput(model: *const Model, input: SwipeInput) SwipeReduction {
     return reduction;
 }
 
-pub fn reduce(model: Model, event: Event) Transition {
+/// Apply `event` to `model` in place. The returned transition borrows `model`
+/// and carries the effects the dispatcher must run.
+pub fn reduce(model: *Model, event: Event) Transition {
     var transition: Transition = .{ .model = model };
     var should_refresh_workspace_focus = false;
 
@@ -130,7 +132,7 @@ pub fn reduce(model: Model, event: Event) Transition {
             workspace_reducer.pruneWindowCandidates(&transition.model.pending_role_windows, catalog);
             workspace_reducer.pruneWindowCandidates(&transition.model.deferred_window_candidates, catalog);
             workspace_reducer.refreshWorkspaceTransition(&transition);
-            workspace_reducer.refreshPendingNativeWindowMoves(&transition.model);
+            workspace_reducer.refreshPendingNativeWindowMoves(transition.model);
             should_refresh_workspace_focus = true;
         },
         .adopt_window => |adoption| window_reducer.reduceWindowAdopted(&transition, adoption),
@@ -185,7 +187,7 @@ pub fn reduce(model: Model, event: Event) Transition {
                 transition.model.deferred_follow_focus = null;
             }
             workspace_reducer.syncNativeWorkspaceTopology(&transition);
-            workspace_reducer.remapWorkspaceFocus(&transition.model, &previous_catalog);
+            workspace_reducer.remapWorkspaceFocus(transition.model, &previous_catalog);
             if (initialization.focused_display_id) |display_id| {
                 if (transition.model.workspace_topology.findDisplay(display_id) != null) {
                     transition.model.workspace_topology.focused_display_id = display_id;
@@ -303,7 +305,7 @@ pub fn reduce(model: Model, event: Event) Transition {
             transition.model.retile_request.all_displays = true;
             transition.model.retile_request.display_count = 0;
         },
-        .request_retile_display => |display_id| workspace_reducer.reduceRetileDisplayRequested(&transition.model, display_id),
+        .request_retile_display => |display_id| workspace_reducer.reduceRetileDisplayRequested(transition.model, display_id),
         .flush_retile_requests => {
             const request = transition.model.retile_request;
             if (request.all_displays or request.display_count > 0) {
@@ -326,21 +328,21 @@ pub fn reduce(model: Model, event: Event) Transition {
         .rebuild_layout => |rebuild| layout_reducer.rebuild(&transition, rebuild),
         .layout_command => |command| {
             if (layout_reducer.applyEvent(&transition, command.event)) {
-                workspace_reducer.reduceRetileDisplayRequested(&transition.model, command.display_id);
+                workspace_reducer.reduceRetileDisplayRequested(transition.model, command.display_id);
             }
         },
         .geometry => |geometry_event| {
-            const geometry_transition = geometry_mod.reduce(transition.model.geometry, geometry_event);
-            transition.model.geometry = geometry_transition.state;
-            if (geometry_transition.effect) |effect| transition.addEffect(.{ .geometry = effect });
+            if (geometry_mod.reduce(&transition.model.geometry, geometry_event)) |effect| {
+                transition.addEffect(.{ .geometry = effect });
+            }
         },
         .layout => |layout_event| {
             _ = layout_reducer.applyEvent(&transition, layout_event);
         },
     }
 
-    if (should_refresh_workspace_focus) workspace_reducer.refreshWorkspaceFocus(&transition.model);
-    invariants.assertModel(&transition.model);
+    if (should_refresh_workspace_focus) workspace_reducer.refreshWorkspaceFocus(transition.model);
+    invariants.assertModel(transition.model);
     return transition;
 }
 
@@ -376,8 +378,22 @@ fn testTopology(first_observed: NativeSpaceId, second_observed: ?NativeSpaceId) 
     return topology;
 }
 
+// Value-in/value-out view of `reduce`, so tests can keep chaining models and
+// comparing before/after states.
+const TestTransition = struct {
+    model: Model,
+    effects: [model_mod.max_effects]model_mod.Effect,
+    effect_count: u8,
+};
+
+fn reduceCopy(model: Model, event: Event) TestTransition {
+    var next = model;
+    const transition = reduce(&next, event);
+    return .{ .model = next, .effects = transition.effects, .effect_count = transition.effect_count };
+}
+
 fn initializedModel(topology: NativeTopology) Model {
-    return reduce(.{}, .{ .initialize_native_topology = .{ .topology = &topology } }).model;
+    return reduceCopy(.{}, .{ .initialize_native_topology = .{ .topology = &topology } }).model;
 }
 
 fn switchRequest(model: *const Model, display_id: DisplayId, workspace_id: WorkspaceId, at_ms: TimestampMs) Event {
@@ -389,19 +405,19 @@ fn switchRequest(model: *const Model, display_id: DisplayId, workspace_id: Works
 
 fn deliverTestSwitch(initial: Model, at_ms: TimestampMs) Model {
     const epoch = initial.pending_switch.?.epoch;
-    var model = reduce(initial, .{ .native_topology_observed = .{
+    var model = reduceCopy(initial, .{ .native_topology_observed = .{
         .topology = &initial.native_topology,
         .epoch = epoch,
         .at_ms = at_ms,
         .is_animating = false,
     } }).model;
-    model = reduce(model, .{ .native_gesture_prepared = .{
+    model = reduceCopy(model, .{ .native_gesture_prepared = .{
         .epoch = epoch,
         .at_ms = at_ms,
         .plan = .{ .direction = .right, .steps = 1, .velocity = 2000, .is_paced = false },
     } }).model;
     for ([_]model_mod.native_gesture.Phase{ .began, .changed, .ended }) |phase| {
-        model = reduce(model, .{ .native_gesture_posted = .{
+        model = reduceCopy(model, .{ .native_gesture_posted = .{
             .epoch = epoch,
             .phase = phase,
             .succeeded = true,
@@ -477,12 +493,12 @@ test "workspace summaries preserve globally unique active workspaces" {
         .spaces = catalog,
         .workspace_topology = topology,
     };
-    model = reduce(model, .{ .adopt_window = .{
+    model = reduceCopy(model, .{ .adopt_window = .{
         .window_id = 101,
         .process_id = 1001,
         .space_key = .{ .id = 101 },
     } }).model;
-    model = reduce(model, .{ .adopt_window = .{
+    model = reduceCopy(model, .{ .adopt_window = .{
         .window_id = 201,
         .process_id = 2001,
         .space_key = .{ .id = 201 },
@@ -504,7 +520,7 @@ test "window catalog owns identity and Space membership" {
     catalog.add(.{ .key = .{ .id = 2 }, .workspace_id = 2, .display_id = 11 });
     const model: Model = .{ .spaces = catalog };
 
-    const first = reduce(model, .{ .adopt_window = .{
+    const first = reduceCopy(model, .{ .adopt_window = .{
         .window_id = 101,
         .process_id = 1001,
         .space_key = .{ .id = 1 },
@@ -512,7 +528,7 @@ test "window catalog owns identity and Space membership" {
         .mode = .floating,
         .float_frame = .{ .x = 10, .y = 20, .width = 800, .height = 600 },
     } });
-    const second = reduce(first.model, .{ .adopt_window = .{
+    const second = reduceCopy(first.model, .{ .adopt_window = .{
         .window_id = 102,
         .process_id = 1002,
         .space_key = .{ .id = 1 },
@@ -532,11 +548,11 @@ test "window catalog owns identity and Space membership" {
     var updated_window = initial_snapshot;
     updated_window.frame.x = 30;
     updated_window.is_fullscreen = true;
-    const updated = reduce(second.model, .{ .update_window = .{ .window = updated_window } });
+    const updated = reduceCopy(second.model, .{ .update_window = .{ .window = updated_window } });
     try testing.expectEqual(@as(f64, 30), updated.model.window(101).?.frame.x);
     try testing.expect(updated.model.window(101).?.is_fullscreen);
 
-    const assigned = reduce(updated.model, .{ .assign_window_space = .{
+    const assigned = reduceCopy(updated.model, .{ .assign_window_space = .{
         .window_id = 101,
         .space_key = .{ .id = 2 },
     } });
@@ -544,7 +560,7 @@ test "window catalog owns identity and Space membership" {
     try testing.expectEqual(@as(u16, 1), assigned.model.windows.countInSpace(.{ .id = 2 }));
     try testing.expect(assigned.model.window(101).?.space_key.eql(.{ .id = 2 }));
 
-    const replaced = reduce(assigned.model, .{ .replace_window_id = .{
+    const replaced = reduceCopy(assigned.model, .{ .replace_window_id = .{
         .old_window_id = 102,
         .new_window_id = 202,
     } });
@@ -553,7 +569,7 @@ test "window catalog owns identity and Space membership" {
     try testing.expect(replaced.model.geometry.get(102) == null);
     try testing.expect(replaced.model.geometry.get(202) != null);
 
-    const removed = reduce(replaced.model, .{ .remove_window = 202 });
+    const removed = reduceCopy(replaced.model, .{ .remove_window = 202 });
     try testing.expect(removed.model.window(202) == null);
     try testing.expect(removed.model.geometry.get(202) == null);
     try testing.expectEqual(@as(u16, 1), removed.model.windows.count);
@@ -568,7 +584,7 @@ test "window lifecycle transitions update catalog geometry focus and layout atom
     catalog.add(.{ .key = second_space, .workspace_id = 2, .display_id = 11 });
     var model: Model = .{ .spaces = catalog };
 
-    model = reduce(model, .{ .adopt_window = .{
+    model = reduceCopy(model, .{ .adopt_window = .{
         .window_id = 101,
         .process_id = 1001,
         .space_key = first_space,
@@ -581,23 +597,23 @@ test "window lifecycle transitions update catalog geometry focus and layout atom
 
     var window = model.windowSnapshot(101).?;
     window.mode = .floating;
-    model = reduce(model, .{ .update_window = .{ .window = window } }).model;
+    model = reduceCopy(model, .{ .update_window = .{ .window = window } }).model;
     try testing.expectEqual(window_mod.WindowMode.floating, model.window(101).?.mode);
     try testing.expect(!model.layout.contains(first_space, 101));
 
     window.mode = .tiled;
-    model = reduce(model, .{ .update_window = .{
+    model = reduceCopy(model, .{ .update_window = .{
         .window = window,
         .layout = testLayoutInsertion(.bsp),
     } }).model;
-    model = reduce(model, .{ .record_workspace_focus = .{
+    model = reduceCopy(model, .{ .record_workspace_focus = .{
         .workspace_id = 1,
         .window_id = 101,
     } }).model;
     try testing.expectEqual(window_mod.WindowMode.tiled, model.window(101).?.mode);
     try testing.expect(model.layout.contains(first_space, 101));
 
-    model = reduce(model, .{ .assign_window_space = .{
+    model = reduceCopy(model, .{ .assign_window_space = .{
         .window_id = 101,
         .space_key = second_space,
         .layout = testLayoutInsertion(.bsp),
@@ -607,11 +623,11 @@ test "window lifecycle transitions update catalog geometry focus and layout atom
     try testing.expect(model.layout.contains(second_space, 101));
     try testing.expectEqual(@as(?WindowId, null), model.focusedWorkspaceWindow(1));
 
-    model = reduce(model, .{ .record_workspace_focus = .{
+    model = reduceCopy(model, .{ .record_workspace_focus = .{
         .workspace_id = 2,
         .window_id = 101,
     } }).model;
-    model = reduce(model, .{ .replace_window_id = .{
+    model = reduceCopy(model, .{ .replace_window_id = .{
         .old_window_id = 101,
         .new_window_id = 201,
     } }).model;
@@ -623,7 +639,7 @@ test "window lifecycle transitions update catalog geometry focus and layout atom
     try testing.expect(model.layout.contains(second_space, 201));
     try testing.expectEqual(@as(?WindowId, 201), model.focusedWorkspaceWindow(2));
 
-    model = reduce(model, .{ .remove_window = 201 }).model;
+    model = reduceCopy(model, .{ .remove_window = 201 }).model;
     try testing.expect(model.window(201) == null);
     try testing.expect(model.geometry.get(201) == null);
     try testing.expect(!model.layout.contains(second_space, 201));
@@ -635,15 +651,15 @@ test "layout rebuild replaces every Space atomically" {
     const space_key: SpaceKey = .{ .id = 1 };
     var catalog: SpaceCatalog = .{};
     catalog.add(.{ .key = space_key, .workspace_id = 1, .display_id = 11 });
-    var model = reduce(.{}, .{ .replace_space_catalog = &catalog }).model;
+    var model = reduceCopy(.{}, .{ .replace_space_catalog = &catalog }).model;
 
-    model = reduce(model, .{ .adopt_window = .{
+    model = reduceCopy(model, .{ .adopt_window = .{
         .window_id = 101,
         .process_id = 1001,
         .space_key = space_key,
         .layout = testLayoutInsertion(.bsp),
     } }).model;
-    model = reduce(model, .{ .adopt_window = .{
+    model = reduceCopy(model, .{ .adopt_window = .{
         .window_id = 102,
         .process_id = 1002,
         .space_key = space_key,
@@ -659,14 +675,14 @@ test "layout rebuild replaces every Space atomically" {
         .split_ratio = 0.5,
     };
     try testing.expect(rebuild.addSpace(space_key, .{ .x = 0, .y = 0, .width = 1000, .height = 800 }));
-    var transition = reduce(model, .{ .rebuild_layout = &rebuild });
+    var transition = reduceCopy(model, .{ .rebuild_layout = &rebuild });
 
     try testing.expectEqual(tiling_mod.LayoutKind.monocle, transition.model.layout.layoutKind(space_key).?);
     try testing.expect(transition.model.layout.contains(space_key, 101));
     try testing.expect(transition.model.layout.contains(space_key, 102));
 
     try testing.expect(rebuild.addSpace(.{ .id = 2 }, null));
-    transition = reduce(model, .{ .rebuild_layout = &rebuild });
+    transition = reduceCopy(model, .{ .rebuild_layout = &rebuild });
     try testing.expectEqual(tiling_mod.LayoutKind.bsp, transition.model.layout.layoutKind(space_key).?);
     try testing.expect(transition.model.layout.contains(space_key, 101));
     try testing.expect(transition.model.layout.contains(space_key, 102));
@@ -679,13 +695,13 @@ test "layout rejection leaves window adoption unchanged" {
     catalog.add(.{ .key = space_key, .workspace_id = 1, .display_id = 11 });
     var model: Model = .{ .spaces = catalog };
 
-    model = reduce(model, .{ .adopt_window = .{
+    model = reduceCopy(model, .{ .adopt_window = .{
         .window_id = 101,
         .process_id = 1001,
         .space_key = space_key,
         .layout = testLayoutInsertion(.bsp),
     } }).model;
-    const rejected = reduce(model, .{ .adopt_window = .{
+    const rejected = reduceCopy(model, .{ .adopt_window = .{
         .window_id = 102,
         .process_id = 1002,
         .space_key = space_key,
@@ -709,13 +725,13 @@ test "cross-domain validation rejects ownership divergence" {
     catalog.add(.{ .key = first_space, .workspace_id = 1, .display_id = 11 });
     catalog.add(.{ .key = second_space, .workspace_id = 2, .display_id = 11 });
     var model: Model = .{ .spaces = catalog };
-    model = reduce(model, .{ .adopt_window = .{
+    model = reduceCopy(model, .{ .adopt_window = .{
         .window_id = 101,
         .process_id = 1001,
         .space_key = first_space,
         .layout = testLayoutInsertion(.bsp),
     } }).model;
-    model = reduce(model, .{ .adopt_window = .{
+    model = reduceCopy(model, .{ .adopt_window = .{
         .window_id = 102,
         .process_id = 1001,
         .space_key = first_space,
@@ -749,16 +765,16 @@ test "cross-domain validation rejects ownership divergence" {
     };
     try testing.expect(group.addMember(101));
     try testing.expect(group.addMember(102));
-    model = reduce(model, .{ .observe_window_tab_group = &group }).model;
+    model = reduceCopy(model, .{ .observe_window_tab_group = &group }).model;
     try testing.expect(invariants.crossDomainStateIsValid(&model));
 
     invalid = model;
-    invalid.layout = tiling_mod.reduce(invalid.layout, .{ .insert = .{
+    try testing.expect(tiling_mod.reduce(&invalid.layout, .{ .insert = .{
         .space_key = first_space,
         .kind = .bsp,
         .window_id = 102,
         .options = testLayoutInsertion(.bsp).options,
-    } }).model;
+    } }) == null);
     try testing.expect(!invariants.crossDomainStateIsValid(&invalid));
 }
 
@@ -769,7 +785,7 @@ test "tab transitions transfer layout ownership atomically" {
     catalog.add(.{ .key = space_key, .workspace_id = 1, .display_id = 11 });
     var model: Model = .{ .spaces = catalog };
 
-    model = reduce(model, .{ .adopt_window = .{
+    model = reduceCopy(model, .{ .adopt_window = .{
         .window_id = 101,
         .process_id = 1001,
         .space_key = space_key,
@@ -781,7 +797,7 @@ test "tab transitions transfer layout ownership atomically" {
     };
     try testing.expect(group.addMember(101));
     try testing.expect(group.addMember(102));
-    model = reduce(model, .{ .adopt_window = .{
+    model = reduceCopy(model, .{ .adopt_window = .{
         .window_id = 102,
         .process_id = 1001,
         .space_key = space_key,
@@ -793,7 +809,7 @@ test "tab transitions transfer layout ownership atomically" {
     try testing.expect(!model.layout.contains(space_key, 102));
     try testing.expectEqual(@as(WindowId, 101), model.windowTabLeader(102));
 
-    model = reduce(model, .{ .detach_window_tab = .{
+    model = reduceCopy(model, .{ .detach_window_tab = .{
         .window_id = 102,
         .layout = testLayoutInsertion(.bsp),
     } }).model;
@@ -802,12 +818,52 @@ test "tab transitions transfer layout ownership atomically" {
     try testing.expect(model.layout.contains(space_key, 102));
     try testing.expectEqual(@as(WindowId, 102), model.windowTabLeader(102));
 
-    model = reduce(model, .{ .observe_window_tab_group = &group }).model;
-    model = reduce(model, .{ .remove_window = 101 }).model;
+    model = reduceCopy(model, .{ .observe_window_tab_group = &group }).model;
+    model = reduceCopy(model, .{ .remove_window = 101 }).model;
     try testing.expectEqual(@as(usize, 1), model.layout.windowCount(space_key));
     try testing.expect(!model.layout.contains(space_key, 101));
     try testing.expect(model.layout.contains(space_key, 102));
     try testing.expectEqual(@as(WindowId, 102), model.windowTabLeader(102));
+}
+
+test "adoption with a rejected tab group leaves the model untouched" {
+    const testing = std.testing;
+    const space_key: SpaceKey = .{ .id = 1 };
+    var catalog: SpaceCatalog = .{};
+    catalog.add(.{ .key = space_key, .workspace_id = 1, .display_id = 11 });
+    var model: Model = .{ .spaces = catalog };
+
+    _ = reduce(&model, .{ .adopt_window = .{
+        .window_id = 101,
+        .process_id = 1001,
+        .space_key = space_key,
+        .layout = testLayoutInsertion(.bsp),
+    } });
+    // The new window belongs to another process, so the group is invalid.
+    var group: WindowTabGroupObservation = .{
+        .leader_window_id = 101,
+        .active_window_id = 102,
+    };
+    try testing.expect(group.addMember(101));
+    try testing.expect(group.addMember(102));
+
+    const before = model;
+    const transition = reduce(&model, .{ .adopt_window = .{
+        .window_id = 102,
+        .process_id = 2002,
+        .space_key = space_key,
+        .layout = testLayoutInsertion(.bsp),
+        .tab_group = &group,
+    } });
+
+    try testing.expectEqual(@as(u8, 1), transition.effect_count);
+    try testing.expectEqual(model_mod.WindowCatalogRejectionReason.invalid_tab_group, transition.effects[0].window_catalog_rejected.reason);
+    try testing.expectEqual(@as(WindowId, 102), transition.effects[0].window_catalog_rejected.window_id);
+    try testing.expect(model.window(102) == null);
+    try testing.expect(model.geometry.get(102) == null);
+    try testing.expect(!model.layout.contains(space_key, 102));
+    try testing.expectEqual(before.windows.count, model.windows.count);
+    try testing.expectEqual(before.layout.windowCount(space_key), model.layout.windowCount(space_key));
 }
 
 test "tab grouping reconciles workspace and layout ownership atomically" {
@@ -818,13 +874,13 @@ test "tab grouping reconciles workspace and layout ownership atomically" {
     catalog.add(.{ .key = first_space, .workspace_id = 1, .display_id = 11 });
     catalog.add(.{ .key = second_space, .workspace_id = 2, .display_id = 11 });
     var model: Model = .{ .spaces = catalog };
-    model = reduce(model, .{ .adopt_window = .{
+    model = reduceCopy(model, .{ .adopt_window = .{
         .window_id = 101,
         .process_id = 1001,
         .space_key = first_space,
         .layout = testLayoutInsertion(.bsp),
     } }).model;
-    model = reduce(model, .{ .adopt_window = .{
+    model = reduceCopy(model, .{ .adopt_window = .{
         .window_id = 102,
         .process_id = 1001,
         .space_key = second_space,
@@ -837,7 +893,7 @@ test "tab grouping reconciles workspace and layout ownership atomically" {
     };
     try testing.expect(group.addMember(101));
     try testing.expect(group.addMember(102));
-    model = reduce(model, .{ .observe_window_tab_group = &group }).model;
+    model = reduceCopy(model, .{ .observe_window_tab_group = &group }).model;
 
     try testing.expect(model.window(102).?.space_key.eql(first_space));
     try testing.expectEqual(@as(WindowId, 101), model.windowTabLeader(102));
@@ -854,34 +910,34 @@ test "workspace focus memory follows window lifecycle" {
     var model: Model = .{ .spaces = catalog };
 
     for ([_]WindowId{ 101, 102 }) |window_id| {
-        model = reduce(model, .{ .adopt_window = .{
+        model = reduceCopy(model, .{ .adopt_window = .{
             .window_id = window_id,
             .process_id = 1001,
             .space_key = .{ .id = 1 },
         } }).model;
-        model = reduce(model, .{ .record_workspace_focus = .{
+        model = reduceCopy(model, .{ .record_workspace_focus = .{
             .workspace_id = 1,
             .window_id = window_id,
         } }).model;
     }
 
-    model = reduce(model, .{ .remove_window = 102 }).model;
+    model = reduceCopy(model, .{ .remove_window = 102 }).model;
     try testing.expectEqual(@as(?WindowId, 101), model.focusedWorkspaceWindow(1));
 
-    model = reduce(model, .{ .replace_window_id = .{
+    model = reduceCopy(model, .{ .replace_window_id = .{
         .old_window_id = 101,
         .new_window_id = 201,
     } }).model;
     try testing.expectEqual(@as(?WindowId, 201), model.focusedWorkspaceWindow(1));
 
-    model = reduce(model, .{ .assign_window_space = .{
+    model = reduceCopy(model, .{ .assign_window_space = .{
         .window_id = 201,
         .space_key = .{ .id = 2 },
     } }).model;
     try testing.expectEqual(@as(?WindowId, null), model.focusedWorkspaceWindow(1));
     try testing.expectEqual(@as(?WindowId, null), model.focusedWorkspaceWindow(2));
 
-    model = reduce(model, .{ .record_workspace_focus = .{
+    model = reduceCopy(model, .{ .record_workspace_focus = .{
         .workspace_id = 2,
         .window_id = 201,
     } }).model;
@@ -894,7 +950,7 @@ test "window catalog rejects invalid lifecycle events" {
     catalog.add(.{ .key = .{ .id = 1 }, .workspace_id = 1, .display_id = 11 });
     const model: Model = .{ .spaces = catalog };
 
-    const invalid = reduce(model, .{ .adopt_window = .{
+    const invalid = reduceCopy(model, .{ .adopt_window = .{
         .window_id = 0,
         .process_id = 1001,
         .space_key = .{ .id = 1 },
@@ -905,7 +961,7 @@ test "window catalog rejects invalid lifecycle events" {
         invalid.effects[0].window_catalog_rejected.reason,
     );
 
-    const missing_space = reduce(model, .{ .adopt_window = .{
+    const missing_space = reduceCopy(model, .{ .adopt_window = .{
         .window_id = 101,
         .process_id = 1001,
         .space_key = .{ .id = 2 },
@@ -915,7 +971,7 @@ test "window catalog rejects invalid lifecycle events" {
         missing_space.effects[0].window_catalog_rejected.reason,
     );
 
-    const missing_window = reduce(model, .{ .assign_window_space = .{
+    const missing_window = reduceCopy(model, .{ .assign_window_space = .{
         .window_id = 101,
         .space_key = .{ .id = 1 },
     } });
@@ -924,12 +980,12 @@ test "window catalog rejects invalid lifecycle events" {
         missing_window.effects[0].window_catalog_rejected.reason,
     );
 
-    const adopted = reduce(model, .{ .adopt_window = .{
+    const adopted = reduceCopy(model, .{ .adopt_window = .{
         .window_id = 101,
         .process_id = 1001,
         .space_key = .{ .id = 1 },
     } });
-    const duplicate = reduce(adopted.model, .{ .adopt_window = .{
+    const duplicate = reduceCopy(adopted.model, .{ .adopt_window = .{
         .window_id = 101,
         .process_id = 1001,
         .space_key = .{ .id = 1 },
@@ -947,7 +1003,7 @@ test "window catalog owns tab identity and group Space assignment" {
     catalog.add(.{ .key = .{ .id = 2 }, .workspace_id = 2, .display_id = 11 });
     var model: Model = .{ .spaces = catalog };
     for ([_]WindowId{ 101, 102, 103 }) |window_id| {
-        model = reduce(model, .{ .adopt_window = .{
+        model = reduceCopy(model, .{ .adopt_window = .{
             .window_id = window_id,
             .process_id = 1001,
             .space_key = .{ .id = 1 },
@@ -961,14 +1017,14 @@ test "window catalog owns tab identity and group Space assignment" {
     try testing.expect(group.addMember(101));
     try testing.expect(group.addMember(102));
     try testing.expect(group.addMember(103));
-    model = reduce(model, .{ .observe_window_tab_group = &group }).model;
+    model = reduceCopy(model, .{ .observe_window_tab_group = &group }).model;
 
     try testing.expectEqual(@as(WindowId, 101), model.window(103).?.tab_leader_window_id);
     try testing.expect(model.window(101).?.is_suppressed);
     try testing.expect(!model.window(102).?.is_suppressed);
     try testing.expect(model.window(103).?.is_suppressed);
 
-    model = reduce(model, .{ .assign_window_space = .{
+    model = reduceCopy(model, .{ .assign_window_space = .{
         .window_id = 103,
         .space_key = .{ .id = 2 },
     } }).model;
@@ -980,11 +1036,11 @@ test "window catalog owns tab identity and group Space assignment" {
     try testing.expectEqual(@as(WindowId, 101), workspace_windows[0]);
 
     group.active_window_id = 103;
-    model = reduce(model, .{ .observe_window_tab_group = &group }).model;
+    model = reduceCopy(model, .{ .observe_window_tab_group = &group }).model;
     try testing.expect(model.window(102).?.is_suppressed);
     try testing.expect(!model.window(103).?.is_suppressed);
 
-    model = reduce(model, .{ .detach_window_tab = .{ .window_id = 102 } }).model;
+    model = reduceCopy(model, .{ .detach_window_tab = .{ .window_id = 102 } }).model;
     try testing.expectEqual(@as(WindowId, 102), model.windowTabLeader(102));
     try testing.expect(!model.window(102).?.is_suppressed);
     try testing.expectEqual(@as(WindowId, 101), model.windowTabLeader(103));
@@ -997,7 +1053,7 @@ test "removing a tab leader leaves valid standalone identities" {
     catalog.add(.{ .key = .{ .id = 1 }, .workspace_id = 1, .display_id = 11 });
     var model: Model = .{ .spaces = catalog };
     for ([_]WindowId{ 101, 102 }) |window_id| {
-        model = reduce(model, .{ .adopt_window = .{
+        model = reduceCopy(model, .{ .adopt_window = .{
             .window_id = window_id,
             .process_id = 1001,
             .space_key = .{ .id = 1 },
@@ -1009,9 +1065,9 @@ test "removing a tab leader leaves valid standalone identities" {
     };
     try testing.expect(group.addMember(101));
     try testing.expect(group.addMember(102));
-    model = reduce(model, .{ .observe_window_tab_group = &group }).model;
+    model = reduceCopy(model, .{ .observe_window_tab_group = &group }).model;
 
-    model = reduce(model, .{ .remove_window = 101 }).model;
+    model = reduceCopy(model, .{ .remove_window = 101 }).model;
 
     const survivor = model.window(102).?;
     try testing.expectEqual(@as(WindowId, 102), survivor.tab_leader_window_id);
@@ -1024,7 +1080,7 @@ test "removing a tab leader preserves a surviving group" {
     catalog.add(.{ .key = .{ .id = 1 }, .workspace_id = 1, .display_id = 11 });
     var model: Model = .{ .spaces = catalog };
     for ([_]WindowId{ 101, 102, 103 }) |window_id| {
-        model = reduce(model, .{ .adopt_window = .{
+        model = reduceCopy(model, .{ .adopt_window = .{
             .window_id = window_id,
             .process_id = 1001,
             .space_key = .{ .id = 1 },
@@ -1037,9 +1093,9 @@ test "removing a tab leader preserves a surviving group" {
     try testing.expect(group.addMember(101));
     try testing.expect(group.addMember(102));
     try testing.expect(group.addMember(103));
-    model = reduce(model, .{ .observe_window_tab_group = &group }).model;
+    model = reduceCopy(model, .{ .observe_window_tab_group = &group }).model;
 
-    model = reduce(model, .{ .remove_window = 101 }).model;
+    model = reduceCopy(model, .{ .remove_window = 101 }).model;
 
     try testing.expectEqual(@as(WindowId, 102), model.windowTabLeader(103));
     try testing.expectEqual(@as(WindowId, 103), model.windowTabActive(102));
@@ -1051,7 +1107,7 @@ test "switch request preserves observed Space until confirmation" {
     const testing = std.testing;
     const model = initializedModel(testTopology(101, null));
 
-    const transition = reduce(model, switchRequest(&model, 1, 2, 100));
+    const transition = reduceCopy(model, switchRequest(&model, 1, 2, 100));
 
     try testing.expectEqual(@as(?WorkspaceId, 1), transition.model.observedWorkspace(1));
     try testing.expectEqual(@as(?WorkspaceId, 2), transition.model.desiredWorkspace(1));
@@ -1080,7 +1136,7 @@ test "captured macOS 27 swipe advances from the first workspace" {
     const target = swipe_reduction.workspace_target.?;
     try testing.expectEqual(@as(WorkspaceId, 2), target.workspace_id);
 
-    const transition = reduce(model, .{ .request_workspace_switch = .{ .target = target, .at_ms = 110 } });
+    const transition = reduceCopy(model, .{ .request_workspace_switch = .{ .target = target, .at_ms = 110 } });
     try testing.expectEqual(@as(?WorkspaceId, 2), transition.model.desiredWorkspace(1));
     try testing.expect(transition.effect_count > 0);
 }
@@ -1089,7 +1145,7 @@ test "swipes follow keyboard pending and queued workspace intent" {
     const testing = std.testing;
     const settings: swipe.Settings = .{ .reverse = false, .macos_major = 27 };
     var model = initializedModel(testTopology(101, null));
-    model = reduce(model, .{ .request_workspace_switch = .{
+    model = reduceCopy(model, .{ .request_workspace_switch = .{
         .target = model.logicalWorkspace(2).?,
         .at_ms = 100,
     } }).model;
@@ -1109,7 +1165,7 @@ test "swipes follow keyboard pending and queued workspace intent" {
     });
     try testing.expectEqual(@as(WorkspaceId, 3), next.workspace_target.?.workspace_id);
 
-    model = reduce(model, .{ .request_workspace_switch = .{
+    model = reduceCopy(model, .{ .request_workspace_switch = .{
         .target = next.workspace_target.?,
         .at_ms = 110,
     } }).model;
@@ -1129,7 +1185,7 @@ test "swipe reduction consumes native gesture at a workspace boundary" {
     const testing = std.testing;
     const settings: swipe.Settings = .{ .reverse = false, .macos_major = 27 };
     var model = initializedModel(testTopology(102, null));
-    model = reduce(model, .{ .request_workspace_switch = .{
+    model = reduceCopy(model, .{ .request_workspace_switch = .{
         .target = model.logicalWorkspace(1).?,
         .at_ms = 100,
     } }).model;
@@ -1152,11 +1208,11 @@ test "swipe reduction consumes native gesture at a workspace boundary" {
 test "observed target completes native switch" {
     const testing = std.testing;
     var model = initializedModel(testTopology(101, null));
-    var transition = reduce(model, switchRequest(&model, 1, 2, 100));
+    var transition = reduceCopy(model, switchRequest(&model, 1, 2, 100));
     model = deliverTestSwitch(transition.model, 110);
     const epoch = model.pending_switch.?.epoch;
 
-    transition = reduce(model, .{ .native_topology_observed = .{
+    transition = reduceCopy(model, .{ .native_topology_observed = .{
         .topology = &testTopology(102, null),
         .epoch = epoch,
         .at_ms = 200,
@@ -1176,11 +1232,11 @@ test "observed target completes native switch" {
 test "unexpected landing retries once then commits observation and fails request" {
     const testing = std.testing;
     var model = initializedModel(testTopology(101, null));
-    var transition = reduce(model, switchRequest(&model, 1, 2, 100));
+    var transition = reduceCopy(model, switchRequest(&model, 1, 2, 100));
     model = deliverTestSwitch(transition.model, 110);
     var pending = model.pending_switch.?;
 
-    transition = reduce(model, .{ .native_topology_observed = .{
+    transition = reduceCopy(model, .{ .native_topology_observed = .{
         .topology = &testTopology(103, null),
         .epoch = pending.epoch,
         .at_ms = pending.deadline_at_ms,
@@ -1194,7 +1250,7 @@ test "unexpected landing retries once then commits observation and fails request
     model = deliverTestSwitch(model, pending.deadline_at_ms + 1);
     pending = model.pending_switch.?;
 
-    transition = reduce(model, .{ .native_topology_observed = .{
+    transition = reduceCopy(model, .{ .native_topology_observed = .{
         .topology = &testTopology(103, null),
         .epoch = pending.epoch,
         .at_ms = pending.deadline_at_ms,
@@ -1212,11 +1268,11 @@ test "unexpected landing retries once then commits observation and fails request
 test "intermediate Space becomes observed while request remains pending" {
     const testing = std.testing;
     var model = initializedModel(testTopology(101, null));
-    var transition = reduce(model, switchRequest(&model, 1, 2, 100));
+    var transition = reduceCopy(model, switchRequest(&model, 1, 2, 100));
     model = deliverTestSwitch(transition.model, 110);
     const pending = model.pending_switch.?;
 
-    transition = reduce(model, .{ .native_topology_observed = .{
+    transition = reduceCopy(model, .{ .native_topology_observed = .{
         .topology = &testTopology(103, null),
         .epoch = pending.epoch,
         .at_ms = 200,
@@ -1415,8 +1471,8 @@ test "initial topology mapping binds logical workspaces to physical Spaces" {
 test "switch effect preserves target Space identity across displays" {
     const testing = std.testing;
     var model = initializedModel(testTopology(102, 201));
-    model = reduce(model, switchRequest(&model, 2, 5, 100)).model;
-    const transition = reduce(model, .{ .native_topology_observed = .{
+    model = reduceCopy(model, switchRequest(&model, 2, 5, 100)).model;
+    const transition = reduceCopy(model, .{ .native_topology_observed = .{
         .topology = &model.native_topology,
         .epoch = model.pending_switch.?.epoch,
         .at_ms = 110,
@@ -1432,28 +1488,28 @@ test "switch effect preserves target Space identity across displays" {
 test "native workspace move commits placement and ownership atomically" {
     const testing = std.testing;
     var model = initializedModel(testTopology(101, 201));
-    model = reduce(model, .{ .adopt_window = .{
+    model = reduceCopy(model, .{ .adopt_window = .{
         .window_id = 101,
         .process_id = 1001,
         .space_key = .{ .id = 101 },
         .layout = testLayoutInsertion(.bsp),
     } }).model;
-    model = reduce(model, .{ .adopt_window = .{
+    model = reduceCopy(model, .{ .adopt_window = .{
         .window_id = 201,
         .process_id = 2001,
         .space_key = .{ .id = 201 },
         .layout = testLayoutInsertion(.bsp),
     } }).model;
-    model = reduce(model, .{ .record_workspace_focus = .{
+    model = reduceCopy(model, .{ .record_workspace_focus = .{
         .workspace_id = 1,
         .window_id = 101,
     } }).model;
-    model = reduce(model, .{ .record_workspace_focus = .{
+    model = reduceCopy(model, .{ .record_workspace_focus = .{
         .workspace_id = 4,
         .window_id = 201,
     } }).model;
 
-    var transition = reduce(model, .{ .request_native_workspace_move = .{
+    var transition = reduceCopy(model, .{ .request_native_workspace_move = .{
         .source = model.space(.{ .id = 101 }).?,
         .target = model.space(.{ .id = 201 }).?,
         .at_ms = 100,
@@ -1462,14 +1518,14 @@ test "native workspace move commits placement and ownership atomically" {
     try testing.expectEqual(std.meta.Tag(Effect).move_native_workspace_contents, std.meta.activeTag(transition.effects[1]));
     const epoch = transition.model.pending_native_workspace_move.?.epoch;
 
-    transition = reduce(transition.model, .{ .native_workspace_move_started = .{
+    transition = reduceCopy(transition.model, .{ .native_workspace_move_started = .{
         .epoch = epoch,
         .succeeded = true,
         .at_ms = 110,
     } });
     try testing.expect(transition.model.pending_native_workspace_move.?.has_started);
 
-    transition = reduce(transition.model, .{ .native_workspace_move_observed = .{
+    transition = reduceCopy(transition.model, .{ .native_workspace_move_observed = .{
         .epoch = epoch,
         .observation = .confirmed,
         .at_ms = 200,
@@ -1492,18 +1548,18 @@ test "native workspace move commits placement and ownership atomically" {
 test "native workspace move timeout rolls physical contents back" {
     const testing = std.testing;
     const model = initializedModel(testTopology(101, 201));
-    var transition = reduce(model, .{ .request_native_workspace_move = .{
+    var transition = reduceCopy(model, .{ .request_native_workspace_move = .{
         .source = model.space(.{ .id = 101 }).?,
         .target = model.space(.{ .id = 201 }).?,
         .at_ms = 100,
     } });
     const pending = transition.model.pending_native_workspace_move.?;
-    transition = reduce(transition.model, .{ .native_workspace_move_started = .{
+    transition = reduceCopy(transition.model, .{ .native_workspace_move_started = .{
         .epoch = pending.epoch,
         .succeeded = true,
         .at_ms = 110,
     } });
-    transition = reduce(transition.model, .{ .native_workspace_move_observed = .{
+    transition = reduceCopy(transition.model, .{ .native_workspace_move_observed = .{
         .epoch = pending.epoch,
         .observation = .pending,
         .at_ms = pending.deadline_at_ms,
@@ -1512,7 +1568,7 @@ test "native workspace move timeout rolls physical contents back" {
     try testing.expect(transition.model.pending_native_workspace_move.?.is_rolling_back);
     try testing.expectEqual(std.meta.Tag(Effect).rollback_native_workspace_contents, std.meta.activeTag(transition.effects[0]));
 
-    transition = reduce(transition.model, .{ .native_workspace_move_rollback_result = .{
+    transition = reduceCopy(transition.model, .{ .native_workspace_move_rollback_result = .{
         .epoch = pending.epoch,
         .succeeded = true,
     } });
@@ -1528,9 +1584,9 @@ test "Space catalog preserves physical identity when placement changes" {
     catalog.add(.{ .key = .{ .id = 1 }, .workspace_id = 1, .display_id = 11 });
     catalog.add(.{ .key = .{ .id = 2 }, .workspace_id = 2, .display_id = 22 });
 
-    var model = reduce(.{}, .{ .replace_space_catalog = &catalog }).model;
+    var model = reduceCopy(.{}, .{ .replace_space_catalog = &catalog }).model;
     catalog.spaces[1].display_id = 11;
-    model = reduce(model, .{ .replace_space_catalog = &catalog }).model;
+    model = reduceCopy(model, .{ .replace_space_catalog = &catalog }).model;
 
     const moved = model.space(.{ .id = 2 }).?;
     try testing.expectEqual(@as(DisplayId, 11), moved.display_id);
@@ -1543,12 +1599,12 @@ test "workspace and focused display are reducer owned" {
     topology.addDisplay(.{ .display_id = 11, .active_workspace_id = 1 });
     topology.addDisplay(.{ .display_id = 22, .active_workspace_id = 2 });
 
-    var transition = reduce(.{}, .{ .replace_workspace_topology = topology });
-    transition = reduce(transition.model, .{ .activate_workspace = .{
+    var transition = reduceCopy(.{}, .{ .replace_workspace_topology = topology });
+    transition = reduceCopy(transition.model, .{ .activate_workspace = .{
         .display_id = 11,
         .workspace_id = 3,
     } });
-    transition = reduce(transition.model, .{ .focus_display = 22 });
+    transition = reduceCopy(transition.model, .{ .focus_display = 22 });
 
     try testing.expectEqual(@as(?WorkspaceId, 3), transition.model.activeWorkspace(11));
     try testing.expectEqual(@as(?WorkspaceId, 2), transition.model.activeWorkspace(22));
@@ -1562,8 +1618,8 @@ test "workspace transition settles from explicit focus and time events" {
     catalog.add(.{ .key = .{ .id = 1 }, .workspace_id = 1, .display_id = 11 });
     catalog.add(.{ .key = .{ .id = 2 }, .workspace_id = 2, .display_id = 11 });
 
-    var model = reduce(.{}, .{ .replace_space_catalog = &catalog }).model;
-    var transition = reduce(model, .{ .start_workspace_transition = .{
+    var model = reduceCopy(.{}, .{ .replace_space_catalog = &catalog }).model;
+    var transition = reduceCopy(model, .{ .start_workspace_transition = .{
         .kind = .switch_workspace,
         .target = model.space(.{ .id = 2 }).?,
         .at_ms = 100,
@@ -1575,7 +1631,7 @@ test "workspace transition settles from explicit focus and time events" {
     try testing.expectEqual(@as(TimestampMs, 500), model.workspace_transition.?.deadline_at_ms);
     try testing.expectEqual(std.meta.Tag(Effect).workspace_transition_started, std.meta.activeTag(transition.effects[0]));
 
-    transition = reduce(model, .{ .complete_workspace_transition = .{
+    transition = reduceCopy(model, .{ .complete_workspace_transition = .{
         .epoch = epoch,
         .reason = .focus_accepted,
         .at_ms = 250,
@@ -1584,14 +1640,14 @@ test "workspace transition settles from explicit focus and time events" {
     try testing.expectEqual(WorkspaceTransitionCompletionReason.focus_accepted, model.workspace_transition.?.completion_reason.?);
     try testing.expectEqual(@as(TimestampMs, 650), model.workspace_transition.?.deadline_at_ms);
 
-    transition = reduce(model, .{ .workspace_transition_timer_fired = .{
+    transition = reduceCopy(model, .{ .workspace_transition_timer_fired = .{
         .epoch = epoch,
         .at_ms = 649,
     } });
     try testing.expect(transition.model.isWorkspaceTransitionActive());
     try testing.expectEqual(@as(u8, 0), transition.effect_count);
 
-    transition = reduce(transition.model, .{ .workspace_transition_timer_fired = .{
+    transition = reduceCopy(transition.model, .{ .workspace_transition_timer_fired = .{
         .epoch = epoch,
         .at_ms = 650,
     } });
@@ -1606,15 +1662,15 @@ test "display move transition follows stable Space identity" {
     catalog.add(.{ .key = .{ .id = 1 }, .workspace_id = 1, .display_id = 11 });
     catalog.add(.{ .key = .{ .id = 2 }, .workspace_id = 2, .display_id = 22 });
 
-    var model = reduce(.{}, .{ .replace_space_catalog = &catalog }).model;
-    model = reduce(model, .{ .start_workspace_transition = .{
+    var model = reduceCopy(.{}, .{ .replace_space_catalog = &catalog }).model;
+    model = reduceCopy(model, .{ .start_workspace_transition = .{
         .kind = .move_workspace_to_display,
         .target = model.space(.{ .id = 2 }).?,
         .at_ms = 100,
     } }).model;
 
     catalog.spaces[1].display_id = 11;
-    model = reduce(model, .{ .replace_space_catalog = &catalog }).model;
+    model = reduceCopy(model, .{ .replace_space_catalog = &catalog }).model;
 
     try testing.expect(model.workspace_transition.?.target.key.eql(.{ .id = 2 }));
     try testing.expectEqual(@as(DisplayId, 11), model.workspace_transition.?.target.display_id);
@@ -1627,22 +1683,22 @@ test "stale workspace transition timer cannot settle newer intent" {
     catalog.add(.{ .key = .{ .id = 1 }, .workspace_id = 1, .display_id = 11 });
     catalog.add(.{ .key = .{ .id = 2 }, .workspace_id = 2, .display_id = 11 });
 
-    var model = reduce(.{}, .{ .replace_space_catalog = &catalog }).model;
-    model = reduce(model, .{ .start_workspace_transition = .{
+    var model = reduceCopy(.{}, .{ .replace_space_catalog = &catalog }).model;
+    model = reduceCopy(model, .{ .start_workspace_transition = .{
         .kind = .switch_workspace,
         .target = model.space(.{ .id = 1 }).?,
         .at_ms = 100,
     } }).model;
     const stale_epoch = model.workspace_transition.?.epoch;
 
-    model = reduce(model, .{ .start_workspace_transition = .{
+    model = reduceCopy(model, .{ .start_workspace_transition = .{
         .kind = .switch_workspace,
         .target = model.space(.{ .id = 2 }).?,
         .at_ms = 200,
     } }).model;
     const current_epoch = model.workspace_transition.?.epoch;
 
-    const transition = reduce(model, .{ .workspace_transition_timer_fired = .{
+    const transition = reduceCopy(model, .{ .workspace_transition_timer_fired = .{
         .epoch = stale_epoch,
         .at_ms = 1000,
     } });
@@ -1655,22 +1711,22 @@ test "stale workspace transition timer cannot settle newer intent" {
 test "pending focus queue replaces by window and applies newest intent" {
     const testing = std.testing;
     var model = initializedModel(testTopology(101, null));
-    model = reduce(model, switchRequest(&model, 1, 2, 100)).model;
+    model = reduceCopy(model, switchRequest(&model, 1, 2, 100)).model;
     const epoch = model.workspace_transition.?.epoch;
 
-    model = reduce(model, windowFocusObservation(&model, 10, 41, .ax, .{ .id = 102 }, false, null)).model;
-    model = reduce(model, windowFocusObservation(&model, 20, 42, .drag, .{ .id = 101 }, false, null)).model;
-    model = reduce(model, windowFocusObservation(&model, 10, 41, .drag, .{ .id = 102 }, false, null)).model;
+    model = reduceCopy(model, windowFocusObservation(&model, 10, 41, .ax, .{ .id = 102 }, false, null)).model;
+    model = reduceCopy(model, windowFocusObservation(&model, 20, 42, .drag, .{ .id = 101 }, false, null)).model;
+    model = reduceCopy(model, windowFocusObservation(&model, 10, 41, .drag, .{ .id = 102 }, false, null)).model;
 
     try testing.expectEqual(@as(u8, 2), model.pendingFocusCount());
-    var transition = reduce(model, .request_pending_focus);
+    var transition = reduceCopy(model, .request_pending_focus);
     const pending = transition.effects[0].apply_pending_focus;
     try testing.expectEqual(@as(WindowId, 41), pending.window_id);
     try testing.expectEqual(FocusEventSource.drag, pending.source);
     try testing.expectEqual(epoch, pending.transition_epoch);
     try testing.expectEqual(@as(u8, 1), transition.model.pendingFocusCount());
 
-    transition = reduce(
+    transition = reduceCopy(
         transition.model,
         windowFocusObservation(&transition.model, 10, 41, .drag, .{ .id = 102 }, true, epoch),
     );
@@ -1684,24 +1740,24 @@ test "new workspace transition rejects stale pending focus observation" {
     catalog.add(.{ .key = .{ .id = 1 }, .workspace_id = 1, .display_id = 11 });
     catalog.add(.{ .key = .{ .id = 2 }, .workspace_id = 2, .display_id = 11 });
 
-    var model = reduce(.{}, .{ .replace_space_catalog = &catalog }).model;
-    model = reduce(model, .{ .start_workspace_transition = .{
+    var model = reduceCopy(.{}, .{ .replace_space_catalog = &catalog }).model;
+    model = reduceCopy(model, .{ .start_workspace_transition = .{
         .kind = .switch_workspace,
         .target = model.space(.{ .id = 1 }).?,
         .at_ms = 100,
     } }).model;
-    model = reduce(model, windowFocusObservation(&model, 10, 41, .ax, .{ .id = 1 }, false, null)).model;
+    model = reduceCopy(model, windowFocusObservation(&model, 10, 41, .ax, .{ .id = 1 }, false, null)).model;
     const stale_epoch = model.workspace_transition.?.epoch;
 
-    model = reduce(model, .{ .start_workspace_transition = .{
+    model = reduceCopy(model, .{ .start_workspace_transition = .{
         .kind = .switch_workspace,
         .target = model.space(.{ .id = 2 }).?,
         .at_ms = 200,
     } }).model;
-    model = reduce(model, windowFocusObservation(&model, 20, 42, .ax, .{ .id = 2 }, false, null)).model;
+    model = reduceCopy(model, windowFocusObservation(&model, 20, 42, .ax, .{ .id = 2 }, false, null)).model;
 
     const current_epoch = model.workspace_transition.?.epoch;
-    const transition = reduce(
+    const transition = reduceCopy(
         model,
         windowFocusObservation(&model, 10, 41, .ax, .{ .id = 1 }, true, stale_epoch),
     );
@@ -1716,15 +1772,15 @@ test "keyboard focus accepts a visible non-target and clears pending focus" {
     catalog.add(.{ .key = .{ .id = 1 }, .workspace_id = 1, .display_id = 11 });
     catalog.add(.{ .key = .{ .id = 2 }, .workspace_id = 2, .display_id = 11 });
 
-    var model = reduce(.{}, .{ .replace_space_catalog = &catalog }).model;
-    model = reduce(model, .{ .start_workspace_transition = .{
+    var model = reduceCopy(.{}, .{ .replace_space_catalog = &catalog }).model;
+    model = reduceCopy(model, .{ .start_workspace_transition = .{
         .kind = .switch_workspace,
         .target = model.space(.{ .id = 2 }).?,
         .at_ms = 100,
     } }).model;
-    model = reduce(model, windowFocusObservation(&model, 10, 41, .ax, .{ .id = 1 }, false, null)).model;
+    model = reduceCopy(model, windowFocusObservation(&model, 10, 41, .ax, .{ .id = 1 }, false, null)).model;
 
-    const transition = reduce(
+    const transition = reduceCopy(
         model,
         windowFocusObservation(&model, 10, 41, .keyboard, .{ .id = 1 }, true, null),
     );
@@ -1740,26 +1796,26 @@ test "deferred follow focus leaves the model with transition settlement" {
     catalog.add(.{ .key = .{ .id = 1 }, .workspace_id = 1, .display_id = 11 });
     catalog.add(.{ .key = .{ .id = 2 }, .workspace_id = 2, .display_id = 11 });
 
-    var model = reduce(.{}, .{ .replace_space_catalog = &catalog }).model;
-    model = reduce(model, .{ .start_workspace_transition = .{
+    var model = reduceCopy(.{}, .{ .replace_space_catalog = &catalog }).model;
+    model = reduceCopy(model, .{ .start_workspace_transition = .{
         .kind = .switch_workspace,
         .target = model.space(.{ .id = 2 }).?,
         .at_ms = 100,
     } }).model;
     const epoch = model.workspace_transition.?.epoch;
 
-    var transition = reduce(model, followFocusObservation(&model, .{ .id = 1 }, false));
+    var transition = reduceCopy(model, followFocusObservation(&model, .{ .id = 1 }, false));
     model = transition.model;
     try testing.expect(model.hasDeferredFollowFocus());
     try testing.expectEqual(epoch, model.deferred_follow_focus.?.transition_epoch);
     try testing.expectEqual(std.meta.Tag(Effect).follow_focus_deferred, std.meta.activeTag(transition.effects[0]));
 
-    transition = reduce(model, followFocusObservation(&model, .{ .id = 2 }, true));
+    transition = reduceCopy(model, followFocusObservation(&model, .{ .id = 2 }, true));
     model = transition.model;
     try testing.expect(model.hasDeferredFollowFocus());
     try testing.expectEqual(@as(u8, 0), transition.effect_count);
 
-    transition = reduce(model, .{ .workspace_transition_timer_fired = .{
+    transition = reduceCopy(model, .{ .workspace_transition_timer_fired = .{
         .epoch = epoch,
         .at_ms = 500,
     } });
@@ -1772,8 +1828,8 @@ test "deferred follow focus leaves the model with transition settlement" {
 test "native switch ignores follow focus until Space observation" {
     const testing = std.testing;
     var model = initializedModel(testTopology(101, null));
-    model = reduce(model, switchRequest(&model, 1, 2, 100)).model;
-    const transition = reduce(model, followFocusObservation(&model, .{ .id = 101 }, false));
+    model = reduceCopy(model, switchRequest(&model, 1, 2, 100)).model;
+    const transition = reduceCopy(model, followFocusObservation(&model, .{ .id = 101 }, false));
 
     try testing.expect(!transition.model.hasDeferredFollowFocus());
     try testing.expectEqual(std.meta.Tag(Effect).follow_focus_ignored_during_native_switch, std.meta.activeTag(transition.effects[0]));
@@ -1782,7 +1838,7 @@ test "native switch ignores follow focus until Space observation" {
 test "hidden focus without a transition requests a workspace switch" {
     const testing = std.testing;
     const model = initializedModel(testTopology(101, null));
-    const transition = reduce(model, followFocusObservation(&model, .{ .id = 102 }, false));
+    const transition = reduceCopy(model, followFocusObservation(&model, .{ .id = 102 }, false));
 
     try testing.expect(transition.model.pending_switch.?.request.target.key.eql(.{ .id = 102 }));
     try testing.expectEqual(std.meta.Tag(Effect).workspace_transition_started, std.meta.activeTag(transition.effects[0]));
@@ -1793,14 +1849,14 @@ test "hidden focus without a transition requests a workspace switch" {
 test "native window move retries then requests rollback" {
     const testing = std.testing;
     var model = initializedModel(testTopology(101, null));
-    var transition = reduce(model, trackNativeWindowMove(&model, 42, 1, 2));
+    var transition = reduceCopy(model, trackNativeWindowMove(&model, 42, 1, 2));
     model = transition.model;
     const epoch = model.pendingNativeWindowMove(42).?.epoch;
 
     try testing.expectEqual(@as(u16, 1), model.pending_native_window_moves.count);
     try testing.expectEqual(@as(u8, native_window_move_attempts_max), model.pendingNativeWindowMove(42).?.attempts_remaining);
 
-    transition = reduce(model, .{ .native_window_move_observed = .{
+    transition = reduceCopy(model, .{ .native_window_move_observed = .{
         .window_id = 42,
         .epoch = epoch,
         .observation = .pending,
@@ -1811,7 +1867,7 @@ test "native window move retries then requests rollback" {
 
     var checks_remaining: u8 = native_window_move_attempts_max - 1;
     while (checks_remaining > 0) : (checks_remaining -= 1) {
-        transition = reduce(model, .{ .native_window_move_observed = .{
+        transition = reduceCopy(model, .{ .native_window_move_observed = .{
             .window_id = 42,
             .epoch = epoch,
             .observation = .pending,
@@ -1820,7 +1876,7 @@ test "native window move retries then requests rollback" {
         try testing.expectEqual(@as(u8, 0), transition.effect_count);
     }
 
-    transition = reduce(model, .{ .native_window_move_observed = .{
+    transition = reduceCopy(model, .{ .native_window_move_observed = .{
         .window_id = 42,
         .epoch = epoch,
         .observation = .pending,
@@ -1831,12 +1887,12 @@ test "native window move retries then requests rollback" {
 test "native window move rollback result is epoch checked" {
     const testing = std.testing;
     var model = initializedModel(testTopology(101, null));
-    model = reduce(model, trackNativeWindowMove(&model, 42, 1, 2)).model;
+    model = reduceCopy(model, trackNativeWindowMove(&model, 42, 1, 2)).model;
     const stale_epoch = model.pendingNativeWindowMove(42).?.epoch;
-    model = reduce(model, trackNativeWindowMove(&model, 42, 1, 3)).model;
+    model = reduceCopy(model, trackNativeWindowMove(&model, 42, 1, 3)).model;
     const current_epoch = model.pendingNativeWindowMove(42).?.epoch;
 
-    var transition = reduce(model, .{ .native_window_move_rollback_result = .{
+    var transition = reduceCopy(model, .{ .native_window_move_rollback_result = .{
         .window_id = 42,
         .epoch = stale_epoch,
         .succeeded = true,
@@ -1844,7 +1900,7 @@ test "native window move rollback result is epoch checked" {
     try testing.expectEqual(current_epoch, transition.model.pendingNativeWindowMove(42).?.epoch);
     try testing.expectEqual(@as(u8, 0), transition.effect_count);
 
-    transition = reduce(transition.model, .{ .native_window_move_rollback_result = .{
+    transition = reduceCopy(transition.model, .{ .native_window_move_rollback_result = .{
         .window_id = 42,
         .epoch = current_epoch,
         .succeeded = false,
@@ -1852,7 +1908,7 @@ test "native window move rollback result is epoch checked" {
     try testing.expect(transition.model.pendingNativeWindowMove(42) != null);
     try testing.expectEqual(std.meta.Tag(Effect).native_window_move_rollback_deferred, std.meta.activeTag(transition.effects[0]));
 
-    transition = reduce(transition.model, .{ .native_window_move_rollback_result = .{
+    transition = reduceCopy(transition.model, .{ .native_window_move_rollback_result = .{
         .window_id = 42,
         .epoch = current_epoch,
         .succeeded = true,
@@ -1864,10 +1920,10 @@ test "native window move rollback result is epoch checked" {
 test "native window move confirmation and ownership change terminate intent" {
     const testing = std.testing;
     var model = initializedModel(testTopology(101, null));
-    model = reduce(model, trackNativeWindowMove(&model, 42, 1, 2)).model;
+    model = reduceCopy(model, trackNativeWindowMove(&model, 42, 1, 2)).model;
     var epoch = model.pendingNativeWindowMove(42).?.epoch;
 
-    var transition = reduce(model, .{ .native_window_move_observed = .{
+    var transition = reduceCopy(model, .{ .native_window_move_observed = .{
         .window_id = 42,
         .epoch = epoch,
         .observation = .confirmed,
@@ -1875,9 +1931,9 @@ test "native window move confirmation and ownership change terminate intent" {
     try testing.expect(transition.model.pendingNativeWindowMove(42) == null);
     try testing.expectEqual(std.meta.Tag(Effect).native_window_move_confirmed, std.meta.activeTag(transition.effects[0]));
 
-    model = reduce(transition.model, trackNativeWindowMove(&transition.model, 42, 1, 2)).model;
+    model = reduceCopy(transition.model, trackNativeWindowMove(&transition.model, 42, 1, 2)).model;
     epoch = model.pendingNativeWindowMove(42).?.epoch;
-    transition = reduce(model, .{ .native_window_move_observed = .{
+    transition = reduceCopy(model, .{ .native_window_move_observed = .{
         .window_id = 42,
         .epoch = epoch,
         .observation = .ownership_changed,
@@ -1889,7 +1945,7 @@ test "native window move confirmation and ownership change terminate intent" {
 test "pending native window move follows Space identity across ordinal changes" {
     const testing = std.testing;
     var model = initializedModel(testTopology(101, null));
-    model = reduce(model, trackNativeWindowMove(&model, 42, 1, 2)).model;
+    model = reduceCopy(model, trackNativeWindowMove(&model, 42, 1, 2)).model;
 
     var topology: NativeTopology = .{};
     var display = DisplayTopology.init(1, 101);
@@ -1898,7 +1954,7 @@ test "pending native window move follows Space identity across ordinal changes" 
     display.addSpace(.{ .id = 102, .workspace_id = 3 });
     topology.addDisplay(display);
 
-    const transition = reduce(model, .{ .native_topology_observed = .{
+    const transition = reduceCopy(model, .{ .native_topology_observed = .{
         .topology = &topology,
         .epoch = 99,
         .at_ms = 100,
@@ -1912,19 +1968,19 @@ test "pending native window move follows Space identity across ordinal changes" 
 test "stale timer cannot observe for newer switch" {
     const testing = std.testing;
     var model = initializedModel(testTopology(101, null));
-    var transition = reduce(model, switchRequest(&model, 1, 2, 100));
+    var transition = reduceCopy(model, switchRequest(&model, 1, 2, 100));
     model = transition.model;
     const stale_epoch = model.pending_switch.?.epoch;
 
-    transition = reduce(model, .{ .native_switch_effect_failed = .{
+    transition = reduceCopy(model, .{ .native_switch_effect_failed = .{
         .epoch = stale_epoch,
         .at_ms = 110,
     } });
     model = transition.model;
-    transition = reduce(model, switchRequest(&model, 1, 3, 120));
+    transition = reduceCopy(model, switchRequest(&model, 1, 3, 120));
     model = transition.model;
 
-    transition = reduce(model, .{ .observation_timer_fired = .{
+    transition = reduceCopy(model, .{ .observation_timer_fired = .{
         .epoch = stale_epoch,
         .at_ms = 1000,
     } });
@@ -1936,11 +1992,11 @@ test "stale timer cannot observe for newer switch" {
 test "rapid switch requests keep only latest target" {
     const testing = std.testing;
     var model = initializedModel(testTopology(101, null));
-    var transition = reduce(model, switchRequest(&model, 1, 2, 100));
+    var transition = reduceCopy(model, switchRequest(&model, 1, 2, 100));
     model = transition.model;
-    transition = reduce(model, switchRequest(&model, 1, 3, 110));
+    transition = reduceCopy(model, switchRequest(&model, 1, 3, 110));
     model = transition.model;
-    transition = reduce(model, switchRequest(&model, 1, 1, 120));
+    transition = reduceCopy(model, switchRequest(&model, 1, 1, 120));
 
     try testing.expectEqual(@as(?WorkspaceId, 1), transition.model.desiredWorkspace(1));
     try testing.expectEqual(@as(?WorkspaceId, 1), if (transition.model.queued_switch) |queued| queued.target.workspace_id else null);
@@ -1949,16 +2005,16 @@ test "rapid switch requests keep only latest target" {
 test "workspace hotkeys queue the observed workspace without replacing the pending transition" {
     const testing = std.testing;
     var model = initializedModel(testTopology(101, null));
-    model = reduce(model, .{ .request_workspace_switch = .{
+    model = reduceCopy(model, .{ .request_workspace_switch = .{
         .target = model.spaceForWorkspace(1, 2).?,
         .at_ms = 100,
     } }).model;
     const epoch = model.pending_switch.?.epoch;
-    model = reduce(model, .{ .request_workspace_switch = .{
+    model = reduceCopy(model, .{ .request_workspace_switch = .{
         .target = model.spaceForWorkspace(1, 3).?,
         .at_ms = 110,
     } }).model;
-    const transition = reduce(model, .{ .request_workspace_switch = .{
+    const transition = reduceCopy(model, .{ .request_workspace_switch = .{
         .target = model.spaceForWorkspace(1, 1).?,
         .at_ms = 120,
     } });
@@ -1971,11 +2027,11 @@ test "workspace hotkeys queue the observed workspace without replacing the pendi
 test "unexpected landing recovers toward latest queued target" {
     const testing = std.testing;
     var model = initializedModel(testTopology(101, null));
-    model = reduce(model, switchRequest(&model, 1, 2, 100)).model;
+    model = reduceCopy(model, switchRequest(&model, 1, 2, 100)).model;
     model = deliverTestSwitch(model, 105);
     const pending = model.pending_switch.?;
-    model = reduce(model, switchRequest(&model, 1, 3, 110)).model;
-    var transition = reduce(model, .{ .native_topology_observed = .{
+    model = reduceCopy(model, switchRequest(&model, 1, 3, 110)).model;
+    var transition = reduceCopy(model, .{ .native_topology_observed = .{
         .topology = &testTopology(101, null),
         .epoch = pending.epoch,
         .at_ms = pending.deadline_at_ms,
@@ -1988,7 +2044,7 @@ test "unexpected landing recovers toward latest queued target" {
     try testing.expect(!model.pending_switch.?.has_retried);
     model = deliverTestSwitch(model, pending.deadline_at_ms + 1);
     const recovered = model.pending_switch.?;
-    transition = reduce(model, .{ .native_topology_observed = .{
+    transition = reduceCopy(model, .{ .native_topology_observed = .{
         .topology = &testTopology(103, null),
         .epoch = recovered.epoch,
         .at_ms = recovered.deadline_at_ms - 1,
@@ -2002,10 +2058,10 @@ test "unexpected landing recovers toward latest queued target" {
 test "native switch waits for idle before preparing gestures" {
     const testing = std.testing;
     var model = initializedModel(testTopology(101, null));
-    model = reduce(model, switchRequest(&model, 1, 2, 100)).model;
+    model = reduceCopy(model, switchRequest(&model, 1, 2, 100)).model;
     const epoch = model.pending_switch.?.epoch;
     for ([_]?bool{ true, null }) |is_animating| {
-        const transition = reduce(model, .{ .native_topology_observed = .{
+        const transition = reduceCopy(model, .{ .native_topology_observed = .{
             .topology = &testTopology(101, null),
             .epoch = epoch,
             .at_ms = 200,
@@ -2015,7 +2071,7 @@ test "native switch waits for idle before preparing gestures" {
         try testing.expectEqual(.waiting_for_idle, transition.model.pending_switch.?.phase);
         try testing.expect(transition.model.hasScheduledObservation());
     }
-    const transition = reduce(model, .{ .native_topology_observed = .{
+    const transition = reduceCopy(model, .{ .native_topology_observed = .{
         .topology = &testTopology(101, null),
         .epoch = epoch,
         .at_ms = 250,
@@ -2026,7 +2082,7 @@ test "native switch waits for idle before preparing gestures" {
 }
 
 fn expectTestEffect(model: *Model, event: Event, expected: ?std.meta.Tag(Effect)) !void {
-    const transition = reduce(model.*, event);
+    const transition = reduceCopy(model.*, event);
     model.* = transition.model;
     if (expected) |tag| {
         try std.testing.expect(transition.effect_count > 0);
@@ -2142,27 +2198,27 @@ test "unpaced multi-space delivery reaches the target before completing" {
 test "late gesture failure cancels delivery and stale callbacks cannot affect its successor" {
     const testing = std.testing;
     var model = initializedModel(testTopology(101, null));
-    model = reduce(model, switchRequest(&model, 1, 2, 100)).model;
+    model = reduceCopy(model, switchRequest(&model, 1, 2, 100)).model;
     const epoch = model.pending_switch.?.epoch;
-    model = reduce(model, .{ .native_topology_observed = .{
+    model = reduceCopy(model, .{ .native_topology_observed = .{
         .topology = &testTopology(101, null),
         .epoch = epoch,
         .at_ms = 110,
         .is_animating = false,
     } }).model;
-    model = reduce(model, .{ .native_gesture_prepared = .{
+    model = reduceCopy(model, .{ .native_gesture_prepared = .{
         .epoch = epoch,
         .at_ms = 110,
         .plan = .{ .direction = .right, .steps = 1, .velocity = 2000, .is_paced = false },
     } }).model;
-    model = reduce(model, .{ .native_gesture_posted = .{
+    model = reduceCopy(model, .{ .native_gesture_posted = .{
         .epoch = epoch,
         .phase = .began,
         .succeeded = true,
         .at_ms = 110,
     } }).model;
-    model = reduce(model, switchRequest(&model, 1, 3, 115)).model;
-    var transition = reduce(model, .{ .native_gesture_posted = .{
+    model = reduceCopy(model, switchRequest(&model, 1, 3, 115)).model;
+    var transition = reduceCopy(model, .{ .native_gesture_posted = .{
         .epoch = epoch,
         .phase = .changed,
         .succeeded = false,
@@ -2177,7 +2233,7 @@ test "late gesture failure cancels delivery and stale callbacks cannot affect it
         .{ .native_gesture_posted = .{ .epoch = epoch, .phase = .ended, .succeeded = true, .at_ms = 200 } },
         .{ .native_topology_observed = .{ .topology = &testTopology(102, null), .epoch = epoch, .at_ms = 200, .is_animating = false } },
     }) |event| {
-        transition = reduce(model, event);
+        transition = reduceCopy(model, event);
         try testing.expectEqual(@as(u8, 0), transition.effect_count);
         try testing.expectEqual(next_epoch, transition.model.pending_switch.?.epoch);
         try testing.expectEqual(@as(?WorkspaceId, 1), transition.model.observedWorkspace(1));
@@ -2187,16 +2243,16 @@ test "late gesture failure cancels delivery and stale callbacks cannot affect it
 test "unknown or stuck animation fails without pretending settlement" {
     const testing = std.testing;
     var model = initializedModel(testTopology(101, null));
-    model = reduce(model, switchRequest(&model, 1, 2, 100)).model;
+    model = reduceCopy(model, switchRequest(&model, 1, 2, 100)).model;
     model = deliverTestSwitch(model, 110);
     const pending = model.pending_switch.?;
-    const timer = reduce(model, .{ .workspace_transition_timer_fired = .{
+    const timer = reduceCopy(model, .{ .workspace_transition_timer_fired = .{
         .epoch = pending.epoch,
         .at_ms = pending.deadline_at_ms,
     } });
     try testing.expect(timer.model.isWorkspaceTransitionActive());
     for ([_]?bool{ true, null }) |is_animating| {
-        const transition = reduce(model, .{ .native_topology_observed = .{
+        const transition = reduceCopy(model, .{ .native_topology_observed = .{
             .topology = &testTopology(102, null),
             .epoch = pending.epoch,
             .at_ms = pending.deadline_at_ms,
@@ -2267,7 +2323,7 @@ test "failed workspace move waits for actual rollback result" {
     const epoch = model.pending_native_workspace_move.?.epoch;
     try expectTestEffect(&model, .{ .native_workspace_move_started = .{ .epoch = epoch, .succeeded = false, .at_ms = 110 } }, .rollback_native_workspace_contents);
     try testing.expect(model.pending_native_workspace_move.?.is_rolling_back);
-    const transition = reduce(model, .{ .native_workspace_move_rollback_result = .{ .epoch = epoch, .succeeded = false, .at_ms = 120 } });
+    const transition = reduceCopy(model, .{ .native_workspace_move_rollback_result = .{ .epoch = epoch, .succeeded = false, .at_ms = 120 } });
     try testing.expect(!transition.effects[1].native_workspace_move_failed.rollback_succeeded);
 }
 
@@ -2296,13 +2352,13 @@ test "display reconnect renumbers surviving Spaces without moving their windows 
     previous.addDisplay(laptop);
     var model = initializedModel(previous);
     for ([_]WindowId{ 42, 43 }, [_]NativeSpaceId{ 102, 103 }) |wid, sid| {
-        model = reduce(model, .{ .adopt_window = .{
+        model = reduceCopy(model, .{ .adopt_window = .{
             .window_id = wid,
             .process_id = 10,
             .space_key = .{ .id = sid },
             .layout = testLayoutInsertion(.bsp),
         } }).model;
-        model = reduce(model, .{ .record_workspace_focus = .{
+        model = reduceCopy(model, .{ .record_workspace_focus = .{
             .window_id = wid,
             .workspace_id = @intCast(sid - 100),
         } }).model;
@@ -2322,7 +2378,7 @@ test "display reconnect renumbers surviving Spaces without moving their windows 
     const mapped = mapNativeTopology(observation, &model.native_topology, &model.workspace_topology, &model.spaces, 10, 2, .native_order).?;
     try testing.expectEqual(@as(?NativeSpaceId, 103), mapped.findDisplay(2).?.spaceForWorkspace(2));
     try testing.expectEqual(@as(?NativeSpaceId, 102), mapped.findDisplay(1).?.spaceForWorkspace(10));
-    model = reduce(model, .{ .initialize_native_topology = .{ .topology = &mapped } }).model;
+    model = reduceCopy(model, .{ .initialize_native_topology = .{ .topology = &mapped } }).model;
     try testing.expectEqual(@as(?WorkspaceId, 10), model.activeWorkspace(1));
     try testing.expectEqual(@as(?WorkspaceId, 1), model.activeWorkspace(2));
     try testing.expectEqual(@as(?WindowId, 42), model.focusedWorkspaceWindow(10));
@@ -2353,7 +2409,7 @@ test "display resettle renumbers restored ordinals even when display identities 
 test "replaced native Spaces retain window and layout ownership" {
     const testing = std.testing;
     var model = initializedModel(testTopology(101, null));
-    model = reduce(model, .{ .adopt_window = .{
+    model = reduceCopy(model, .{ .adopt_window = .{
         .window_id = 42,
         .process_id = 10,
         .space_key = .{ .id = 103 },
@@ -2367,18 +2423,18 @@ test "replaced native Spaces retain window and layout ownership" {
     var second = DisplayTopology.init(2, 201);
     second.addSpace(.{ .id = 201, .workspace_id = 3 });
     topology.addDisplay(second);
-    model = reduce(model, .{ .initialize_native_topology = .{ .topology = &topology } }).model;
+    model = reduceCopy(model, .{ .initialize_native_topology = .{ .topology = &topology } }).model;
     try testing.expect(model.window(42).?.space_key.eql(.{ .id = 201 }));
     try testing.expect(model.layout.contains(.{ .id = 201 }, 42));
     try testing.expect(!model.layout.contains(.{ .id = 103 }, 42));
-    model = reduce(model, .{ .initialize_native_topology = .{ .topology = &testTopology(101, null) } }).model;
+    model = reduceCopy(model, .{ .initialize_native_topology = .{ .topology = &testTopology(101, null) } }).model;
     try testing.expect(model.window(42).?.space_key.eql(.{ .id = 103 }));
     try testing.expect(model.layout.contains(.{ .id = 103 }, 42));
 }
 
 test "failed display observation schedules another settle attempt" {
     const testing = std.testing;
-    const transition = reduce(initializedModel(testTopology(101, null)), .{ .display_reconcile_unavailable = .{
+    const transition = reduceCopy(initializedModel(testTopology(101, null)), .{ .display_reconcile_unavailable = .{
         .at_ms = 500,
         .mapping = .preserve_space_ids,
     } });
@@ -2435,7 +2491,7 @@ test "window discovery retries are reducer owned" {
     const testing = std.testing;
     var catalog: SpaceCatalog = .{};
     catalog.add(.{ .key = .{ .id = 1 }, .workspace_id = 1, .display_id = 11 });
-    var model = reduce(.{}, .{ .replace_space_catalog = &catalog }).model;
+    var model = reduceCopy(.{}, .{ .replace_space_catalog = &catalog }).model;
     const candidate: WindowCandidate = .{
         .process_id = 42,
         .window_id = 100,
@@ -2443,23 +2499,23 @@ test "window discovery retries are reducer owned" {
         .attempts_remaining = 1,
     };
 
-    model = reduce(model, .{ .track_pending_role_window = candidate }).model;
-    var transition = reduce(model, .{ .pending_role_observed = .{
+    model = reduceCopy(model, .{ .track_pending_role_window = candidate }).model;
+    var transition = reduceCopy(model, .{ .pending_role_observed = .{
         .window_id = candidate.window_id,
         .readiness = .pending,
     } });
     try testing.expectEqual(@as(u8, 0), transition.effect_count);
     try testing.expectEqual(@as(u8, 0), transition.model.pending_role_windows.get(candidate.window_id).?.attempts_remaining);
 
-    transition = reduce(transition.model, .{ .pending_role_observed = .{
+    transition = reduceCopy(transition.model, .{ .pending_role_observed = .{
         .window_id = candidate.window_id,
         .readiness = .pending,
     } });
     try testing.expectEqual(@as(?WindowCandidate, null), transition.model.pending_role_windows.get(candidate.window_id));
     try testing.expectEqual(std.meta.Tag(Effect).pending_role_expired, std.meta.activeTag(transition.effects[0]));
 
-    model = reduce(transition.model, .{ .track_deferred_window_candidate = candidate }).model;
-    transition = reduce(model, .{ .deferred_window_observed = .{
+    model = reduceCopy(transition.model, .{ .track_deferred_window_candidate = candidate }).model;
+    transition = reduceCopy(model, .{ .deferred_window_observed = .{
         .window_id = candidate.window_id,
         .readiness = .ready,
         .is_visible = true,
@@ -2467,9 +2523,9 @@ test "window discovery retries are reducer owned" {
     try testing.expect(transition.model.hasDeferredWindowCandidate(candidate.window_id));
     try testing.expectEqual(std.meta.Tag(Effect).deferred_window_ready, std.meta.activeTag(transition.effects[0]));
 
-    transition = reduce(transition.model, .{ .deferred_window_promotion_failed = candidate.window_id });
+    transition = reduceCopy(transition.model, .{ .deferred_window_promotion_failed = candidate.window_id });
     try testing.expectEqual(@as(u8, 0), transition.model.deferred_window_candidates.get(candidate.window_id).?.attempts_remaining);
-    transition = reduce(transition.model, .{ .deferred_window_promotion_failed = candidate.window_id });
+    transition = reduceCopy(transition.model, .{ .deferred_window_promotion_failed = candidate.window_id });
     try testing.expect(!transition.model.hasDeferredWindowCandidate(candidate.window_id));
     try testing.expectEqual(DeferredWindowExpiryReason.unsettled_bounds, transition.effects[0].deferred_window_expired.reason);
 }
@@ -2477,16 +2533,16 @@ test "window discovery retries are reducer owned" {
 test "process retry outcomes are reducer owned" {
     const testing = std.testing;
     const retry: ProcessRetry = .{ .process_id = 42, .attempts_remaining = 1 };
-    var model = reduce(.{}, .{ .track_app_launch_retry = retry }).model;
+    var model = reduceCopy(.{}, .{ .track_app_launch_retry = retry }).model;
 
-    var transition = reduce(model, .{ .app_launch_retry_timer_fired = retry.process_id });
+    var transition = reduceCopy(model, .{ .app_launch_retry_timer_fired = retry.process_id });
     try testing.expectEqual(@as(u8, 0), transition.effect_count);
-    transition = reduce(transition.model, .{ .app_launch_retry_timer_fired = retry.process_id });
+    transition = reduceCopy(transition.model, .{ .app_launch_retry_timer_fired = retry.process_id });
     try testing.expectEqual(@as(?ProcessRetry, null), transition.model.app_launch_retries.get(retry.process_id));
     try testing.expectEqual(std.meta.Tag(Effect).app_launch_retry_ready, std.meta.activeTag(transition.effects[0]));
 
-    model = reduce(transition.model, .{ .track_focus_retry = retry }).model;
-    transition = reduce(model, .{ .focus_retry_observed = .{
+    model = reduceCopy(transition.model, .{ .track_focus_retry = retry }).model;
+    transition = reduceCopy(model, .{ .focus_retry_observed = .{
         .process_id = retry.process_id,
         .focused_window_id = 100,
     } });
@@ -2496,13 +2552,13 @@ test "process retry outcomes are reducer owned" {
 
 test "display settle timer is reducer owned" {
     const testing = std.testing;
-    const model = reduce(.{}, .{ .display_changed = .{
+    const model = reduceCopy(.{}, .{ .display_changed = .{
         .at_ms = 100,
         .resettle_at_ms = 500,
     } }).model;
-    var transition = reduce(model, .{ .display_resettle_timer_fired = 499 });
+    var transition = reduceCopy(model, .{ .display_resettle_timer_fired = 499 });
     try testing.expect(transition.model.hasDisplayResettleScheduled());
-    transition = reduce(transition.model, .{ .display_resettle_timer_fired = 500 });
+    transition = reduceCopy(transition.model, .{ .display_resettle_timer_fired = 500 });
     try testing.expect(!transition.model.hasDisplayResettleScheduled());
     try testing.expectEqual(std.meta.Tag(Effect).display_resettle_due, std.meta.activeTag(transition.effects[0]));
 }
@@ -2511,15 +2567,15 @@ test "pointer drop swaps layout inside the reducer" {
     const testing = std.testing;
     var catalog: SpaceCatalog = .{};
     catalog.add(.{ .key = .{ .id = 1 }, .workspace_id = 1, .display_id = 11 });
-    var model = reduce(.{}, .{ .replace_space_catalog = &catalog }).model;
-    model = reduce(model, .{ .adopt_window = .{
+    var model = reduceCopy(.{}, .{ .replace_space_catalog = &catalog }).model;
+    model = reduceCopy(model, .{ .adopt_window = .{
         .window_id = 100,
         .process_id = 42,
         .space_key = .{ .id = 1 },
         .frame = .{ .x = 0, .y = 0, .width = 500, .height = 500 },
         .layout = testLayoutInsertion(.bsp),
     } }).model;
-    model = reduce(model, .{ .adopt_window = .{
+    model = reduceCopy(model, .{ .adopt_window = .{
         .window_id = 200,
         .process_id = 43,
         .space_key = .{ .id = 1 },
@@ -2527,16 +2583,16 @@ test "pointer drop swaps layout inside the reducer" {
         .layout = testLayoutInsertion(.bsp),
     } }).model;
 
-    model = reduce(model, .{ .pointer_down = 100 }).model;
-    model = reduce(model, .pointer_dragged).model;
-    var transition = reduce(model, .{ .drag_preview_observed = .{
+    model = reduceCopy(model, .{ .pointer_down = 100 }).model;
+    model = reduceCopy(model, .pointer_dragged).model;
+    var transition = reduceCopy(model, .{ .drag_preview_observed = .{
         .source_window_id = 100,
         .target_window_id = 200,
         .target_frame = .{ .x = 500, .y = 0, .width = 500, .height = 500 },
     } });
     try testing.expectEqual(std.meta.Tag(Effect).show_drag_preview, std.meta.activeTag(transition.effects[0]));
 
-    transition = reduce(transition.model, .pointer_up);
+    transition = reduceCopy(transition.model, .pointer_up);
     try testing.expectEqual(@as(?WindowId, 200), transition.model.layout.firstWid(.{ .id = 1 }));
     try testing.expect(!transition.model.pointer_drag.is_down);
     try testing.expectEqual(std.meta.Tag(Effect).hide_drag_preview, std.meta.activeTag(transition.effects[0]));
@@ -2550,16 +2606,16 @@ test "directional commands resolve focus and layout in the reducer" {
     catalog.add(.{ .key = space_key, .workspace_id = 1, .display_id = 11 });
     var topology: WorkspaceTopology = .{};
     topology.addDisplay(.{ .display_id = 11, .active_workspace_id = 1 });
-    var model = reduce(.{}, .{ .replace_space_catalog = &catalog }).model;
-    model = reduce(model, .{ .replace_workspace_topology = topology }).model;
-    model = reduce(model, .{ .adopt_window = .{
+    var model = reduceCopy(.{}, .{ .replace_space_catalog = &catalog }).model;
+    model = reduceCopy(model, .{ .replace_workspace_topology = topology }).model;
+    model = reduceCopy(model, .{ .adopt_window = .{
         .window_id = 100,
         .process_id = 42,
         .space_key = space_key,
         .frame = .{ .x = 0, .y = 0, .width = 500, .height = 500 },
         .layout = testLayoutInsertion(.bsp),
     } }).model;
-    model = reduce(model, .{ .adopt_window = .{
+    model = reduceCopy(model, .{ .adopt_window = .{
         .window_id = 200,
         .process_id = 43,
         .space_key = space_key,
@@ -2567,7 +2623,7 @@ test "directional commands resolve focus and layout in the reducer" {
         .layout = testLayoutInsertion(.bsp),
     } }).model;
 
-    var transition = reduce(model, .{ .focus_direction = .{
+    var transition = reduceCopy(model, .{ .focus_direction = .{
         .window_id = 100,
         .direction = .right,
     } });
@@ -2575,7 +2631,7 @@ test "directional commands resolve focus and layout in the reducer" {
     try testing.expectEqual(std.meta.Tag(Effect).focus_window, std.meta.activeTag(transition.effects[0]));
     try testing.expectEqual(@as(WindowId, 200), transition.effects[0].focus_window.window_id);
 
-    transition = reduce(transition.model, .{ .swap_direction = .{
+    transition = reduceCopy(transition.model, .{ .swap_direction = .{
         .window_id = 200,
         .direction = .left,
     } });
@@ -2591,10 +2647,10 @@ test "resize command leaves fullscreen layout unchanged and resumes after exit" 
     catalog.add(.{ .key = space_key, .workspace_id = 1, .display_id = 11 });
     var topology: WorkspaceTopology = .{};
     topology.addDisplay(.{ .display_id = 11, .active_workspace_id = 1 });
-    var model = reduce(.{}, .{ .replace_space_catalog = &catalog }).model;
-    model = reduce(model, .{ .replace_workspace_topology = topology }).model;
+    var model = reduceCopy(.{}, .{ .replace_space_catalog = &catalog }).model;
+    model = reduceCopy(model, .{ .replace_workspace_topology = topology }).model;
     for ([_]WindowId{ 100, 200 }) |window_id| {
-        model = reduce(model, .{ .adopt_window = .{
+        model = reduceCopy(model, .{ .adopt_window = .{
             .window_id = window_id,
             .process_id = 42,
             .space_key = space_key,
@@ -2602,11 +2658,11 @@ test "resize command leaves fullscreen layout unchanged and resumes after exit" 
             .layout = testLayoutInsertion(.bsp),
         } }).model;
     }
-    model = reduce(model, .{ .toggle_window_fullscreen = .{
+    model = reduceCopy(model, .{ .toggle_window_fullscreen = .{
         .window_id = 100,
         .observed_frame = null,
     } }).model;
-    model = reduce(model, .flush_retile_requests).model;
+    model = reduceCopy(model, .flush_retile_requests).model;
     try testing.expect(model.window(100).?.is_fullscreen);
     try testing.expectEqual(window_mod.WindowMode.tiled, model.window(100).?.mode);
 
@@ -2615,15 +2671,15 @@ test "resize command leaves fullscreen layout unchanged and resumes after exit" 
             .event = .{ .resize_window = .{ .space_key = space_key, .window_id = 100, .delta = delta } },
             .display_id = 11,
         } };
-        const blocked = reduce(model, command);
+        const blocked = reduceCopy(model, command);
         try testing.expectEqualDeep(model.layout, blocked.model.layout);
         try testing.expectEqual(@as(u8, 0), blocked.model.retile_request.display_count);
 
-        const restored = reduce(model, .{ .toggle_window_fullscreen = .{
+        const restored = reduceCopy(model, .{ .toggle_window_fullscreen = .{
             .window_id = 100,
             .observed_frame = null,
         } }).model;
-        const resized = reduce(restored, command);
+        const resized = reduceCopy(restored, command);
         try testing.expect(!std.meta.eql(restored.layout, resized.model.layout));
     }
 }
@@ -2635,9 +2691,9 @@ test "window presentation commands reduce intent before platform effects" {
     catalog.add(.{ .key = space_key, .workspace_id = 1, .display_id = 11 });
     var topology: WorkspaceTopology = .{};
     topology.addDisplay(.{ .display_id = 11, .active_workspace_id = 1 });
-    var model = reduce(.{}, .{ .replace_space_catalog = &catalog }).model;
-    model = reduce(model, .{ .replace_workspace_topology = topology }).model;
-    model = reduce(model, .{ .adopt_window = .{
+    var model = reduceCopy(.{}, .{ .replace_space_catalog = &catalog }).model;
+    model = reduceCopy(model, .{ .replace_workspace_topology = topology }).model;
+    model = reduceCopy(model, .{ .adopt_window = .{
         .window_id = 100,
         .process_id = 42,
         .space_key = space_key,
@@ -2645,7 +2701,7 @@ test "window presentation commands reduce intent before platform effects" {
         .layout = testLayoutInsertion(.bsp),
     } }).model;
 
-    var transition = reduce(model, .{ .set_window_mode = .{
+    var transition = reduceCopy(model, .{ .set_window_mode = .{
         .window_id = 100,
         .mode = .floating,
     } });
@@ -2653,21 +2709,21 @@ test "window presentation commands reduce intent before platform effects" {
     try testing.expect(!transition.model.layout.contains(space_key, 100));
     try testing.expectEqual(std.meta.Tag(Effect).window_mode_changed, std.meta.activeTag(transition.effects[0]));
 
-    transition = reduce(transition.model, .{ .toggle_window_fullscreen = .{
+    transition = reduceCopy(transition.model, .{ .toggle_window_fullscreen = .{
         .window_id = 100,
         .observed_frame = .{ .x = 30, .y = 40, .width = 500, .height = 350 },
     } });
     try testing.expect(transition.model.window(100).?.is_fullscreen);
     try testing.expectEqual(@as(f64, 30), transition.model.window(100).?.float_frame.?.x);
 
-    transition = reduce(transition.model, .{ .toggle_window_fullscreen = .{
+    transition = reduceCopy(transition.model, .{ .toggle_window_fullscreen = .{
         .window_id = 100,
         .observed_frame = null,
     } });
     try testing.expect(!transition.model.window(100).?.is_fullscreen);
     try testing.expectEqual(@as(f64, 30), transition.effects[0].fullscreen_changed.restore_frame.?.x);
 
-    transition = reduce(transition.model, .{ .center_floating_window = .{
+    transition = reduceCopy(transition.model, .{ .center_floating_window = .{
         .window_id = 100,
         .observed_frame = .{ .x = 30, .y = 40, .width = 500, .height = 350 },
         .display_frame = .{ .x = 0, .y = 0, .width = 1000, .height = 800 },
@@ -2676,7 +2732,7 @@ test "window presentation commands reduce intent before platform effects" {
     try testing.expectEqual(@as(f64, 250), center.target_frame.x);
     try testing.expectEqual(@as(f64, 225), center.target_frame.y);
 
-    transition = reduce(transition.model, .{ .window_frame_command_result = .{
+    transition = reduceCopy(transition.model, .{ .window_frame_command_result = .{
         .leader_window_id = 100,
         .window_id = 100,
         .target_frame = center.target_frame,
@@ -2696,20 +2752,20 @@ test "window move command commits ownership layout and intent atomically" {
     catalog.add(.{ .key = target_key, .workspace_id = 2, .display_id = 11 });
     var topology: WorkspaceTopology = .{};
     topology.addDisplay(.{ .display_id = 11, .active_workspace_id = 1 });
-    var model = reduce(.{}, .{ .replace_space_catalog = &catalog }).model;
-    model = reduce(model, .{ .replace_workspace_topology = topology }).model;
-    model = reduce(model, .{ .adopt_window = .{
+    var model = reduceCopy(.{}, .{ .replace_space_catalog = &catalog }).model;
+    model = reduceCopy(model, .{ .replace_workspace_topology = topology }).model;
+    model = reduceCopy(model, .{ .adopt_window = .{
         .window_id = 100,
         .process_id = 42,
         .space_key = source_key,
         .layout = testLayoutInsertion(.bsp),
     } }).model;
-    model = reduce(model, .{ .record_workspace_focus = .{
+    model = reduceCopy(model, .{ .record_workspace_focus = .{
         .workspace_id = 1,
         .window_id = 100,
     } }).model;
 
-    const transition = reduce(model, .{ .request_window_move = .{
+    const transition = reduceCopy(model, .{ .request_window_move = .{
         .window_id = 100,
         .target = catalog.find(target_key).?,
         .layout = testLayoutInsertion(.bsp),

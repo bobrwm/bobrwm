@@ -3877,8 +3877,7 @@ fn nativeTopologyFromSnapshot(snapshot: *const skylight.NativeSpaceTopology, map
 }
 
 fn dispatchStateEvent(event: state_mod.Event) void {
-    const transition = state_mod.reduce(g_state, event);
-    g_state = transition.model;
+    const transition = state_mod.reduce(&g_state, event);
 
     for (transition.effects[0..transition.effect_count]) |effect| {
         if (!g_state_effect_queue.push(effect)) @panic("state effect queue overflow");

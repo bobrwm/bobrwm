@@ -145,11 +145,6 @@ pub const Effect = union(enum) {
     },
 };
 
-pub const Transition = struct {
-    state: Self,
-    effect: ?Effect = null,
-};
-
 pub const max_entries = 1024;
 
 const StoredEntry = struct {
@@ -171,25 +166,27 @@ pub fn initWithSettleInterval(settle_interval_ns: i128) Self {
     return .{ .settle_interval_ns = settle_interval_ns };
 }
 
-pub fn reduce(state: Self, event: Event) Transition {
-    var transition: Transition = .{ .state = state };
+/// Apply `event` to `state` in place. The table is 200+ KiB, so taking it by
+/// value would copy it on every geometry event.
+pub fn reduce(state: *Self, event: Event) ?Effect {
+    var effect: ?Effect = null;
     switch (event) {
         .seed => |observation| {
-            transition.state.seedObserved(observation.window_id, observation.observed) catch |err| {
-                transition.effect = rejectionEffect(observation.window_id, err);
+            state.seedObserved(observation.window_id, observation.observed) catch |err| {
+                effect = rejectionEffect(observation.window_id, err);
             };
         },
         .observe => |observation| {
-            const owner = transition.state.observe(
+            const owner = state.observe(
                 observation.window_id,
                 observation.observed,
                 observation.at_ns,
                 observation.dragged_window_id,
             ) catch |err| {
-                transition.effect = rejectionEffect(observation.window_id, err);
-                return transition;
+                effect = rejectionEffect(observation.window_id, err);
+                return effect;
             };
-            transition.effect = .{ .observed = .{
+            effect = .{ .observed = .{
                 .process_id = observation.process_id,
                 .window_id = observation.window_id,
                 .frame = observation.observed,
@@ -199,60 +196,60 @@ pub fn reduce(state: Self, event: Event) Transition {
         },
         .accept_frame => |accepted| {
             if (accepted.settle_interval_ns) |settle_interval_ns| {
-                _ = transition.state.recordFrameAcceptedFor(
+                _ = state.recordFrameAcceptedFor(
                     accepted.window_id,
                     accepted.target,
                     accepted.source,
                     accepted.at_ns,
                     settle_interval_ns,
                 ) catch |err| {
-                    transition.effect = rejectionEffect(accepted.window_id, err);
+                    effect = rejectionEffect(accepted.window_id, err);
                 };
             } else {
-                _ = transition.state.recordFrameAccepted(
+                _ = state.recordFrameAccepted(
                     accepted.window_id,
                     accepted.target,
                     accepted.source,
                     accepted.at_ns,
                 ) catch |err| {
-                    transition.effect = rejectionEffect(accepted.window_id, err);
+                    effect = rejectionEffect(accepted.window_id, err);
                 };
             }
         },
         .accept_position => |accepted| {
-            _ = transition.state.recordPositionAccepted(
+            _ = state.recordPositionAccepted(
                 accepted.window_id,
                 accepted.x,
                 accepted.y,
                 accepted.source,
                 accepted.at_ns,
             ) catch |err| {
-                transition.effect = rejectionEffect(accepted.window_id, err);
+                effect = rejectionEffect(accepted.window_id, err);
             };
         },
-        .begin_resample => |window_id| transition.state.beginResample(window_id),
-        .defer_resample => |resample| transition.state.deferResample(resample.window_id, resample.at_ns),
+        .begin_resample => |window_id| state.beginResample(window_id),
+        .defer_resample => |resample| state.deferResample(resample.window_id, resample.at_ns),
         .settle => |observation| {
-            const pending_intent = if (transition.state.get(observation.window_id)) |entry|
+            const pending_intent = if (state.get(observation.window_id)) |entry|
                 entry.intent
             else
                 null;
-            const owner = transition.state.settle(
+            const owner = state.settle(
                 observation.window_id,
                 observation.observed,
                 observation.at_ns,
             );
-            transition.effect = .{ .settled = .{
+            effect = .{ .settled = .{
                 .window_id = observation.window_id,
                 .frame = observation.observed,
                 .pending_intent = pending_intent,
                 .owner = owner,
             } };
         },
-        .forget => |window_id| transition.state.forget(window_id),
-        .clear_intents => transition.state.clearIntents(),
+        .forget => |window_id| state.forget(window_id),
+        .clear_intents => state.clearIntents(),
     }
-    return transition;
+    return effect;
 }
 
 /// Record a frame write only after AX accepted the full operation. A newer
@@ -709,16 +706,17 @@ test "value copies do not share geometry entries" {
     try testing.expect(copied.get(20) != null);
 }
 
-test "reducer returns geometry state and ownership effects" {
-    var transition = reduce(.{}, .{ .accept_frame = .{
+test "reducer updates geometry state in place and returns ownership effects" {
+    var state: Self = .{};
+    var effect = reduce(&state, .{ .accept_frame = .{
         .window_id = 10,
         .target = fullscreen,
         .source = .layout,
         .at_ns = 1_000,
     } });
-    try testing.expect(transition.effect == null);
+    try testing.expect(effect == null);
 
-    transition = reduce(transition.state, .{ .observe = .{
+    effect = reduce(&state, .{ .observe = .{
         .process_id = 20,
         .window_id = 10,
         .observed = tiled,
@@ -726,11 +724,11 @@ test "reducer returns geometry state and ownership effects" {
         .at_ns = 1_001,
         .dragged_window_id = null,
     } });
-    try testing.expectEqual(ObservationOwner.manager, transition.effect.?.observed.owner);
+    try testing.expectEqual(ObservationOwner.manager, effect.?.observed.owner);
 
     var due_window_ids: [1]WindowId = undefined;
     const due_at_ns = 1_001 + default_resample_delay_ns;
-    try testing.expectEqual(@as(usize, 1), transition.state.dueResamples(due_at_ns, &due_window_ids));
-    transition = reduce(transition.state, .{ .begin_resample = 10 });
-    try testing.expectEqual(@as(usize, 0), transition.state.dueResamples(due_at_ns, &due_window_ids));
+    try testing.expectEqual(@as(usize, 1), state.dueResamples(due_at_ns, &due_window_ids));
+    _ = reduce(&state, .{ .begin_resample = 10 });
+    try testing.expectEqual(@as(usize, 0), state.dueResamples(due_at_ns, &due_window_ids));
 }
