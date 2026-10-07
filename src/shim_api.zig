@@ -68,10 +68,8 @@ pub const bw_frame = extern struct {
 // The two remaining extern symbols bridge leaf modules to state owned by
 // main.zig without importing the root module: bw_emit_event is called from
 // ax_observer.zig (per-app AX observer threads), and bw_set_keybinds from
-// config.zig — which is also compiled standalone as the bobrwm-swipe
-// `bobrwm_config` module, where lazy extern resolution keeps the window
-// manager out of the swipe binary. Everything else that used to live here
-// is plain Zig now (see ax.zig and osutil.zig).
+// config.zig. Everything else that used to live here is plain Zig now (see
+// ax.zig and osutil.zig).
 
 // Thread-safe: may be called from per-app AX observer background threads.
 pub extern fn bw_emit_event(kind: u8, pid: i32, wid: u32) void;

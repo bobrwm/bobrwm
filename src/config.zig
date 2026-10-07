@@ -325,12 +325,8 @@ pub const AppRule = struct {
 
 pub const SwipeConfig = struct {
     enabled: bool = false,
-    fingers: u8 = 3,
-    distance_pct: f64 = 0.08,
     reverse: bool = false,
 };
-
-pub const max_swipe_fingers: u8 = 16;
 
 /// Inactive-window dimming via owned black overlay panels. When enabled, every
 /// visible managed window except the focused one gets a click-through black
@@ -518,8 +514,6 @@ const ConfigDiagnostics = struct {
         invalid_workspace_name,
         invalid_bsp_split_ratio,
         invalid_dim_level,
-        invalid_swipe_finger_count,
-        invalid_swipe_distance,
         unknown_key_name,
         invalid_keybind_workspace,
         invalid_keybind_display,
@@ -536,8 +530,6 @@ const ConfigDiagnostics = struct {
                 .invalid_workspace_name => error.InvalidWorkspaceName,
                 .invalid_bsp_split_ratio => error.InvalidBspSplitRatio,
                 .invalid_dim_level => error.InvalidDimLevel,
-                .invalid_swipe_finger_count => error.InvalidSwipeFingerCount,
-                .invalid_swipe_distance => error.InvalidSwipeDistance,
                 .unknown_key_name => error.UnknownKeyName,
                 .invalid_keybind_workspace => error.InvalidKeybindWorkspace,
                 .invalid_keybind_display => error.InvalidKeybindDisplay,
@@ -552,7 +544,6 @@ const ConfigDiagnostics = struct {
         fn parentField(self: ValidationKind) ?[]const u8 {
             return switch (self) {
                 .invalid_dim_level => "dimmed_inactive",
-                .invalid_swipe_finger_count, .invalid_swipe_distance => "swipe",
                 .unknown_key_name, .invalid_keybind_workspace, .invalid_keybind_display => "keybinds",
                 .empty_app_rule_id, .invalid_app_rule_workspace, .duplicate_app_rule => "app_rules",
                 .empty_workspace_assignment_id,
@@ -568,8 +559,6 @@ const ConfigDiagnostics = struct {
                 .too_many_workspaces, .invalid_workspace_name => "workspace_names",
                 .invalid_bsp_split_ratio => "bsp_split_ratio",
                 .invalid_dim_level => "level",
-                .invalid_swipe_finger_count => "fingers",
-                .invalid_swipe_distance => "distance_pct",
                 .unknown_key_name => "key",
                 .invalid_keybind_workspace, .invalid_keybind_display => "arg",
                 .empty_app_rule_id,
@@ -636,14 +625,6 @@ const ConfigDiagnostics = struct {
             config.dimmed_inactive.level < 0 or config.dimmed_inactive.level > 1)
         {
             if (!sink.emit(.{ .kind = .invalid_dim_level })) return;
-        }
-        if (config.swipe.fingers == 0 or config.swipe.fingers > max_swipe_fingers) {
-            if (!sink.emit(.{ .kind = .invalid_swipe_finger_count })) return;
-        }
-        if (!std.math.isFinite(config.swipe.distance_pct) or
-            config.swipe.distance_pct <= 0 or config.swipe.distance_pct > 1)
-        {
-            if (!sink.emit(.{ .kind = .invalid_swipe_distance })) return;
         }
 
         if (!visitKeybindDiagnostics(config.keybinds, workspace_count, sink)) return;
@@ -826,11 +807,6 @@ const ConfigDiagnostics = struct {
             .invalid_workspace_name => try writer.writeAll("workspace names must be valid UTF-8 and contain no NUL bytes"),
             .invalid_bsp_split_ratio => try writer.print("expected a finite value from 0.1 through 0.9, found {d}", .{config.bsp_split_ratio}),
             .invalid_dim_level => try writer.print("expected a finite value from 0 through 1, found {d}", .{config.dimmed_inactive.level}),
-            .invalid_swipe_finger_count => try writer.print("expected a value from 1 through {d}, found {d}", .{
-                max_swipe_fingers,
-                config.swipe.fingers,
-            }),
-            .invalid_swipe_distance => try writer.print("expected a finite value greater than 0 and at most 1, found {d}", .{config.swipe.distance_pct}),
             .unknown_key_name => try writer.print("unknown key name \"{s}\"; expected a letter, digit, or named navigation key", .{
                 config.keybinds[diagnostic.index.?].key,
             }),
@@ -901,6 +877,14 @@ const ConfigDiagnostics = struct {
 
         for (parse_error.notes) |note| {
             try writer.print("   = note: {s}\n", .{note.msg});
+            // This supported-field list identifies SwipeConfig. The same names
+            // in other config objects should retain only the generic warning.
+            if (!std.mem.eql(u8, note.msg, "supported: 'enabled', 'reverse'")) continue;
+            if (std.mem.eql(u8, parse_error.msg, "unexpected field 'fingers'")) {
+                try writer.writeAll("   = note: swipe.fingers was removed; configure finger count in macOS System Settings > Trackpad > More Gestures > Swipe between full-screen applications\n");
+            } else if (std.mem.eql(u8, parse_error.msg, "unexpected field 'distance_pct'")) {
+                try writer.writeAll("   = note: swipe.distance_pct was removed; workspace switching now uses native gesture direction rather than a configured distance threshold\n");
+            }
         }
     }
 
@@ -1340,8 +1324,7 @@ test "default config" {
     try t.expectEqual(@as(usize, 0), cfg.workspace_assignments.len);
     try t.expectEqual(@as(usize, 0), cfg.workspace_names.len);
     try t.expect(!cfg.swipe.enabled);
-    try t.expectEqual(@as(u8, 3), cfg.swipe.fingers);
-    try t.expectApproxEqAbs(@as(f64, 0.08), cfg.swipe.distance_pct, 0.0001);
+    try t.expect(!cfg.swipe.reverse);
     try t.expectEqual(@as(u16, 0), cfg.gaps.inner);
     try t.expectEqual(@as(u16, 0), cfg.gaps.outer.left);
     try t.expectEqual(tiling.LayoutKind.bsp, cfg.layout);
@@ -1364,7 +1347,7 @@ test "validate accepts defaults and a reduced workspace set" {
     try t.expectEqual(@as(u8, 4), workspaceCount(&reduced));
 }
 
-test "validate rejects geometry and gesture values that are not finite or bounded" {
+test "validate rejects geometry values that are not bounded" {
     var cfg: Config = .{};
 
     cfg.bsp_split_ratio = std.math.inf(f64);
@@ -1373,14 +1356,6 @@ test "validate rejects geometry and gesture values that are not finite or bounde
     cfg = .{};
     cfg.dimmed_inactive.level = std.math.nan(f32);
     try t.expectError(error.InvalidDimLevel, validate(&cfg));
-
-    cfg = .{};
-    cfg.swipe.fingers = max_swipe_fingers + 1;
-    try t.expectError(error.InvalidSwipeFingerCount, validate(&cfg));
-
-    cfg = .{};
-    cfg.swipe.distance_pct = std.math.nan(f64);
-    try t.expectError(error.InvalidSwipeDistance, validate(&cfg));
 }
 
 test "semantic validation renders every invalid field" {
@@ -1388,7 +1363,6 @@ test "semantic validation renders every invalid field" {
         \\.{
         \\    .bsp_split_ratio = 1.0,
         \\    .dimmed_inactive = .{ .level = -0.1 },
-        \\    .swipe = .{ .fingers = 0, .distance_pct = 2.0 },
         \\    .keybinds = .{
         \\        .{ .key = "F1", .action = .focus_left },
         \\        .{ .key = "F2", .action = .focus_right },
@@ -1434,11 +1408,9 @@ test "semantic validation renders every invalid field" {
     try t.expect(!context.failed);
     const rendered = writer.buffered();
 
-    try t.expectEqual(@as(usize, 6), std.mem.count(u8, rendered, "error: invalid value for `"));
+    try t.expectEqual(@as(usize, 4), std.mem.count(u8, rendered, "error: invalid value for `"));
     try t.expect(std.mem.indexOf(u8, rendered, "`.bsp_split_ratio`") != null);
     try t.expect(std.mem.indexOf(u8, rendered, "`.dimmed_inactive.level`") != null);
-    try t.expect(std.mem.indexOf(u8, rendered, "`.swipe.fingers`") != null);
-    try t.expect(std.mem.indexOf(u8, rendered, "`.swipe.distance_pct`") != null);
     try t.expect(std.mem.indexOf(u8, rendered, "`.keybinds[0].key`") != null);
     try t.expect(std.mem.indexOf(u8, rendered, "`.keybinds[1].key`") != null);
 }
@@ -1532,6 +1504,33 @@ test "parse recovery reports unknown fields at every nesting level" {
     try t.expect(std.mem.indexOf(u8, rendered, "|         .nonsense = true,") != null);
 }
 
+test "parse recovery explains removed swipe settings only in swipe config" {
+    const source: [:0]const u8 =
+        \\.{
+        \\    .fingers = 3,
+        \\    .swipe = .{
+        \\        .enabled = true,
+        \\        .fingers = 4,
+        \\        .distance_pct = 10,
+        \\    },
+        \\    .gaps = .{ .distance_pct = 5 },
+        \\}
+    ;
+    var buffer: [8192]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buffer);
+    const recovery = try ConfigDiagnostics.writeRecoveredParseDiagnostics(&writer, "/tmp/config.zon", source);
+    const rendered = writer.buffered();
+
+    try t.expectEqual(ConfigDiagnostics.ParseRecovery.ignored_unknown_fields, recovery);
+    try t.expectEqual(@as(usize, 4), std.mem.count(u8, rendered, "warning: invalid field ignored"));
+    try t.expectEqual(@as(usize, 1), std.mem.count(u8, rendered, "swipe.fingers was removed"));
+    try t.expectEqual(@as(usize, 1), std.mem.count(u8, rendered, "swipe.distance_pct was removed"));
+    try t.expect(std.mem.indexOf(u8, rendered, "macOS System Settings > Trackpad > More Gestures") != null);
+    try t.expect(std.mem.indexOf(u8, rendered, "native gesture direction rather than a configured distance threshold") != null);
+    try t.expect(std.mem.indexOf(u8, rendered, "--> /tmp/config.zon:5:") != null);
+    try t.expect(std.mem.indexOf(u8, rendered, "--> /tmp/config.zon:6:") != null);
+}
+
 test "parse recovery continues from an unknown field to a typed error" {
     const source: [:0]const u8 =
         \\.{
@@ -1554,7 +1553,7 @@ test "parse recovery masks a final nested initializer without a comma" {
     const source: [:0]const u8 =
         \\.{
         \\    .swipe = .{
-        \\        .fingers = 3,
+        \\        .enabled = true,
         \\        .unknown = .{
         \\            .nested = true,
         \\        }
@@ -1834,7 +1833,7 @@ test "loadFromPath: custom zon" {
         \\    .workspace_assignments = .{
         \\        .{ .app_id = "com.test.App", .workspace = 3 },
         \\    },
-        \\    .swipe = .{ .enabled = true, .fingers = 4, .distance_pct = 0.1, .fingres = 5 },
+        \\    .swipe = .{ .enabled = true, .reverse = true, .fingres = 5 },
         \\    .gaps = .{ .inner = 8, .outer = .{ .left = 4, .right = 4, .top = 4, .bottom = 4 } },
         \\    .layout = .monocle,
         \\    .bsp_split = .vertical,
@@ -1862,8 +1861,7 @@ test "loadFromPath: custom zon" {
     try t.expect(std.mem.eql(u8, "com.test.App", cfg.workspace_assignments[0].app_id));
     try t.expectEqual(@as(u8, 3), cfg.workspace_assignments[0].workspace);
     try t.expect(cfg.swipe.enabled);
-    try t.expectEqual(@as(u8, 4), cfg.swipe.fingers);
-    try t.expectApproxEqAbs(@as(f64, 0.1), cfg.swipe.distance_pct, 0.0001);
+    try t.expect(cfg.swipe.reverse);
 
     try t.expectEqual(@as(u16, 8), cfg.gaps.inner);
     try t.expectEqual(@as(u16, 4), cfg.gaps.outer.left);

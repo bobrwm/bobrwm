@@ -60,6 +60,11 @@ pub extern fn CGEventGetIntegerValueField(
     field: c.CGEventField,
 ) i64;
 
+pub extern fn CGEventGetDoubleValueField(
+    event: c.CGEventRef,
+    field: c.CGEventField,
+) f64;
+
 pub const CGEventTapCallBack = ?*const fn (
     proxy: c.CGEventTapProxy,
     @"type": c.CGEventType,

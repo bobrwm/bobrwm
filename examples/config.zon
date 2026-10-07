@@ -26,13 +26,10 @@
     // .second = right/bottom, .first = left/top
     // .new_window_split = .second,
 
-    // Optional bobrwm-swipe companion configuration. Core bobrwm only
-    // parses this field; the companion package owns gesture handling.
+    // Optional trackpad workspace switching handled directly by bobrwm.
     // .swipe = .{
     //     .enabled = false,
-    //     .fingers = 3,
-    //     // Fraction of normalized trackpad width before a swipe fires.
-    //     .distance_pct = 0.08,
+    //     // Uses the finger count selected for macOS Spaces swipes.
     //     // Reverse swipe direction.
     //     .reverse = false,
     // },

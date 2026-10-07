@@ -96,7 +96,6 @@ jobs:
           # deprecated it.
           for helper in \
             MacOS/bobrwm-cli:com.bobrwm.cli \
-            MacOS/bobrwm-swipe:com.bobrwm.swipe \
             Frameworks/libbobrwm-ui.dylib:com.bobrwm.ui \
             Frameworks/libbobrwm-oslog.dylib:com.bobrwm.oslog; do
             codesign \
@@ -124,8 +123,6 @@ jobs:
             "com.bobrwm.bobrwm"
           test "$(codesign -dvv "$APP_PATH/Contents/MacOS/bobrwm-cli" 2>&1 | sed -n 's/^Identifier=//p')" = \
             "com.bobrwm.cli"
-          test "$(codesign -dvv "$APP_PATH/Contents/MacOS/bobrwm-swipe" 2>&1 | sed -n 's/^Identifier=//p')" = \
-            "com.bobrwm.swipe"
           test "$(codesign -dvv "$APP_PATH/Contents/Frameworks/libbobrwm-ui.dylib" 2>&1 | sed -n 's/^Identifier=//p')" = \
             "com.bobrwm.ui"
           test "$(codesign -dvv "$APP_PATH/Contents/Frameworks/libbobrwm-oslog.dylib" 2>&1 | sed -n 's/^Identifier=//p')" = \

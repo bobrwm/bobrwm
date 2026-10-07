@@ -8,6 +8,7 @@ const command_reducer = @import("state/reducer/command.zig");
 const discovery_reducer = @import("state/reducer/discovery.zig");
 const layout_reducer = @import("state/reducer/layout.zig");
 const pointer_reducer = @import("state/reducer/pointer.zig");
+const swipe_reducer = @import("state/reducer/swipe.zig");
 const window_reducer = @import("state/reducer/window.zig");
 const workspace_reducer = @import("state/reducer/workspace.zig");
 const tiling_mod = @import("tiling.zig");
@@ -53,6 +54,8 @@ pub const TimestampMs = model_mod.TimestampMs;
 pub const WindowId = model_mod.WindowId;
 pub const FocusEventSource = model_mod.FocusEventSource;
 pub const FocusDirection = model_mod.FocusDirection;
+pub const swipe = model_mod.swipe;
+pub const SwipeInput = model_mod.SwipeInput;
 pub const DeferredFollowFocus = model_mod.DeferredFollowFocus;
 pub const FollowFocusObservation = model_mod.FollowFocusObservation;
 pub const WindowFocusObservation = model_mod.WindowFocusObservation;
@@ -107,6 +110,15 @@ pub const WindowCatalogRejectionReason = model_mod.WindowCatalogRejectionReason;
 pub const Effect = model_mod.Effect;
 pub const max_effects = model_mod.max_effects;
 pub const Transition = model_mod.Transition;
+pub const SwipeReduction = model_mod.SwipeReduction;
+
+/// Event taps need an immediate consume/pass result. This reducer copies only
+/// its tiny protocol state rather than the complete application model.
+pub fn reduceSwipeInput(model: *const Model, input: SwipeInput) SwipeReduction {
+    const reduction = swipe_reducer.reduceInput(model, input);
+    reduction.state.assertValid();
+    return reduction;
+}
 
 pub fn reduce(model: Model, event: Event) Transition {
     var transition: Transition = .{ .model = model };
@@ -1048,6 +1060,93 @@ test "switch request preserves observed Space until confirmation" {
     try testing.expectEqual(@as(u8, 2), transition.effect_count);
     try testing.expectEqual(std.meta.Tag(Effect).workspace_transition_started, std.meta.activeTag(transition.effects[0]));
     try testing.expectEqual(std.meta.Tag(Effect).observe_native_topology, std.meta.activeTag(transition.effects[1]));
+}
+
+test "captured macOS 27 swipe advances from the first workspace" {
+    const testing = std.testing;
+    var model = initializedModel(testTopology(101, null));
+    const settings: swipe.Settings = .{ .reverse = false, .macos_major = 27 };
+    var swipe_reduction = reduceSwipeInput(&model, .{
+        .event = .{ .dock = .{ .phase = .began, .progress = 0.015228271484375, .velocity_x = 0 } },
+        .settings = settings,
+    });
+    model.swipe = swipe_reduction.state;
+    swipe_reduction = reduceSwipeInput(&model, .{
+        .event = .{ .dock = .{ .phase = .changed, .progress = 0.046661376953125, .velocity_x = 0 } },
+        .settings = settings,
+    });
+    try testing.expectEqual(swipe.Disposition.consume, swipe_reduction.result.disposition);
+    try testing.expectEqual(swipe.Direction.next, swipe_reduction.result.direction.?);
+    const target = swipe_reduction.workspace_target.?;
+    try testing.expectEqual(@as(WorkspaceId, 2), target.workspace_id);
+
+    const transition = reduce(model, .{ .request_workspace_switch = .{ .target = target, .at_ms = 110 } });
+    try testing.expectEqual(@as(?WorkspaceId, 2), transition.model.desiredWorkspace(1));
+    try testing.expect(transition.effect_count > 0);
+}
+
+test "swipes follow keyboard pending and queued workspace intent" {
+    const testing = std.testing;
+    const settings: swipe.Settings = .{ .reverse = false, .macos_major = 27 };
+    var model = initializedModel(testTopology(101, null));
+    model = reduce(model, .{ .request_workspace_switch = .{
+        .target = model.logicalWorkspace(2).?,
+        .at_ms = 100,
+    } }).model;
+    try testing.expectEqual(@as(?WorkspaceId, 1), model.observedWorkspace(1));
+    try testing.expectEqual(@as(?WorkspaceId, 2), model.desiredWorkspace(1));
+
+    model.swipe = reduceSwipeInput(&model, .{
+        .event = .{ .dock = .{ .phase = .began, .progress = 0, .velocity_x = 0 } },
+        .settings = settings,
+    }).state;
+    const synthetic = reduceSwipeInput(&model, .{ .event = .synthetic_dock, .settings = settings });
+    model.swipe = synthetic.state;
+    try testing.expect(synthetic.workspace_target == null);
+    const next = reduceSwipeInput(&model, .{
+        .event = .{ .dock = .{ .phase = .changed, .progress = 0.1, .velocity_x = 0 } },
+        .settings = settings,
+    });
+    try testing.expectEqual(@as(WorkspaceId, 3), next.workspace_target.?.workspace_id);
+
+    model = reduce(model, .{ .request_workspace_switch = .{
+        .target = next.workspace_target.?,
+        .at_ms = 110,
+    } }).model;
+    try testing.expectEqual(@as(?WorkspaceId, 3), model.desiredWorkspace(1));
+    model.swipe = reduceSwipeInput(&model, .{
+        .event = .{ .dock = .{ .phase = .began, .progress = 0, .velocity_x = 0 } },
+        .settings = settings,
+    }).state;
+    const previous = reduceSwipeInput(&model, .{
+        .event = .{ .dock = .{ .phase = .changed, .progress = -0.1, .velocity_x = 0 } },
+        .settings = settings,
+    });
+    try testing.expectEqual(@as(WorkspaceId, 2), previous.workspace_target.?.workspace_id);
+}
+
+test "swipe reduction consumes native gesture at a workspace boundary" {
+    const testing = std.testing;
+    const settings: swipe.Settings = .{ .reverse = false, .macos_major = 27 };
+    var model = initializedModel(testTopology(102, null));
+    model = reduce(model, .{ .request_workspace_switch = .{
+        .target = model.logicalWorkspace(1).?,
+        .at_ms = 100,
+    } }).model;
+    try testing.expectEqual(@as(?WorkspaceId, 2), model.observedWorkspace(1));
+    try testing.expectEqual(@as(?WorkspaceId, 1), model.desiredWorkspace(1));
+    var swipe_reduction = reduceSwipeInput(&model, .{
+        .event = .{ .dock = .{ .phase = .began, .progress = 0, .velocity_x = 0 } },
+        .settings = settings,
+    });
+    model.swipe = swipe_reduction.state;
+    swipe_reduction = reduceSwipeInput(&model, .{
+        .event = .{ .dock = .{ .phase = .changed, .progress = -0.1, .velocity_x = 0 } },
+        .settings = settings,
+    });
+    try testing.expectEqual(swipe.Disposition.consume, swipe_reduction.result.disposition);
+    try testing.expectEqual(swipe.Direction.previous, swipe_reduction.result.direction.?);
+    try testing.expect(swipe_reduction.workspace_target == null);
 }
 
 test "observed target completes native switch" {
