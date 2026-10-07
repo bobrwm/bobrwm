@@ -877,6 +877,14 @@ const ConfigDiagnostics = struct {
 
         for (parse_error.notes) |note| {
             try writer.print("   = note: {s}\n", .{note.msg});
+            // This supported-field list identifies SwipeConfig. The same names
+            // in other config objects should retain only the generic warning.
+            if (!std.mem.eql(u8, note.msg, "supported: 'enabled', 'reverse'")) continue;
+            if (std.mem.eql(u8, parse_error.msg, "unexpected field 'fingers'")) {
+                try writer.writeAll("   = note: swipe.fingers was removed; configure finger count in macOS System Settings > Trackpad > More Gestures > Swipe between full-screen applications\n");
+            } else if (std.mem.eql(u8, parse_error.msg, "unexpected field 'distance_pct'")) {
+                try writer.writeAll("   = note: swipe.distance_pct was removed; workspace switching now uses native gesture direction rather than a configured distance threshold\n");
+            }
         }
     }
 
@@ -1494,6 +1502,33 @@ test "parse recovery reports unknown fields at every nesting level" {
     try t.expect(std.mem.indexOf(u8, rendered, "unexpected field 'nope'") != null);
     try t.expect(std.mem.indexOf(u8, rendered, "--> /tmp/config.zon:5:") != null);
     try t.expect(std.mem.indexOf(u8, rendered, "|         .nonsense = true,") != null);
+}
+
+test "parse recovery explains removed swipe settings only in swipe config" {
+    const source: [:0]const u8 =
+        \\.{
+        \\    .fingers = 3,
+        \\    .swipe = .{
+        \\        .enabled = true,
+        \\        .fingers = 4,
+        \\        .distance_pct = 10,
+        \\    },
+        \\    .gaps = .{ .distance_pct = 5 },
+        \\}
+    ;
+    var buffer: [8192]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buffer);
+    const recovery = try ConfigDiagnostics.writeRecoveredParseDiagnostics(&writer, "/tmp/config.zon", source);
+    const rendered = writer.buffered();
+
+    try t.expectEqual(ConfigDiagnostics.ParseRecovery.ignored_unknown_fields, recovery);
+    try t.expectEqual(@as(usize, 4), std.mem.count(u8, rendered, "warning: invalid field ignored"));
+    try t.expectEqual(@as(usize, 1), std.mem.count(u8, rendered, "swipe.fingers was removed"));
+    try t.expectEqual(@as(usize, 1), std.mem.count(u8, rendered, "swipe.distance_pct was removed"));
+    try t.expect(std.mem.indexOf(u8, rendered, "macOS System Settings > Trackpad > More Gestures") != null);
+    try t.expect(std.mem.indexOf(u8, rendered, "native gesture direction rather than a configured distance threshold") != null);
+    try t.expect(std.mem.indexOf(u8, rendered, "--> /tmp/config.zon:5:") != null);
+    try t.expect(std.mem.indexOf(u8, rendered, "--> /tmp/config.zon:6:") != null);
 }
 
 test "parse recovery continues from an unknown field to a typed error" {
