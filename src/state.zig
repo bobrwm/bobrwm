@@ -1468,6 +1468,79 @@ test "initial topology mapping binds logical workspaces to physical Spaces" {
     }
 }
 
+test "fullscreen observation preserves ordinary mapping through startup and topology changes" {
+    const testing = std.testing;
+    var observation: NativeTopologyObservation = .{};
+    var primary: NativeDisplayObservation = .{
+        .display_id = 1,
+        .observed_space_id = 65,
+        .space_count = 2,
+    };
+    primary.space_ids[0] = 57;
+    primary.space_ids[1] = 58;
+    observation.addDisplay(primary);
+    var secondary: NativeDisplayObservation = .{
+        .display_id = 2,
+        .observed_space_id = 3,
+        .space_count = 1,
+    };
+    secondary.space_ids[0] = 3;
+    observation.addDisplay(secondary);
+    const empty: NativeTopology = .{};
+    const workspace_topology: WorkspaceTopology = .{};
+    const catalog: SpaceCatalog = .{};
+    const initial = mapNativeTopology(observation, &empty, &workspace_topology, &catalog, 3, 1, .native_order).?;
+    var model = initializedModel(initial);
+    try testing.expectEqual(@as(NativeSpaceId, 65), model.native_topology.findDisplay(1).?.observed_space_id);
+    try testing.expectEqual(@as(?WorkspaceId, null), model.observedWorkspace(1));
+    try testing.expectEqual(@as(?WorkspaceId, 1), model.activeWorkspace(1));
+    try testing.expectEqual(@as(?WorkspaceId, 3), model.activeWorkspace(2));
+    try testing.expect(model.space(.{ .id = 65 }) == null);
+
+    observation.displays[0].observed_space_id = 58;
+    const desktop = mapNativeTopology(observation, &initial, &model.workspace_topology, &model.spaces, 3, 1, .preserve_space_ids).?;
+    model = reduceCopy(model, .{ .native_topology_observed = .{ .topology = &desktop, .epoch = 0, .at_ms = 10 } }).model;
+    try testing.expectEqual(@as(?WorkspaceId, 2), model.activeWorkspace(1));
+
+    observation.displays[0].observed_space_id = 65;
+    const fullscreen = mapNativeTopology(observation, &desktop, &model.workspace_topology, &model.spaces, 3, 1, .preserve_space_ids).?;
+    model = reduceCopy(model, .{ .native_topology_observed = .{ .topology = &fullscreen, .epoch = 0, .at_ms = 20 } }).model;
+    try testing.expectEqual(@as(NativeSpaceId, 65), model.native_topology.findDisplay(1).?.observed_space_id);
+    try testing.expectEqual(@as(?WorkspaceId, 2), model.activeWorkspace(1));
+    try testing.expectEqual(@as(?WorkspaceId, null), model.observedWorkspace(1));
+
+    // A replaced ordinary desktop forces the non-stable mapping path while
+    // fullscreen is visible; it must not require fullscreen in the catalog.
+    observation.displays[0].space_ids[0] = 59;
+    const replaced = mapNativeTopology(observation, &fullscreen, &model.workspace_topology, &model.spaces, 3, 1, .preserve_space_ids).?;
+    try testing.expectEqual(@as(?NativeSpaceId, 59), replaced.findDisplay(1).?.spaceForWorkspace(1));
+    try testing.expectEqual(@as(?NativeSpaceId, 58), replaced.findDisplay(1).?.spaceForWorkspace(2));
+    try testing.expectEqual(@as(NativeSpaceId, 65), replaced.findDisplay(1).?.observed_space_id);
+}
+
+test "secondary fullscreen retains workspace and explicit switch leaves fullscreen" {
+    const testing = std.testing;
+    const desktop = testTopology(102, 202);
+    var model = initializedModel(desktop);
+    const fullscreen = testTopology(102, 65);
+    model = reduceCopy(model, .{ .native_topology_observed = .{ .topology = &fullscreen, .epoch = 0, .at_ms = 10 } }).model;
+    try testing.expectEqual(@as(?WorkspaceId, 2), model.activeWorkspace(1));
+    try testing.expectEqual(@as(?WorkspaceId, 5), model.activeWorkspace(2));
+    try testing.expectEqual(@as(?WorkspaceId, null), model.observedWorkspace(2));
+
+    const requested = reduceCopy(model, .{ .request_workspace_switch = .{
+        .target = model.spaceForWorkspace(2, 5).?,
+        .at_ms = 20,
+    } });
+    try testing.expect(requested.model.pending_switch != null);
+    try testing.expectEqual(@as(NativeSpaceId, 202), requested.model.pending_switch.?.request.target.key.id);
+
+    const returned = reduceCopy(model, .{ .native_topology_observed = .{ .topology = &desktop, .epoch = 0, .at_ms = 30 } });
+    try testing.expectEqual(@as(?WorkspaceId, 5), returned.model.observedWorkspace(2));
+    try testing.expectEqual(@as(?WorkspaceId, 5), returned.model.activeWorkspace(2));
+    try testing.expectEqual(@as(u8, 6), returned.model.spaces.space_count);
+}
+
 test "switch effect preserves target Space identity across displays" {
     const testing = std.testing;
     var model = initializedModel(testTopology(102, 201));
