@@ -6241,7 +6241,7 @@ fn checkTabDragOut(_: i32, wid: u32) bool {
 // Workspace resolution (config-based app → workspace mapping)
 
 /// Return the workspace a window should be placed on, checking
-/// config workspace_assignments by bundle ID before falling back
+/// config app rules by bundle ID before falling back
 /// to the active workspace for the target display.
 fn configuredWorkspace(pid: i32, display_id: u32) ?state_mod.SpaceRef {
     if (g_config.hasAppWorkspaceRules()) {

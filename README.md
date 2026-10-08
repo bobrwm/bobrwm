@@ -83,7 +83,7 @@ bobrwm bsp rotate 90                  # IPC: 90 | 180 | 270
 ### Starting and stopping
 
 Launch `Bobrwm.app` from Finder or Spotlight, or with `open -a Bobrwm`. Quit
-from the menu-bar item. To run it at login, set `.start_at_login = true` in
+from the menu-bar item. To run it at login, set `start-at-login = true` in
 your config; there is no launchd agent to install by hand.
 
 ### Logging
@@ -113,36 +113,34 @@ LOG_LEVEL=trace zig build   # alias of debug (extra trace-style diagnostics)
 Config is loaded from (in order):
 
 1. `-c` / `--config` CLI argument
-2. `$XDG_CONFIG_HOME/bobrwm/config.zon`
-3. `~/.config/bobrwm/config.zon`
+2. `$XDG_CONFIG_HOME/bobrwm/config`
+3. `~/.config/bobrwm/config`
 
-If no config file is found, built-in defaults are used.
+If no config file is found, built-in defaults are used. The format follows
+[ghostty's](https://ghostty.org/docs/config): one `key = value` per line, `#`
+comments, and list options repeated once per entry. Set only what you want to
+change:
 
-```zon
-.{
-    .workspace_names = .{ "term", "web", "code", "chat" },
-    .gaps = .{ .inner = 4, .outer = .{ .left = 4, .right = 4, .top = 4, .bottom = 4 } },
-    .keybinds = .{
-        .{ .key = "h", .mods = .{ .alt = true }, .action = .focus_left },
-    },
-    .app_rules = .{
-        .{ .app_id = "com.apple.Safari", .workspace = 2 },
-    },
-}
+```ini
+workspace-name = term
+workspace-name = web
+workspace-name = code
+gaps-inner = 4
+gaps-outer-top = 4
+keybind = alt+shift+h=swap_left
+keybind = alt+1=focus_workspace:1
+app-rule = app-id:com.apple.Safari,workspace:2
 ```
 
-To start from every option with its documentation and the default keybinds:
+`bobrwm show-config --default --docs` lists every option with its
+documentation and default, `bobrwm show-config` prints what your file changes,
+and `bobrwm list-actions --docs` lists every keybind action.
 
-```bash
-bobrwm show-config --default --docs > ~/.config/bobrwm/config.zon
-```
-
-`bobrwm show-config` prints the config bobrwm would load, and
-`bobrwm list-actions --docs` lists every keybind action.
+Upgrading from a `config.zon`? Run `bobrwm migrate-config` to convert it.
 
 Press `Alt+Shift+R` (the default `reload_config` binding) or run
 `bobrwm reload-config` to apply changes without restarting. If the file
-contains invalid ZON or values outside the documented bounds, bobrwm keeps the
+contains invalid lines or values outside the documented bounds, bobrwm keeps the
 last valid configuration and shows a temporary error in its menu-bar item;
 details remain in the error log. `bobrwm reload-config` is silent on success and
 exits non-zero with an error message when the new config cannot be loaded.
@@ -180,11 +178,9 @@ requests.
 
 Enable trackpad workspace switching in the main bobrwm config:
 
-```zon
-.swipe = .{
-    .enabled = true,
-    .reverse = false,
-},
+```ini
+swipe-enabled = true
+swipe-reverse = false
 ```
 
 Bobrwm intercepts macOS's native horizontal Spaces gesture and immediately

@@ -23,30 +23,40 @@ pub const Command = enum {
 
     /// Usage: bobrwm show-config [--default] [--docs]
     ///
-    /// Print the configuration in `config.zon` format.
+    /// Print a configuration in config file format.
     ///
-    /// Without flags this prints the configuration bobrwm loads from your
-    /// config file, with every option spelled out, including ones left at
-    /// their default. If your config file is invalid, it prints the errors
-    /// and exits non-zero instead.
+    /// Without flags this prints the options your config file changes from
+    /// the defaults, as bobrwm reads them. If your config file is invalid, it
+    /// prints the errors and exits non-zero instead.
     ///
-    /// New to bobrwm? Start a config from every option with its
-    /// documentation:
-    ///
-    ///     bobrwm show-config --default --docs > ~/.config/bobrwm/config.zon
+    /// To see every option with its documentation and default value, run
+    /// `bobrwm show-config --default --docs`. Do not save that output as your
+    /// config: it pins every default, so you would miss improved defaults in
+    /// later releases. Set only the options you want to change.
     ///
     /// Flags:
     ///
-    ///   --default  Print the built-in defaults instead of loading your
-    ///              config file.
+    ///   --default  Print every option at its built-in default instead of
+    ///              loading your config file.
     ///
     ///   --docs     Print each option's documentation above it as a comment.
     @"show-config",
 
+    /// Usage: bobrwm migrate-config
+    ///
+    /// Convert a `config.zon` from an earlier bobrwm into the current config
+    /// file format, next to it at `~/.config/bobrwm/config` (or under
+    /// `$XDG_CONFIG_HOME`). Only options that differ from the defaults are
+    /// written, and `workspace_assignments` entries become `app-rule` lines.
+    ///
+    /// Refuses to overwrite an existing config file. The old `config.zon` is
+    /// left in place; delete it once the new file looks right.
+    @"migrate-config",
+
     /// Usage: bobrwm list-actions [--docs]
     ///
-    /// List the actions a keybind can run, the values of `.action` in a
-    /// `.keybinds` entry.
+    /// List the actions a `keybind` line can run: the part after the
+    /// trigger's `=`, as in `keybind = alt+h=focus_left`.
     ///
     /// Flags:
     ///
