@@ -117,6 +117,10 @@ The status item and its menu live in `packages/bobrwm-ui/`, built by `build.zig`
 - `NSMenuItem` with a custom `view` does not fire its action and gets no highlight drawing. Both are hand-rolled in `MenuRowHostView` (mouse-up → `cancelTracking` + `performActionForItem`) and via `NSMenuDelegate.menu(_:willHighlight:)`, which unlike mouse tracking also covers keyboard navigation.
 - `.primary`/`.secondary` are NSColor-backed and resolve against the drawing appearance, not SwiftUI's `colorScheme`. Offscreen renders must set an `NSAppearance` explicitly.
 
+## User-Facing Docs
+
+`///` doc comments on `Config` fields (including nested structs and slice-element structs), on `config.Action` tags, and on `command.Command` tags are the source of truth for user-facing docs. `src/helpgen.zig` extracts them at build time into the generated `help_strings` module. The client prints them (`bobrwm <command> --help`, `bobrwm list-actions --docs`, and `bobrwm show-config --default --docs` through `src/config_format.zig`), and `zig build docs` exports them to `zig-out/share/bobrwm/docs.json` for the website as `{ "config": [{ "key", "doc" }], "keybind_actions": [...], "commands": [...] }`, keys in declaration order. Every key must have a `///` doc comment: helpgen lists each missing one by file and line and fails the build. Nested keys are dotted, slice elements use `[]` (`keybinds[].mods.alt`). Write these comments for users, and keep implementation notes in `//`. Config types must be top-level declarations of a file in `src/` so helpgen can find their source; `zig build test` runs helpgen, so a type it cannot locate fails the build.
+
 ## Window Management Invariants
 
 Bobrwm reconciles AX, WindowServer/CG, SkyLight, and internal workspace/layout state. Do not trust one source alone. AX can lag or expose stale native-tab window IDs; CG can retain invisible Electron windows; SkyLight bounds can fail for destroyed windows; internal workspace state can be stale until cleanup runs.
