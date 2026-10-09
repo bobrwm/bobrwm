@@ -417,6 +417,16 @@ pub const NativeSpaceTopology = struct {
         return spaceId(current_space, self.keys.id);
     }
 
+    /// Fullscreen Spaces remain visible without joining the desktop mapping.
+    pub fn currentSpaceIsOrdinary(self: *const NativeSpaceTopology, display_id: u32) ?bool {
+        const display = self.managedDisplayInfo(display_id) orelse return null;
+        const current_space: CFDictionaryRef = @ptrCast(c.CFDictionaryGetValue(@ptrCast(display), self.keys.current_space) orelse return null);
+        const type_ref = c.CFDictionaryGetValue(@ptrCast(current_space), self.keys.space_type) orelse return null;
+        var space_type: i32 = -1;
+        if (c.CFNumberGetValue(@ptrCast(type_ref), c.kCFNumberSInt32Type, &space_type) == 0) return null;
+        return space_type == 0;
+    }
+
     /// Return the unique ordinary native Space containing a window.
     pub fn spaceIdForWindow(
         self: *const NativeSpaceTopology,

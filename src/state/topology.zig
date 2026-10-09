@@ -282,7 +282,7 @@ pub fn mapNativeTopology(
             NativeSpaceId,
             display.space_ids[0..display.space_count],
             display.observed_space_id,
-        ) orelse return null;
+        ) orelse continue; // Native fullscreen does not claim a logical workspace.
         if (assignments[display_index][observed_index] != 0) continue;
         var workspace_id = workspaceForNativeSpace(previous, display.observed_space_id) orelse
             workspace_topology.activeWorkspace(display.display_id) orelse 0;
@@ -387,7 +387,8 @@ fn preserveStableNativeTopology(
     var mapped_count: u8 = 0;
     for (observation.displays[0..observation.display_count]) |display| {
         const previous_display = previous.findDisplay(display.display_id) orelse return null;
-        const observed_space_id = if (previous_display.workspaceForSpace(display.observed_space_id) != null)
+        const observed_space_id = if (previous_display.workspaceForSpace(display.observed_space_id) != null or
+            std.mem.indexOfScalar(NativeSpaceId, display.space_ids[0..display.space_count], display.observed_space_id) == null)
             display.observed_space_id
         else
             previous_display.observed_space_id;

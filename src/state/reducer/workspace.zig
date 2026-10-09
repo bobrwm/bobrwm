@@ -57,7 +57,9 @@ pub fn reduceWorkspaceSwitchRequest(
         return;
     }
     const active_workspace_id = transition.model.activeWorkspace(target.display_id) orelse return;
-    if (transition.model.pending_switch == null and active_workspace_id == target.workspace_id) {
+    if (transition.model.pending_switch == null and active_workspace_id == target.workspace_id and
+        transition.model.native_topology.observedWorkspace(target.display_id) == target.workspace_id)
+    {
         startWorkspaceTransition(
             transition,
             .switch_workspace,
@@ -290,7 +292,16 @@ pub fn syncNativeWorkspaceTopology(transition: *Transition) void {
             });
         }
 
-        const workspace_id = display.workspaceForSpace(display.observed_space_id) orelse continue;
+        // A fullscreen Space is visible but does not own a workspace. Keep the
+        // hidden desktop's ownership; startup uses the first mapped desktop.
+        const previous_workspace = transition.model.workspace_topology.activeWorkspace(display.display_id);
+        const workspace_id = display.workspaceForSpace(display.observed_space_id) orelse blk: {
+            if (previous_workspace) |workspace_id| {
+                if (display.spaceForWorkspace(workspace_id) != null) break :blk workspace_id;
+            }
+            if (display.space_count == 0) continue;
+            break :blk display.spaces[0].workspace_id;
+        };
         topology.addDisplay(.{
             .display_id = display.display_id,
             .active_workspace_id = workspace_id,
