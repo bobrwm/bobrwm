@@ -565,6 +565,8 @@ pub const CleanupRequest = struct {
 pub const LayoutSpaceFrame = struct {
     space_key: SpaceKey,
     root_frame: ?window_mod.Window.Frame,
+    // Per Space, not per rebuild: gaps follow the Space's display.
+    inner_gap: f64,
 };
 
 pub const LayoutRebuild = struct {
@@ -572,18 +574,26 @@ pub const LayoutRebuild = struct {
     split_mode: tiling_mod.SplitMode,
     insert_child: tiling_mod.InsertChild,
     insert_point: tiling_mod.InsertionPointPolicy,
-    inner_gap: f64,
     split_ratio: f64,
     spaces: [tiling_mod.max_layouts]LayoutSpaceFrame = undefined,
     space_count: u8 = 0,
 
-    /// Add one configured Space and its current content frame.
-    pub fn addSpace(self: *LayoutRebuild, space_key: SpaceKey, root_frame: ?window_mod.Window.Frame) bool {
+    /// Add one configured Space with its current content frame and inner gap.
+    pub fn addSpace(
+        self: *LayoutRebuild,
+        space_key: SpaceKey,
+        root_frame: ?window_mod.Window.Frame,
+        inner_gap: f64,
+    ) bool {
         if (self.space_count == self.spaces.len) return false;
         for (self.spaces[0..self.space_count]) |space| {
             if (space.space_key.eql(space_key)) return false;
         }
-        self.spaces[self.space_count] = .{ .space_key = space_key, .root_frame = root_frame };
+        self.spaces[self.space_count] = .{
+            .space_key = space_key,
+            .root_frame = root_frame,
+            .inner_gap = inner_gap,
+        };
         self.space_count += 1;
         return true;
     }

@@ -24,7 +24,7 @@ pub fn applyEvent(transition: *Transition, event: tiling_mod.Event) bool {
 
 pub fn rebuild(transition: *Transition, request: *const LayoutRebuild) void {
     if (request.space_count > request.spaces.len) return;
-    if (!std.math.isFinite(request.inner_gap) or !std.math.isFinite(request.split_ratio)) return;
+    if (!std.math.isFinite(request.split_ratio)) return;
 
     const original_layout = transition.model.layout;
     transition.model.layout = .{};
@@ -33,6 +33,10 @@ pub fn rebuild(transition: *Transition, request: *const LayoutRebuild) void {
             transition.model.layout = original_layout;
             return;
         };
+        if (!std.math.isFinite(layout_space.inner_gap)) {
+            transition.model.layout = original_layout;
+            return;
+        }
         if (layout_space.root_frame) |frame| {
             if (!invariants.frameIsFinite(frame) or frame.width <= 0 or frame.height <= 0) {
                 transition.model.layout = original_layout;
@@ -64,7 +68,7 @@ pub fn rebuild(transition: *Transition, request: *const LayoutRebuild) void {
                     .child = request.insert_child,
                     .anchor_wid = anchor_window_id,
                     .root_frame = layout_space.root_frame,
-                    .inner_gap = request.inner_gap,
+                    .inner_gap = layout_space.inner_gap,
                     .split_ratio = request.split_ratio,
                 },
             } })) {

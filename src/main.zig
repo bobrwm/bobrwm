@@ -2009,11 +2009,10 @@ fn rebuildTilingStatesForConfig() void {
         .split_mode = g_state.bsp_split_mode,
         .insert_child = g_config.new_window_split,
         .insert_point = g_state.bsp_insert_point,
-        .inner_gap = @floatFromInt(g_config.gaps.inner),
         .split_ratio = g_config.bsp_split_ratio,
     };
     for (g_state.spaces.spaces[0..g_state.spaces.space_count]) |ws| {
-        if (!rebuild.addSpace(ws.key, displayContentFrame(ws.display_id))) {
+        if (!rebuild.addSpace(ws.key, displayContentFrame(ws.display_id), @floatFromInt(g_config.gaps.inner))) {
             log.err("layout rebuild rejected workspace={d}", .{ws.workspace_id});
             return;
         }
