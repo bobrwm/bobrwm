@@ -21,6 +21,7 @@ pub const Callbacks = struct {
     app_launched: *const fn (i32) void,
     app_terminated: *const fn (i32) void,
     active_app_changed: *const fn (i32) void,
+    app_visibility_changed: *const fn () void,
     space_changed: *const fn () void,
     display_changed: *const fn () void,
 };
@@ -48,6 +49,7 @@ fn registerObserver() void {
     _ = cls.addMethod("appLaunched:", observerAppLaunched);
     _ = cls.addMethod("appTerminated:", observerAppTerminated);
     _ = cls.addMethod("activeAppChanged:", observerActiveAppChanged);
+    _ = cls.addMethod("appVisibilityChanged:", observerAppVisibilityChanged);
     _ = cls.addMethod("spaceChanged:", observerSpaceChanged);
     _ = cls.addMethod("displayChanged:", observerDisplayChanged);
     objc.registerClassPair(cls);
@@ -86,6 +88,10 @@ fn observerAppTerminated(_: c.id, _: c.SEL, note_id: c.id) callconv(.c) void {
 fn observerActiveAppChanged(_: c.id, _: c.SEL, note_id: c.id) callconv(.c) void {
     const pid = notificationApp(note_id).msgSend(i32, "processIdentifier", .{});
     g_callbacks.active_app_changed(pid);
+}
+
+fn observerAppVisibilityChanged(_: c.id, _: c.SEL, _: c.id) callconv(.c) void {
+    g_callbacks.app_visibility_changed();
 }
 
 fn observerSpaceChanged(_: c.id, _: c.SEL, _: c.id) callconv(.c) void {

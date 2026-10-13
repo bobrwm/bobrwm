@@ -1287,6 +1287,8 @@ var g_hotkey_bindings: []const shim.bw_keybind = &.{};
 var g_waker_source: c.CFRunLoopSourceRef = null;
 var g_role_poll_source: c.dispatch_source_t = null;
 var g_scheduled_observation: ?state_mod.ObservationTimer = null;
+/// Tags each armed observation fire so a replaced timer's fire can be told apart.
+var g_observation_generation: u32 = 0;
 /// Set when the model changes or focus moves; the drain only snapshots dimming
 /// when it is set, so mouse moves and animation echoes skip the window-list copy.
 var g_dim_dirty: bool = false;
@@ -1389,6 +1391,18 @@ fn initWorkspaceObservers() void {
         nsString("NSWorkspaceDidTerminateApplicationNotification"),
         nil_object,
     });
+    // Hiding or unhiding moves windows on/off screen without any AX focus event.
+    for ([_][:0]const u8{
+        "NSWorkspaceDidHideApplicationNotification",
+        "NSWorkspaceDidUnhideApplicationNotification",
+    }) |name| {
+        workspace_notification_center.msgSend(void, "addObserver:selector:name:object:", .{
+            observer,
+            objc.sel("appVisibilityChanged:"),
+            nsString(name),
+            nil_object,
+        });
+    }
     workspace_notification_center.msgSend(void, "addObserver:selector:name:object:", .{
         observer,
         objc.sel("spaceChanged:"),
@@ -2607,6 +2621,11 @@ fn workspaceActiveAppChanged(pid: i32) void {
     bw_emit_event(shim.BW_EVENT_WINDOW_FOCUSED, pid, 0);
 }
 
+/// Callback target for BWObserver.appVisibilityChanged:.
+fn workspaceAppVisibilityChanged() void {
+    bw_emit_event(shim.BW_EVENT_APP_VISIBILITY_CHANGED, 0, 0);
+}
+
 /// Callback target for BWObserver.spaceChanged:.
 fn workspaceSpaceChanged() void {
     bw_emit_event(shim.BW_EVENT_SPACE_CHANGED, 0, 0);
@@ -2785,6 +2804,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
         .app_launched = workspaceAppLaunched,
         .app_terminated = workspaceAppTerminated,
         .active_app_changed = workspaceActiveAppChanged,
+        .app_visibility_changed = workspaceAppVisibilityChanged,
         .space_changed = workspaceSpaceChanged,
         .display_changed = workspaceDisplayChanged,
     });
@@ -3608,6 +3628,9 @@ fn handleEvent(ev: *const event_mod.Event) void {
         .native_topology_poll_tick => reconcileNativeSpaceTopologyIfNeeded(),
         .native_observation_due => {
             if (processDueNativeStateObservation()) return;
+            // A replaced timer's fire must not re-arm: the current timer already
+            // has its own fire pending, and each re-arm would add another.
+            if (ev.wid != g_observation_generation) return;
             // GCD's monotonic clock can fire before the wall-clock due time
             // the model uses; re-arm instead of falling back to the role poll.
             g_scheduled_observation = null;
@@ -3639,6 +3662,7 @@ fn handleEvent(ev: *const event_mod.Event) void {
             processDeferredWindowCandidates();
         },
         .mouse_moved => focusWindowUnderMouse(),
+        .app_visibility_changed => g_dim_dirty = true,
         .window_moved, .window_resized => {
             // Every animation tick sets the AX frame, which echoes back here
             // as moved/resized notifications (~60/sec per window). Ignore
@@ -4273,21 +4297,20 @@ fn scheduleNativeObservation() void {
         if (std.meta.eql(scheduled, timer)) return;
     }
     g_scheduled_observation = timer;
+    g_observation_generation +%= 1;
 
     const delay_ms = timer.due_at_ms -| nativeStateNowMs();
     c.dispatch_after_f(
         c.dispatch_time(c.DISPATCH_TIME_NOW, @intCast(delay_ms * std.time.ns_per_ms)),
         cg_extra.dispatch_get_main_queue(),
-        null,
+        @ptrFromInt(g_observation_generation),
         nativeObservationTimerFired,
     );
 }
 
-// Stale fires are harmless: the reducer drops timers whose epoch or due time
-// no longer matches.
 fn nativeObservationTimerFired(context: ?*anyopaque) callconv(.c) void {
-    _ = context;
-    bw_emit_event(shim.BW_EVENT_NATIVE_OBSERVATION_DUE, 0, 0);
+    const generation: u32 = @intCast(@intFromPtr(context));
+    bw_emit_event(shim.BW_EVENT_NATIVE_OBSERVATION_DUE, 0, generation);
 }
 
 fn executeStateEffect(effect: state_mod.Effect) void {
