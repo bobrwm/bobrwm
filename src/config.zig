@@ -136,6 +136,12 @@ pub const Config = struct {
         return self.app_rules.len > 0 or self.workspace_assignments.len > 0;
     }
 
+    /// Settings for one display. Every display gets the global values for now;
+    /// per-display overrides will resolve here.
+    pub fn displaySettings(self: *const Config) DisplaySettings {
+        return .{ .gaps = self.gaps };
+    }
+
     /// Build the effective keybind table without allocating. Defaults are
     /// applied first unless disabled; config entries with the same trigger replace them.
     fn buildKeybinds(self: *const Config, table: *KeybindTable) []const shim.bw_keybind {
@@ -478,6 +484,14 @@ pub const Gaps = struct {
     inner: u16 = 0,
     /// Gaps in pixels between tiled windows and the display edges.
     outer: OuterGaps = .{},
+};
+
+/// Settings that can differ per display, resolved by `Config.displaySettings`
+/// when displays are refreshed or config reloads. Layout code reads a
+/// display's resolved copy instead of the global config, so resolution has a
+/// single owner and no call site can miss an override.
+pub const DisplaySettings = struct {
+    gaps: Gaps,
 };
 
 // Default keybinds (matches the previously hardcoded behaviour)
