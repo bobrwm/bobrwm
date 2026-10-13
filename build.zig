@@ -243,7 +243,7 @@ pub fn build(b: *std.Build) !void {
 
     // Doc comments on config fields, keybind actions, and client commands are
     // the source of truth for user-facing docs. helpgen extracts them into a
-    // generated Zig module that the client prints and docgen exports.
+    // generated Zig module that the client prints.
     const help_strings = helpStrings(b);
 
     // The client links no frameworks at all: it only parses arguments and
@@ -345,19 +345,6 @@ pub fn build(b: *std.Build) !void {
 
     const preview_step = b.step("ui-preview", "Render the menu bar UI to PNGs");
     preview_step.dependOn(&preview_run.step);
-
-    // docgen exports the generated help strings as JSON for the website.
-    const docgen = b.addExecutable(.{
-        .name = "docgen",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/build/docgen.zig"),
-            .target = b.graph.host,
-        }),
-    });
-    docgen.root_module.addImport("help_strings", help_strings.module);
-    const docgen_out = b.addRunArtifact(docgen).captureStdOut(.{});
-    const docs_step = b.step("docs", "Export config and keybind docs to share/bobrwm/docs.json");
-    docs_step.dependOn(&b.addInstallFile(docgen_out, "share/bobrwm/docs.json").step);
 
     // config.zig imports only Zig declarations, so the test module needs
     // no SDK or include wiring.
