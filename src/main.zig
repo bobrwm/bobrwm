@@ -367,13 +367,9 @@ fn pushDimSnapshot() void {
         if (n >= entries.len) break;
         if (!isVisibleManaged(&win)) continue;
         if (!on_screen.contains(win.wid)) continue;
-        entries[n] = .{
-            .wid = win.wid,
-            .x = win.frame.x,
-            .y = win.frame.y,
-            .w = win.frame.width,
-            .h = win.frame.height,
-        };
+        const space = managedWindowSpace(win.wid) orelse continue;
+        if (isDisplayInTransition(space.display_id)) continue;
+        entries[n] = dimEntry(win.wid, g_animator.displayedFrame(win.wid) orelse win.frame);
         n += 1;
     }
 
@@ -394,6 +390,38 @@ fn pushDimSnapshot() void {
     }
 
     dim.apply(focused[0..fn_count], entries[0..n]);
+}
+
+fn dimEntry(wid: u32, frame: window_mod.Window.Frame) dim.Entry {
+    return .{ .wid = wid, .x = frame.x, .y = frame.y, .w = frame.width, .h = frame.height };
+}
+
+/// A display mid-switch still reports the outgoing Space as visible while
+/// WindowServer slides the incoming one in, so overlays there would cover the
+/// wrong windows. Overlays return once the switch lands rather than after the
+/// settle tail; the settle-time frame reconcile re-pushes them anyway.
+fn isDisplayInTransition(display_id: u32) bool {
+    if (g_state.pending_switch) |pending| {
+        if (pending.request.target.display_id == display_id) return true;
+    }
+    const transition = g_state.workspace_transition orelse return false;
+    if (transition.completion_reason != null) return false;
+    // Moving a workspace changes the source display too, which the
+    // transition does not record.
+    if (transition.kind == .move_workspace_to_display) return true;
+    return transition.target.display_id == display_id;
+}
+
+/// Keep overlays on animating windows. A finished animation needs a full
+/// snapshot to land on the model's final frame.
+fn syncDimWithAnimations(has_finished: bool) void {
+    if (has_finished) {
+        pushDimSnapshot();
+        return;
+    }
+    for (g_animator.active()) |a| {
+        dim.follow(dimEntry(a.wid, a.last_displayed_frame));
+    }
 }
 
 fn focusedDisplayId() u32 {
@@ -1956,7 +1984,9 @@ fn signalWaker() void {
 
 fn animatorTimerTick(context: ?*anyopaque) callconv(.c) void {
     _ = context;
+    const animating_before = g_animator.active().len;
     g_animator.tick();
+    if (dim.enabled) syncDimWithAnimations(g_animator.active().len < animating_before);
     if (!g_animator.isAnimating()) {
         if (g_animator_source) |source| {
             c.dispatch_source_cancel(source);
@@ -2817,7 +2847,7 @@ fn bw_drain_events() void {
     // Guard at the call site so a disabled feature costs exactly one branch
     // here and never enters the snapshot path — no call, no loop, no reliance
     // on the optimizer eliding a no-op body.
-    if (dim.enabled and !nativeSwitchPending()) {
+    if (dim.enabled) {
         pushDimSnapshot();
     }
 
@@ -4723,6 +4753,10 @@ fn executeWorkspaceTransitionSettled(settlement: state_mod.WorkspaceTransitionSe
 fn executeNativeSwitch(effect: @FieldType(state_mod.Effect, "switch_native_space")) void {
     const pending = g_state.pending_switch orelse return;
     if (pending.epoch != effect.epoch or pending.phase != .preparing) return;
+    // Hide the display's overlays before WindowServer starts the slide; the
+    // drain-end snapshot runs after the gesture is already posted.
+    if (dim.enabled) pushDimSnapshot();
+
     const request = effect.request;
     const native_space_id = request.target.key.id;
     const plan = g_sky.?.prepareNativeSpaceSwitch(request.target.display_id, native_space_id) orelse {

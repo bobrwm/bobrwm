@@ -39,6 +39,8 @@ pub const Entry = struct {
 };
 
 const max_overlays = 64;
+// One focused window per display; matches the topology's display limit.
+const max_focused = 8;
 
 const ns_window_style_mask_borderless: usize = 0;
 const ns_backing_store_buffered: usize = 2;
@@ -66,6 +68,11 @@ const Slot = struct {
 var slots: [max_overlays]Slot = undefined;
 var slot_count: usize = 0; // number of lazily created panels
 
+// Focus set of the last apply(). A focus change usually raises windows, which
+// lifts them above overlays that were ordered against the old stacking.
+var applied_focused: [max_focused]u32 = undefined;
+var applied_focused_count: usize = 0;
+
 pub fn configure(cfg: config.DimConfig) void {
     enabled = cfg.enabled;
     level = std.math.clamp(@as(f64, cfg.level), 0.0, 1.0);
@@ -82,6 +89,7 @@ pub fn configure(cfg: config.DimConfig) void {
 pub fn apply(focused: []const u32, entries: []const Entry) void {
     if (!enabled) return;
     std.debug.assert(level >= 0.0 and level <= 1.0);
+    std.debug.assert(focused.len <= max_focused);
 
     // Nothing focused anywhere (focus loss / mid-transition): undim rather than
     // dimming the whole screen.
@@ -102,6 +110,31 @@ pub fn apply(focused: []const u32, entries: []const Entry) void {
         if (e.w <= 0 or e.h <= 0) continue;
         ensureOverlay(e);
     }
+
+    // Activating an app raises all of its windows, not just the focused one,
+    // so unmoved overlays can end up beneath their targets.
+    if (std.mem.eql(u32, focused, applied_focused[0..applied_focused_count])) return;
+    for (slots[0..slot_count]) |*s| {
+        if (s.shown) orderAbove(s.panel, s.wid);
+    }
+    @memcpy(applied_focused[0..focused.len], focused);
+    applied_focused_count = focused.len;
+}
+
+/// Move an existing overlay to `e`'s frame without re-diffing the snapshot.
+/// Used per animation tick, where a full snapshot would cost a WindowServer
+/// window-list copy every 16ms.
+pub fn follow(e: Entry) void {
+    if (!enabled) return;
+
+    const frame = nsRectFromCg(e.x, e.y, e.w, e.h);
+    for (slots[0..slot_count]) |*s| {
+        if (!s.shown or s.wid != e.wid) continue;
+        if (rectEql(s.frame, frame)) return;
+        s.panel.msgSend(void, "setFrame:display:", .{ frame, true });
+        s.frame = frame;
+        return;
+    }
 }
 
 /// Flip the enabled state at runtime and return the new value. When turning
@@ -118,6 +151,7 @@ pub fn resetAll() void {
     for (slots[0..slot_count]) |*s| {
         if (s.shown) hideSlot(s);
     }
+    applied_focused_count = 0;
 }
 
 fn contains(set: []const u32, wid: u32) bool {
