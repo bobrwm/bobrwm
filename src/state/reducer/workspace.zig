@@ -9,12 +9,10 @@ const window_reducer = @import("window.zig");
 const tiling_mod = @import("../../tiling.zig");
 
 const native_switch_timeout_ms = model_mod.native_switch_timeout_ms;
-const native_switch_stall_ms = model_mod.native_switch_stall_ms;
 const native_observation_delay_ms = model_mod.native_observation_delay_ms;
 const native_workspace_move_timeout_ms = model_mod.native_workspace_move_timeout_ms;
 const workspace_transition_settle_ms = model_mod.workspace_transition_settle_ms;
 const DisplayId = model_mod.DisplayId;
-const NativeSpaceId = model_mod.NativeSpaceId;
 const WorkspaceId = model_mod.WorkspaceId;
 const SpaceKey = model_mod.SpaceKey;
 const SpaceRef = model_mod.SpaceRef;
@@ -155,7 +153,6 @@ pub fn reduceTopologyObserved(
     const display = event.topology.findDisplay(pending.request.target.display_id);
     const actual_space_id = if (display) |value| value.observed_space_id else null;
     if (pending.phase == .preparing or pending.phase == .delivering or event.is_animating != false) {
-        transition.model.pending_switch.?.stall = null;
         if (event.at_ms < pending.deadline_at_ms) {
             schedulePendingObservation(transition.model, pending, event.at_ms);
             return;
@@ -178,8 +175,6 @@ pub fn reduceTopologyObserved(
     }
 
     if (event.at_ms < pending.deadline_at_ms) {
-        if (observeSwitchStall(transition.model, actual_space_id, event.at_ms) and
-            recoverUnexpectedLanding(transition, pending, event.at_ms)) return;
         schedulePendingObservation(transition.model, pending, event.at_ms);
         return;
     }
@@ -263,23 +258,6 @@ fn postGesturePhase(transition: *Transition, pending: PendingSwitch) void {
         .direction = gesture.plan.direction,
         .velocity = gesture.plan.velocity,
     } });
-}
-
-/// Record an idle observation short of the target and return whether the
-/// switch has stalled. Dock drops swipes that arrive mid-animation, and the
-/// deadline is seconds away. Requiring the display to stay idle on one Space
-/// rides out the Dock's start latency and the gaps between pipelined swipes.
-fn observeSwitchStall(model: *Model, observed_space_id: ?NativeSpaceId, at_ms: TimestampMs) bool {
-    const pending = &model.pending_switch.?;
-    const space_id = observed_space_id orelse {
-        pending.stall = null;
-        return false;
-    };
-    if (pending.stall) |stall| {
-        if (stall.space_id == space_id) return at_ms -| stall.since_ms >= native_switch_stall_ms;
-    }
-    pending.stall = .{ .space_id = space_id, .since_ms = at_ms };
-    return false;
 }
 
 fn recoverUnexpectedLanding(transition: *Transition, pending: PendingSwitch, at_ms: TimestampMs) bool {

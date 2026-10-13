@@ -24,7 +24,6 @@ pub const max_spaces_per_display = model_mod.max_spaces_per_display;
 pub const max_workspace_focus_history = model_mod.max_workspace_focus_history;
 pub const max_pending_native_window_moves = model_mod.max_pending_native_window_moves;
 pub const native_switch_timeout_ms = model_mod.native_switch_timeout_ms;
-pub const native_switch_stall_ms = model_mod.native_switch_stall_ms;
 pub const native_observation_delay_ms = model_mod.native_observation_delay_ms;
 pub const native_window_move_attempts_max = model_mod.native_window_move_attempts_max;
 pub const native_workspace_move_timeout_ms = model_mod.native_workspace_move_timeout_ms;
@@ -1264,48 +1263,6 @@ test "unexpected landing retries once then commits observation and fails request
     try testing.expectEqual(WorkspaceTransitionSettlementReason.native_switch_failed, transition.effects[0].workspace_transition_settled.reason);
     try testing.expectEqual(std.meta.Tag(Effect).native_switch_failed, std.meta.activeTag(transition.effects[1]));
     try testing.expectEqual(SwitchFailureReason.unexpected_space, transition.effects[1].native_switch_failed.reason);
-}
-
-fn observeTestSwitch(model: Model, space_id: NativeSpaceId, at_ms: TimestampMs, is_animating: bool) Model {
-    return reduceCopy(model, .{ .native_topology_observed = .{
-        .topology = &testTopology(space_id, null),
-        .epoch = model.pending_switch.?.epoch,
-        .at_ms = at_ms,
-        .is_animating = is_animating,
-    } }).model;
-}
-
-test "switch idle short of its target replans before the deadline" {
-    const testing = std.testing;
-    var model = initializedModel(testTopology(101, null));
-    model = reduceCopy(model, switchRequest(&model, 1, 2, 100)).model;
-    model = deliverTestSwitch(model, 110);
-    const pending = model.pending_switch.?;
-
-    model = observeTestSwitch(model, 101, 120, false);
-    try testing.expectEqual(pending.epoch, model.pending_switch.?.epoch);
-
-    model = observeTestSwitch(model, 101, 120 + native_switch_stall_ms, false);
-    try testing.expect(model.pending_switch.?.epoch != pending.epoch);
-    try testing.expect(model.pending_switch.?.has_retried);
-    try testing.expectEqual(@as(?WorkspaceId, 2), model.desiredWorkspace(1));
-}
-
-test "animation between idle observations restarts the stall window" {
-    const testing = std.testing;
-    var model = initializedModel(testTopology(101, null));
-    model = reduceCopy(model, switchRequest(&model, 1, 2, 100)).model;
-    model = deliverTestSwitch(model, 110);
-    const pending = model.pending_switch.?;
-
-    model = observeTestSwitch(model, 101, 120, false);
-    model = observeTestSwitch(model, 101, 170, true);
-    model = observeTestSwitch(model, 101, 120 + native_switch_stall_ms, false);
-    try testing.expectEqual(pending.epoch, model.pending_switch.?.epoch);
-
-    // Landing idle on a different Space restarts the window too.
-    model = observeTestSwitch(model, 103, 120 + 2 * native_switch_stall_ms, false);
-    try testing.expectEqual(pending.epoch, model.pending_switch.?.epoch);
 }
 
 test "intermediate Space becomes observed while request remains pending" {

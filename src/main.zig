@@ -3606,7 +3606,13 @@ fn handleEvent(ev: *const event_mod.Event) void {
             processPendingFocusQueue();
         },
         .native_topology_poll_tick => reconcileNativeSpaceTopologyIfNeeded(),
-        .native_observation_due => _ = processDueNativeStateObservation(),
+        .native_observation_due => {
+            if (processDueNativeStateObservation()) return;
+            // GCD's monotonic clock can fire before the wall-clock due time
+            // the model uses; re-arm instead of falling back to the role poll.
+            g_scheduled_observation = null;
+            scheduleNativeObservation();
+        },
         .mouse_down => {
             cancelPendingMouseFocus(true, true);
             dispatchStateEvent(.{ .pointer_down = managedWindowAtPoint(g_mouse_down_location) });
