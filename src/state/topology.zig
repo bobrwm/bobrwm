@@ -238,10 +238,20 @@ pub const NativeTopologyObservation = struct {
     }
 };
 
-/// Display changes rebuild ordinal numbering; ordinary observations preserve it.
+/// Startup numbers Spaces in Mission Control order. Every later observation,
+/// display changes included, keeps each workspace on its Space so keybinds and
+/// rules keep naming the same windows across hotplug (#117).
 pub const NativeTopologyMapping = enum {
     preserve_space_ids,
     native_order,
+};
+
+/// Why displays are being reconciled. A display change returns windows macOS
+/// moved off their workspace; topology repair adopts WindowServer placement,
+/// because there the user moved windows on purpose.
+pub const DisplayReconcileCause = enum {
+    display_change,
+    topology_repair,
 };
 
 /// Assign global logical workspaces to an observed physical Space topology.
@@ -256,9 +266,6 @@ pub fn mapNativeTopology(
 ) ?NativeTopology {
     if (workspace_count == 0 or observation.display_count > workspace_count) return null;
     if (!observationContainsDisplay(&observation, primary_display_id)) return null;
-    // Reconnecting displays can restore old Space IDs at different ordinals.
-    // Display reconciliation explicitly renumbers them; ordinary observations
-    // preserve identities so switching or moving a workspace cannot renumber it.
     if (mapping == .native_order or (previous.display_count == 0 and catalog.space_count == 0)) {
         return mapTopologyInNativeOrder(observation, workspace_count, primary_display_id);
     }
@@ -287,7 +294,8 @@ pub fn mapNativeTopology(
         var workspace_id = workspaceForNativeSpace(previous, display.observed_space_id) orelse
             workspace_topology.activeWorkspace(display.display_id) orelse 0;
         if (workspace_id == 0 or workspace_id > workspace_count or claimed[workspace_id]) {
-            workspace_id = firstUnclaimedWorkspaceId(&claimed, workspace_count) orelse return null;
+            workspace_id = firstUnclaimedWorkspaceId(&claimed, workspace_count) orelse
+                takeWorkspaceForDisplay(&observation, &assignments, display_index) orelse return null;
         }
         assignments[display_index][observed_index] = workspace_id;
         claimed[workspace_id] = true;
@@ -402,6 +410,37 @@ fn preserveStableNativeTopology(
     }
     if (mapped_count != workspace_count) return null;
     return topology;
+}
+
+/// A reconnected display can come back with a fresh Space while every workspace
+/// is still bound on the remaining displays, because bobrwm keeps occupied
+/// Spaces instead of destroying them. Hand it the highest-numbered workspace of
+/// a display that has several; secondary displays hold the high numbers, so
+/// this is usually the workspace that lived there before the unplug. The
+/// donor's visible workspace never moves.
+fn takeWorkspaceForDisplay(
+    observation: *const NativeTopologyObservation,
+    assignments: *[workspace_mod.max_displays][max_spaces_per_display]WorkspaceId,
+    display_index: usize,
+) ?WorkspaceId {
+    var donor: ?struct { display_index: usize, space_index: usize, workspace_id: WorkspaceId } = null;
+    for (observation.displays[0..observation.display_count], 0..) |display, candidate_index| {
+        if (candidate_index == display_index) continue;
+        const display_assignments = assignments[candidate_index][0..display.space_count];
+        var assigned_count: u8 = 0;
+        for (display_assignments) |workspace_id| {
+            if (workspace_id != 0) assigned_count += 1;
+        }
+        if (assigned_count < 2) continue;
+        for (display_assignments, display.space_ids[0..display.space_count], 0..) |workspace_id, space_id, space_index| {
+            if (workspace_id == 0 or space_id == display.observed_space_id) continue;
+            if (donor != null and donor.?.workspace_id > workspace_id) continue;
+            donor = .{ .display_index = candidate_index, .space_index = space_index, .workspace_id = workspace_id };
+        }
+    }
+    const taken = donor orelse return null;
+    assignments[taken.display_index][taken.space_index] = 0;
+    return taken.workspace_id;
 }
 
 fn workspaceForNativeSpace(topology: *const NativeTopology, space_id: NativeSpaceId) ?WorkspaceId {

@@ -32,6 +32,7 @@ pub const NativeTopology = model_mod.NativeTopology;
 pub const NativeDisplayObservation = model_mod.NativeDisplayObservation;
 pub const NativeTopologyObservation = model_mod.NativeTopologyObservation;
 pub const NativeTopologyMapping = model_mod.NativeTopologyMapping;
+pub const DisplayReconcileCause = model_mod.DisplayReconcileCause;
 pub const mapNativeTopology = model_mod.mapNativeTopology;
 pub const WindowTabGroupObservation = model_mod.WindowTabGroupObservation;
 pub const WindowTabGroupSnapshot = model_mod.WindowTabGroupSnapshot;
@@ -221,7 +222,7 @@ pub fn reduce(model: *Model, event: Event) Transition {
         .focus_retry_observed => |observation| discovery_reducer.reduceFocusRetryObserved(&transition, observation),
         .display_changed => |change| {
             transition.model.display_resettle_due_at_ms = change.resettle_at_ms;
-            transition.model.display_resettle_mapping = .native_order;
+            transition.model.display_resettle_cause = .display_change;
             const is_debounced = if (transition.model.last_display_change_at_ms) |previous|
                 change.at_ms < previous +| display_event_debounce_ms
             else
@@ -234,7 +235,7 @@ pub fn reduce(model: *Model, event: Event) Transition {
         .display_resettle_timer_fired => |at_ms| workspace_reducer.reduceDisplayResettleTimer(&transition, at_ms),
         .display_reconcile_unavailable => |failure| {
             transition.model.display_resettle_due_at_ms = failure.at_ms +| display_event_debounce_ms;
-            transition.model.display_resettle_mapping = failure.mapping;
+            transition.model.display_resettle_cause = failure.cause;
         },
         .configure_layout_interaction => |configuration| {
             transition.model.bsp_split_mode = configuration.split_mode;
@@ -2353,66 +2354,42 @@ test "ordinary observations preserve surviving workspace shortcut identities" {
     try testing.expectEqual(@as(?NativeSpaceId, 201), mapped.findDisplay(2).?.spaceForWorkspace(3));
 }
 
-test "display reconnect renumbers surviving Spaces without moving their windows or layouts" {
+test "reconnected display with a fresh Space takes the highest workspace without renumbering the rest" {
     const testing = std.testing;
     var previous: NativeTopology = .{};
     var laptop = DisplayTopology.init(1, 102);
-    for (0..10) |index| laptop.addSpace(.{ .id = 101 + index, .workspace_id = @intCast(index + 1) });
+    for (0..5) |index| laptop.addSpace(.{ .id = 101 + index, .workspace_id = @intCast(index + 1) });
     previous.addDisplay(laptop);
     var model = initializedModel(previous);
-    for ([_]WindowId{ 42, 43 }, [_]NativeSpaceId{ 102, 103 }) |wid, sid| {
-        model = reduceCopy(model, .{ .adopt_window = .{
-            .window_id = wid,
-            .process_id = 10,
-            .space_key = .{ .id = sid },
-            .layout = testLayoutInsertion(.bsp),
-        } }).model;
-        model = reduceCopy(model, .{ .record_workspace_focus = .{
-            .window_id = wid,
-            .workspace_id = @intCast(sid - 100),
-        } }).model;
-    }
+    model = reduceCopy(model, .{ .adopt_window = .{
+        .window_id = 42,
+        .process_id = 10,
+        .space_key = .{ .id = 105 },
+        .layout = testLayoutInsertion(.bsp),
+    } }).model;
 
-    // macOS restores the old workspace 2 on the laptop, after the nine
-    // ordinary Spaces on the newly connected primary display.
+    // Workspace 5 kept its windows on the laptop while unplugged, so its Space
+    // survived; macOS gives the returning display a new, empty Space.
     var observation: NativeTopologyObservation = .{};
-    var observed_laptop: NativeDisplayObservation = .{ .display_id = 1, .observed_space_id = 102, .space_count = 1 };
-    observed_laptop.space_ids[0] = 102;
+    var observed_laptop: NativeDisplayObservation = .{ .display_id = 1, .observed_space_id = 102, .space_count = 5 };
+    for (0..5) |index| observed_laptop.space_ids[index] = 101 + index;
     observation.addDisplay(observed_laptop);
-    var external: NativeDisplayObservation = .{ .display_id = 2, .observed_space_id = 101, .space_count = 9 };
-    external.space_ids[0] = 101;
-    for (1..9) |index| external.space_ids[index] = 102 + index;
+    var external: NativeDisplayObservation = .{ .display_id = 2, .observed_space_id = 201, .space_count = 1 };
+    external.space_ids[0] = 201;
     observation.addDisplay(external);
 
-    const mapped = mapNativeTopology(observation, &model.native_topology, &model.workspace_topology, &model.spaces, 10, 2, .native_order).?;
-    try testing.expectEqual(@as(?NativeSpaceId, 103), mapped.findDisplay(2).?.spaceForWorkspace(2));
-    try testing.expectEqual(@as(?NativeSpaceId, 102), mapped.findDisplay(1).?.spaceForWorkspace(10));
-    model = reduceCopy(model, .{ .initialize_native_topology = .{ .topology = &mapped } }).model;
-    try testing.expectEqual(@as(?WorkspaceId, 10), model.activeWorkspace(1));
-    try testing.expectEqual(@as(?WorkspaceId, 1), model.activeWorkspace(2));
-    try testing.expectEqual(@as(?WindowId, 42), model.focusedWorkspaceWindow(10));
-    try testing.expectEqual(@as(?WindowId, 43), model.focusedWorkspaceWindow(2));
-    for ([_]WindowId{ 42, 43 }, [_]NativeSpaceId{ 102, 103 }) |wid, sid| {
-        try testing.expectEqual(sid, model.window(wid).?.space_key.id);
-        try testing.expect(model.layout.contains(.{ .id = sid }, wid));
+    const mapped = mapNativeTopology(observation, &model.native_topology, &model.workspace_topology, &model.spaces, 5, 1, .preserve_space_ids).?;
+    for (1..5) |workspace_id| {
+        try testing.expectEqual(@as(?NativeSpaceId, 100 + workspace_id), mapped.findDisplay(1).?.spaceForWorkspace(@intCast(workspace_id)));
     }
-    const repeated = mapNativeTopology(observation, &model.native_topology, &model.workspace_topology, &model.spaces, 10, 2, .native_order).?;
-    try testing.expect(mapped.eql(&repeated));
-}
+    try testing.expectEqual(@as(?NativeSpaceId, 201), mapped.findDisplay(2).?.spaceForWorkspace(5));
+    try testing.expectEqual(@as(?WorkspaceId, null), mapped.findDisplay(1).?.workspaceForSpace(105));
 
-test "display resettle renumbers restored ordinals even when display identities are unchanged" {
-    const testing = std.testing;
-    const model = initializedModel(testTopology(101, null));
-    var observation: NativeTopologyObservation = .{};
-    var display: NativeDisplayObservation = .{ .display_id = 1, .observed_space_id = 102, .space_count = 3 };
-    @memcpy(display.space_ids[0..3], &[_]NativeSpaceId{ 103, 101, 102 });
-    observation.addDisplay(display);
-
-    const preserved = mapNativeTopology(observation, &model.native_topology, &model.workspace_topology, &model.spaces, 3, 1, .preserve_space_ids).?;
-    try testing.expectEqual(@as(?NativeSpaceId, 102), preserved.findDisplay(1).?.spaceForWorkspace(2));
-    const reordered = mapNativeTopology(observation, &model.native_topology, &model.workspace_topology, &model.spaces, 3, 1, .native_order).?;
-    try testing.expectEqual(@as(?NativeSpaceId, 101), reordered.findDisplay(1).?.spaceForWorkspace(2));
-    try testing.expectEqual(@as(?WorkspaceId, 3), reordered.observedWorkspace(1));
+    // The window follows its workspace, so display reconciliation moves it
+    // to the new Space and leaves 105 empty for removal.
+    model = reduceCopy(model, .{ .initialize_native_topology = .{ .topology = &mapped } }).model;
+    try testing.expectEqual(@as(NativeSpaceId, 201), model.window(42).?.space_key.id);
+    try testing.expectEqual(@as(?WorkspaceId, 2), model.activeWorkspace(1));
 }
 
 test "replaced native Spaces retain window and layout ownership" {
@@ -2445,10 +2422,10 @@ test "failed display observation schedules another settle attempt" {
     const testing = std.testing;
     const transition = reduceCopy(initializedModel(testTopology(101, null)), .{ .display_reconcile_unavailable = .{
         .at_ms = 500,
-        .mapping = .preserve_space_ids,
+        .cause = .topology_repair,
     } });
     try testing.expect(transition.model.display_resettle_due_at_ms.? > 500);
-    try testing.expectEqual(NativeTopologyMapping.preserve_space_ids, transition.model.display_resettle_mapping);
+    try testing.expectEqual(DisplayReconcileCause.topology_repair, transition.model.display_resettle_cause);
     try testing.expectEqual(@as(?WorkspaceId, 1), transition.model.activeWorkspace(1));
 }
 

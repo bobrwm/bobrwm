@@ -3950,9 +3950,12 @@ fn completeNativeWorkspaceMove(pending: state_mod.PendingNativeWorkspaceMove) vo
 
 /// Full reconcile after a topology change: rebuild display/workspace state,
 /// pick up windows, retile, refresh the bar.
-fn reconcileDisplays(mapping: state_mod.NativeTopologyMapping) void {
-    if (!reconcileDisplayChange(mapping)) return;
-    reconcileNativeWindowAssignmentsFromWindowServer(false);
+fn reconcileDisplays(cause: state_mod.DisplayReconcileCause) void {
+    if (!reconcileDisplayChange(cause)) return;
+    switch (cause) {
+        .display_change => returnDisplacedWindows(),
+        .topology_repair => reconcileNativeWindowAssignmentsFromWindowServer(false),
+    }
     discoverWindows();
     retile();
     updateStatusBar();
@@ -3960,7 +3963,15 @@ fn reconcileDisplays(mapping: state_mod.NativeTopologyMapping) void {
 
 const NativeSpaceCapacity = struct {
     total_count: u16,
+    /// An excess Space that is safe to destroy, if any. Excess Spaces that are
+    /// occupied, current, or bound to a workspace stay as unnumbered extras.
     excess_space_id: ?u64,
+
+    /// Whether the Space count needs creating or removing a Space.
+    fn needsRepair(self: NativeSpaceCapacity, required_count: u16) bool {
+        return self.total_count < required_count or
+            (self.total_count > required_count and self.excess_space_id != null);
+    }
 };
 
 fn nativeSpaceCapacity() ?NativeSpaceCapacity {
@@ -3972,8 +3983,8 @@ fn nativeSpaceCapacity() ?NativeSpaceCapacity {
 
 fn nativeSpaceCapacityFromSnapshot(snapshot: *const skylight.NativeSpaceTopology) ?NativeSpaceCapacity {
     var total: u16 = 0;
-    var excess_space_id: ?u64 = null;
     var remaining_required: u16 = workspaceCount();
+    var permitted_counts: [workspace_mod.max_displays]u16 = undefined;
     const display_indices = stableDisplayIndices();
     for (display_indices[0..g_display_count], 0..) |display_index, order_index| {
         const display = g_displays[display_index];
@@ -3984,12 +3995,101 @@ fn nativeSpaceCapacityFromSnapshot(snapshot: *const skylight.NativeSpaceTopology
         if (remaining_required <= later_display_count) return null;
         const permitted_count = @min(count, remaining_required - later_display_count);
         remaining_required -= permitted_count;
-        if (excess_space_id != null or count <= permitted_count) continue;
-
-        excess_space_id = snapshot.ordinarySpaceIdAtOrdinal(display.id, @intCast(count)) orelse return null;
+        permitted_counts[order_index] = permitted_count;
     }
-    return .{ .total_count = total, .excess_space_id = excess_space_id };
+    if (total <= workspaceCount()) return .{ .total_count = total, .excess_space_id = null };
+
+    var occupied: ?OccupiedNativeSpaces = null;
+    for (display_indices[0..g_display_count], 0..) |display_index, order_index| {
+        const display_id = g_displays[display_index].id;
+        if (removableExcessSpace(snapshot, display_id, permitted_counts[order_index], &occupied)) |space_id| {
+            return .{ .total_count = total, .excess_space_id = space_id };
+        }
+    }
+    return .{ .total_count = total, .excess_space_id = null };
 }
+
+/// Destroying a Space makes macOS pile its windows onto another one, merging
+/// two workspaces, and destroying a bound Space renumbers its workspace. Only
+/// an empty, unbound Space past the display's share goes; the last ordinal
+/// first, so Mission Control order of the rest is untouched.
+fn removableExcessSpace(
+    snapshot: *const skylight.NativeSpaceTopology,
+    display_id: u32,
+    permitted_count: u16,
+    occupied: *?OccupiedNativeSpaces,
+) ?u64 {
+    const count = snapshot.ordinarySpaceCount(display_id) orelse return null;
+    if (count <= permitted_count) return null;
+    const current_space_id = snapshot.currentSpaceId(display_id) orelse return null;
+
+    var ordinal: u8 = count;
+    while (ordinal > 0) : (ordinal -= 1) {
+        const space_id = snapshot.ordinarySpaceIdAtOrdinal(display_id, ordinal) orelse return null;
+        if (space_id == current_space_id) continue;
+        if (g_state.space(.{ .id = space_id }) != null) continue;
+        if (occupied.* == null) occupied.* = OccupiedNativeSpaces.snapshot() orelse return null;
+        if (occupied.*.?.contains(space_id)) continue;
+        return space_id;
+    }
+    return null;
+}
+
+/// Native Spaces holding at least one real window, including windows on
+/// inactive Spaces and minimized ones, which would spill if their Space went.
+/// One batched Space query covers every window: this runs on each topology
+/// poll while an extra Space is kept. A window on every Space marks them all
+/// occupied, which only keeps an extra Space around.
+const OccupiedNativeSpaces = struct {
+    space_ids: [256]u64 = undefined,
+    count: usize = 0,
+
+    /// Null when the window list is unavailable or too large to trust; callers
+    /// then treat every Space as occupied.
+    fn snapshot() ?OccupiedNativeSpaces {
+        const options: cg_extra.CGWindowListOption = cg_extra.kCGWindowListOptionAll | cg_extra.kCGWindowListExcludeDesktopElements;
+        trace.countWindowList();
+        const list = cg_extra.CGWindowListCopyWindowInfo(options, cg_extra.kCGNullWindowID) orelse return null;
+        defer c.CFRelease(@ptrCast(list));
+
+        var wids: [skylight.space_query_window_capacity]u32 = undefined;
+        var wid_count: usize = 0;
+        const total = c.CFArrayGetCount(list);
+        std.debug.assert(total >= 0);
+        var i: c.CFIndex = 0;
+        while (i < total) : (i += 1) {
+            const info: c.CFDictionaryRef = @ptrCast(c.CFArrayGetValueAtIndex(list, i) orelse continue);
+            if (!cgWindowInfoVisible(info)) continue;
+
+            var layer: i32 = 0;
+            if (c.CFDictionaryGetValue(info, cg_extra.kCGWindowLayer)) |layer_ref| {
+                _ = c.CFNumberGetValue(@ptrCast(layer_ref), c.kCFNumberSInt32Type, &layer);
+            }
+            if (layer != 0) continue;
+
+            var bounds: c.CGRect = std.mem.zeroes(c.CGRect);
+            if (c.CFDictionaryGetValue(info, cg_extra.kCGWindowBounds)) |bounds_ref| {
+                _ = c.CGRectMakeWithDictionaryRepresentation(@ptrCast(bounds_ref), &bounds);
+            }
+            if (bounds.size.width < 1 or bounds.size.height < 1) continue;
+
+            const wid_ref = c.CFDictionaryGetValue(info, cg_extra.kCGWindowNumber) orelse continue;
+            var wid: u32 = 0;
+            if (c.CFNumberGetValue(@ptrCast(wid_ref), c.kCFNumberSInt32Type, &wid) == 0) continue;
+            if (wid_count == wids.len) return null;
+            wids[wid_count] = wid;
+            wid_count += 1;
+        }
+
+        var self: OccupiedNativeSpaces = .{};
+        self.count = g_sky.?.spaceIdsForWindows(wids[0..wid_count], &self.space_ids) orelse return null;
+        return self;
+    }
+
+    fn contains(self: *const OccupiedNativeSpaces, space_id: u64) bool {
+        return std.mem.findScalar(u64, self.space_ids[0..self.count], space_id) != null;
+    }
+};
 
 fn reconcileNativeSpaceCapacity() bool {
     const required_count: u16 = workspaceCount();
@@ -4054,8 +4154,11 @@ fn reconcileNativeSpaceCapacity() bool {
 
     while (capacity.total_count > required_count) {
         const space_id = capacity.excess_space_id orelse {
-            log.warn("native Space removal found no removable excess Space", .{});
-            return false;
+            log.debug("keeping excess Mission Control Spaces required={d} available={d}", .{
+                required_count,
+                capacity.total_count,
+            });
+            break;
         };
         if (!sky.destroyNativeSpace(space_id)) {
             log.warn("native Space removal failed space={d}", .{space_id});
@@ -4109,7 +4212,7 @@ fn nativeSpaceTopologyDiverged() bool {
     defer snapshot.deinit();
 
     const capacity = nativeSpaceCapacityFromSnapshot(&snapshot) orelse return false;
-    if (capacity.total_count != workspaceCount()) return true;
+    if (capacity.needsRepair(workspaceCount())) return true;
 
     const topology = nativeTopologyFromSnapshot(&snapshot, .preserve_space_ids) orelse return false;
     return !g_state.native_topology.eql(&topology);
@@ -4126,7 +4229,7 @@ fn reconcileNativeSpaceTopologyIfNeeded() void {
     var snapshot = g_sky.?.nativeSpaceTopology() orelse return;
     defer snapshot.deinit();
     const capacity = nativeSpaceCapacityFromSnapshot(&snapshot) orelse return;
-    if (capacity.total_count != workspaceCount()) {
+    if (capacity.needsRepair(workspaceCount())) {
         log.debug("native Space count changed required={d} available={d}", .{
             workspaceCount(),
             capacity.total_count,
@@ -4139,7 +4242,7 @@ fn reconcileNativeSpaceTopologyIfNeeded() void {
             });
             return;
         }
-        reconcileDisplays(.preserve_space_ids);
+        reconcileDisplays(.topology_repair);
         return;
     }
 
@@ -4147,7 +4250,7 @@ fn reconcileNativeSpaceTopologyIfNeeded() void {
     if (g_state.native_topology.eql(&topology)) return;
 
     log.debug("native Space topology changed", .{});
-    reconcileDisplays(.preserve_space_ids);
+    reconcileDisplays(.topology_repair);
 }
 
 fn captureNativeTopology(mapping: state_mod.NativeTopologyMapping) ?state_mod.NativeTopology {
@@ -4390,11 +4493,11 @@ fn executeStateEffect(effect: state_mod.Effect) void {
         .focus_retry_expired => |process_id| log.debug("focus-retry: gave up pid={d}", .{process_id}),
         .display_resettle_due => {
             log.debug("display resettle", .{});
-            reconcileDisplays(g_state.display_resettle_mapping);
+            reconcileDisplays(g_state.display_resettle_cause);
         },
         .reconcile_displays => {
             log.debug("display changed", .{});
-            reconcileDisplays(.native_order);
+            reconcileDisplays(.display_change);
         },
         .focus_window => |focus| {
             cancelPendingMouseFocus(false, false);
@@ -4984,16 +5087,71 @@ fn reconcileNativeWindowAssignmentsFromWindowServer(should_require_visible: bool
     }
 }
 
+/// Send windows back to their workspace's Space after a display change. macOS
+/// piles the windows of a vanished display onto a surviving Space, and a
+/// reconnected display can take over a workspace whose windows are still on
+/// the old Space. Adopting WindowServer placement here would merge workspaces.
+fn returnDisplacedWindows() void {
+    const sky = &g_sky.?;
+    var topology = sky.nativeSpaceTopology() orelse {
+        log.warn("display reconcile could not snapshot window placement", .{});
+        return;
+    };
+    defer topology.deinit();
+
+    var returns: [256]struct { wid: u32, source_space_id: u64, target: state_mod.SpaceRef } = undefined;
+    var return_count: usize = 0;
+    for (g_state.windows.items()) |managed_window| {
+        const wid = managed_window.snapshot().wid;
+        const managed = g_state.window(wid) orelse continue;
+        if (g_state.windowTabLeader(wid) != wid) continue;
+        if (g_state.pendingNativeWindowMove(wid) != null) continue;
+        const target = g_state.space(managed.space_key) orelse continue;
+        const source_space_id = nativeSpaceIdForWindowInTopology(&topology, g_state.windowTabActive(wid)) orelse continue;
+        if (source_space_id == target.key.id) continue;
+        if (return_count == returns.len) {
+            log.warn("display reconcile window return truncated limit={d}", .{returns.len});
+            break;
+        }
+        returns[return_count] = .{ .wid = wid, .source_space_id = source_space_id, .target = target };
+        return_count += 1;
+    }
+
+    for (returns[0..return_count]) |displaced| {
+        log.debug("display reconcile: returning wid={d} space={d} -> workspace={d} space={d}", .{
+            displaced.wid,
+            displaced.source_space_id,
+            displaced.target.workspace_id,
+            displaced.target.key.id,
+        });
+        // A source bound to a workspace gets a tracked move that rolls back if
+        // it does not land; an unbound leftover Space has no workspace to roll
+        // back to, so that move is best effort.
+        if (g_state.space(.{ .id = displaced.source_space_id })) |source| {
+            requestNativeWindowMove(displaced.wid, source, displaced.target);
+        } else if (!moveTabGroupToNativeSpace(displaced.wid, displaced.target)) {
+            log.warn("display reconcile: window return failed wid={d} workspace={d}", .{
+                displaced.wid,
+                displaced.target.workspace_id,
+            });
+        }
+    }
+}
+
+fn nativeSpaceIdForWindowInTopology(topology: *const skylight.NativeSpaceTopology, wid: u32) ?u64 {
+    const sky = &g_sky.?;
+    for (g_displays[0..g_display_count]) |display| {
+        if (topology.spaceIdForWindow(sky, wid, display.id)) |space_id| return space_id;
+    }
+    return null;
+}
+
 fn nativeWorkspaceForWindowInTopology(
     topology: *const skylight.NativeSpaceTopology,
     wid: u32,
 ) ?state_mod.SpaceRef {
-    const sky = &g_sky.?;
-    for (g_displays[0..g_display_count]) |display| {
-        const space_id = topology.spaceIdForWindow(sky, wid, display.id) orelse continue;
-        return g_state.space(.{ .id = space_id });
-    }
-    return null;
+    const space_id = nativeSpaceIdForWindowInTopology(topology, wid) orelse return null;
+    return g_state.space(.{ .id = space_id });
 }
 
 fn reassignManagedWindowToNativeWorkspace(wid: u32, target: state_mod.SpaceRef) void {
@@ -6222,10 +6380,10 @@ fn handleExternalWindowGeometry(wid: u32, frame: window_mod.Window.Frame) void {
 
 /// Reconciles workspace/display state after monitor topology changes.
 ///
-/// Display events rebuild native ordinal numbering on both the leading and
-/// trailing observations because macOS can restore Space order after its
-/// first display notification. Routine topology repair preserves Space IDs.
-fn reconcileDisplayChange(mapping: state_mod.NativeTopologyMapping) bool {
+/// Workspaces keep their Space IDs across display changes, even when macOS
+/// restores Spaces at different ordinals, so a workspace number always names
+/// the same windows.
+fn reconcileDisplayChange(cause: state_mod.DisplayReconcileCause) bool {
     const focused_uuid: ?[16]u8 = blk: {
         const slot = displayIndexById(focusedDisplayId()) orelse break :blk null;
         break :blk g_displays[slot].uuid;
@@ -6236,12 +6394,12 @@ fn reconcileDisplayChange(mapping: state_mod.NativeTopologyMapping) bool {
     refreshDisplays();
 
     const restored_focused_display_id = displayIdForUuid(focused_uuid) orelse primaryDisplayId();
-    const native_topology = (if (reconcileNativeSpaceCapacity()) captureNativeTopology(mapping) else null) orelse {
+    const native_topology = (if (reconcileNativeSpaceCapacity()) captureNativeTopology(.preserve_space_ids) else null) orelse {
         g_displays = previous_displays;
         g_display_count = previous_display_count;
         dispatchStateEvent(.{ .display_reconcile_unavailable = .{
             .at_ms = nativeStateNowMs(),
-            .mapping = mapping,
+            .cause = cause,
         } });
         log.debug("display reconcile deferred until native Space topology is available", .{});
         return false;

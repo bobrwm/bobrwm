@@ -39,6 +39,7 @@ const dock_swipe_progress: f64 = 1.401298464324817e-45;
 const dock_swipe_modern_progress: f64 = 0.000016;
 const serialized_event_capacity: usize = 4096;
 const native_window_batch_capacity: usize = 256;
+pub const space_query_window_capacity: usize = 1024;
 
 /// Identifies our synthetic gestures without relying on event arrival order.
 pub const dock_swipe_event_marker: i64 = 0x424f425253574950;
@@ -381,6 +382,40 @@ pub const SkyLight = struct {
             if (source_sid != 0 and candidate == source_sid) is_on_source = true;
         }
         return is_on_target and !is_on_source;
+    }
+
+    /// Collect every Space holding any of `wids` into `out`, deduplicated.
+    /// Returns null when the query fails or `out` is too small, so callers can
+    /// fall back to treating Spaces as occupied.
+    pub fn spaceIdsForWindows(self: *const SkyLight, wids: []const u32, out: []u64) ?usize {
+        if (wids.len == 0) return 0;
+        const copy_spaces = self.copySpacesForWindows orelse return null;
+        if (wids.len > space_query_window_capacity) return null;
+        var values: [space_query_window_capacity]?*const anyopaque = undefined;
+        var value_count: usize = 0;
+        defer for (values[0..value_count]) |value| c.CFRelease(value);
+        for (wids) |*wid| {
+            values[value_count] = c.CFNumberCreate(null, c.kCFNumberSInt32Type, wid) orelse return null;
+            value_count += 1;
+        }
+        const windows = c.CFArrayCreate(null, &values, @intCast(value_count), &c.kCFTypeArrayCallBacks) orelse return null;
+        defer c.CFRelease(windows);
+        const spaces = copy_spaces(self.mainConnectionID(), 0x7, windows) orelse return null;
+        defer c.CFRelease(spaces);
+
+        var count: usize = 0;
+        const space_count = c.CFArrayGetCount(@ptrCast(spaces));
+        for (0..@intCast(space_count)) |index| {
+            const space = c.CFArrayGetValueAtIndex(@ptrCast(spaces), @intCast(index)) orelse continue;
+            var sid: i64 = 0;
+            if (c.CFNumberGetValue(@ptrCast(space), c.kCFNumberSInt64Type, &sid) == 0 or sid <= 0) continue;
+            const space_id: u64 = @intCast(sid);
+            if (std.mem.findScalar(u64, out[0..count], space_id) != null) continue;
+            if (count == out.len) return null;
+            out[count] = space_id;
+            count += 1;
+        }
+        return count;
     }
 
     /// Return the unique ordinary native Space containing a window.
