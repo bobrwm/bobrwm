@@ -4831,14 +4831,27 @@ fn observeNativeTopology(epoch: state_mod.Epoch) void {
         } });
         return;
     };
+    const is_animating = if (g_state.pending_switch) |pending|
+        g_sky.?.nativeDisplayIsAnimating(pending.request.target.display_id)
+    else
+        null;
+    if (g_state.pending_switch) |pending| {
+        const display = topology.findDisplay(pending.request.target.display_id);
+        log.debug("native switch observe epoch={d} phase={s} target_space={d} observed_space={?d} animating={?} queued={?d} remaining_ms={d}", .{
+            pending.epoch,
+            @tagName(pending.phase),
+            pending.request.target.key.id,
+            if (display) |value| value.observed_space_id else null,
+            is_animating,
+            if (g_state.queued_switch) |queued| queued.target.workspace_id else null,
+            pending.deadline_at_ms -| at_ms,
+        });
+    }
     dispatchStateEvent(.{ .native_topology_observed = .{
         .topology = &topology,
         .epoch = epoch,
         .at_ms = at_ms,
-        .is_animating = if (g_state.pending_switch) |pending|
-            g_sky.?.nativeDisplayIsAnimating(pending.request.target.display_id)
-        else
-            null,
+        .is_animating = is_animating,
     } });
 }
 
