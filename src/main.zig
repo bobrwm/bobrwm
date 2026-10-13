@@ -353,6 +353,11 @@ fn pushDimSnapshot() void {
     // reaches the window-scan loops below. Assert rather than early-return so
     // the invariant is documented and compiles out in release builds.
     std.debug.assert(dim.enabled);
+    g_dim_dirty = false;
+
+    // Transitioning displays were already cleared by hideTransitioningDim, so
+    // with nothing else on screen the window-list copy would buy nothing.
+    if (!hasSettledDisplay()) return;
 
     // An overlay is placed over the window's accepted frame, so a stale entry
     // that is not on screen — a stale native-tab id, a window an app closed to
@@ -369,14 +374,22 @@ fn pushDimSnapshot() void {
         if (!on_screen.contains(win.wid)) continue;
         const space = managedWindowSpace(win.wid) orelse continue;
         if (isDisplayInTransition(space.display_id)) continue;
-        entries[n] = dimEntry(win.wid, g_animator.displayedFrame(win.wid) orelse win.frame);
+        const frame = g_animator.displayedFrame(win.wid) orelse win.frame;
+        entries[n] = .{
+            .wid = win.wid,
+            .pid = win.pid,
+            .display_id = space.display_id,
+            .x = frame.x,
+            .y = frame.y,
+            .w = frame.width,
+            .h = frame.height,
+        };
         n += 1;
     }
 
     // Keep the focused window of every display's visible workspace bright, not
     // just the single globally-focused one, so a multi-display active window
     // is not dimmed.
-    comptime std.debug.assert(g_displays.len <= dim.max_focused);
     var focused: [g_displays.len]u32 = undefined;
     var fn_count: usize = 0;
     for (0..g_display_count) |slot| {
@@ -390,32 +403,40 @@ fn pushDimSnapshot() void {
         fn_count += 1;
     }
 
-    dim.apply(focused[0..fn_count], entries[0..n]);
+    dim.apply(focused[0..fn_count], frontmostApplicationPid() orelse 0, entries[0..n]);
 }
 
-fn dimEntry(wid: u32, frame: window_mod.Window.Frame) dim.Entry {
-    return .{ .wid = wid, .x = frame.x, .y = frame.y, .w = frame.width, .h = frame.height };
-}
-
-/// A display mid-switch still reports the outgoing Space as visible while
-/// WindowServer slides the incoming one in, so overlays there would cover the
-/// wrong windows. Overlays return once the switch lands, not after the settle
-/// tail; the drain that runs the settle-time frame reconcile corrects them.
+/// A display whose visible Space is being replaced still reports the outgoing
+/// Space while WindowServer slides the incoming one in, so overlays there
+/// would cover the wrong windows. Keyed on the native operations rather than
+/// the workspace transition, which also covers re-focusing the current
+/// workspace and lingers through focus acceptance and the settle tail.
 fn isDisplayInTransition(display_id: u32) bool {
     if (g_state.pending_switch) |pending| {
         if (pending.request.target.display_id == display_id) return true;
     }
-    const transition = g_state.workspace_transition orelse return false;
-    if (transition.completion_reason != null) return false;
-    // Moving a workspace changes the source display too, which the
-    // transition does not record.
-    if (transition.kind == .move_workspace_to_display) return true;
-    return transition.target.display_id == display_id;
+    const move = g_state.pendingNativeWorkspaceMove() orelse return false;
+    return move.source.display_id == display_id or move.target.display_id == display_id;
+}
+
+fn hasSettledDisplay() bool {
+    for (g_displays[0..g_display_count]) |display| {
+        if (!isDisplayInTransition(display.id)) return true;
+    }
+    return false;
+}
+
+fn hideTransitioningDim() void {
+    if (!dim.enabled) return;
+    for (g_displays[0..g_display_count]) |display| {
+        if (isDisplayInTransition(display.id)) dim.hideDisplay(display.id);
+    }
 }
 
 fn followAnimationsWithDim() void {
     for (g_animator.active()) |a| {
-        dim.follow(dimEntry(a.wid, a.last_displayed_frame));
+        const frame = a.last_displayed_frame;
+        dim.follow(a.wid, frame.x, frame.y, frame.width, frame.height);
     }
 }
 
@@ -1266,6 +1287,9 @@ var g_hotkey_bindings: []const shim.bw_keybind = &.{};
 var g_waker_source: c.CFRunLoopSourceRef = null;
 var g_role_poll_source: c.dispatch_source_t = null;
 var g_scheduled_observation: ?state_mod.ObservationTimer = null;
+/// Set when the model changes or focus moves; the drain only snapshots dimming
+/// when it is set, so mouse moves and animation echoes skip the window-list copy.
+var g_dim_dirty: bool = false;
 var g_native_space_topology_poll_source: c.dispatch_source_t = null;
 var g_tap_port: c.CFMachPortRef = null;
 var g_swipe_tap_port: c.CFMachPortRef = null;
@@ -2843,10 +2867,7 @@ fn bw_drain_events() void {
     flushRetileRequests();
 
     // Same settled point: dim inactive windows (diffed, no-op if unchanged).
-    // Guard at the call site so a disabled feature costs exactly one branch
-    // here and never enters the snapshot path — no call, no loop, no reliance
-    // on the optimizer eliding a no-op body.
-    if (dim.enabled) {
+    if (dim.enabled and g_dim_dirty) {
         pushDimSnapshot();
     }
 
@@ -3481,6 +3502,8 @@ fn handleEvent(ev: *const event_mod.Event) void {
             retile();
         },
         .window_focused => {
+            // Activation raises windows even when no managed focus changes.
+            g_dim_dirty = true;
             const focused_wid_opt = focusedWindowIdForLoggedEvent("window focused", ev.pid);
             if (!g_state.isWorkspaceTransitionActive()) {
                 requestCleanupForPid(ev.pid);
@@ -3497,6 +3520,7 @@ fn handleEvent(ev: *const event_mod.Event) void {
             }
         },
         .focused_window_changed => {
+            g_dim_dirty = true;
             const focused_wid_opt = focusedWindowIdForLoggedEvent("focused window changed", ev.pid);
             if (!g_state.isWorkspaceTransitionActive()) {
                 requestCleanupForPid(ev.pid);
@@ -4211,6 +4235,7 @@ fn nativeTopologyFromSnapshot(snapshot: *const skylight.NativeSpaceTopology, map
 
 fn dispatchStateEvent(event: state_mod.Event) void {
     const transition = state_mod.reduce(&g_state, event);
+    g_dim_dirty = true;
 
     for (transition.effects[0..transition.effect_count]) |effect| {
         if (!g_state_effect_queue.push(effect)) @panic("state effect queue overflow");
@@ -4230,6 +4255,7 @@ fn drainStateEffects() void {
     }
     refreshRolePolling();
     scheduleNativeObservation();
+    hideTransitioningDim();
 }
 
 /// Fire the native observation at its due time. The role poll would run it
@@ -4780,9 +4806,9 @@ fn executeWorkspaceTransitionSettled(settlement: state_mod.WorkspaceTransitionSe
 fn executeNativeSwitch(effect: @FieldType(state_mod.Effect, "switch_native_space")) void {
     const pending = g_state.pending_switch orelse return;
     if (pending.epoch != effect.epoch or pending.phase != .preparing) return;
-    // Hide the display's overlays before WindowServer starts the slide; the
-    // drain-end snapshot runs after the gesture is already posted.
-    if (dim.enabled) pushDimSnapshot();
+    // Before WindowServer starts the slide; the effect drain's own hide runs
+    // after the gesture is already posted.
+    hideTransitioningDim();
 
     const request = effect.request;
     const native_space_id = request.target.key.id;

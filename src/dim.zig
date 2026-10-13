@@ -33,6 +33,8 @@ pub var level: f64 = 0.35;
 /// A window to (potentially) dim, in CG coordinates (top-left origin).
 pub const Entry = struct {
     wid: u32,
+    pid: i32,
+    display_id: u32,
     x: f64,
     y: f64,
     w: f64,
@@ -40,8 +42,6 @@ pub const Entry = struct {
 };
 
 const max_overlays = 64;
-/// One focused window per display.
-pub const max_focused = 8;
 
 const ns_window_style_mask_borderless: usize = 0;
 const ns_backing_store_buffered: usize = 2;
@@ -62,17 +62,20 @@ const NSRect = extern struct { origin: NSPoint, size: NSSize };
 const Slot = struct {
     panel: objc.Object,
     wid: u32 = 0, // target window; 0 when the slot is hidden/free
+    pid: i32 = 0,
+    display_id: u32 = 0,
     shown: bool = false,
+    // Ordered during the current apply(), so restacking can skip it.
+    is_ordered: bool = false,
     frame: NSRect = .{ .origin = .{ .x = 0, .y = 0 }, .size = .{ .width = 0, .height = 0 } },
 };
 
 var slots: [max_overlays]Slot = undefined;
 var slot_count: usize = 0; // number of lazily created panels
 
-// Focus set of the last apply(). A focus change usually raises windows, which
-// lifts them above overlays that were ordered against the old stacking.
-var applied_focused: [max_focused]u32 = undefined;
-var applied_focused_count: usize = 0;
+// Frontmost app at the last apply(). Activation raises all of an app's
+// windows above their overlays, focused or not.
+var applied_frontmost_pid: i32 = 0;
 
 pub fn configure(cfg: config.DimConfig) void {
     enabled = cfg.enabled;
@@ -87,10 +90,9 @@ pub fn configure(cfg: config.DimConfig) void {
 /// `focused` holds the active window of each display's visible workspace, so
 /// the frontmost window on every display stays bright. Diffs against current
 /// panel state; unchanged overlays are left untouched.
-pub fn apply(focused: []const u32, entries: []const Entry) void {
+pub fn apply(focused: []const u32, frontmost_pid: i32, entries: []const Entry) void {
     if (!enabled) return;
     std.debug.assert(level >= 0.0 and level <= 1.0);
-    std.debug.assert(focused.len <= max_focused);
 
     // Nothing focused anywhere (focus loss / mid-transition): undim rather than
     // dimming the whole screen.
@@ -106,33 +108,42 @@ pub fn apply(focused: []const u32, entries: []const Entry) void {
     }
 
     // Pass 2: ensure an overlay exists (and is current) for each candidate.
+    for (slots[0..slot_count]) |*s| s.is_ordered = false;
     for (entries) |e| {
         if (e.wid == 0 or contains(focused, e.wid)) continue;
         if (e.w <= 0 or e.h <= 0) continue;
         ensureOverlay(e);
     }
 
-    // Activating an app raises all of its windows, not just the focused one,
-    // so unmoved overlays can end up beneath their targets.
-    if (std.mem.eql(u32, focused, applied_focused[0..applied_focused_count])) return;
+    // Only the activated app's windows were raised, so only its overlays can
+    // have ended up beneath their targets.
+    if (frontmost_pid == applied_frontmost_pid) return;
+    applied_frontmost_pid = frontmost_pid;
     for (slots[0..slot_count]) |*s| {
-        if (s.shown) orderAbove(s.panel, s.wid);
+        if (s.shown and !s.is_ordered and s.pid == frontmost_pid) orderAbove(s);
     }
-    @memcpy(applied_focused[0..focused.len], focused);
-    applied_focused_count = focused.len;
 }
 
-/// Move an existing overlay to `e`'s frame without re-diffing the snapshot.
-/// Used per animation tick, where a full snapshot would cost a WindowServer
-/// window-list copy every 16ms.
-pub fn follow(e: Entry) void {
+/// Hide the overlays on one display without a snapshot, so a Space switch can
+/// clear them before the slide starts.
+pub fn hideDisplay(display_id: u32) void {
+    for (slots[0..slot_count]) |*s| {
+        if (s.shown and s.display_id == display_id) hideSlot(s);
+    }
+}
+
+/// Move an existing overlay to a new CG frame without re-diffing the
+/// snapshot. Used per animation tick, where a full snapshot would cost a
+/// WindowServer window-list copy every 16ms.
+pub fn follow(wid: u32, x: f64, y: f64, w: f64, h: f64) void {
     if (!enabled) return;
 
-    const frame = nsRectFromCg(e.x, e.y, e.w, e.h);
+    const frame = nsRectFromCg(x, y, w, h);
     for (slots[0..slot_count]) |*s| {
-        if (!s.shown or s.wid != e.wid) continue;
+        if (!s.shown or s.wid != wid) continue;
         if (rectEql(s.frame, frame)) return;
-        s.panel.msgSend(void, "setFrame:display:", .{ frame, true });
+        // The content is a static layer; forcing a redraw per tick buys nothing.
+        s.panel.msgSend(void, "setFrame:display:", .{ frame, false });
         s.frame = frame;
         return;
     }
@@ -152,7 +163,7 @@ pub fn resetAll() void {
     for (slots[0..slot_count]) |*s| {
         if (s.shown) hideSlot(s);
     }
-    applied_focused_count = 0;
+    applied_frontmost_pid = 0;
 }
 
 fn contains(set: []const u32, wid: u32) bool {
@@ -175,10 +186,11 @@ fn ensureOverlay(e: Entry) void {
     // avoid needless AppKit churn and flicker.
     for (slots[0..slot_count]) |*s| {
         if (s.shown and s.wid == e.wid) {
+            s.display_id = e.display_id;
             if (!rectEql(s.frame, frame)) {
-                s.panel.msgSend(void, "setFrame:display:", .{ frame, true });
+                s.panel.msgSend(void, "setFrame:display:", .{ frame, false });
                 s.frame = frame;
-                orderAbove(s.panel, e.wid);
+                orderAbove(s);
             }
             return;
         }
@@ -188,14 +200,17 @@ fn ensureOverlay(e: Entry) void {
     // z-order need setting here.
     const s = acquireSlot() orelse return;
     s.wid = e.wid;
+    s.pid = e.pid;
+    s.display_id = e.display_id;
     s.frame = frame;
     s.shown = true;
     s.panel.msgSend(void, "setFrame:display:", .{ frame, true });
-    orderAbove(s.panel, e.wid);
+    orderAbove(s);
 }
 
-fn orderAbove(panel: objc.Object, wid: u32) void {
-    panel.msgSend(void, "orderWindow:relativeTo:", .{ ns_window_order_above, @as(i64, wid) });
+fn orderAbove(s: *Slot) void {
+    s.panel.msgSend(void, "orderWindow:relativeTo:", .{ ns_window_order_above, @as(i64, s.wid) });
+    s.is_ordered = true;
 }
 
 fn hideSlot(s: *Slot) void {
@@ -325,8 +340,8 @@ test "configure clamps level and sets enabled" {
 
 test "isDimTarget" {
     const entries = [_]Entry{
-        .{ .wid = 3, .x = 0, .y = 0, .w = 10, .h = 10 },
-        .{ .wid = 7, .x = 0, .y = 0, .w = 10, .h = 10 },
+        .{ .wid = 3, .pid = 1, .display_id = 1, .x = 0, .y = 0, .w = 10, .h = 10 },
+        .{ .wid = 7, .pid = 1, .display_id = 1, .x = 0, .y = 0, .w = 10, .h = 10 },
     };
     const focused = [_]u32{7};
     try t.expect(isDimTarget(&entries, &focused, 3)); // 3 is inactive → dim
@@ -337,9 +352,9 @@ test "isDimTarget" {
 
 test "isDimTarget with per-display focus set" {
     const entries = [_]Entry{
-        .{ .wid = 3, .x = 0, .y = 0, .w = 10, .h = 10 },
-        .{ .wid = 7, .x = 0, .y = 0, .w = 10, .h = 10 },
-        .{ .wid = 8, .x = 0, .y = 0, .w = 10, .h = 10 },
+        .{ .wid = 3, .pid = 1, .display_id = 1, .x = 0, .y = 0, .w = 10, .h = 10 },
+        .{ .wid = 7, .pid = 1, .display_id = 1, .x = 0, .y = 0, .w = 10, .h = 10 },
+        .{ .wid = 8, .pid = 1, .display_id = 1, .x = 0, .y = 0, .w = 10, .h = 10 },
     };
     // Two displays, each with its own focused window.
     const focused = [_]u32{ 7, 8 };
@@ -361,9 +376,9 @@ test "apply is a no-op when disabled" {
 
     enabled = false;
     slot_count = 0;
-    const entries = [_]Entry{.{ .wid = 3, .x = 0, .y = 0, .w = 10, .h = 10 }};
+    const entries = [_]Entry{.{ .wid = 3, .pid = 1, .display_id = 1, .x = 0, .y = 0, .w = 10, .h = 10 }};
     const focused = [_]u32{7};
-    apply(&focused, &entries);
+    apply(&focused, 0, &entries);
     try t.expectEqual(@as(usize, 0), slot_count);
 }
 
