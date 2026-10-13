@@ -243,7 +243,7 @@ pub fn build(b: *std.Build) !void {
 
     // Doc comments on config fields, keybind actions, and client commands are
     // the source of truth for user-facing docs. helpgen extracts them into a
-    // generated Zig module that the client prints.
+    // generated Zig module that the client prints and webgen exports.
     const help_strings = helpStrings(b);
 
     // The client links no frameworks at all: it only parses arguments and
@@ -345,6 +345,25 @@ pub fn build(b: *std.Build) !void {
 
     const preview_step = b.step("ui-preview", "Render the menu bar UI to PNGs");
     preview_step.dependOn(&preview_run.step);
+
+    // webgen renders the generated help strings as MDX pages for the
+    // website, one generator per page, the way ghostty emits its webdata.
+    const docs_step = b.step("docs", "Generate website docs into share/bobrwm/webdata");
+    for ([_][]const u8{ "config", "actions", "commands" }) |page| {
+        const webgen = b.addExecutable(.{
+            .name = b.fmt("webgen_{s}", .{page}),
+            .root_module = b.createModule(.{
+                .root_source_file = b.path(b.fmt("src/build/webgen/main_{s}.zig", .{page})),
+                .target = b.graph.host,
+            }),
+        });
+        webgen.root_module.addImport("help_strings", help_strings.module);
+        const webgen_out = b.addRunArtifact(webgen).captureStdOut(.{});
+        docs_step.dependOn(&b.addInstallFile(
+            webgen_out,
+            b.fmt("share/bobrwm/webdata/{s}.mdx", .{page}),
+        ).step);
+    }
 
     // config.zig imports only Zig declarations, so the test module needs
     // no SDK or include wiring.
