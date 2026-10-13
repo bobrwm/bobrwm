@@ -98,6 +98,7 @@ const DisplayInfo = struct {
     visible: shim.bw_frame,
     full: shim.bw_frame,
     is_primary: bool,
+    settings: config_mod.DisplaySettings,
 };
 
 const DropTarget = struct {
@@ -978,20 +979,44 @@ fn displayUuidBytes(display_id: u32) ?[16]u8 {
     };
 }
 
+/// Single synthetic display for when NSScreen reports none we can manage.
+fn useFallbackDisplay() void {
+    const frame = bw_get_display_frame();
+    g_display_count = 1;
+    g_displays[0] = .{
+        .id = 1,
+        .uuid = null,
+        .visible = frame,
+        .full = frame,
+        .is_primary = true,
+        .settings = g_config.displaySettings(),
+    };
+}
+
+/// Re-resolve every display's settings after the config changes.
+fn resolveDisplaySettings() void {
+    for (g_displays[0..g_display_count]) |*display| {
+        display.settings = g_config.displaySettings();
+    }
+}
+
+/// Inner gap for layout requests on a display. A detached display also has no
+/// root frame, and tiling ignores the gap without one, so 0 is never used.
+fn displayInnerGap(display_id: u32) f64 {
+    const display_slot = displayIndexById(display_id) orelse return 0;
+    return @floatFromInt(g_displays[display_slot].settings.gaps.inner);
+}
+
 fn refreshDisplays() void {
     const NSScreen = objc.getClass("NSScreen") orelse {
-        const frame = bw_get_display_frame();
-        g_display_count = 1;
-        g_displays[0] = .{ .id = 1, .uuid = null, .visible = frame, .full = frame, .is_primary = true };
+        useFallbackDisplay();
         return;
     };
 
     const screens = NSScreen.msgSend(objc.Object, "screens", .{});
     const count = screens.msgSend(usize, "count", .{});
     if (count == 0) {
-        const frame = bw_get_display_frame();
-        g_display_count = 1;
-        g_displays[0] = .{ .id = 1, .uuid = null, .visible = frame, .full = frame, .is_primary = true };
+        useFallbackDisplay();
         return;
     }
 
@@ -1044,14 +1069,13 @@ fn refreshDisplays() void {
             .visible = visible_frame,
             .full = full_frame,
             .is_primary = is_primary,
+            .settings = g_config.displaySettings(),
         };
         next_count += 1;
     }
 
     if (next_count == 0) {
-        const frame = bw_get_display_frame();
-        g_display_count = 1;
-        g_displays[0] = .{ .id = 1, .uuid = null, .visible = frame, .full = frame, .is_primary = true };
+        useFallbackDisplay();
         return;
     }
 
@@ -2012,7 +2036,7 @@ fn rebuildTilingStatesForConfig() void {
         .split_ratio = g_config.bsp_split_ratio,
     };
     for (g_state.spaces.spaces[0..g_state.spaces.space_count]) |ws| {
-        if (!rebuild.addSpace(ws.key, displayContentFrame(ws.display_id), @floatFromInt(g_config.gaps.inner))) {
+        if (!rebuild.addSpace(ws.key, displayContentFrame(ws.display_id), displayInnerGap(ws.display_id))) {
             log.err("layout rebuild rejected workspace={d}", .{ws.workspace_id});
             return;
         }
@@ -2030,6 +2054,7 @@ fn applyReloadedConfig(next: ConfigRuntime) void {
     const layout_changed = previous.config.layout != replacement.config.layout;
     g_config_runtime = replacement;
     g_config = replacement.config;
+    resolveDisplaySettings();
     setMouseEventTapEnabled(g_config.focus_follows_mouse);
     if (g_config.focus_follows_mouse and !g_sky.?.supportsWindowHitTesting()) {
         log.warn("focus follows mouse: SLSFindWindowAndOwner fallback unavailable; event window IDs are required", .{});
@@ -3106,7 +3131,7 @@ fn tilingInsertOptions(space_key: state_mod.SpaceKey, wid: u32) !tiling.InsertOp
         .child = g_config.new_window_split,
         .anchor_wid = anchor_wid,
         .root_frame = displayContentFrame(ws.display_id),
-        .inner_gap = @floatFromInt(g_config.gaps.inner),
+        .inner_gap = displayInnerGap(ws.display_id),
         .split_ratio = g_config.bsp_split_ratio,
     };
 }
@@ -3321,8 +3346,12 @@ fn clearDragPreview() void {
 
 fn displayContentFrame(display_id: u32) ?window_mod.Window.Frame {
     const display_slot = displayIndexById(display_id) orelse return null;
-    const display = g_displays[display_slot].visible;
-    const outer = g_config.gaps.outer;
+    const display = g_displays[display_slot];
+    return contentFrame(display.visible, display.settings.gaps.outer);
+}
+
+/// Display frame inset by the outer gaps: the root of the tiling layout.
+fn contentFrame(display: shim.bw_frame, outer: config_mod.OuterGaps) window_mod.Window.Frame {
     return .{
         .x = display.x + @as(f64, @floatFromInt(outer.left)),
         .y = display.y + @as(f64, @floatFromInt(outer.top)),
@@ -3369,7 +3398,7 @@ fn updateWindowMovePreview(wid: u32) void {
     const target_entry = g_state.layout.entryAtPoint(
         space.key,
         display_frame,
-        @floatFromInt(g_config.gaps.inner),
+        displayInnerGap(space.display_id),
         center_x,
         center_y,
         wid,
@@ -6359,6 +6388,7 @@ fn retileDisplay(display_id: u32) void {
     const ws = spaceForWorkspace(display_id, ws_id) orelse return;
     const display_slot = displayIndexById(display_id) orelse return;
     const display = g_displays[display_slot].visible;
+    const gaps = g_displays[display_slot].settings.gaps;
 
     const span = trace.begin("retile display");
     defer _ = span.endIfSlow();
@@ -6366,13 +6396,7 @@ fn retileDisplay(display_id: u32) void {
     ax_mod.beginGeometryBatch();
     defer ax_mod.endGeometryBatch();
 
-    const outer = g_config.gaps.outer;
-    const frame = window_mod.Window.Frame{
-        .x = display.x + @as(f64, @floatFromInt(outer.left)),
-        .y = display.y + @as(f64, @floatFromInt(outer.top)),
-        .width = display.w - @as(f64, @floatFromInt(@as(u32, outer.left) + @as(u32, outer.right))),
-        .height = display.h - @as(f64, @floatFromInt(@as(u32, outer.top) + @as(u32, outer.bottom))),
-    };
+    const frame = contentFrame(display, gaps.outer);
 
     restoreFloatingWindows(ws, display, frame);
 
@@ -6384,7 +6408,7 @@ fn retileDisplay(display_id: u32) void {
         log.err("retile: layout buffer reserve failed display={d} windows={d}", .{ display_id, window_count });
         return;
     };
-    g_state.layout.computeLayout(ws.key, frame, @floatFromInt(g_config.gaps.inner), &g_layout_entries);
+    g_state.layout.computeLayout(ws.key, frame, @floatFromInt(gaps.inner), &g_layout_entries);
     std.debug.assert(g_layout_entries.items.len == window_count);
 
     for (g_layout_entries.items) |entry| {
