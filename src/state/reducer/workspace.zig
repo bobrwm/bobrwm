@@ -10,11 +10,11 @@ const tiling_mod = @import("../../tiling.zig");
 
 const native_switch_timeout_ms = model_mod.native_switch_timeout_ms;
 const native_switch_stall_ms = model_mod.native_switch_stall_ms;
-const NativeSpaceId = model_mod.NativeSpaceId;
 const native_observation_delay_ms = model_mod.native_observation_delay_ms;
 const native_workspace_move_timeout_ms = model_mod.native_workspace_move_timeout_ms;
 const workspace_transition_settle_ms = model_mod.workspace_transition_settle_ms;
 const DisplayId = model_mod.DisplayId;
+const NativeSpaceId = model_mod.NativeSpaceId;
 const WorkspaceId = model_mod.WorkspaceId;
 const SpaceKey = model_mod.SpaceKey;
 const SpaceRef = model_mod.SpaceRef;
@@ -178,7 +178,7 @@ pub fn reduceTopologyObserved(
     }
 
     if (event.at_ms < pending.deadline_at_ms) {
-        if (hasSwitchStalled(transition.model, actual_space_id, event.at_ms) and
+        if (observeSwitchStall(transition.model, actual_space_id, event.at_ms) and
             recoverUnexpectedLanding(transition, pending, event.at_ms)) return;
         schedulePendingObservation(transition.model, pending, event.at_ms);
         return;
@@ -265,11 +265,11 @@ fn postGesturePhase(transition: *Transition, pending: PendingSwitch) void {
     } });
 }
 
-/// Dock drops swipes that arrive mid-animation, leaving the display idle short
-/// of the target. Waiting for the deadline turned each dropped swipe into a
-/// multi-second stall. Requiring the display to stay idle on one Space rides
-/// out the Dock's start latency and the gaps between pipelined swipes.
-fn hasSwitchStalled(model: *Model, observed_space_id: ?NativeSpaceId, at_ms: TimestampMs) bool {
+/// Record an idle observation short of the target and return whether the
+/// switch has stalled. Dock drops swipes that arrive mid-animation, and the
+/// deadline is seconds away. Requiring the display to stay idle on one Space
+/// rides out the Dock's start latency and the gaps between pipelined swipes.
+fn observeSwitchStall(model: *Model, observed_space_id: ?NativeSpaceId, at_ms: TimestampMs) bool {
     const pending = &model.pending_switch.?;
     const space_id = observed_space_id orelse {
         pending.stall = null;

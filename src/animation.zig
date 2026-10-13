@@ -222,6 +222,7 @@ pub const Animator = struct {
         return null;
     }
 
+    /// In-flight animations; invalidated by the next tick.
     pub fn active(self: *const Animator) []const WindowAnimation {
         return self.animations[0..self.count];
     }

@@ -1300,11 +1300,11 @@ test "animation between idle observations restarts the stall window" {
 
     model = observeTestSwitch(model, 101, 120, false);
     model = observeTestSwitch(model, 101, 170, true);
-    model = observeTestSwitch(model, 103, 120 + native_switch_stall_ms, false);
+    model = observeTestSwitch(model, 101, 120 + native_switch_stall_ms, false);
     try testing.expectEqual(pending.epoch, model.pending_switch.?.epoch);
 
-    // A different idle Space restarts the window too.
-    model = observeTestSwitch(model, 101, 130 + native_switch_stall_ms, false);
+    // Landing idle on a different Space restarts the window too.
+    model = observeTestSwitch(model, 103, 120 + 2 * native_switch_stall_ms, false);
     try testing.expectEqual(pending.epoch, model.pending_switch.?.epoch);
 }
 

@@ -168,8 +168,8 @@ pub const PendingSwitch = struct {
     has_retried: bool = false,
     phase: enum { waiting_for_idle, preparing, delivering, observing } = .waiting_for_idle,
     gesture: ?native_gesture.Delivery = null,
-    /// First idle observation short of the target; cleared when the display
-    /// animates or moves to another Space.
+    /// Since when the display has sat idle on one Space short of the target.
+    /// Cleared while it animates; restarted when it lands somewhere else.
     stall: ?SwitchStall = null,
 };
 

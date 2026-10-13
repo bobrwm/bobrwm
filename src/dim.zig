@@ -13,9 +13,10 @@
 //! target window in the global z-order, so the focused window (which has no
 //! overlay) stays clear even when windows overlap.
 //!
-//! Overlays are pooled and reused. apply() is called once per settled event
-//! drain; it only reconfigures a panel when its target or frame changed, so an
-//! unchanged frame issues no AppKit work and does not flicker.
+//! Overlays are pooled and reused. apply() runs at the end of each event drain
+//! and when an animation finishes; it only reconfigures a panel when its target
+//! or frame changed, so an unchanged frame issues no AppKit work and does not
+//! flicker.
 
 const std = @import("std");
 const objc = @import("objc");
@@ -39,8 +40,8 @@ pub const Entry = struct {
 };
 
 const max_overlays = 64;
-// One focused window per display; matches the topology's display limit.
-const max_focused = 8;
+/// One focused window per display.
+pub const max_focused = 8;
 
 const ns_window_style_mask_borderless: usize = 0;
 const ns_backing_store_buffered: usize = 2;

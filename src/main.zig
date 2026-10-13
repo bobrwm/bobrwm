@@ -343,8 +343,8 @@ fn isVisibleManaged(win: *const window_mod.Window) bool {
 
 /// Dim every visible managed window except the focused one with black overlay
 /// panels. Callers must gate on `dim.enabled`. Uses the model's accepted frames
-/// directly (no WindowServer round-trip): retile and move/resize events have
-/// already synchronized them by the time this runs at the end of the drain.
+/// directly (no WindowServer round-trip), except for animating windows, whose
+/// accepted frame is already the animation's target.
 fn pushDimSnapshot() void {
     const span = trace.begin("dim snapshot");
     defer _ = span.endIfSlow();
@@ -376,6 +376,7 @@ fn pushDimSnapshot() void {
     // Keep the focused window of every display's visible workspace bright, not
     // just the single globally-focused one, so a multi-display active window
     // is not dimmed.
+    comptime std.debug.assert(g_displays.len <= dim.max_focused);
     var focused: [g_displays.len]u32 = undefined;
     var fn_count: usize = 0;
     for (0..g_display_count) |slot| {
@@ -398,8 +399,8 @@ fn dimEntry(wid: u32, frame: window_mod.Window.Frame) dim.Entry {
 
 /// A display mid-switch still reports the outgoing Space as visible while
 /// WindowServer slides the incoming one in, so overlays there would cover the
-/// wrong windows. Overlays return once the switch lands rather than after the
-/// settle tail; the settle-time frame reconcile re-pushes them anyway.
+/// wrong windows. Overlays return once the switch lands, not after the settle
+/// tail; the drain that runs the settle-time frame reconcile corrects them.
 fn isDisplayInTransition(display_id: u32) bool {
     if (g_state.pending_switch) |pending| {
         if (pending.request.target.display_id == display_id) return true;
@@ -412,13 +413,7 @@ fn isDisplayInTransition(display_id: u32) bool {
     return transition.target.display_id == display_id;
 }
 
-/// Keep overlays on animating windows. A finished animation needs a full
-/// snapshot to land on the model's final frame.
-fn syncDimWithAnimations(has_finished: bool) void {
-    if (has_finished) {
-        pushDimSnapshot();
-        return;
-    }
+fn followAnimationsWithDim() void {
     for (g_animator.active()) |a| {
         dim.follow(dimEntry(a.wid, a.last_displayed_frame));
     }
@@ -1987,7 +1982,10 @@ fn animatorTimerTick(context: ?*anyopaque) callconv(.c) void {
     _ = context;
     const animating_before = g_animator.active().len;
     g_animator.tick();
-    if (dim.enabled) syncDimWithAnimations(g_animator.active().len < animating_before);
+    if (dim.enabled) {
+        // A finished animation needs a full snapshot to land on the final frame.
+        if (g_animator.active().len < animating_before) pushDimSnapshot() else followAnimationsWithDim();
+    }
     if (!g_animator.isAnimating()) {
         if (g_animator_source) |source| {
             c.dispatch_source_cancel(source);
@@ -4860,11 +4858,9 @@ fn observeNativeTopology(epoch: state_mod.Epoch) void {
         } });
         return;
     };
-    const is_animating = if (g_state.pending_switch) |pending|
-        g_sky.?.nativeDisplayIsAnimating(pending.request.target.display_id)
-    else
-        null;
+    var is_animating: ?bool = null;
     if (g_state.pending_switch) |pending| {
+        is_animating = g_sky.?.nativeDisplayIsAnimating(pending.request.target.display_id);
         const display = topology.findDisplay(pending.request.target.display_id);
         log.debug("native switch observe epoch={d} phase={s} target_space={d} observed_space={?d} animating={?} queued={?d} remaining_ms={d}", .{
             pending.epoch,
