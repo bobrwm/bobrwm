@@ -154,16 +154,21 @@ Each bobrwm workspace is assigned to exactly one ordinary Mission Control
 Space across all displays. At startup, the primary display receives the lowest
 workspace numbers in native ordinal order, so Bobrwm workspace 1 maps to its
 native Space 1. Secondary displays follow in stable display order, with at
-least one workspace reserved for each. Display configuration changes, including
-disconnecting or reconnecting a monitor, rebuild this numbering in native Space
-order. Renumbering keeps windows, layouts and focus history attached to surviving
-Spaces. Ordinary Space observations preserve assignments by native Space ID.
+least one workspace reserved for each. After startup, each workspace keeps its
+Space: switching, moving windows, and disconnecting or reconnecting a monitor
+never renumber workspaces, so keybinds and rules keep naming the same windows.
+When a monitor goes away, its workspaces move to the remaining displays, and
+windows macOS piles onto another workspace are sent back to their own. A
+reconnected monitor that comes back with a fresh Space takes over the
+highest-numbered workspace of a display that has several.
+
 Configure at least as many ordinary Mission Control Spaces in total as Bobrwm
 workspaces, with at least one on every managed display. Bobrwm creates missing
-Spaces on the primary display and
-removes trailing extras so the physical count matches the configured workspace
-count. It watches the native topology while running and reapplies this invariant
-after external Space creation or deletion.
+Spaces on the primary display. It removes extra Spaces only when they are empty
+and hold no workspace; extras that still have windows stay, unnumbered, because
+destroying them would make macOS merge their windows into another workspace. It
+watches the native topology while running and reapplies this after external
+Space creation or deletion.
 
 Full-screen application spaces are ignored when assigning workspace numbers,
 but are crossed when switching. Switching uses the
