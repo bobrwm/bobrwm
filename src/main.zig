@@ -1270,6 +1270,7 @@ var g_last_focused_window_id: u32 = 0;
 var g_hotkey_bindings: []const shim.bw_keybind = &.{};
 var g_waker_source: c.CFRunLoopSourceRef = null;
 var g_role_poll_source: c.dispatch_source_t = null;
+var g_scheduled_observation: ?state_mod.ObservationTimer = null;
 var g_native_space_topology_poll_source: c.dispatch_source_t = null;
 var g_tap_port: c.CFMachPortRef = null;
 var g_swipe_tap_port: c.CFMachPortRef = null;
@@ -3583,6 +3584,7 @@ fn handleEvent(ev: *const event_mod.Event) void {
             processPendingFocusQueue();
         },
         .native_topology_poll_tick => reconcileNativeSpaceTopologyIfNeeded(),
+        .native_observation_due => _ = processDueNativeStateObservation(),
         .mouse_down => {
             cancelPendingMouseFocus(true, true);
             dispatchStateEvent(.{ .pointer_down = managedWindowAtPoint(g_mouse_down_location) });
@@ -4229,6 +4231,33 @@ fn drainStateEffects() void {
         executeStateEffect(effect);
     }
     refreshRolePolling();
+    scheduleNativeObservation();
+}
+
+/// Fire the native observation at its due time. The role poll would run it
+/// up to 100ms late, and a switch re-observes every 50ms until it lands, so
+/// that lag lands on every hop of a queued switch.
+fn scheduleNativeObservation() void {
+    const timer = g_state.observation_timer orelse return;
+    if (g_scheduled_observation) |scheduled| {
+        if (std.meta.eql(scheduled, timer)) return;
+    }
+    g_scheduled_observation = timer;
+
+    const delay_ms = timer.due_at_ms -| nativeStateNowMs();
+    c.dispatch_after_f(
+        c.dispatch_time(c.DISPATCH_TIME_NOW, @intCast(delay_ms * std.time.ns_per_ms)),
+        cg_extra.dispatch_get_main_queue(),
+        null,
+        nativeObservationTimerFired,
+    );
+}
+
+// Stale fires are harmless: the reducer drops timers whose epoch or due time
+// no longer matches.
+fn nativeObservationTimerFired(context: ?*anyopaque) callconv(.c) void {
+    _ = context;
+    bw_emit_event(shim.BW_EVENT_NATIVE_OBSERVATION_DUE, 0, 0);
 }
 
 fn executeStateEffect(effect: state_mod.Effect) void {

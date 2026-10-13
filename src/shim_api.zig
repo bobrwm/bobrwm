@@ -21,6 +21,7 @@ pub const BW_EVENT_MOUSE_DRAGGED: u8 = @backingInt(event_mod.EventKind.mouse_dra
 pub const BW_EVENT_ROLE_POLL_TICK: u8 = @backingInt(event_mod.EventKind.role_poll_tick);
 pub const BW_EVENT_NATIVE_TOPOLOGY_POLL_TICK: u8 = @backingInt(event_mod.EventKind.native_topology_poll_tick);
 pub const BW_EVENT_MOUSE_MOVED: u8 = @backingInt(event_mod.EventKind.mouse_moved);
+pub const BW_EVENT_NATIVE_OBSERVATION_DUE: u8 = @backingInt(event_mod.EventKind.native_observation_due);
 
 pub const BW_HK_FOCUS_WORKSPACE: u8 = @backingInt(event_mod.EventKind.hk_focus_workspace);
 pub const BW_HK_MOVE_TO_WORKSPACE: u8 = @backingInt(event_mod.EventKind.hk_move_to_workspace);

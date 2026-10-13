@@ -19,6 +19,7 @@ pub const max_spaces_per_display = topology_mod.max_spaces_per_display;
 pub const max_workspace_focus_history = 32;
 pub const max_pending_native_window_moves = 256;
 pub const native_switch_timeout_ms: u64 = 3200;
+pub const native_switch_stall_ms: u64 = 250;
 pub const native_observation_delay_ms: u64 = 50;
 pub const native_window_move_attempts_max: u8 = 3;
 pub const native_workspace_move_timeout_ms: u64 = 3200;
@@ -167,6 +168,14 @@ pub const PendingSwitch = struct {
     has_retried: bool = false,
     phase: enum { waiting_for_idle, preparing, delivering, observing } = .waiting_for_idle,
     gesture: ?native_gesture.Delivery = null,
+    /// First idle observation short of the target; cleared when the display
+    /// animates or moves to another Space.
+    stall: ?SwitchStall = null,
+};
+
+pub const SwitchStall = struct {
+    space_id: NativeSpaceId,
+    since_ms: TimestampMs,
 };
 
 pub const WorkspaceTransitionKind = enum {
