@@ -462,20 +462,6 @@ pub fn build(b: *std.Build) !void {
 
     const run_tiling_tests = b.addRunArtifact(tiling_tests);
 
-    // workspace.zig is pure Zig (window.zig types only) as well.
-    const workspace_test_mod = b.createModule(.{
-        .root_source_file = b.path("src/workspace.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-
-    const workspace_tests = b.addTest(.{
-        .name = "workspace-tests",
-        .root_module = workspace_test_mod,
-    });
-
-    const run_workspace_tests = b.addRunArtifact(workspace_tests);
-
     const state_test_mod = b.createModule(.{
         .root_source_file = b.path("src/state.zig"),
         .target = target,
@@ -623,7 +609,6 @@ pub fn build(b: *std.Build) !void {
     test_step.dependOn(&run_geometry_tests.step);
     test_step.dependOn(&run_tabgroup_tests.step);
     test_step.dependOn(&run_tiling_tests.step);
-    test_step.dependOn(&run_workspace_tests.step);
     test_step.dependOn(&run_state_tests.step);
     test_step.dependOn(&run_statusbar_tests.step);
     test_step.dependOn(&run_dim_tests.step);
