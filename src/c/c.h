@@ -61,10 +61,6 @@
 // from the umbrella. AXError must be declared before AXUIElement.
 #include <HIServices/AXError.h>
 #include <HIServices/AXValue.h>
-#include <HIServices/AXActionConstants.h>
-#include <HIServices/AXAttributeConstants.h>
-#include <HIServices/AXNotificationConstants.h>
-#include <HIServices/AXRoleConstants.h>
 #include <HIServices/AXUIElement.h>
 
 #include <dispatch/dispatch.h>
