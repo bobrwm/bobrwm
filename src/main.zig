@@ -2749,7 +2749,6 @@ pub fn main(init: std.process.Init.Minimal) !void {
         return err;
     };
     defer g_ipc.deinit(g_allocator);
-    ipc.g_dispatch = ipcDispatch;
 
     // -- Config --
     const config_path = config_mod.resolvePath(g_allocator, parseConfigPath(init.args)) catch null;
@@ -3104,13 +3103,9 @@ fn handleIpcRequest(request: ipc_transport.Request) void {
     const cmd = request.command();
     log.debug("[trace] ipc recv fd={} bytes={} cmd={s}", .{ request.fd, request.len, cmd });
 
-    if (ipc.g_dispatch) |dispatch| {
-        dispatch(cmd, request.fd);
-        const elapsed_ms = @divTrunc(nanoTimestamp() - started_ns, std.time.ns_per_ms);
-        log.debug("[trace] ipc handled fd={} cmd={s} elapsed_ms={}", .{ request.fd, cmd, elapsed_ms });
-    } else {
-        log.warn("ipc dispatch callback missing", .{});
-    }
+    ipcDispatch(cmd, request.fd);
+    const elapsed_ms = @divTrunc(nanoTimestamp() - started_ns, std.time.ns_per_ms);
+    log.debug("[trace] ipc handled fd={} cmd={s} elapsed_ms={}", .{ request.fd, cmd, elapsed_ms });
 }
 
 fn drainIpcRequests() void {
@@ -5561,7 +5556,7 @@ fn addNewWindowManagedWithAssignment(
     const rule_float = blk: {
         if (g_config.app_rules.len == 0) break :blk false;
         var id_buf: [256]u8 = undefined;
-        const bundle_id = config_mod.getAppBundleId(pid, &id_buf) orelse break :blk false;
+        const bundle_id = osutil.appBundleId(pid, &id_buf) orelse break :blk false;
         break :blk g_config.shouldFloatApp(bundle_id);
     };
 
@@ -6703,7 +6698,7 @@ fn checkTabDragOut(_: i32, wid: u32) bool {
 fn configuredWorkspace(pid: i32, display_id: u32) ?state_mod.SpaceRef {
     if (g_config.hasAppWorkspaceRules()) {
         var id_buf: [256]u8 = undefined;
-        if (config_mod.getAppBundleId(pid, &id_buf)) |bundle_id| {
+        if (osutil.appBundleId(pid, &id_buf)) |bundle_id| {
             if (g_config.workspaceForApp(bundle_id)) |ws_id| {
                 return spaceForCommand(display_id, ws_id);
             }
