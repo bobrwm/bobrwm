@@ -2749,7 +2749,6 @@ pub fn main(init: std.process.Init.Minimal) !void {
         return err;
     };
     defer g_ipc.deinit(g_allocator);
-    ipc.g_dispatch = ipcDispatch;
 
     // -- Config --
     const config_path = config_mod.resolvePath(g_allocator, parseConfigPath(init.args)) catch null;
@@ -3104,13 +3103,9 @@ fn handleIpcRequest(request: ipc_transport.Request) void {
     const cmd = request.command();
     log.debug("[trace] ipc recv fd={} bytes={} cmd={s}", .{ request.fd, request.len, cmd });
 
-    if (ipc.g_dispatch) |dispatch| {
-        dispatch(cmd, request.fd);
-        const elapsed_ms = @divTrunc(nanoTimestamp() - started_ns, std.time.ns_per_ms);
-        log.debug("[trace] ipc handled fd={} cmd={s} elapsed_ms={}", .{ request.fd, cmd, elapsed_ms });
-    } else {
-        log.warn("ipc dispatch callback missing", .{});
-    }
+    ipcDispatch(cmd, request.fd);
+    const elapsed_ms = @divTrunc(nanoTimestamp() - started_ns, std.time.ns_per_ms);
+    log.debug("[trace] ipc handled fd={} cmd={s} elapsed_ms={}", .{ request.fd, cmd, elapsed_ms });
 }
 
 fn drainIpcRequests() void {

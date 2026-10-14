@@ -8,10 +8,6 @@ const runtime_paths = @import("runtime_paths.zig");
 
 const log = std.log.scoped(.ipc);
 
-/// Dispatch callback: receives the trimmed command string and the client fd.
-/// Callee writes the response to client_fd before returning.
-pub const DispatchFn = *const fn (cmd: []const u8, client_fd: posix.socket_t) void;
-
 pub const IpcCommand = union(enum) {
     retile,
     reload_config,
@@ -142,9 +138,6 @@ pub const IpcCommand = union(enum) {
         return .{ .move_workspace_to_display = .{ .index = n } };
     }
 };
-
-/// Module-level dispatch — set by main before calling bw_app_setup.
-pub var g_dispatch: ?DispatchFn = null;
 
 // Zig 0.16 removed the std.posix.{socket,bind,listen,connect,write,close,
 // shutdown} wrappers ("posix and os.windows removals" in the release notes).
