@@ -128,6 +128,7 @@ pub extern const kCGWindowAlpha: c.CFStringRef;
 pub extern var _dispatch_main_q: anyopaque;
 pub extern const _dispatch_source_type_timer: anyopaque;
 pub extern const _dispatch_source_type_read: anyopaque;
+pub extern const _dispatch_source_type_vnode: anyopaque;
 
 pub inline fn dispatch_get_main_queue() c.dispatch_queue_t {
     return @ptrCast(&_dispatch_main_q);
@@ -139,4 +140,8 @@ pub inline fn DISPATCH_SOURCE_TYPE_TIMER() c.dispatch_source_type_t {
 
 pub inline fn DISPATCH_SOURCE_TYPE_READ() c.dispatch_source_type_t {
     return @ptrCast(&_dispatch_source_type_read);
+}
+
+pub inline fn DISPATCH_SOURCE_TYPE_VNODE() c.dispatch_source_type_t {
+    return @ptrCast(&_dispatch_source_type_vnode);
 }

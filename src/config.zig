@@ -107,6 +107,12 @@ pub const Config = struct {
     /// While registered, launchd restarts bobrwm if it crashes, but not after
     /// you quit it from the menu bar.
     start_at_login: bool = false,
+    /// Reload the config whenever this file is saved, including saves through
+    /// a symlink. An invalid save keeps the current config, as with the
+    /// `reload_config` action.
+    ///
+    /// Note: changing this setting requires a restart.
+    auto_reload_config: bool = false,
 
     /// Look up the assigned workspace for a given bundle identifier. `app_rules`
     /// take precedence; `workspace_assignments` is a fallback alias.

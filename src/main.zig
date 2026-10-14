@@ -16,6 +16,7 @@ const tiling = @import("tiling.zig");
 const ipc = @import("ipc.zig");
 const ipc_transport = @import("ipc_transport.zig");
 const signal_transport = @import("signal_transport.zig");
+const config_watch = @import("config_watch.zig");
 const tab_detect = @import("tabgroup/detect.zig");
 const config_mod = @import("config.zig");
 const dim = @import("dim.zig");
@@ -2182,6 +2183,10 @@ fn reloadConfig() bool {
     return true;
 }
 
+fn configFileChanged() void {
+    _ = reloadConfig();
+}
+
 fn setRolePolling(enabled: bool) void {
     if (!enabled) {
         if (g_role_poll_source) |source| {
@@ -2858,6 +2863,12 @@ pub fn main(init: std.process.Init.Minimal) !void {
     );
     defer statusbar.deinit();
     updateStatusBar();
+
+    // Watch after the status bar exists: reloads update its menu.
+    var config_watcher: config_watch.Watcher = undefined;
+    if (g_config.auto_reload_config) {
+        if (g_config_path) |path| config_watcher.start(path, configFileChanged);
+    }
 
     // -- Enter NSApp run loop --
     // Returns when CFRunLoopStop is called (e.g. graceful signal handler).
