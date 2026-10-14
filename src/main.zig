@@ -2204,8 +2204,8 @@ fn setRolePolling(enabled: bool) void {
 
     c.dispatch_source_set_timer(
         source,
-        c.dispatch_time(c.DISPATCH_TIME_NOW, @as(i64, 100) * c.NSEC_PER_MSEC),
-        @as(u64, 100) * c.NSEC_PER_MSEC,
+        c.dispatch_time(c.DISPATCH_TIME_NOW, @as(i64, role_poll_interval_ms) * c.NSEC_PER_MSEC),
+        role_poll_interval_ms * c.NSEC_PER_MSEC,
         @as(u64, 20) * c.NSEC_PER_MSEC,
     );
     c.dispatch_source_set_event_handler_f(source, rolePollTimerTick);
