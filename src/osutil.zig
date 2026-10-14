@@ -92,22 +92,6 @@ pub fn pathExists(path_z: [*:0]const u8) bool {
     return std.c.access(path_z, 0) == 0;
 }
 
-/// Recursively create `path` and any missing parents (mode 0o755).
-/// Returns true if the path exists or was created.
-pub fn makePath(allocator: std.mem.Allocator, path: []const u8) bool {
-    const path_z = allocator.dupeZ(u8, path) catch return false;
-    defer allocator.free(path_z);
-    if (pathExists(path_z)) return true;
-
-    if (std.fs.path.dirname(path)) |parent| {
-        if (parent.len > 0 and !std.mem.eql(u8, parent, "/")) {
-            if (!makePath(allocator, parent)) return false;
-        }
-    }
-    if (std.c.mkdir(path_z, 0o755) == 0) return true;
-    return pathExists(path_z);
-}
-
 // App metadata
 
 /// Look up the bundle identifier for a PID via NSRunningApplication.
