@@ -134,7 +134,6 @@ const AxStrings = ax_mod.AxStrings;
 const ensureAxStrings = ax_mod.strings;
 const deinitAxStrings = ax_mod.deinitStrings;
 const findAxWindow = ax_mod.findWindow;
-const axEnhancedUserInterface = ax_mod.enhancedUserInterface;
 
 fn displayIndexById(display_id: u32) ?usize {
     for (g_displays[0..g_display_count], 0..) |display, i| {

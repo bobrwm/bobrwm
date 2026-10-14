@@ -398,12 +398,6 @@ fn readEnhancedUserInterface(app: c.AXUIElementRef, ax: *const AxStrings) ?bool 
     return c.CFEqual(value.?, @ptrCast(c.kCFBooleanTrue)) != 0;
 }
 
-/// Return whether AXEnhancedUserInterface is enabled, treating an unreadable
-/// attribute as disabled to preserve the existing best-effort behavior.
-pub fn enhancedUserInterface(app: c.AXUIElementRef, ax: *const AxStrings) bool {
-    return readEnhancedUserInterface(app, ax) orelse false;
-}
-
 // A workspace switch revisits the same apps several times in a short burst.
 // Cache only successful false reads: a stale entry can delay geometry repair,
 // but it can never make us restore a value that an assistive client changed.
