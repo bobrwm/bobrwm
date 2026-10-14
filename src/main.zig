@@ -5561,7 +5561,7 @@ fn addNewWindowManagedWithAssignment(
     const rule_float = blk: {
         if (g_config.app_rules.len == 0) break :blk false;
         var id_buf: [256]u8 = undefined;
-        const bundle_id = config_mod.getAppBundleId(pid, &id_buf) orelse break :blk false;
+        const bundle_id = osutil.appBundleId(pid, &id_buf) orelse break :blk false;
         break :blk g_config.shouldFloatApp(bundle_id);
     };
 
@@ -6703,7 +6703,7 @@ fn checkTabDragOut(_: i32, wid: u32) bool {
 fn configuredWorkspace(pid: i32, display_id: u32) ?state_mod.SpaceRef {
     if (g_config.hasAppWorkspaceRules()) {
         var id_buf: [256]u8 = undefined;
-        if (config_mod.getAppBundleId(pid, &id_buf)) |bundle_id| {
+        if (osutil.appBundleId(pid, &id_buf)) |bundle_id| {
             if (g_config.workspaceForApp(bundle_id)) |ws_id| {
                 return spaceForCommand(display_id, ws_id);
             }

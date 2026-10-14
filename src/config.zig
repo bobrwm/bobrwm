@@ -1339,12 +1339,6 @@ pub fn loadFromPath(allocator: std.mem.Allocator, path: []const u8) ?Config {
     return parsed;
 }
 
-// Bundle ID helper
-
-pub fn getAppBundleId(pid: i32, buf: *[256]u8) ?[]const u8 {
-    return osutil.appBundleId(pid, buf);
-}
-
 // macOS virtual key code mapping
 
 fn keyNameToCode(name: []const u8) ?u16 {
