@@ -5317,11 +5317,11 @@ fn discoverWindowsImpl(should_refresh_tabs: bool) usize {
             continue;
         };
 
-        const win = window_mod.Window{
+        const win: window_mod.Window = .{
             .wid = info.wid,
             .pid = info.pid,
             .frame = frame,
-            .mode = .tiled,
+            .mode = if (shouldFloatWindow(info.pid, info.wid, frame)) .floating else .tiled,
         };
 
         adoptWindow(target_ws, win) catch |err| {
@@ -5491,6 +5491,29 @@ fn appWindowSnapshot(
     return .{ .count = count, .truncated = truncated };
 }
 
+/// Whether a window should start floating when bobrwm begins managing it.
+/// Startup discovery and window creation both use this, so a window gets the
+/// same mode whether it existed before bobrwm started or appeared afterwards.
+fn shouldFloatWindow(pid: i32, wid: u32, frame: window_mod.Window.Frame) bool {
+    // An app_rules entry with .float = true floats every window of that app.
+    if (g_config.app_rules.len > 0) {
+        var id_buf: [256]u8 = undefined;
+        if (config_mod.getAppBundleId(pid, &id_buf)) |bundle_id| {
+            if (g_config.shouldFloatApp(bundle_id)) return true;
+        }
+    }
+
+    // Non-resizable windows that are undersized (≤500px in either dimension)
+    // are floated instead of tiled. This catches transient splash screens and
+    // updater dialogs (e.g. Discord Updater at 300x300) that have standard
+    // AX roles but are not real application windows.
+    if (frame.width > 500 and frame.height > 500) return false;
+    const ax_win = findAxWindow(pid, wid) orelse return false;
+    defer c.CFRelease(@ptrCast(ax_win));
+    const ax = ensureAxStrings() orelse return false;
+    return !axCanResize(ax_win, ax);
+}
+
 fn addNewWindowManagedWithAssignment(
     pid: i32,
     wid: u32,
@@ -5557,34 +5580,13 @@ fn addNewWindowManagedWithAssignment(
     // that just went off-screen (i.e. a new tab was created and became active,
     // pushing the old tab to background). If so, form a tab group.
     if (detect == .needed and tryFormTabGroupOnCreate(pid, wid, .adopt) == .joined) return false;
-    // An app_rules entry with .float = true floats every window of that app.
-    const rule_float = blk: {
-        if (g_config.app_rules.len == 0) break :blk false;
-        var id_buf: [256]u8 = undefined;
-        const bundle_id = config_mod.getAppBundleId(pid, &id_buf) orelse break :blk false;
-        break :blk g_config.shouldFloatApp(bundle_id);
-    };
-
-    // Non-resizable windows that are undersized (≤500px in either dimension)
-    // are floated instead of tiled. This catches transient splash screens and
-    // updater dialogs (e.g. Discord Updater at 300x300) that have standard
-    // AX roles but are not real application windows.
-    const should_float = rule_float or blk: {
-        if (window_frame.width > 500 and window_frame.height > 500) break :blk false;
-        const ax_win = findAxWindow(pid, wid) orelse break :blk false;
-        defer c.CFRelease(@ptrCast(ax_win));
-        const ax = ensureAxStrings() orelse break :blk false;
-        break :blk !axCanResize(ax_win, ax);
-    };
 
     const ws = g_state.space(assigned_space.key) orelse return false;
-    const mode: window_mod.WindowMode = if (should_float) .floating else .tiled;
-
-    const win = window_mod.Window{
+    const win: window_mod.Window = .{
         .wid = wid,
         .pid = pid,
         .frame = window_frame,
-        .mode = mode,
+        .mode = if (shouldFloatWindow(pid, wid, window_frame)) .floating else .tiled,
     };
 
     adoptWindow(ws, win) catch |err| {
@@ -5595,9 +5597,8 @@ fn addNewWindowManagedWithAssignment(
 
     if (!source_ws.key.eql(ws.key)) requestNativeWindowMove(wid, source_ws, ws);
 
-    const float_reason = if (mode == .tiled) "tiled" else if (rule_float) "floated (app rule)" else "floated (undersized+non-resizable)";
     log.debug("addNewWindow: {s} pid={d} wid={d} on workspace {d} display {d} frame=({d:.0},{d:.0},{d:.0},{d:.0})", .{
-        float_reason,        pid,
+        @tagName(win.mode),  pid,
         wid,                 ws.workspace_id,
         ws.display_id,       window_frame.x,
         window_frame.y,      window_frame.width,
