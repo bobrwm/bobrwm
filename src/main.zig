@@ -101,11 +101,6 @@ const DisplayInfo = struct {
     settings: config_mod.DisplaySettings,
 };
 
-const DropTarget = struct {
-    wid: u32,
-    frame: window_mod.Window.Frame,
-};
-
 const WindowRoleState = state_mod.WindowReadiness;
 
 const FocusEventSource = state_mod.FocusEventSource;
