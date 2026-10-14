@@ -1271,20 +1271,6 @@ const ConfigDiagnostics = struct {
     }
 };
 
-pub fn load(allocator: std.mem.Allocator, explicit_path: ?[]const u8) Config {
-    const path = resolvePath(allocator, explicit_path) catch return .{};
-    defer allocator.free(path);
-
-    return loadFromPath(allocator, path) orelse {
-        if (explicit_path != null) {
-            log.err("failed to load config from {s}, using defaults", .{path});
-        } else {
-            log.info("no config file found, using defaults", .{});
-        }
-        return .{};
-    };
-}
-
 /// Resolve the configured path even when it does not exist yet, allowing the
 /// daemon to notice a config file created after startup.
 pub fn resolvePath(allocator: std.mem.Allocator, explicit_path: ?[]const u8) ![:0]u8 {
