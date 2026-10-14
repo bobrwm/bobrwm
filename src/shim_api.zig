@@ -25,14 +25,6 @@ pub const BW_EVENT_NATIVE_OBSERVATION_DUE: u8 = @backingInt(event_mod.EventKind.
 pub const BW_EVENT_APP_VISIBILITY_CHANGED: u8 = @backingInt(event_mod.EventKind.app_visibility_changed);
 
 pub const BW_HK_FOCUS_WORKSPACE: u8 = @backingInt(event_mod.EventKind.hk_focus_workspace);
-pub const BW_HK_MOVE_TO_WORKSPACE: u8 = @backingInt(event_mod.EventKind.hk_move_to_workspace);
-pub const BW_HK_FOCUS_LEFT: u8 = @backingInt(event_mod.EventKind.hk_focus_left);
-pub const BW_HK_FOCUS_RIGHT: u8 = @backingInt(event_mod.EventKind.hk_focus_right);
-pub const BW_HK_FOCUS_UP: u8 = @backingInt(event_mod.EventKind.hk_focus_up);
-pub const BW_HK_FOCUS_DOWN: u8 = @backingInt(event_mod.EventKind.hk_focus_down);
-pub const BW_HK_TOGGLE_SPLIT: u8 = @backingInt(event_mod.EventKind.hk_toggle_split);
-pub const BW_HK_TOGGLE_FULLSCREEN: u8 = @backingInt(event_mod.EventKind.hk_toggle_fullscreen);
-pub const BW_HK_TOGGLE_FLOAT: u8 = @backingInt(event_mod.EventKind.hk_toggle_float);
 pub const BW_HK_FOCUS_PREVIOUS_WORKSPACE: u8 = @backingInt(event_mod.EventKind.hk_focus_previous_workspace);
 pub const BW_HK_FOCUS_NEXT_WORKSPACE: u8 = @backingInt(event_mod.EventKind.hk_focus_next_workspace);
 

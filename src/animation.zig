@@ -63,10 +63,6 @@ pub const Animator = struct {
         self.easing = config.easing;
     }
 
-    pub fn deinit(self: *Animator) void {
-        self.finishAll();
-    }
-
     /// Start or update an animation for a window.
     /// If the window is already animating, the animation is redirected to
     /// the new target from its current displayed position.
@@ -177,22 +173,6 @@ pub const Animator = struct {
         for (0..self.count) |i| {
             if (self.animations[i].wid == wid) {
                 self.animations[i].end();
-                self.count -= 1;
-                if (i < self.count) {
-                    self.animations[i] = self.animations[self.count];
-                }
-                return;
-            }
-        }
-    }
-
-    /// Complete animation for a specific window, placing it at its target.
-    pub fn finish(self: *Animator, wid: u32) void {
-        for (0..self.count) |i| {
-            if (self.animations[i].wid == wid) {
-                const a = self.animations[i];
-                _ = placeFinal(a.pid, a.wid, a.start_frame, a.end_frame);
-                a.end();
                 self.count -= 1;
                 if (i < self.count) {
                     self.animations[i] = self.animations[self.count];

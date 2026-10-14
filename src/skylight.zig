@@ -69,7 +69,6 @@ pub const SetFrontProcessFn = *const fn (*ProcessSerialNumber, u32, u32) callcon
 pub const PostEventRecordFn = *const fn (*ProcessSerialNumber, [*]u8) callconv(.c) c_int;
 
 pub const SkyLight = struct {
-    handle: *anyopaque,
     mainConnectionID: *const fn () callconv(.c) c_int,
     getWindowBounds: *const fn (c_int, u32, *CGRect) callconv(.c) c_int,
     findWindowAndOwner: ?FindWindowAndOwnerFn,
@@ -148,7 +147,6 @@ pub const SkyLight = struct {
         log.info("SkyLight.framework loaded", .{});
 
         return .{
-            .handle = lib.inner.handle,
             .mainConnectionID = conn_id,
             .getWindowBounds = get_bounds,
             .findWindowAndOwner = lib.lookup(FindWindowAndOwnerFn, "SLSFindWindowAndOwner"),

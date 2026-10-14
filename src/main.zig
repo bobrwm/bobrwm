@@ -101,11 +101,6 @@ const DisplayInfo = struct {
     settings: config_mod.DisplaySettings,
 };
 
-const DropTarget = struct {
-    wid: u32,
-    frame: window_mod.Window.Frame,
-};
-
 const WindowRoleState = state_mod.WindowReadiness;
 
 const FocusEventSource = state_mod.FocusEventSource;
@@ -139,7 +134,6 @@ const AxStrings = ax_mod.AxStrings;
 const ensureAxStrings = ax_mod.strings;
 const deinitAxStrings = ax_mod.deinitStrings;
 const findAxWindow = ax_mod.findWindow;
-const axEnhancedUserInterface = ax_mod.enhancedUserInterface;
 
 fn displayIndexById(display_id: u32) ?usize {
     for (g_displays[0..g_display_count], 0..) |display, i| {
@@ -2210,8 +2204,8 @@ fn setRolePolling(enabled: bool) void {
 
     c.dispatch_source_set_timer(
         source,
-        c.dispatch_time(c.DISPATCH_TIME_NOW, @as(i64, 100) * c.NSEC_PER_MSEC),
-        @as(u64, 100) * c.NSEC_PER_MSEC,
+        c.dispatch_time(c.DISPATCH_TIME_NOW, @as(i64, role_poll_interval_ms) * c.NSEC_PER_MSEC),
+        role_poll_interval_ms * c.NSEC_PER_MSEC,
         @as(u64, 20) * c.NSEC_PER_MSEC,
     );
     c.dispatch_source_set_event_handler_f(source, rolePollTimerTick);

@@ -9,8 +9,7 @@
 //!     policy (Electron apps need both).
 //!
 //! Memory management is MRR (no ARC). Every `alloc/init` pair owns a +1
-//! retain that we balance manually, and every custom `dealloc` calls
-//! `[super dealloc]`.
+//! retain that we balance manually.
 
 const std = @import("std");
 const objc = @import("objc");
@@ -123,7 +122,6 @@ fn registerLaunchGate() void {
         "observeValueForKeyPath:ofObject:change:context:",
         launchGateObserveValue,
     );
-    _ = cls.addMethod("dealloc", launchGateDealloc);
     objc.registerClassPair(cls);
 }
 
@@ -165,12 +163,6 @@ fn launchGateObserveValue(
     const pid = app.msgSend(i32, "processIdentifier", .{});
     g_callbacks.app_launched(pid);
     dropLaunchGate(pid);
-}
-
-fn launchGateDealloc(self_id: c.id, _: c.SEL) callconv(.c) void {
-    // [super dealloc] — Zig-defined classes have no ARC, so this is required.
-    const self: objc.Object = .{ .value = self_id };
-    self.msgSendSuper(objc.getClass("NSObject").?, void, "dealloc", .{});
 }
 
 /// Tear down the gate for `pid` if any. Safe to call when no gate exists.
