@@ -3234,16 +3234,6 @@ fn removeWindowIdentity(wid: u32) void {
     dispatchStateEvent(.{ .remove_window = wid });
 }
 
-fn replaceWindowIdentity(old_wid: u32, new_wid: u32) bool {
-    if (g_state.window(old_wid) == null or g_state.window(new_wid) != null) return false;
-
-    dispatchStateEvent(.{ .replace_window_id = .{
-        .old_window_id = old_wid,
-        .new_window_id = new_wid,
-    } });
-    return g_state.window(old_wid) == null and g_state.window(new_wid) != null;
-}
-
 fn observeWindowTabGroup(observation: *const state_mod.WindowTabGroupObservation) bool {
     dispatchStateEvent(.{ .observe_window_tab_group = observation });
     for (observation.members()) |member_wid| {
@@ -3344,46 +3334,6 @@ fn setTilingActive(space_key: state_mod.SpaceKey, wid: u32) void {
         .space_key = space_key,
         .window_id = layout_wid,
     } } });
-}
-
-fn replaceManagedWindowId(old_wid: u32, new_wid: u32, frame: window_mod.Window.Frame) bool {
-    std.debug.assert(old_wid != 0);
-    std.debug.assert(new_wid != 0);
-    std.debug.assert(frame.width > 0 and frame.height > 0);
-    if (old_wid == new_wid) return false;
-    if (managedWindow(new_wid) != null) return false;
-    if (g_state.windowTabGroup(old_wid) != null) return false;
-    if (g_state.windowTabGroup(new_wid) != null) return false;
-
-    const old = managedWindow(old_wid) orelse return false;
-    const space = managedWindowSpace(old.wid) orelse return false;
-    const replaced_in_layout = g_state.layout.contains(space.key, old_wid);
-
-    if (old.mode == .tiled and !replaced_in_layout) {
-        log.warn("window id replacement failed old={d} new={d} workspace={d} in_layout={}", .{
-            old_wid,
-            new_wid,
-            space.workspace_id,
-            replaced_in_layout,
-        });
-        return false;
-    }
-
-    var updated = old;
-    updated.wid = new_wid;
-    updated.frame = frame;
-    if (!replaceWindowIdentity(old_wid, new_wid)) return false;
-    _ = updateManagedWindow(updated);
-    seedObservedFrame(new_wid, frame);
-    ax_mod.invalidateWindow(old_wid);
-    log.debug("window id replaced old={d} new={d} pid={d} workspace={d} display={d}", .{
-        old_wid,
-        new_wid,
-        updated.pid,
-        space.workspace_id,
-        space.display_id,
-    });
-    return true;
 }
 
 const FocusedLayoutContext = struct {

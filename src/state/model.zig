@@ -7,9 +7,9 @@ const window_catalog_mod = @import("window_catalog.zig");
 pub const swipe = @import("../swipe.zig");
 const tiling_mod = @import("../tiling.zig");
 const window_mod = @import("../window.zig");
+const workspace_mod = @import("../workspace.zig");
 pub const native_gesture = @import("../native_gesture.zig");
 
-pub const max_displays = topology_mod.max_displays;
 pub const max_managed_windows = window_catalog_mod.max_managed_windows;
 pub const max_pending_focus_entries = 16;
 pub const max_pending_window_candidates = 256;
@@ -28,7 +28,7 @@ pub const display_event_debounce_ms: u64 = 50;
 comptime {
     std.debug.assert(geometry_mod.max_entries >= max_managed_windows);
     std.debug.assert(tiling_mod.max_windows >= max_managed_windows);
-    std.debug.assert(tiling_mod.max_layouts >= max_displays * max_spaces_per_display);
+    std.debug.assert(tiling_mod.max_layouts >= workspace_mod.max_displays * max_spaces_per_display);
 }
 
 pub const DisplayId = topology_mod.DisplayId;
@@ -128,13 +128,6 @@ pub const WorkspaceFocus = struct {
         self.history[self.history_count] = window_id;
         self.history_count += 1;
         self.focused_window_id = window_id;
-    }
-
-    pub fn replaceWindowId(self: *WorkspaceFocus, old_window_id: WindowId, new_window_id: WindowId) void {
-        for (self.history[0..self.history_count]) |*window_id| {
-            if (window_id.* == old_window_id) window_id.* = new_window_id;
-        }
-        if (self.focused_window_id == old_window_id) self.focused_window_id = new_window_id;
     }
 
     fn removeFromHistory(self: *WorkspaceFocus, window_id: WindowId) void {
@@ -552,7 +545,7 @@ pub const PointerDragCompletion = struct {
 
 pub const RetileRequest = struct {
     all_displays: bool = false,
-    display_ids: [max_displays]DisplayId = @splat(0),
+    display_ids: [workspace_mod.max_displays]DisplayId = @splat(0),
     display_count: u8 = 0,
 };
 
@@ -917,10 +910,6 @@ pub const Event = union(enum) {
     adopt_window: WindowAdoption,
     update_window: WindowUpdate,
     remove_window: WindowId,
-    replace_window_id: struct {
-        old_window_id: WindowId,
-        new_window_id: WindowId,
-    },
     assign_window_space: WindowSpaceAssignment,
     observe_window_tab_group: *const WindowTabGroupObservation,
     detach_window_tab: WindowTabDetachment,

@@ -192,15 +192,6 @@ pub const WindowCatalog = struct {
         }
     }
 
-    pub fn replaceId(self: *WindowCatalog, old_window_id: WindowId, new_window_id: WindowId) bool {
-        const index = self.findIndex(old_window_id) orelse return false;
-        self.entries[index].window_id = new_window_id;
-        for (self.entries[0..self.count]) |*entry| {
-            if (entry.tab_leader_window_id == old_window_id) entry.tab_leader_window_id = new_window_id;
-        }
-        return true;
-    }
-
     pub fn observeTabGroup(self: *WindowCatalog, observation: *const WindowTabGroupObservation) void {
         self.dissolveTabGroupByLeader(observation.leader_window_id);
         for (observation.members()) |window_id| {

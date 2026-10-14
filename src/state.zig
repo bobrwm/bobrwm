@@ -14,41 +14,27 @@ const workspace_reducer = @import("state/reducer/workspace.zig");
 const tiling_mod = @import("tiling.zig");
 const window_mod = @import("window.zig");
 
-pub const max_displays = model_mod.max_displays;
 pub const max_managed_windows = model_mod.max_managed_windows;
-pub const max_pending_focus_entries = model_mod.max_pending_focus_entries;
-pub const max_pending_window_candidates = model_mod.max_pending_window_candidates;
-pub const max_process_retries = model_mod.max_process_retries;
-pub const max_cleanup_processes = model_mod.max_cleanup_processes;
 pub const max_spaces_per_display = model_mod.max_spaces_per_display;
-pub const max_workspace_focus_history = model_mod.max_workspace_focus_history;
-pub const max_pending_native_window_moves = model_mod.max_pending_native_window_moves;
 pub const native_switch_timeout_ms = model_mod.native_switch_timeout_ms;
-pub const native_observation_delay_ms = model_mod.native_observation_delay_ms;
 pub const native_window_move_attempts_max = model_mod.native_window_move_attempts_max;
-pub const native_workspace_move_timeout_ms = model_mod.native_workspace_move_timeout_ms;
-pub const workspace_transition_settle_ms = model_mod.workspace_transition_settle_ms;
 pub const display_event_debounce_ms = model_mod.display_event_debounce_ms;
 pub const DisplayId = model_mod.DisplayId;
 pub const NativeSpaceId = model_mod.NativeSpaceId;
 pub const WorkspaceId = model_mod.WorkspaceId;
 pub const SpaceKey = model_mod.SpaceKey;
 pub const SpaceRef = model_mod.SpaceRef;
-pub const DisplayWorkspace = model_mod.DisplayWorkspace;
 pub const WorkspaceTopology = model_mod.WorkspaceTopology;
 pub const SpaceCatalog = model_mod.SpaceCatalog;
 pub const Space = model_mod.Space;
 pub const DisplayTopology = model_mod.DisplayTopology;
 pub const NativeTopology = model_mod.NativeTopology;
-pub const NativeTopologyInitialization = model_mod.NativeTopologyInitialization;
 pub const NativeDisplayObservation = model_mod.NativeDisplayObservation;
 pub const NativeTopologyObservation = model_mod.NativeTopologyObservation;
 pub const NativeTopologyMapping = model_mod.NativeTopologyMapping;
 pub const mapNativeTopology = model_mod.mapNativeTopology;
-pub const ManagedWindow = model_mod.ManagedWindow;
 pub const WindowTabGroupObservation = model_mod.WindowTabGroupObservation;
 pub const WindowTabGroupSnapshot = model_mod.WindowTabGroupSnapshot;
-pub const WindowCatalog = model_mod.WindowCatalog;
 pub const Epoch = model_mod.Epoch;
 pub const TimestampMs = model_mod.TimestampMs;
 pub const WindowId = model_mod.WindowId;
@@ -57,52 +43,29 @@ pub const FocusDirection = model_mod.FocusDirection;
 pub const swipe = model_mod.swipe;
 pub const SwipeInput = model_mod.SwipeInput;
 pub const DeferredFollowFocus = model_mod.DeferredFollowFocus;
-pub const FollowFocusObservation = model_mod.FollowFocusObservation;
-pub const WindowFocusObservation = model_mod.WindowFocusObservation;
 pub const WorkspaceSummary = model_mod.WorkspaceSummary;
-pub const WorkspaceFocus = model_mod.WorkspaceFocus;
-pub const SwitchRequest = model_mod.SwitchRequest;
-pub const PendingSwitch = model_mod.PendingSwitch;
 pub const WorkspaceTransitionKind = model_mod.WorkspaceTransitionKind;
 pub const WorkspaceTransitionCompletionReason = model_mod.WorkspaceTransitionCompletionReason;
 pub const WorkspaceTransition = model_mod.WorkspaceTransition;
 pub const WorkspaceTransitionSettlementReason = model_mod.WorkspaceTransitionSettlementReason;
 pub const WorkspaceTransitionSettlement = model_mod.WorkspaceTransitionSettlement;
 pub const PendingNativeWindowMove = model_mod.PendingNativeWindowMove;
-pub const PendingNativeWindowMoves = model_mod.PendingNativeWindowMoves;
 pub const PendingNativeWorkspaceMove = model_mod.PendingNativeWorkspaceMove;
-pub const NativeWorkspaceMoveObservation = model_mod.NativeWorkspaceMoveObservation;
-pub const NativeWindowMoveRequest = model_mod.NativeWindowMoveRequest;
 pub const NativeWindowMoveObservation = model_mod.NativeWindowMoveObservation;
 pub const DeferredWindowExpiryReason = model_mod.DeferredWindowExpiryReason;
 pub const WorkspaceSwitchEffect = model_mod.WorkspaceSwitchEffect;
-pub const FocusWindowEffect = model_mod.FocusWindowEffect;
-pub const WindowSwapEffect = model_mod.WindowSwapEffect;
-pub const WindowModeEffect = model_mod.WindowModeEffect;
 pub const FullscreenEffect = model_mod.FullscreenEffect;
 pub const CenterWindowEffect = model_mod.CenterWindowEffect;
-pub const WindowMoveRequest = model_mod.WindowMoveRequest;
 pub const WindowMoveEffect = model_mod.WindowMoveEffect;
 pub const PendingFocus = model_mod.PendingFocus;
-pub const PendingFocusQueue = model_mod.PendingFocusQueue;
 pub const WindowReadiness = model_mod.WindowReadiness;
 pub const WindowCandidate = model_mod.WindowCandidate;
-pub const WindowCandidates = model_mod.WindowCandidates;
 pub const ProcessRetry = model_mod.ProcessRetry;
-pub const ProcessRetries = model_mod.ProcessRetries;
-pub const PointerDragState = model_mod.PointerDragState;
-pub const DragPreviewState = model_mod.DragPreviewState;
-pub const PointerDragCompletion = model_mod.PointerDragCompletion;
 pub const RetileRequest = model_mod.RetileRequest;
 pub const CleanupRequest = model_mod.CleanupRequest;
-pub const LayoutSpaceFrame = model_mod.LayoutSpaceFrame;
 pub const LayoutRebuild = model_mod.LayoutRebuild;
 pub const ObservationTimer = model_mod.ObservationTimer;
 pub const LayoutInsertion = model_mod.LayoutInsertion;
-pub const WindowAdoption = model_mod.WindowAdoption;
-pub const WindowUpdate = model_mod.WindowUpdate;
-pub const WindowSpaceAssignment = model_mod.WindowSpaceAssignment;
-pub const WindowTabDetachment = model_mod.WindowTabDetachment;
 pub const Model = model_mod.Model;
 pub const Event = model_mod.Event;
 pub const SwitchFailureReason = model_mod.SwitchFailureReason;
@@ -141,7 +104,6 @@ pub fn reduce(model: *Model, event: Event) Transition {
             window_reducer.reduceWindowRemoved(&transition, window_id);
             should_refresh_workspace_focus = true;
         },
-        .replace_window_id => |replacement| window_reducer.reduceWindowIdReplaced(&transition, replacement),
         .assign_window_space => |assignment| {
             window_reducer.reduceWindowSpaceAssigned(&transition, assignment);
             should_refresh_workspace_focus = true;
@@ -560,18 +522,9 @@ test "window catalog owns identity and Space membership" {
     try testing.expectEqual(@as(u16, 1), assigned.model.windows.countInSpace(.{ .id = 2 }));
     try testing.expect(assigned.model.window(101).?.space_key.eql(.{ .id = 2 }));
 
-    const replaced = reduceCopy(assigned.model, .{ .replace_window_id = .{
-        .old_window_id = 102,
-        .new_window_id = 202,
-    } });
-    try testing.expect(replaced.model.window(102) == null);
-    try testing.expectEqual(@as(i32, 1002), replaced.model.window(202).?.process_id);
-    try testing.expect(replaced.model.geometry.get(102) == null);
-    try testing.expect(replaced.model.geometry.get(202) != null);
-
-    const removed = reduceCopy(replaced.model, .{ .remove_window = 202 });
-    try testing.expect(removed.model.window(202) == null);
-    try testing.expect(removed.model.geometry.get(202) == null);
+    const removed = reduceCopy(assigned.model, .{ .remove_window = 102 });
+    try testing.expect(removed.model.window(102) == null);
+    try testing.expect(removed.model.geometry.get(102) == null);
     try testing.expectEqual(@as(u16, 1), removed.model.windows.count);
 }
 
@@ -627,22 +580,12 @@ test "window lifecycle transitions update catalog geometry focus and layout atom
         .workspace_id = 2,
         .window_id = 101,
     } }).model;
-    model = reduceCopy(model, .{ .replace_window_id = .{
-        .old_window_id = 101,
-        .new_window_id = 201,
-    } }).model;
-    try testing.expect(model.window(101) == null);
-    try testing.expect(model.window(201) != null);
-    try testing.expect(model.geometry.get(101) == null);
-    try testing.expect(model.geometry.get(201) != null);
-    try testing.expect(!model.layout.contains(second_space, 101));
-    try testing.expect(model.layout.contains(second_space, 201));
-    try testing.expectEqual(@as(?WindowId, 201), model.focusedWorkspaceWindow(2));
+    try testing.expectEqual(@as(?WindowId, 101), model.focusedWorkspaceWindow(2));
 
-    model = reduceCopy(model, .{ .remove_window = 201 }).model;
-    try testing.expect(model.window(201) == null);
-    try testing.expect(model.geometry.get(201) == null);
-    try testing.expect(!model.layout.contains(second_space, 201));
+    model = reduceCopy(model, .{ .remove_window = 101 }).model;
+    try testing.expect(model.window(101) == null);
+    try testing.expect(model.geometry.get(101) == null);
+    try testing.expect(!model.layout.contains(second_space, 101));
     try testing.expectEqual(@as(?WindowId, null), model.focusedWorkspaceWindow(2));
 }
 
@@ -923,14 +866,8 @@ test "workspace focus memory follows window lifecycle" {
     model = reduceCopy(model, .{ .remove_window = 102 }).model;
     try testing.expectEqual(@as(?WindowId, 101), model.focusedWorkspaceWindow(1));
 
-    model = reduceCopy(model, .{ .replace_window_id = .{
-        .old_window_id = 101,
-        .new_window_id = 201,
-    } }).model;
-    try testing.expectEqual(@as(?WindowId, 201), model.focusedWorkspaceWindow(1));
-
     model = reduceCopy(model, .{ .assign_window_space = .{
-        .window_id = 201,
+        .window_id = 101,
         .space_key = .{ .id = 2 },
     } }).model;
     try testing.expectEqual(@as(?WindowId, null), model.focusedWorkspaceWindow(1));
@@ -938,9 +875,9 @@ test "workspace focus memory follows window lifecycle" {
 
     model = reduceCopy(model, .{ .record_workspace_focus = .{
         .workspace_id = 2,
-        .window_id = 201,
+        .window_id = 101,
     } }).model;
-    try testing.expectEqual(@as(?WindowId, 201), model.focusedWorkspaceWindow(2));
+    try testing.expectEqual(@as(?WindowId, 101), model.focusedWorkspaceWindow(2));
 }
 
 test "window catalog rejects invalid lifecycle events" {

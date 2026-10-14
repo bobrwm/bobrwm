@@ -2,8 +2,8 @@
 
 const std = @import("std");
 const space_mod = @import("../space.zig");
+const workspace_mod = @import("../workspace.zig");
 
-pub const max_displays = 8;
 pub const max_spaces_per_display = 10;
 
 pub const DisplayId = space_mod.DisplayId;
@@ -18,7 +18,7 @@ pub const DisplayWorkspace = struct {
 };
 
 pub const WorkspaceTopology = struct {
-    displays: [max_displays]DisplayWorkspace = undefined,
+    displays: [workspace_mod.max_displays]DisplayWorkspace = undefined,
     display_count: u8 = 0,
     focused_display_id: ?DisplayId = null,
 
@@ -56,7 +56,7 @@ pub const WorkspaceTopology = struct {
 };
 
 pub const SpaceCatalog = struct {
-    spaces: [max_displays * max_spaces_per_display]SpaceRef = undefined,
+    spaces: [workspace_mod.max_displays * max_spaces_per_display]SpaceRef = undefined,
     space_count: u8 = 0,
 
     pub fn add(self: *SpaceCatalog, space: SpaceRef) void {
@@ -149,7 +149,7 @@ pub const DisplayTopology = struct {
 };
 
 pub const NativeTopology = struct {
-    displays: [max_displays]DisplayTopology = undefined,
+    displays: [workspace_mod.max_displays]DisplayTopology = undefined,
     display_count: u8 = 0,
 
     pub fn addDisplay(self: *NativeTopology, topology: DisplayTopology) void {
@@ -228,7 +228,7 @@ pub const NativeDisplayObservation = struct {
 };
 
 pub const NativeTopologyObservation = struct {
-    displays: [max_displays]NativeDisplayObservation = undefined,
+    displays: [workspace_mod.max_displays]NativeDisplayObservation = undefined,
     display_count: u8 = 0,
 
     pub fn addDisplay(self: *NativeTopologyObservation, display: NativeDisplayObservation) void {
@@ -264,7 +264,7 @@ pub fn mapNativeTopology(
     }
     if (preserveStableNativeTopology(&observation, previous, workspace_count)) |topology| return topology;
 
-    var assignments: [max_displays][max_spaces_per_display]WorkspaceId = @splat(@splat(0));
+    var assignments: [workspace_mod.max_displays][max_spaces_per_display]WorkspaceId = @splat(@splat(0));
     var claimed: [max_spaces_per_display + 1]bool = @splat(false);
 
     // Reserve surviving Space identities before new displays claim numbers.
@@ -332,7 +332,7 @@ fn mapTopologyInNativeOrder(
     workspace_count: WorkspaceId,
     primary_display_id: DisplayId,
 ) ?NativeTopology {
-    var display_indices: [max_displays]u8 = undefined;
+    var display_indices: [workspace_mod.max_displays]u8 = undefined;
     var next_index: u8 = 0;
     for (observation.displays[0..observation.display_count], 0..) |display, index| {
         if (display.display_id != primary_display_id) continue;

@@ -5,7 +5,6 @@ const model_mod = @import("../model.zig");
 const layout_reducer = @import("layout.zig");
 
 const Event = model_mod.Event;
-const Model = model_mod.Model;
 const Transition = model_mod.Transition;
 const WindowId = model_mod.WindowId;
 
@@ -21,21 +20,6 @@ pub fn removeWindowFromPointerState(transition: *Transition, window_id: WindowId
         transition.model.drag_preview.target_window_id == window_id)
     {
         clearDragPreview(transition);
-    }
-}
-
-pub fn replacePointerWindowId(model: *Model, old_window_id: WindowId, new_window_id: WindowId) void {
-    if (model.pointer_drag.candidate_window_id == old_window_id) {
-        model.pointer_drag.candidate_window_id = new_window_id;
-    }
-    if (model.pointer_drag.active_window_id == old_window_id) {
-        model.pointer_drag.active_window_id = new_window_id;
-    }
-    if (model.drag_preview.source_window_id == old_window_id) {
-        model.drag_preview.source_window_id = new_window_id;
-    }
-    if (model.drag_preview.target_window_id == old_window_id) {
-        model.drag_preview.target_window_id = new_window_id;
     }
 }
 

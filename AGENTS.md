@@ -138,7 +138,7 @@ Bobrwm reconciles AX, WindowServer/CG, SkyLight, and internal workspace/layout s
 **Native tabs and window IDs:**
 - A tab group leader owns the workspace/layout slot. Suppressed tab members live in the store but not in workspace window lists or BSP layout leaves.
 - Only infer background tabs when the candidate is same-PID, frame-matching, and off-screen. A visible unknown same-PID window is usually standalone or a creation race.
-- Some apps can replace the active native-tab CG window ID before AX focus reconciliation catches up. If an AX frame write fails for a stored window ID, it may be stale; reconcile against the app's current focused window ID and update workspace/layout/store together.
+- Some apps can replace the active native-tab CG window ID before AX focus reconciliation catches up. If a geometry write targets a stored window ID that is off-screen while the app reports a different focused ID, the stored ID may be stale; route the focused ID through `reconcileFocusedWindow` so it joins the tab group, rather than rewriting the old ID in place.
 
 **Focus reconciliation:** Unknown focused window IDs should go through the tab-aware reconciliation path before falling back to broad discovery. Broad discovery during a workspace switch can assign ownership from the wrong active workspace.
 

@@ -169,54 +169,6 @@ pub fn reduceWindowRemoved(transition: *Transition, window_id: WindowId) void {
     } });
 }
 
-pub fn reduceWindowIdReplaced(
-    transition: *Transition,
-    replacement: @FieldType(Event, "replace_window_id"),
-) void {
-    if (replacement.new_window_id == 0) {
-        transition.addEffect(.{ .window_catalog_rejected = .{
-            .window_id = replacement.new_window_id,
-            .reason = .invalid_window,
-        } });
-        return;
-    }
-    if (transition.model.window(replacement.new_window_id) != null) {
-        transition.addEffect(.{ .window_catalog_rejected = .{
-            .window_id = replacement.new_window_id,
-            .reason = .window_exists,
-        } });
-        return;
-    }
-    const previous = transition.model.window(replacement.old_window_id) orelse {
-        transition.addEffect(.{ .window_catalog_rejected = .{
-            .window_id = replacement.old_window_id,
-            .reason = .window_missing,
-        } });
-        return;
-    };
-    if (transition.model.layout.contains(previous.space_key, replacement.old_window_id)) {
-        _ = layout_reducer.applyEvent(transition, .{ .replace_window_id = .{
-            .space_key = previous.space_key,
-            .old_window_id = replacement.old_window_id,
-            .new_window_id = replacement.new_window_id,
-        } });
-    }
-
-    std.debug.assert(transition.model.windows.replaceId(replacement.old_window_id, replacement.new_window_id));
-    transition.model.geometry.replaceWindowId(replacement.old_window_id, replacement.new_window_id);
-    if (transition.model.pending_native_window_moves.remove(replacement.old_window_id)) |pending| {
-        var updated = pending;
-        updated.window_id = replacement.new_window_id;
-        std.debug.assert(transition.model.pending_native_window_moves.put(updated));
-    }
-    pointer_reducer.replacePointerWindowId(transition.model, replacement.old_window_id, replacement.new_window_id);
-    _ = transition.model.pending_role_windows.remove(replacement.new_window_id);
-    _ = transition.model.deferred_window_candidates.remove(replacement.new_window_id);
-    for (&transition.model.workspace_focus) |*focus| {
-        focus.replaceWindowId(replacement.old_window_id, replacement.new_window_id);
-    }
-}
-
 pub fn reduceWindowSpaceAssigned(
     transition: *Transition,
     assignment: @FieldType(Event, "assign_window_space"),
