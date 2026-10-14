@@ -344,8 +344,8 @@ fn isVisibleManaged(win: *const window_mod.Window) bool {
 
 /// Dim every visible managed window except the focused one with black overlay
 /// panels. Callers must gate on `dim.enabled`. Uses the model's accepted frames
-/// directly (no WindowServer round-trip): retile and move/resize events have
-/// already synchronized them by the time this runs at the end of the drain.
+/// directly (no WindowServer round-trip), except for animating windows, whose
+/// accepted frame is already the animation's target.
 fn pushDimSnapshot() void {
     const span = trace.begin("dim snapshot");
     defer _ = span.endIfSlow();
@@ -354,6 +354,11 @@ fn pushDimSnapshot() void {
     // reaches the window-scan loops below. Assert rather than early-return so
     // the invariant is documented and compiles out in release builds.
     std.debug.assert(dim.enabled);
+    g_dim_dirty = false;
+
+    // Transitioning displays were already cleared by hideTransitioningDim, so
+    // with nothing else on screen the window-list copy would buy nothing.
+    if (!hasSettledDisplay()) return;
 
     // An overlay is placed over the window's accepted frame, so a stale entry
     // that is not on screen — a stale native-tab id, a window an app closed to
@@ -368,12 +373,17 @@ fn pushDimSnapshot() void {
         if (n >= entries.len) break;
         if (!isVisibleManaged(&win)) continue;
         if (!on_screen.contains(win.wid)) continue;
+        const space = managedWindowSpace(win.wid) orelse continue;
+        if (isDisplayInTransition(space.display_id)) continue;
+        const frame = g_animator.displayedFrame(win.wid) orelse win.frame;
         entries[n] = .{
             .wid = win.wid,
-            .x = win.frame.x,
-            .y = win.frame.y,
-            .w = win.frame.width,
-            .h = win.frame.height,
+            .pid = win.pid,
+            .display_id = space.display_id,
+            .x = frame.x,
+            .y = frame.y,
+            .w = frame.width,
+            .h = frame.height,
         };
         n += 1;
     }
@@ -394,7 +404,41 @@ fn pushDimSnapshot() void {
         fn_count += 1;
     }
 
-    dim.apply(focused[0..fn_count], entries[0..n]);
+    dim.apply(focused[0..fn_count], frontmostApplicationPid() orelse 0, entries[0..n]);
+}
+
+/// A display whose visible Space is being replaced still reports the outgoing
+/// Space while WindowServer slides the incoming one in, so overlays there
+/// would cover the wrong windows. Keyed on the native operations rather than
+/// the workspace transition, which also covers re-focusing the current
+/// workspace and lingers through focus acceptance and the settle tail.
+fn isDisplayInTransition(display_id: u32) bool {
+    if (g_state.pending_switch) |pending| {
+        if (pending.request.target.display_id == display_id) return true;
+    }
+    const move = g_state.pendingNativeWorkspaceMove() orelse return false;
+    return move.source.display_id == display_id or move.target.display_id == display_id;
+}
+
+fn hasSettledDisplay() bool {
+    for (g_displays[0..g_display_count]) |display| {
+        if (!isDisplayInTransition(display.id)) return true;
+    }
+    return false;
+}
+
+fn hideTransitioningDim() void {
+    if (!dim.enabled) return;
+    for (g_displays[0..g_display_count]) |display| {
+        if (isDisplayInTransition(display.id)) dim.hideDisplay(display.id);
+    }
+}
+
+fn followAnimationsWithDim() void {
+    for (g_animator.active()) |a| {
+        const frame = a.last_displayed_frame;
+        dim.follow(a.wid, frame.x, frame.y, frame.width, frame.height);
+    }
 }
 
 fn focusedDisplayId() u32 {
@@ -1266,6 +1310,12 @@ var g_last_focused_window_id: u32 = 0;
 var g_hotkey_bindings: []const shim.bw_keybind = &.{};
 var g_waker_source: c.CFRunLoopSourceRef = null;
 var g_role_poll_source: c.dispatch_source_t = null;
+var g_scheduled_observation: ?state_mod.ObservationTimer = null;
+/// Tags each armed observation fire so a replaced timer's fire can be told apart.
+var g_observation_generation: u32 = 0;
+/// Set when the model changes or focus moves; the drain only snapshots dimming
+/// when it is set, so mouse moves and animation echoes skip the window-list copy.
+var g_dim_dirty: bool = false;
 var g_native_space_topology_poll_source: c.dispatch_source_t = null;
 var g_tap_port: c.CFMachPortRef = null;
 var g_swipe_tap_port: c.CFMachPortRef = null;
@@ -1365,6 +1415,18 @@ fn initWorkspaceObservers() void {
         nsString("NSWorkspaceDidTerminateApplicationNotification"),
         nil_object,
     });
+    // Hiding or unhiding moves windows on/off screen without any AX focus event.
+    for ([_][:0]const u8{
+        "NSWorkspaceDidHideApplicationNotification",
+        "NSWorkspaceDidUnhideApplicationNotification",
+    }) |name| {
+        workspace_notification_center.msgSend(void, "addObserver:selector:name:object:", .{
+            observer,
+            objc.sel("appVisibilityChanged:"),
+            nsString(name),
+            nil_object,
+        });
+    }
     workspace_notification_center.msgSend(void, "addObserver:selector:name:object:", .{
         observer,
         objc.sel("spaceChanged:"),
@@ -1980,7 +2042,12 @@ fn signalWaker() void {
 
 fn animatorTimerTick(context: ?*anyopaque) callconv(.c) void {
     _ = context;
+    const animating_before = g_animator.active().len;
     g_animator.tick();
+    if (dim.enabled) {
+        // A finished animation needs a full snapshot to land on the final frame.
+        if (g_animator.active().len < animating_before) pushDimSnapshot() else followAnimationsWithDim();
+    }
     if (!g_animator.isAnimating()) {
         if (g_animator_source) |source| {
             c.dispatch_source_cancel(source);
@@ -2578,6 +2645,11 @@ fn workspaceActiveAppChanged(pid: i32) void {
     bw_emit_event(shim.BW_EVENT_WINDOW_FOCUSED, pid, 0);
 }
 
+/// Callback target for BWObserver.appVisibilityChanged:.
+fn workspaceAppVisibilityChanged() void {
+    bw_emit_event(shim.BW_EVENT_APP_VISIBILITY_CHANGED, 0, 0);
+}
+
 /// Callback target for BWObserver.spaceChanged:.
 fn workspaceSpaceChanged() void {
     bw_emit_event(shim.BW_EVENT_SPACE_CHANGED, 0, 0);
@@ -2756,6 +2828,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
         .app_launched = workspaceAppLaunched,
         .app_terminated = workspaceAppTerminated,
         .active_app_changed = workspaceActiveAppChanged,
+        .app_visibility_changed = workspaceAppVisibilityChanged,
         .space_changed = workspaceSpaceChanged,
         .display_changed = workspaceDisplayChanged,
     });
@@ -2838,10 +2911,7 @@ fn bw_drain_events() void {
     flushRetileRequests();
 
     // Same settled point: dim inactive windows (diffed, no-op if unchanged).
-    // Guard at the call site so a disabled feature costs exactly one branch
-    // here and never enters the snapshot path — no call, no loop, no reliance
-    // on the optimizer eliding a no-op body.
-    if (dim.enabled and !nativeSwitchPending()) {
+    if (dim.enabled and g_dim_dirty) {
         pushDimSnapshot();
     }
 
@@ -3480,6 +3550,8 @@ fn handleEvent(ev: *const event_mod.Event) void {
             retile();
         },
         .window_focused => {
+            // Activation raises windows even when no managed focus changes.
+            g_dim_dirty = true;
             const focused_wid_opt = focusedWindowIdForLoggedEvent("window focused", ev.pid);
             if (!g_state.isWorkspaceTransitionActive()) {
                 requestCleanupForPid(ev.pid);
@@ -3496,6 +3568,7 @@ fn handleEvent(ev: *const event_mod.Event) void {
             }
         },
         .focused_window_changed => {
+            g_dim_dirty = true;
             const focused_wid_opt = focusedWindowIdForLoggedEvent("focused window changed", ev.pid);
             if (!g_state.isWorkspaceTransitionActive()) {
                 requestCleanupForPid(ev.pid);
@@ -3581,6 +3654,16 @@ fn handleEvent(ev: *const event_mod.Event) void {
             processPendingFocusQueue();
         },
         .native_topology_poll_tick => reconcileNativeSpaceTopologyIfNeeded(),
+        .native_observation_due => {
+            if (processDueNativeStateObservation()) return;
+            // A replaced timer's fire must not re-arm: the current timer already
+            // has its own fire pending, and each re-arm would add another.
+            if (ev.wid != g_observation_generation) return;
+            // GCD's monotonic clock can fire before the wall-clock due time
+            // the model uses; re-arm instead of falling back to the role poll.
+            g_scheduled_observation = null;
+            scheduleNativeObservation();
+        },
         .mouse_down => {
             cancelPendingMouseFocus(true, true);
             dispatchStateEvent(.{ .pointer_down = managedWindowAtPoint(g_mouse_down_location) });
@@ -3607,6 +3690,7 @@ fn handleEvent(ev: *const event_mod.Event) void {
             processDeferredWindowCandidates();
         },
         .mouse_moved => focusWindowUnderMouse(),
+        .app_visibility_changed => g_dim_dirty = true,
         .window_moved, .window_resized => {
             // Every animation tick sets the AX frame, which echoes back here
             // as moved/resized notifications (~60/sec per window). Ignore
@@ -4209,6 +4293,7 @@ fn nativeTopologyFromSnapshot(snapshot: *const skylight.NativeSpaceTopology, map
 
 fn dispatchStateEvent(event: state_mod.Event) void {
     const transition = state_mod.reduce(&g_state, event);
+    g_dim_dirty = true;
 
     for (transition.effects[0..transition.effect_count]) |effect| {
         if (!g_state_effect_queue.push(effect)) @panic("state effect queue overflow");
@@ -4227,6 +4312,33 @@ fn drainStateEffects() void {
         executeStateEffect(effect);
     }
     refreshRolePolling();
+    scheduleNativeObservation();
+    hideTransitioningDim();
+}
+
+/// Fire the native observation at its due time. The role poll would run it
+/// up to 100ms late, and a switch re-observes every 50ms until it lands, so
+/// that lag lands on every hop of a queued switch.
+fn scheduleNativeObservation() void {
+    const timer = g_state.observation_timer orelse return;
+    if (g_scheduled_observation) |scheduled| {
+        if (std.meta.eql(scheduled, timer)) return;
+    }
+    g_scheduled_observation = timer;
+    g_observation_generation +%= 1;
+
+    const delay_ms = timer.due_at_ms -| nativeStateNowMs();
+    c.dispatch_after_f(
+        c.dispatch_time(c.DISPATCH_TIME_NOW, @intCast(delay_ms * std.time.ns_per_ms)),
+        cg_extra.dispatch_get_main_queue(),
+        @ptrFromInt(g_observation_generation),
+        nativeObservationTimerFired,
+    );
+}
+
+fn nativeObservationTimerFired(context: ?*anyopaque) callconv(.c) void {
+    const generation: u32 = @intCast(@intFromPtr(context));
+    bw_emit_event(shim.BW_EVENT_NATIVE_OBSERVATION_DUE, 0, generation);
 }
 
 fn executeStateEffect(effect: state_mod.Effect) void {
@@ -4751,6 +4863,10 @@ fn executeWorkspaceTransitionSettled(settlement: state_mod.WorkspaceTransitionSe
 fn executeNativeSwitch(effect: @FieldType(state_mod.Effect, "switch_native_space")) void {
     const pending = g_state.pending_switch orelse return;
     if (pending.epoch != effect.epoch or pending.phase != .preparing) return;
+    // Before WindowServer starts the slide; the effect drain's own hide runs
+    // after the gesture is already posted.
+    hideTransitioningDim();
+
     const request = effect.request;
     const native_space_id = request.target.key.id;
     const plan = g_sky.?.prepareNativeSpaceSwitch(request.target.display_id, native_space_id) orelse {
@@ -4825,14 +4941,25 @@ fn observeNativeTopology(epoch: state_mod.Epoch) void {
         } });
         return;
     };
+    var is_animating: ?bool = null;
+    if (g_state.pending_switch) |pending| {
+        is_animating = g_sky.?.nativeDisplayIsAnimating(pending.request.target.display_id);
+        const display = topology.findDisplay(pending.request.target.display_id);
+        log.debug("native switch observe epoch={d} phase={s} target_space={d} observed_space={?d} animating={?} queued={?d} remaining_ms={d}", .{
+            pending.epoch,
+            @tagName(pending.phase),
+            pending.request.target.key.id,
+            if (display) |value| value.observed_space_id else null,
+            is_animating,
+            if (g_state.queued_switch) |queued| queued.target.workspace_id else null,
+            pending.deadline_at_ms -| at_ms,
+        });
+    }
     dispatchStateEvent(.{ .native_topology_observed = .{
         .topology = &topology,
         .epoch = epoch,
         .at_ms = at_ms,
-        .is_animating = if (g_state.pending_switch) |pending|
-            g_sky.?.nativeDisplayIsAnimating(pending.request.target.display_id)
-        else
-            null,
+        .is_animating = is_animating,
     } });
 }
 

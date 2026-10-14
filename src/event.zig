@@ -19,6 +19,8 @@ pub const EventKind = enum(u8) {
     mouse_dragged = 16,
     native_topology_poll_tick = 17,
     mouse_moved = 18,
+    native_observation_due = 19,
+    app_visibility_changed = 41,
 
     hk_focus_workspace = 20,
     hk_move_to_workspace = 21,

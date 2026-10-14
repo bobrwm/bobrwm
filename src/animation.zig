@@ -33,7 +33,7 @@ pub const AnimationConfig = struct {
     easing: Easing = .ease_out,
 };
 
-const WindowAnimation = struct {
+pub const WindowAnimation = struct {
     wid: u32,
     pid: i32,
     start_frame: window_mod.Window.Frame,
@@ -211,6 +211,20 @@ pub const Animator = struct {
 
     pub fn isAnimating(self: *const Animator) bool {
         return self.count > 0;
+    }
+
+    /// Frame last written to `wid`, or null when it is not animating. Retile
+    /// records the target frame up front, so this is where the window is.
+    pub fn displayedFrame(self: *const Animator, wid: u32) ?window_mod.Window.Frame {
+        for (self.active()) |a| {
+            if (a.wid == wid) return a.last_displayed_frame;
+        }
+        return null;
+    }
+
+    /// In-flight animations; invalidated by the next tick.
+    pub fn active(self: *const Animator) []const WindowAnimation {
+        return self.animations[0..self.count];
     }
 };
 
