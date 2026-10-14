@@ -6,7 +6,6 @@ const window_mod = @import("../window.zig");
 
 const Model = model_mod.Model;
 const ProcessRetries = model_mod.ProcessRetries;
-const SpaceRef = model_mod.SpaceRef;
 const WindowCandidate = model_mod.WindowCandidate;
 const WindowCandidates = model_mod.WindowCandidates;
 const WorkspaceId = model_mod.WorkspaceId;

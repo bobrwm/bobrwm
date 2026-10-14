@@ -5,7 +5,6 @@ const model_mod = @import("../model.zig");
 const layout_reducer = @import("layout.zig");
 
 const Event = model_mod.Event;
-const Model = model_mod.Model;
 const Transition = model_mod.Transition;
 const WindowId = model_mod.WindowId;
 
