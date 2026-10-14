@@ -463,12 +463,6 @@ pub fn forget(self: *Self, wid: WindowId) void {
     if (index != self.entry_count) self.entries[index] = self.entries[self.entry_count];
 }
 
-pub fn replaceWindowId(self: *Self, old_window_id: WindowId, new_window_id: WindowId) void {
-    const index = self.findIndex(old_window_id) orelse return;
-    std.debug.assert(self.findIndex(new_window_id) == null);
-    self.entries[index].window_id = new_window_id;
-}
-
 pub fn clearIntents(self: *Self) void {
     for (self.itemsMut()) |*stored| stored.value.intent = null;
 }

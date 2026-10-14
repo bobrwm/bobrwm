@@ -130,13 +130,6 @@ pub const WorkspaceFocus = struct {
         self.focused_window_id = window_id;
     }
 
-    pub fn replaceWindowId(self: *WorkspaceFocus, old_window_id: WindowId, new_window_id: WindowId) void {
-        for (self.history[0..self.history_count]) |*window_id| {
-            if (window_id.* == old_window_id) window_id.* = new_window_id;
-        }
-        if (self.focused_window_id == old_window_id) self.focused_window_id = new_window_id;
-    }
-
     fn removeFromHistory(self: *WorkspaceFocus, window_id: WindowId) void {
         for (self.history[0..self.history_count], 0..) |candidate, index| {
             if (candidate != window_id) continue;
@@ -917,10 +910,6 @@ pub const Event = union(enum) {
     adopt_window: WindowAdoption,
     update_window: WindowUpdate,
     remove_window: WindowId,
-    replace_window_id: struct {
-        old_window_id: WindowId,
-        new_window_id: WindowId,
-    },
     assign_window_space: WindowSpaceAssignment,
     observe_window_tab_group: *const WindowTabGroupObservation,
     detach_window_tab: WindowTabDetachment,

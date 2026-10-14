@@ -141,7 +141,6 @@ pub fn reduce(model: *Model, event: Event) Transition {
             window_reducer.reduceWindowRemoved(&transition, window_id);
             should_refresh_workspace_focus = true;
         },
-        .replace_window_id => |replacement| window_reducer.reduceWindowIdReplaced(&transition, replacement),
         .assign_window_space => |assignment| {
             window_reducer.reduceWindowSpaceAssigned(&transition, assignment);
             should_refresh_workspace_focus = true;
@@ -560,18 +559,9 @@ test "window catalog owns identity and Space membership" {
     try testing.expectEqual(@as(u16, 1), assigned.model.windows.countInSpace(.{ .id = 2 }));
     try testing.expect(assigned.model.window(101).?.space_key.eql(.{ .id = 2 }));
 
-    const replaced = reduceCopy(assigned.model, .{ .replace_window_id = .{
-        .old_window_id = 102,
-        .new_window_id = 202,
-    } });
-    try testing.expect(replaced.model.window(102) == null);
-    try testing.expectEqual(@as(i32, 1002), replaced.model.window(202).?.process_id);
-    try testing.expect(replaced.model.geometry.get(102) == null);
-    try testing.expect(replaced.model.geometry.get(202) != null);
-
-    const removed = reduceCopy(replaced.model, .{ .remove_window = 202 });
-    try testing.expect(removed.model.window(202) == null);
-    try testing.expect(removed.model.geometry.get(202) == null);
+    const removed = reduceCopy(assigned.model, .{ .remove_window = 102 });
+    try testing.expect(removed.model.window(102) == null);
+    try testing.expect(removed.model.geometry.get(102) == null);
     try testing.expectEqual(@as(u16, 1), removed.model.windows.count);
 }
 
@@ -627,22 +617,12 @@ test "window lifecycle transitions update catalog geometry focus and layout atom
         .workspace_id = 2,
         .window_id = 101,
     } }).model;
-    model = reduceCopy(model, .{ .replace_window_id = .{
-        .old_window_id = 101,
-        .new_window_id = 201,
-    } }).model;
-    try testing.expect(model.window(101) == null);
-    try testing.expect(model.window(201) != null);
-    try testing.expect(model.geometry.get(101) == null);
-    try testing.expect(model.geometry.get(201) != null);
-    try testing.expect(!model.layout.contains(second_space, 101));
-    try testing.expect(model.layout.contains(second_space, 201));
-    try testing.expectEqual(@as(?WindowId, 201), model.focusedWorkspaceWindow(2));
+    try testing.expectEqual(@as(?WindowId, 101), model.focusedWorkspaceWindow(2));
 
-    model = reduceCopy(model, .{ .remove_window = 201 }).model;
-    try testing.expect(model.window(201) == null);
-    try testing.expect(model.geometry.get(201) == null);
-    try testing.expect(!model.layout.contains(second_space, 201));
+    model = reduceCopy(model, .{ .remove_window = 101 }).model;
+    try testing.expect(model.window(101) == null);
+    try testing.expect(model.geometry.get(101) == null);
+    try testing.expect(!model.layout.contains(second_space, 101));
     try testing.expectEqual(@as(?WindowId, null), model.focusedWorkspaceWindow(2));
 }
 
@@ -923,14 +903,8 @@ test "workspace focus memory follows window lifecycle" {
     model = reduceCopy(model, .{ .remove_window = 102 }).model;
     try testing.expectEqual(@as(?WindowId, 101), model.focusedWorkspaceWindow(1));
 
-    model = reduceCopy(model, .{ .replace_window_id = .{
-        .old_window_id = 101,
-        .new_window_id = 201,
-    } }).model;
-    try testing.expectEqual(@as(?WindowId, 201), model.focusedWorkspaceWindow(1));
-
     model = reduceCopy(model, .{ .assign_window_space = .{
-        .window_id = 201,
+        .window_id = 101,
         .space_key = .{ .id = 2 },
     } }).model;
     try testing.expectEqual(@as(?WindowId, null), model.focusedWorkspaceWindow(1));
@@ -938,9 +912,9 @@ test "workspace focus memory follows window lifecycle" {
 
     model = reduceCopy(model, .{ .record_workspace_focus = .{
         .workspace_id = 2,
-        .window_id = 201,
+        .window_id = 101,
     } }).model;
-    try testing.expectEqual(@as(?WindowId, 201), model.focusedWorkspaceWindow(2));
+    try testing.expectEqual(@as(?WindowId, 101), model.focusedWorkspaceWindow(2));
 }
 
 test "window catalog rejects invalid lifecycle events" {
