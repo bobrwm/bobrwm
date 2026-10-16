@@ -27,6 +27,7 @@ const osutil = @import("osutil.zig");
 const loginitem = @import("loginitem.zig");
 const objc_classes = @import("objc_classes.zig");
 const animation_mod = @import("animation.zig");
+const display_link = @import("display_link.zig");
 const ax_mod = @import("ax.zig");
 const geometry_mod = @import("geometry.zig");
 const spsc_queue = @import("spsc_queue.zig");
@@ -1321,7 +1322,6 @@ var g_event_overflow_recovery_pending = false;
 var g_on_screen_truncation_logged = false;
 
 var g_animator: animation_mod.Animator = undefined;
-var g_animator_source: c.dispatch_source_t = null;
 var g_ipc_transport: ipc_transport.Transport = .{};
 
 const ConfigRuntime = struct {
@@ -2035,43 +2035,24 @@ fn signalWaker() void {
     }
 }
 
-fn animatorTimerTick(context: ?*anyopaque) callconv(.c) void {
-    _ = context;
+/// Display link frame handler for `display_id`.
+fn animationFrame(display_id: u32, target_ns: i128) void {
     const animating_before = g_animator.active().len;
-    g_animator.tick();
+    g_animator.tick(display_id, target_ns);
     if (dim.enabled) {
         // A finished animation needs a full snapshot to land on the final frame.
         if (g_animator.active().len < animating_before) pushDimSnapshot() else followAnimationsWithDim();
     }
-    if (!g_animator.isAnimating()) {
-        if (g_animator_source) |source| {
-            c.dispatch_source_cancel(source);
-            // Unlike the long-lived role-poll source, this one is recreated
-            // for every animation burst — drop our reference or each burst
-            // leaks a source. GCD keeps it alive until cancellation completes.
-            c.dispatch_release(.{ ._ds = source });
-            g_animator_source = null;
-        }
-    }
+    if (!g_animator.isAnimatingOnDisplay(display_id)) display_link.stop(display_id);
 }
 
-fn ensureAnimatorTimer() void {
-    if (g_animator_source != null) return;
-    const source = c.dispatch_source_create(
-        cg_extra.DISPATCH_SOURCE_TYPE_TIMER(),
-        0,
-        0,
-        cg_extra.dispatch_get_main_queue(),
-    ) orelse return;
-    c.dispatch_source_set_timer(
-        source,
-        c.dispatch_time(c.DISPATCH_TIME_NOW, 0),
-        16 * c.NSEC_PER_MSEC,
-        0,
-    );
-    c.dispatch_source_set_event_handler_f(source, animatorTimerTick);
-    c.dispatch_resume(.{ ._ds = source });
-    g_animator_source = source;
+fn ensureAnimationFrames(display_id: u32) void {
+    if (!g_animator.isAnimatingOnDisplay(display_id)) return;
+    if (display_link.start(display_id)) return;
+    // Without frames the animations would never finish, and in-flight windows
+    // ignore their own move events. A target past every deadline lands each
+    // one on its final frame now.
+    animationFrame(display_id, std.math.maxInt(i128));
 }
 
 fn rolePollTimerTick(context: ?*anyopaque) callconv(.c) void {
@@ -2764,6 +2745,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     } });
     g_config.applyKeybinds(&g_config_runtime.?.keybind_table);
     g_animator.init(g_config.animation);
+    display_link.init(animationFrame);
 
     // Inactive-window dimming via SkyLight (SLSSetWindowListBrightness).
     dim.configure(g_config.dimmed_inactive);
@@ -3585,6 +3567,11 @@ fn handleEvent(ev: *const event_mod.Event) void {
             retile();
         },
         .display_changed => {
+            // A link bound to a removed display may stop firing, which would
+            // strand its animations mid-flight. Land them; the reconfigure
+            // retile animates from the final frames.
+            g_animator.finishAll();
+            display_link.stopAll();
             const at_ms = nativeStateNowMs();
             dispatchStateEvent(.{ .display_changed = .{
                 .at_ms = at_ms,
@@ -3648,10 +3635,10 @@ fn handleEvent(ev: *const event_mod.Event) void {
         .app_visibility_changed => g_dim_dirty = true,
         .window_moved, .window_resized => {
             // Every animation tick sets the AX frame, which echoes back here
-            // as moved/resized notifications (~60/sec per window). Ignore
-            // them: reacting would overwrite the stored target frame with a
-            // mid-flight position and, for fullscreen windows, trigger a full
-            // retile per tick.
+            // as moved/resized notifications (once per display refresh per
+            // window). Ignore them: reacting would overwrite the stored target
+            // frame with a mid-flight position and, for fullscreen windows,
+            // trigger a full retile per tick.
             if (g_animator.isAnimatingWindow(ev.wid)) return;
 
             if (inWorkspaceTransition() and g_state.pointer_drag.active_window_id != ev.wid) {
@@ -6526,9 +6513,9 @@ fn retileDisplay(display_id: u32) void {
             // exact display frame.
             var applied = true;
             if (g_config.animation.enabled and !win.is_fullscreen) {
-                applied = g_animator.animate(visible.pid, visible_wid, visible.frame, target_frame);
+                applied = g_animator.animate(display_id, visible.pid, visible_wid, visible.frame, target_frame, display_link.nowNs());
                 if (applied) recordAnimationIntent(visible_wid, target_frame);
-                ensureAnimatorTimer();
+                ensureAnimationFrames(display_id);
             } else {
                 // The window may have entered fullscreen mid-animation; stop
                 // the in-flight animation so it doesn't fight the placement.
