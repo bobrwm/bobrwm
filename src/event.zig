@@ -21,6 +21,8 @@ pub const EventKind = enum(u8) {
     mouse_moved = 18,
     native_observation_due = 19,
     app_visibility_changed = 41,
+    geometry_resample_due = 42,
+    geometry_write_failed = 43,
 
     hk_focus_workspace = 20,
     hk_move_to_workspace = 21,

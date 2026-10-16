@@ -93,6 +93,15 @@ pub const Config = struct {
     /// Side a new window takes when it splits a tile: `.second` is
     /// right/bottom, `.first` is left/top.
     new_window_split: tiling.InsertChild = .second,
+    /// When an app resizes one of its own tiled windows, for example to show
+    /// or hide a sidebar, move the splits next to it so the window keeps its
+    /// new size and its neighbors make room. When off, bobrwm resizes the
+    /// window back into its tile.
+    ///
+    /// Only size changes move splits: an app that just moves its window is
+    /// put back. Growth against a screen edge is taken from the window's
+    /// neighbor on the other side.
+    follow_app_resizes: bool = false,
     /// Animate window movement during layout changes.
     ///
     /// Warning: alpha. Animations run on the window manager's main thread,
