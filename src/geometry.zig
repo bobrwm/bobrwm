@@ -74,6 +74,10 @@ pub const Entry = struct {
     /// Consecutive unconverged manager writes. Reset when a sample reaches
     /// the target or new external or user input arrives.
     unsettled_repairs: u8 = 0,
+    /// The last observation came from the active pointer drag. Its trailing
+    /// sample is the user's placement, which the drop already reconciles, so
+    /// it must not be mistaken for the app resizing its own window.
+    user_driven: bool = false,
 };
 
 pub const ObservationOwner = enum {
@@ -88,6 +92,8 @@ pub const SettlementOwner = enum {
     manager_unsettled,
     /// A manager write did not converge and the repair budget is spent.
     manager_abandoned,
+    /// Trailing sample of a pointer drag with no manager write since.
+    user,
     external,
 };
 
@@ -129,6 +135,8 @@ pub const Event = union(enum) {
         at_ns: i128,
     },
     forget: WindowId,
+    /// The write behind the window's intent was rejected after it was queued.
+    drop_intent: WindowId,
     clear_intents,
 };
 
@@ -259,6 +267,9 @@ pub fn reduce(state: *Self, event: Event) ?Effect {
             } };
         },
         .forget => |window_id| state.forget(window_id),
+        .drop_intent => |window_id| if (state.getPtr(window_id)) |entry| {
+            entry.intent = null;
+        },
         .clear_intents => state.clearIntents(),
     }
     return effect;
@@ -296,6 +307,7 @@ fn recordAccepted(
 
     const entry = try self.getOrPut(wid);
     entry.intent = intent;
+    entry.user_driven = false;
     entry.resample_at_ns = std.math.add(i128, now_ns, default_resample_delay_ns) catch
         std.math.maxInt(i128);
     return intent;
@@ -368,8 +380,10 @@ pub fn observe(
     if (dragged_wid == wid) {
         entry.intent = null;
         entry.unsettled_repairs = 0;
+        entry.user_driven = true;
         return .user;
     }
+    entry.user_driven = false;
 
     if (entry.intent) |intent| {
         const still_settling = now_ns <= intent.settle_deadline_ns;
@@ -416,6 +430,10 @@ pub fn settle(self: *Self, wid: WindowId, observed: Frame, now_ns: i128) Settlem
         return .manager_unsettled;
     }
 
+    if (entry.user_driven) {
+        entry.user_driven = false;
+        return .user;
+    }
     return .external;
 }
 
@@ -465,6 +483,15 @@ pub fn needsRepair(self: *const Self, wid: WindowId, desired: Frame, now_ns: i12
     }
     const observed = entry.observed orelse return false;
     return !observed.approxEqual(desired, Frame.tolerance);
+}
+
+/// Whether a change bobrwm did not request is still in flight: a
+/// notification arrived without a manager intent or pointer drag and its
+/// trailing sample,
+/// which every further notification postpones, has not run yet.
+pub fn externalChangePending(self: *const Self, wid: WindowId) bool {
+    const entry = self.get(wid) orelse return false;
+    return entry.intent == null and !entry.user_driven and entry.resample_at_ns != null;
 }
 
 pub fn get(self: *const Self, wid: WindowId) ?Entry {
@@ -581,6 +608,14 @@ test "only the dragged window overrides manager ownership" {
         try coordinator.observe(10, tiled, 1_051, 10),
     );
     try testing.expect(coordinator.get(10).?.intent == null);
+    // The drop's retile must still place the window, and its trailing
+    // sample must not read as the app resizing itself.
+    try testing.expect(!coordinator.externalChangePending(10));
+    try testing.expectEqual(SettlementOwner.user, coordinator.settle(10, tiled, 1_200));
+
+    try testing.expectEqual(ObservationOwner.external, try coordinator.observe(10, fullscreen, 1_300, null));
+    try testing.expect(coordinator.externalChangePending(10));
+    try testing.expectEqual(SettlementOwner.external, coordinator.settle(10, fullscreen, 1_400));
 }
 
 test "new accepted write supersedes the prior generation" {

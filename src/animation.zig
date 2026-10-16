@@ -1,17 +1,14 @@
-//! Animates window frame changes by stepping AX frame sets once per display
-//! refresh (see display_link.zig). AX writes are synchronous IPC to the
-//! target app, so every animating window costs main-thread time each tick,
-//! and an unresponsive app can stall the window manager for the AX messaging
-//! timeout. To keep the per-tick cost down, each animation resolves and
-//! retains the window's AX element once up front (ax.animationBegin) and
-//! intermediate ticks issue a single-pass position(+size) write; only the
-//! final frame of a resizing animation goes through the full three-pass
-//! clamping-safe ax.setWindowFrame. Pure moves finish with a position-only
-//! write, since an AXSize write would flash and reflow size-sensitive apps.
-//! Alpha until animation is moved off the main thread.
+//! Animates window frame changes by interpolating frames once per display
+//! refresh (see display_link.zig) and handing each one to ax_writer, which
+//! applies it on the app's own queue. A slow app coalesces the frames it
+//! cannot keep up with instead of stalling the tick. Intermediate ticks are
+//! single-pass position(+size) writes; only the final frame of a resizing
+//! animation is the clamping-safe size-position-size write. Pure moves
+//! finish with a position-only write, since an AXSize write would flash and
+//! reflow size-sensitive apps.
 
 const std = @import("std");
-const ax = @import("ax.zig");
+const ax_writer = @import("ax_writer.zig");
 const window_mod = @import("window.zig");
 
 pub const Easing = enum {
@@ -42,13 +39,6 @@ pub const WindowAnimation = struct {
     last_displayed_frame: window_mod.Window.Frame,
     /// On the display_link.nowNs clock, which frame target times share.
     start_time_ns: i128,
-    /// Retains the AX element for the animation's lifetime so ticks skip
-    /// the per-call window-list lookup. Released via ax.animationEnd.
-    handle: ax.AnimationHandle,
-
-    fn end(self: *const WindowAnimation) void {
-        ax.animationEnd(self.handle);
-    }
 };
 
 const max_animations = 64;
@@ -70,8 +60,8 @@ pub const Animator = struct {
     /// the new target from its current displayed position.
     /// Returns whether the target was accepted: an animation was scheduled
     /// or redirected (it converges on the target on its own), or the direct
-    /// placement fallback's AX write succeeded. Callers must not record the
-    /// target frame when this returns false.
+    /// placement fallback was queued. Callers must not record the target
+    /// frame when this returns false.
     pub fn animate(
         self: *Animator,
         display_id: u32,
@@ -96,11 +86,6 @@ pub const Animator = struct {
             return placeFinal(pid, wid, current_frame, target_frame);
         }
 
-        const handle = ax.animationBegin(pid, wid) orelse {
-            // Window can't be resolved — place it directly instead.
-            return placeFinal(pid, wid, current_frame, target_frame);
-        };
-
         self.animations[self.count] = .{
             .wid = wid,
             .pid = pid,
@@ -109,7 +94,6 @@ pub const Animator = struct {
             .end_frame = target_frame,
             .last_displayed_frame = current_frame,
             .start_time_ns = now_ns,
-            .handle = handle,
         };
         self.count += 1;
         return true;
@@ -142,7 +126,6 @@ pub const Animator = struct {
                 // drift. Pure moves never wrote a size, so they finish with
                 // a position-only write.
                 _ = placeFinal(a.pid, a.wid, a.start_frame, a.end_frame);
-                a.end();
                 continue;
             }
 
@@ -152,8 +135,8 @@ pub const Animator = struct {
                 // Pure moves skip the size write, halving the per-tick IPC.
                 const resizing = @abs(a.end_frame.width - a.start_frame.width) > tol or
                     @abs(a.end_frame.height - a.start_frame.height) > tol;
-                ax.animationStep(a.handle, frame.x, frame.y, frame.width, frame.height, resizing);
-                a.last_displayed_frame = frame;
+                const step: ax_writer.Write = .{ .position = true, .size = resizing, .quiet = true };
+                if (ax_writer.write(a.pid, a.wid, frame, step)) a.last_displayed_frame = frame;
             }
 
             if (i != j) self.animations[j] = self.animations[i];
@@ -168,7 +151,6 @@ pub const Animator = struct {
         for (0..self.count) |i| {
             const a = self.animations[i];
             _ = placeFinal(a.pid, a.wid, a.start_frame, a.end_frame);
-            a.end();
         }
         self.count = 0;
     }
@@ -178,7 +160,6 @@ pub const Animator = struct {
     pub fn cancel(self: *Animator, wid: u32) void {
         for (0..self.count) |i| {
             if (self.animations[i].wid == wid) {
-                self.animations[i].end();
                 self.count -= 1;
                 if (i < self.count) {
                     self.animations[i] = self.animations[self.count];
@@ -222,19 +203,13 @@ pub const Animator = struct {
 /// intermediate ticks never wrote a size, so there is no size drift to heal,
 /// and an AXSize write would flash and reflow size-sensitive apps. Resizing
 /// animations keep the full clamping-safe frame write. Returns whether the
-/// AX write was accepted.
+/// write was queued.
 fn placeFinal(pid: i32, wid: u32, from: window_mod.Window.Frame, to: window_mod.Window.Frame) bool {
-    if (from.sizeApproxEqual(to, window_mod.Window.Frame.tolerance)) {
-        return ax.setWindowPosition(pid, wid, to.x, to.y);
-    }
-    return ax.setWindowFrame(
-        pid,
-        wid,
-        to.x,
-        to.y,
-        to.width,
-        to.height,
-    );
+    const kind: ax_writer.Write = if (from.sizeApproxEqual(to, window_mod.Window.Frame.tolerance))
+        .position_only
+    else
+        .frame;
+    return ax_writer.write(pid, wid, to, kind);
 }
 
 fn interpolateFrame(
