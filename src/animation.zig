@@ -1,7 +1,7 @@
-//! Animates window frame changes by stepping AX frame sets from a 16ms
-//! main-queue timer. AX writes are synchronous IPC to the target app, so
-//! every animating window costs main-thread time each tick, and an
-//! unresponsive app can stall the window manager for the AX messaging
+//! Animates window frame changes by stepping AX frame sets once per display
+//! refresh (see display_link.zig). AX writes are synchronous IPC to the
+//! target app, so every animating window costs main-thread time each tick,
+//! and an unresponsive app can stall the window manager for the AX messaging
 //! timeout. To keep the per-tick cost down, each animation resolves and
 //! retains the window's AX element once up front (ax.animationBegin) and
 //! intermediate ticks issue a single-pass position(+size) write; only the
@@ -13,7 +13,6 @@
 const std = @import("std");
 const ax = @import("ax.zig");
 const window_mod = @import("window.zig");
-const osutil = @import("osutil.zig");
 
 pub const Easing = enum {
     linear,
@@ -36,9 +35,12 @@ pub const AnimationConfig = struct {
 pub const WindowAnimation = struct {
     wid: u32,
     pid: i32,
+    /// Display whose refresh drives this animation: the target's display.
+    display_id: u32,
     start_frame: window_mod.Window.Frame,
     end_frame: window_mod.Window.Frame,
     last_displayed_frame: window_mod.Window.Frame,
+    /// On the display_link.nowNs clock, which frame target times share.
     start_time_ns: i128,
     /// Retains the AX element for the animation's lifetime so ticks skip
     /// the per-call window-list lookup. Released via ax.animationEnd.
@@ -72,16 +74,17 @@ pub const Animator = struct {
     /// target frame when this returns false.
     pub fn animate(
         self: *Animator,
+        display_id: u32,
         pid: i32,
         wid: u32,
         current_frame: window_mod.Window.Frame,
         target_frame: window_mod.Window.Frame,
+        now_ns: i128,
     ) bool {
-        const now_ns = osutil.nanoTimestamp();
-
         for (0..self.count) |i| {
             if (self.animations[i].wid == wid) {
                 const a = &self.animations[i];
+                a.display_id = display_id;
                 a.start_frame = a.last_displayed_frame;
                 a.end_frame = target_frame;
                 a.start_time_ns = now_ns;
@@ -101,6 +104,7 @@ pub const Animator = struct {
         self.animations[self.count] = .{
             .wid = wid,
             .pid = pid,
+            .display_id = display_id,
             .start_frame = current_frame,
             .end_frame = target_frame,
             .last_displayed_frame = current_frame,
@@ -111,18 +115,20 @@ pub const Animator = struct {
         return true;
     }
 
-    /// Advance all active animations by one frame. Moves each animated window
-    /// to its interpolated position. Removes completed animations.
-    pub fn tick(self: *Animator) void {
-        if (self.count == 0) return;
-
-        const now_ns = osutil.nanoTimestamp();
-
+    /// Advance the animations on `display_id` to the frame shown at
+    /// `target_ns`. Moves each animated window to its interpolated position.
+    /// Removes completed animations.
+    pub fn tick(self: *Animator, display_id: u32, target_ns: i128) void {
         var j: usize = 0;
         for (0..self.count) |i| {
             const a = &self.animations[i];
+            if (a.display_id != display_id) {
+                if (i != j) self.animations[j] = self.animations[i];
+                j += 1;
+                continue;
+            }
 
-            const elapsed_ns = now_ns - a.start_time_ns;
+            const elapsed_ns = target_ns - a.start_time_ns;
             const t_raw = if (self.duration_ns == 0)
                 @as(f64, 1)
             else
@@ -189,8 +195,11 @@ pub const Animator = struct {
         return false;
     }
 
-    pub fn isAnimating(self: *const Animator) bool {
-        return self.count > 0;
+    pub fn isAnimatingOnDisplay(self: *const Animator, display_id: u32) bool {
+        for (self.active()) |a| {
+            if (a.display_id == display_id) return true;
+        }
+        return false;
     }
 
     /// Frame last written to `wid`, or null when it is not animating. Retile

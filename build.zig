@@ -679,6 +679,7 @@ fn configureAppModule(module: *std.Build.Module, dependencies: AppModuleDependen
     module.linkFramework("Carbon", .{});
     module.linkFramework("AppKit", .{});
     module.linkFramework("CoreFoundation", .{});
+    module.linkFramework("CoreVideo", .{});
     module.linkFramework("ServiceManagement", .{});
 
     module.addSystemFrameworkPath(.{ .cwd_relative = dependencies.sdk_frameworks });
