@@ -22,6 +22,12 @@ pub const default_settle_interval_ns: i128 = 500 * std.time.ns_per_ms;
 /// read can precede the physical update and no second notification is
 /// guaranteed, so every notification requires one trailing sample.
 pub const default_resample_delay_ns: i128 = 75 * std.time.ns_per_ms;
+/// Repairs allowed after manager writes that never converged. Apps that run
+/// their own frame animation (Rex growing for its sidebar) can finish after
+/// the manager's write and land inside its settle interval, so the first
+/// repair usually converges. Apps that clamp to a minimum size never do, and
+/// the bound keeps those from being rewritten forever.
+pub const max_unsettled_repairs: u8 = 2;
 
 pub const IntentSource = enum {
     layout,
@@ -65,6 +71,9 @@ pub const Entry = struct {
     intent: ?Intent = null,
     /// Absolute time for the mandatory trailing WindowServer sample.
     resample_at_ns: ?i128 = null,
+    /// Consecutive unconverged manager writes. Reset when a sample reaches
+    /// the target or new external or user input arrives.
+    unsettled_repairs: u8 = 0,
 };
 
 pub const ObservationOwner = enum {
@@ -75,7 +84,10 @@ pub const ObservationOwner = enum {
 
 pub const SettlementOwner = enum {
     manager,
+    /// A manager write did not converge and the repair budget allows another.
     manager_unsettled,
+    /// A manager write did not converge and the repair budget is spent.
+    manager_abandoned,
     external,
 };
 
@@ -355,12 +367,14 @@ pub fn observe(
 
     if (dragged_wid == wid) {
         entry.intent = null;
+        entry.unsettled_repairs = 0;
         return .user;
     }
 
     if (entry.intent) |intent| {
         const still_settling = now_ns <= intent.settle_deadline_ns;
         const reached_target = intent.target.matches(observed);
+        if (reached_target) entry.unsettled_repairs = 0;
         if (still_settling or reached_target) {
             // Once a delayed notification confirms the target after the grace
             // interval, retain the observation but release the old intent.
@@ -370,6 +384,7 @@ pub fn observe(
         entry.intent = null;
     }
 
+    entry.unsettled_repairs = 0;
     return .external;
 }
 
@@ -392,7 +407,12 @@ pub fn settle(self: *Self, wid: WindowId, observed: Frame, now_ns: i128) Settlem
             return .manager;
         }
         entry.intent = null;
-        if (reached_target) return .manager;
+        if (reached_target) {
+            entry.unsettled_repairs = 0;
+            return .manager;
+        }
+        if (entry.unsettled_repairs >= max_unsettled_repairs) return .manager_abandoned;
+        entry.unsettled_repairs += 1;
         return .manager_unsettled;
     }
 
@@ -684,6 +704,23 @@ test "unreached manager intent does not become external input" {
 
     var due: [1]WindowId = undefined;
     try testing.expectEqual(@as(usize, 0), coordinator.dueResamples(1_101, &due));
+}
+
+test "unconverged manager writes stop repairing until input resets the budget" {
+    var coordinator = Self.initWithSettleInterval(100);
+
+    for (0..max_unsettled_repairs) |i| {
+        const at_ns: i128 = 1_000 + @as(i128, @intCast(i)) * 1_000;
+        _ = try coordinator.recordFrameAccepted(10, fullscreen, .layout, at_ns);
+        try testing.expectEqual(SettlementOwner.manager_unsettled, coordinator.settle(10, tiled, at_ns + 101));
+    }
+    _ = try coordinator.recordFrameAccepted(10, fullscreen, .layout, 9_000);
+    try testing.expectEqual(SettlementOwner.manager_abandoned, coordinator.settle(10, tiled, 9_101));
+
+    // A fresh app-driven change gets a fresh budget.
+    try testing.expectEqual(ObservationOwner.external, try coordinator.observe(10, tiled, 9_200, null));
+    _ = try coordinator.recordFrameAccepted(10, fullscreen, .layout, 10_000);
+    try testing.expectEqual(SettlementOwner.manager_unsettled, coordinator.settle(10, tiled, 10_101));
 }
 
 test "value copies do not share geometry entries" {
