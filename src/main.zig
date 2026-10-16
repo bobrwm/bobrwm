@@ -4675,6 +4675,11 @@ fn executeWindowGeometryObserved(
         return;
     }
     if (observation.owner == .external) {
+        // Layout repair waits for the trailing sample, which every
+        // notification pushes out. An app animating its own frame (Rex
+        // resizing for its sidebar) then finishes before bobrwm writes once,
+        // instead of both animating the window at the same time.
+        if (isLayoutOwned(observation.window_id)) return;
         handleExternalWindowGeometry(observation.window_id, observation.frame);
         return;
     }
@@ -4718,15 +4723,37 @@ fn executeWindowGeometrySettled(
 ) void {
     switch (observation.owner) {
         .manager => return,
-        .manager_unsettled => {
+        .manager_unsettled, .manager_abandoned => {
             const intent = observation.pending_intent orelse return;
             if (reconcileDivergedGeometryIntent(observation.window_id, intent)) return;
+            if (observation.owner == .manager_unsettled and repairUnsettledLayoutGeometry(observation.window_id)) return;
 
             logUnsettledGeometry(observation, intent);
             return;
         },
         .external => handleExternalWindowGeometry(observation.window_id, observation.frame),
     }
+}
+
+/// Rewrite a layout-owned window whose frame diverged from the manager's
+/// write. Notifications inside the settle interval are attributed to that
+/// write, so an app frame animation that outlasts it (Rex growing or
+/// shrinking for its sidebar) produces no external event to trigger repair.
+fn repairUnsettledLayoutGeometry(wid: u32) bool {
+    if (!isLayoutOwned(wid)) return false;
+    const space = managedWindowSpace(wid) orelse return false;
+    if (!spaceVisible(space)) return false;
+
+    log.debug("geometry: unsettled layout write wid={d}; scheduling repair", .{wid});
+    requestRetileDisplay(space.display_id);
+    return true;
+}
+
+/// Whether retile owns the window's frame, so drift is repaired rather than
+/// adopted as the window's new geometry.
+fn isLayoutOwned(wid: u32) bool {
+    const win = managedWindow(wid) orelse return false;
+    return win.mode == .tiled or win.is_fullscreen;
 }
 
 fn logUnsettledGeometry(observation: @FieldType(geometry_mod.Effect, "settled"), intent: geometry_mod.Intent) void {
@@ -6356,7 +6383,7 @@ fn handleExternalWindowGeometry(wid: u32, frame: window_mod.Window.Frame) void {
         return;
     }
 
-    if (win.mode == .tiled or win.is_fullscreen) {
+    if (isLayoutOwned(wid)) {
         log.debug("geometry: external layout drift wid={d}; scheduling retile", .{wid});
         requestRetileDisplay(space.display_id);
         return;
@@ -6429,11 +6456,7 @@ fn applyWindowFrame(
     two_pass: bool,
     source: geometry_mod.IntentSource,
 ) bool {
-    // Choose position-only from observed physical geometry, not the stored
-    // target. External resize drift can leave the model already equal to the
-    // desired layout while WindowServer has a different size; consulting the
-    // model there would issue a move and permanently leave the bad size.
-    const physical = if (g_state.geometry.get(wid)) |entry| entry.observed orelse current else current;
+    const physical = physicalFrame(wid, current);
     if (!two_pass and physical.sizeApproxEqual(target, window_mod.Window.Frame.tolerance)) {
         return setWindowPositionTracked(pid, wid, target.x, target.y, source);
     }
@@ -6445,6 +6468,16 @@ fn applyWindowFrame(
     }
     if (ok) recordFrameIntent(wid, target, source);
     return ok;
+}
+
+/// Last WindowServer frame sampled for `wid`, or `stored` when none exists.
+/// Writes must choose between move and resize from this, not the stored
+/// target: external resize drift (an app growing itself for a sidebar) leaves
+/// the model equal to the desired layout while WindowServer has a different
+/// size, and a move-only write would then permanently leave the bad size.
+fn physicalFrame(wid: u32, stored: window_mod.Window.Frame) window_mod.Window.Frame {
+    const entry = g_state.geometry.get(wid) orelse return stored;
+    return entry.observed orelse stored;
 }
 
 fn setWindowFrameTracked(
@@ -6671,7 +6704,7 @@ fn retileDisplay(display_id: u32) void {
             // exact display frame.
             var applied = true;
             if (g_config.animation.enabled and !win.is_fullscreen) {
-                applied = g_animator.animate(display_id, visible.pid, visible_wid, visible.frame, target_frame, display_link.nowNs());
+                applied = g_animator.animate(display_id, visible.pid, visible_wid, physicalFrame(visible_wid, visible.frame), target_frame, display_link.nowNs());
                 if (applied) recordAnimationIntent(visible_wid, target_frame);
                 ensureAnimationFrames(display_id);
             } else {
