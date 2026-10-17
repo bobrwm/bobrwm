@@ -22,6 +22,12 @@ pub const default_settle_interval_ns: i128 = 500 * std.time.ns_per_ms;
 /// read can precede the physical update and no second notification is
 /// guaranteed, so every notification requires one trailing sample.
 pub const default_resample_delay_ns: i128 = 75 * std.time.ns_per_ms;
+/// Repairs allowed after manager writes that never converged. Apps that run
+/// their own frame animation (Rex growing for its sidebar) can finish after
+/// the manager's write and land inside its settle interval, so the first
+/// repair usually converges. Apps that clamp to a minimum size never do, and
+/// the bound keeps those from being rewritten forever.
+pub const max_unsettled_repairs: u8 = 2;
 
 pub const IntentSource = enum {
     layout,
@@ -65,6 +71,13 @@ pub const Entry = struct {
     intent: ?Intent = null,
     /// Absolute time for the mandatory trailing WindowServer sample.
     resample_at_ns: ?i128 = null,
+    /// Consecutive unconverged manager writes. Reset when a sample reaches
+    /// the target or new external or user input arrives.
+    unsettled_repairs: u8 = 0,
+    /// The last observation came from the active pointer drag. Its trailing
+    /// sample is the user's placement, which the drop already reconciles, so
+    /// it must not be mistaken for the app resizing its own window.
+    user_driven: bool = false,
 };
 
 pub const ObservationOwner = enum {
@@ -75,7 +88,12 @@ pub const ObservationOwner = enum {
 
 pub const SettlementOwner = enum {
     manager,
+    /// A manager write did not converge and the repair budget allows another.
     manager_unsettled,
+    /// A manager write did not converge and the repair budget is spent.
+    manager_abandoned,
+    /// Trailing sample of a pointer drag with no manager write since.
+    user,
     external,
 };
 
@@ -117,6 +135,8 @@ pub const Event = union(enum) {
         at_ns: i128,
     },
     forget: WindowId,
+    /// The write behind the window's intent was rejected after it was queued.
+    drop_intent: WindowId,
     clear_intents,
 };
 
@@ -247,6 +267,9 @@ pub fn reduce(state: *Self, event: Event) ?Effect {
             } };
         },
         .forget => |window_id| state.forget(window_id),
+        .drop_intent => |window_id| if (state.getPtr(window_id)) |entry| {
+            entry.intent = null;
+        },
         .clear_intents => state.clearIntents(),
     }
     return effect;
@@ -284,6 +307,7 @@ fn recordAccepted(
 
     const entry = try self.getOrPut(wid);
     entry.intent = intent;
+    entry.user_driven = false;
     entry.resample_at_ns = std.math.add(i128, now_ns, default_resample_delay_ns) catch
         std.math.maxInt(i128);
     return intent;
@@ -355,12 +379,16 @@ pub fn observe(
 
     if (dragged_wid == wid) {
         entry.intent = null;
+        entry.unsettled_repairs = 0;
+        entry.user_driven = true;
         return .user;
     }
+    entry.user_driven = false;
 
     if (entry.intent) |intent| {
         const still_settling = now_ns <= intent.settle_deadline_ns;
         const reached_target = intent.target.matches(observed);
+        if (reached_target) entry.unsettled_repairs = 0;
         if (still_settling or reached_target) {
             // Once a delayed notification confirms the target after the grace
             // interval, retain the observation but release the old intent.
@@ -370,6 +398,7 @@ pub fn observe(
         entry.intent = null;
     }
 
+    entry.unsettled_repairs = 0;
     return .external;
 }
 
@@ -392,10 +421,19 @@ pub fn settle(self: *Self, wid: WindowId, observed: Frame, now_ns: i128) Settlem
             return .manager;
         }
         entry.intent = null;
-        if (reached_target) return .manager;
+        if (reached_target) {
+            entry.unsettled_repairs = 0;
+            return .manager;
+        }
+        if (entry.unsettled_repairs >= max_unsettled_repairs) return .manager_abandoned;
+        entry.unsettled_repairs += 1;
         return .manager_unsettled;
     }
 
+    if (entry.user_driven) {
+        entry.user_driven = false;
+        return .user;
+    }
     return .external;
 }
 
@@ -445,6 +483,15 @@ pub fn needsRepair(self: *const Self, wid: WindowId, desired: Frame, now_ns: i12
     }
     const observed = entry.observed orelse return false;
     return !observed.approxEqual(desired, Frame.tolerance);
+}
+
+/// Whether a change bobrwm did not request is still in flight: a
+/// notification arrived without a manager intent or pointer drag and its
+/// trailing sample,
+/// which every further notification postpones, has not run yet.
+pub fn externalChangePending(self: *const Self, wid: WindowId) bool {
+    const entry = self.get(wid) orelse return false;
+    return entry.intent == null and !entry.user_driven and entry.resample_at_ns != null;
 }
 
 pub fn get(self: *const Self, wid: WindowId) ?Entry {
@@ -561,6 +608,14 @@ test "only the dragged window overrides manager ownership" {
         try coordinator.observe(10, tiled, 1_051, 10),
     );
     try testing.expect(coordinator.get(10).?.intent == null);
+    // The drop's retile must still place the window, and its trailing
+    // sample must not read as the app resizing itself.
+    try testing.expect(!coordinator.externalChangePending(10));
+    try testing.expectEqual(SettlementOwner.user, coordinator.settle(10, tiled, 1_200));
+
+    try testing.expectEqual(ObservationOwner.external, try coordinator.observe(10, fullscreen, 1_300, null));
+    try testing.expect(coordinator.externalChangePending(10));
+    try testing.expectEqual(SettlementOwner.external, coordinator.settle(10, fullscreen, 1_400));
 }
 
 test "new accepted write supersedes the prior generation" {
@@ -684,6 +739,23 @@ test "unreached manager intent does not become external input" {
 
     var due: [1]WindowId = undefined;
     try testing.expectEqual(@as(usize, 0), coordinator.dueResamples(1_101, &due));
+}
+
+test "unconverged manager writes stop repairing until input resets the budget" {
+    var coordinator = Self.initWithSettleInterval(100);
+
+    for (0..max_unsettled_repairs) |i| {
+        const at_ns: i128 = 1_000 + @as(i128, @intCast(i)) * 1_000;
+        _ = try coordinator.recordFrameAccepted(10, fullscreen, .layout, at_ns);
+        try testing.expectEqual(SettlementOwner.manager_unsettled, coordinator.settle(10, tiled, at_ns + 101));
+    }
+    _ = try coordinator.recordFrameAccepted(10, fullscreen, .layout, 9_000);
+    try testing.expectEqual(SettlementOwner.manager_abandoned, coordinator.settle(10, tiled, 9_101));
+
+    // A fresh app-driven change gets a fresh budget.
+    try testing.expectEqual(ObservationOwner.external, try coordinator.observe(10, tiled, 9_200, null));
+    _ = try coordinator.recordFrameAccepted(10, fullscreen, .layout, 10_000);
+    try testing.expectEqual(SettlementOwner.manager_unsettled, coordinator.settle(10, tiled, 10_101));
 }
 
 test "value copies do not share geometry entries" {

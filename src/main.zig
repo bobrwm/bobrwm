@@ -29,6 +29,7 @@ const objc_classes = @import("objc_classes.zig");
 const animation_mod = @import("animation.zig");
 const display_link = @import("display_link.zig");
 const ax_mod = @import("ax.zig");
+const ax_writer = @import("ax_writer.zig");
 const geometry_mod = @import("geometry.zig");
 const spsc_queue = @import("spsc_queue.zig");
 const trace = @import("trace.zig");
@@ -2751,6 +2752,8 @@ pub fn main(init: std.process.Init.Minimal) !void {
     dim.configure(g_config.dimmed_inactive);
     loginitem.reconcile(g_config.start_at_login);
 
+    ax_writer.init(geometryWriteFailed);
+
     // -- Accessibility check --
     if (!ax_mod.isTrusted()) {
         log.warn("accessibility not trusted — prompting user", .{});
@@ -3481,7 +3484,7 @@ fn handleEvent(ev: *const event_mod.Event) void {
             }
             untrackAppLaunchRetry(ev.pid);
             untrackFocusRetry(ev.pid);
-            ax_mod.invalidateApp(ev.pid);
+            ax_writer.forgetApp(ev.pid);
             ax_observer.unobserveApp(ev.pid);
             removeAppWindows(ev.pid);
             retile();
@@ -3582,6 +3585,8 @@ fn handleEvent(ev: *const event_mod.Event) void {
             log.debug("native space changed", .{});
             dispatchStateEvent(.{ .native_space_changed = nativeStateNowMs() });
         },
+        .geometry_resample_due => reconcileDueGeometryObservations(),
+        .geometry_write_failed => handleGeometryWriteFailed(ev.wid),
         .role_poll_tick => {
             reconcileDueGeometryObservations();
             processPendingNativeWindowMoves();
@@ -4381,6 +4386,45 @@ fn scheduleNativeObservation() void {
     );
 }
 
+/// Wake for the trailing sample instead of waiting for the next role poll,
+/// which adds up to a full poll interval of visible lag between an app
+/// finishing its own resize and bobrwm settling the layout around it. Every
+/// notification postpones the sample, so wakes before the last one find
+/// nothing due.
+fn scheduleGeometryResample() void {
+    // Past the resample deadline so the final wake never lands just short of it.
+    const delay_ns = geometry_mod.default_resample_delay_ns + std.time.ns_per_ms;
+    c.dispatch_after_f(
+        c.dispatch_time(c.DISPATCH_TIME_NOW, @intCast(delay_ns)),
+        cg_extra.dispatch_get_main_queue(),
+        null,
+        geometryResampleTimerFired,
+    );
+}
+
+fn geometryResampleTimerFired(_: ?*anyopaque) callconv(.c) void {
+    bw_emit_event(shim.BW_EVENT_GEOMETRY_RESAMPLE_DUE, 0, 0);
+}
+
+/// Called on an ax_writer queue. Hands the rejection to the main thread,
+/// which owns the intent the write was recorded under.
+fn geometryWriteFailed(pid: i32, wid: u32) void {
+    bw_emit_event(shim.BW_EVENT_GEOMETRY_WRITE_FAILED, pid, wid);
+}
+
+/// Undo the optimistic bookkeeping for a write the app rejected. The intent
+/// would otherwise classify the window's real frame as an in-flight echo, and
+/// the stored target would make retile believe the window is already placed.
+/// No retile is requested: an app that keeps rejecting must not be retried
+/// in a loop, and the next retile repairs it as before.
+fn handleGeometryWriteFailed(wid: u32) void {
+    var win = managedWindow(wid) orelse return;
+    log.debug("geometry: write rejected wid={d}", .{wid});
+    dispatchStateEvent(.{ .geometry = .{ .drop_intent = wid } });
+    win.frame = physicalFrame(wid, win.frame);
+    _ = updateManagedWindow(win);
+}
+
 fn nativeObservationTimerFired(context: ?*anyopaque) callconv(.c) void {
     const generation: u32 = @intCast(@intFromPtr(context));
     bw_emit_event(shim.BW_EVENT_NATIVE_OBSERVATION_DUE, 0, generation);
@@ -4675,7 +4719,17 @@ fn executeWindowGeometryObserved(
         return;
     }
     if (observation.owner == .external) {
-        handleExternalWindowGeometry(observation.window_id, observation.frame);
+        // Layout repair waits for the trailing sample, which every
+        // notification pushes out. An app animating its own frame (Rex
+        // resizing for its sidebar) then finishes before bobrwm writes once,
+        // instead of both animating the window at the same time. Following
+        // the resize into the splits happens live so neighbors move with it.
+        if (isLayoutOwned(observation.window_id)) {
+            fitLayoutToWindowFrame(observation.window_id, observation.frame);
+            scheduleGeometryResample();
+            return;
+        }
+        handleExternalWindowGeometry(observation.window_id, observation.frame, true);
         return;
     }
 
@@ -4718,15 +4772,44 @@ fn executeWindowGeometrySettled(
 ) void {
     switch (observation.owner) {
         .manager => return,
-        .manager_unsettled => {
+        .manager_unsettled, .manager_abandoned => {
             const intent = observation.pending_intent orelse return;
             if (reconcileDivergedGeometryIntent(observation.window_id, intent)) return;
+            // An app that resized itself right after a manager write lands
+            // here rather than on the external path; follow it the same way
+            // instead of forcing the window back into its old tile.
+            fitLayoutToWindowFrame(observation.window_id, observation.frame);
+            if (observation.owner == .manager_unsettled and repairUnsettledLayoutGeometry(observation.window_id)) return;
 
             logUnsettledGeometry(observation, intent);
             return;
         },
-        .external => handleExternalWindowGeometry(observation.window_id, observation.frame),
+        // The drop already reconciled a dragged window into its new slot;
+        // only an app's own change may move the splits.
+        .user => handleExternalWindowGeometry(observation.window_id, observation.frame, false),
+        .external => handleExternalWindowGeometry(observation.window_id, observation.frame, true),
     }
+}
+
+/// Rewrite a layout-owned window whose frame diverged from the manager's
+/// write. Notifications inside the settle interval are attributed to that
+/// write, so an app frame animation that outlasts it (Rex growing or
+/// shrinking for its sidebar) produces no external event to trigger repair.
+fn repairUnsettledLayoutGeometry(wid: u32) bool {
+    if (!isLayoutOwned(wid)) return false;
+    const space = managedWindowSpace(wid) orelse return false;
+    if (!spaceVisible(space)) return false;
+
+    log.debug("geometry: unsettled layout write wid={d}; scheduling repair", .{wid});
+    requestRetileDisplay(space.display_id);
+    return true;
+}
+
+/// Whether retile owns the window's frame, so drift is repaired rather than
+/// adopted as the window's new geometry.
+fn isLayoutOwned(wid: u32) bool {
+    const win = managedWindow(wid) orelse return false;
+    return win.mode == .tiled or win.is_fullscreen;
 }
 
 fn logUnsettledGeometry(observation: @FieldType(geometry_mod.Effect, "settled"), intent: geometry_mod.Intent) void {
@@ -5963,6 +6046,7 @@ fn removeWindow(wid: u32) void {
     const tab_group = g_state.windowTabGroup(wid);
     g_animator.cancel(wid);
     ax_mod.invalidateWindow(wid);
+    ax_writer.forgetWindow(wid);
     removeWindowIdentity(wid);
 
     if (tab_group) |group| reconcileTabGroupAfterRemoval(&group, wid);
@@ -6055,7 +6139,7 @@ fn removeStoppedAppWindows() bool {
         };
         const pid = stopped_pid orelse return removed_any;
 
-        ax_mod.invalidateApp(pid);
+        ax_writer.forgetApp(pid);
         ax_observer.unobserveApp(pid);
         removeAppWindows(pid);
         removed_any = true;
@@ -6343,9 +6427,10 @@ fn adoptDraggedFrame(
 }
 
 /// Apply ownership policy to geometry changed without an active pointer drag.
-/// Layout-owned windows are repaired from their desired frame; floating
-/// windows accept same-display application changes as their new restore frame.
-fn handleExternalWindowGeometry(wid: u32, frame: window_mod.Window.Frame) void {
+/// Layout-owned windows are repaired from their desired frame, after fitting
+/// the splits to it when the app made the change; floating windows accept
+/// same-display changes as their new restore frame.
+fn handleExternalWindowGeometry(wid: u32, frame: window_mod.Window.Frame, app_driven: bool) void {
     var win = managedWindow(wid) orelse return;
     const space = managedWindowSpace(win.wid) orelse return;
 
@@ -6356,7 +6441,8 @@ fn handleExternalWindowGeometry(wid: u32, frame: window_mod.Window.Frame) void {
         return;
     }
 
-    if (win.mode == .tiled or win.is_fullscreen) {
+    if (isLayoutOwned(wid)) {
+        if (app_driven) fitLayoutToWindowFrame(wid, frame);
         log.debug("geometry: external layout drift wid={d}; scheduling retile", .{wid});
         requestRetileDisplay(space.display_id);
         return;
@@ -6376,6 +6462,38 @@ fn handleExternalWindowGeometry(wid: u32, frame: window_mod.Window.Frame) void {
     win.frame = frame;
     win.float_frame = frame;
     _ = updateManagedWindow(win);
+}
+
+/// Move the splits around a tiled window to the size its app gave it, when
+/// `follow_app_resizes` is on. Edges the layout cannot move are left for the
+/// following retile to restore.
+fn fitLayoutToWindowFrame(wid: u32, frame: window_mod.Window.Frame) void {
+    if (!g_config.follow_app_resizes) return;
+    const leader_wid = g_state.windowTabLeader(wid);
+    const leader = managedWindow(leader_wid) orelse return;
+    if (leader.mode != .tiled or leader.is_fullscreen) return;
+    const space = managedWindowSpace(leader_wid) orelse return;
+    if (!spaceVisible(space)) return;
+    const display_slot = displayIndexById(space.display_id) orelse return;
+    const gaps = g_displays[display_slot].settings.gaps;
+
+    log.debug("geometry: fitting layout to app resize wid={d} leader={d}", .{ wid, leader_wid });
+    dispatchLayoutCommand(.{ .fit_window = .{
+        .space_key = space.key,
+        .window_id = leader_wid,
+        .root_frame = contentFrame(g_displays[display_slot].visible, gaps.outer),
+        .inner_gap = @floatFromInt(gaps.inner),
+        .observed = frame,
+    } }, space.display_id);
+
+    // The app already put the window here. Record it so the retile only
+    // writes it when the layout could not absorb the change; a redundant
+    // write would leave a manager intent that swallows the app's next resize.
+    if (managedWindow(wid)) |win| {
+        var updated = win;
+        updated.frame = frame;
+        _ = updateManagedWindow(updated);
+    }
 }
 
 /// Reconciles workspace/display state after monitor topology changes.
@@ -6419,8 +6537,9 @@ fn reconcileDisplayChange(cause: state_mod.DisplayReconcileCause) bool {
 /// fires. `two_pass` (fullscreen) always writes the full frame and re-issues
 /// it once: the stored size records intent, not what macOS actually granted,
 /// and clamped fullscreen sizes must be re-asserted even when the model
-/// believes they already match. Returns whether the final AX write was
-/// accepted so callers can avoid recording frames that were never applied.
+/// believes they already match. Returns whether the write was queued so
+/// callers can avoid recording frames that will never be applied; a write the
+/// app later rejects comes back as `geometry_write_failed`.
 fn applyWindowFrame(
     pid: i32,
     wid: u32,
@@ -6429,22 +6548,33 @@ fn applyWindowFrame(
     two_pass: bool,
     source: geometry_mod.IntentSource,
 ) bool {
-    // Choose position-only from observed physical geometry, not the stored
-    // target. External resize drift can leave the model already equal to the
-    // desired layout while WindowServer has a different size; consulting the
-    // model there would issue a move and permanently leave the bad size.
-    const physical = if (g_state.geometry.get(wid)) |entry| entry.observed orelse current else current;
-    if (!two_pass and physical.sizeApproxEqual(target, window_mod.Window.Frame.tolerance)) {
-        return setWindowPositionTracked(pid, wid, target.x, target.y, source);
+    const physical = physicalFrame(wid, current);
+    const tolerance = window_mod.Window.Frame.tolerance;
+    if (!two_pass and physical.sizeApproxEqual(target, tolerance)) {
+        return setWindowPositionTracked(pid, wid, target, source);
     }
-
-    var ok = false;
-    const passes: usize = if (two_pass) 2 else 1;
-    for (0..passes) |_| {
-        ok = ax_mod.setWindowFrame(pid, wid, target.x, target.y, target.width, target.height);
-    }
+    // Already at the target origin, so the layout frame fits where the
+    // window is and one AXSize write suffices. Each extra size write is a
+    // round trip into the app and, in Chromium apps, a full relayout (~4ms).
+    const kind: ax_writer.Write = if (two_pass)
+        .{ .position = true, .size = true, .guarded = true, .repeat = true }
+    else if (@abs(physical.x - target.x) <= tolerance and @abs(physical.y - target.y) <= tolerance)
+        .size_only
+    else
+        .frame;
+    const ok = ax_writer.write(pid, wid, target, kind);
     if (ok) recordFrameIntent(wid, target, source);
     return ok;
+}
+
+/// Last WindowServer frame sampled for `wid`, or `stored` when none exists.
+/// Writes must choose between move and resize from this, not the stored
+/// target: external resize drift (an app growing itself for a sidebar) leaves
+/// the model equal to the desired layout while WindowServer has a different
+/// size, and a move-only write would then permanently leave the bad size.
+fn physicalFrame(wid: u32, stored: window_mod.Window.Frame) window_mod.Window.Frame {
+    const entry = g_state.geometry.get(wid) orelse return stored;
+    return entry.observed orelse stored;
 }
 
 fn setWindowFrameTracked(
@@ -6453,24 +6583,25 @@ fn setWindowFrameTracked(
     target: window_mod.Window.Frame,
     source: geometry_mod.IntentSource,
 ) bool {
-    const ok = ax_mod.setWindowFrame(pid, wid, target.x, target.y, target.width, target.height);
+    const ok = ax_writer.write(pid, wid, target, .frame);
     if (ok) recordFrameIntent(wid, target, source);
     return ok;
 }
 
+/// Move without resizing. Takes the whole target frame because a queued
+/// resize for the same window merges with this write and needs its size.
 fn setWindowPositionTracked(
     pid: i32,
     wid: u32,
-    x: f64,
-    y: f64,
+    target: window_mod.Window.Frame,
     source: geometry_mod.IntentSource,
 ) bool {
-    const ok = ax_mod.setWindowPosition(pid, wid, x, y);
+    const ok = ax_writer.write(pid, wid, target, .position_only);
     if (ok) {
         dispatchStateEvent(.{ .geometry = .{ .accept_position = .{
             .window_id = wid,
-            .x = x,
-            .y = y,
+            .x = target.x,
+            .y = target.y,
             .source = source,
             .at_ns = nanoTimestamp(),
         } } });
@@ -6621,12 +6752,10 @@ fn retileDisplay(display_id: u32) void {
     const span = trace.begin("retile display");
     defer _ = span.endIfSlow();
 
-    ax_mod.beginGeometryBatch();
-    defer ax_mod.endGeometryBatch();
-
     const frame = contentFrame(display, gaps.outer);
 
     restoreFloatingWindows(ws, display, frame);
+    const following_app_resize = followingAppResize(ws.key);
 
     const window_count = g_state.layout.windowCount(ws.key);
     if (window_count == 0) return;
@@ -6660,6 +6789,11 @@ fn retileDisplay(display_id: u32) void {
         const visible_wid = g_state.windowTabActive(entry.wid);
         var visible = managedWindow(visible_wid) orelse continue;
 
+        // While an app is still resizing its own window, only its neighbors
+        // follow. Writing the window too would fight the app's animation;
+        // the trailing sample retiles it once the app is done.
+        if (g_config.follow_app_resizes and g_state.geometry.externalChangePending(visible_wid)) continue;
+
         // Fullscreen windows fill the outer-gap-inset frame, skipping BSP splits and inner gaps
         const target_frame = if (win.is_fullscreen) frame else entry.frame;
 
@@ -6670,8 +6804,8 @@ fn retileDisplay(display_id: u32) void {
             // mid-flight and they need the two-pass set below to land on the
             // exact display frame.
             var applied = true;
-            if (g_config.animation.enabled and !win.is_fullscreen) {
-                applied = g_animator.animate(display_id, visible.pid, visible_wid, visible.frame, target_frame, display_link.nowNs());
+            if (g_config.animation.enabled and !win.is_fullscreen and !following_app_resize) {
+                applied = g_animator.animate(display_id, visible.pid, visible_wid, physicalFrame(visible_wid, visible.frame), target_frame, display_link.nowNs());
                 if (applied) recordAnimationIntent(visible_wid, target_frame);
                 ensureAnimationFrames(display_id);
             } else {
@@ -6692,6 +6826,19 @@ fn retileDisplay(display_id: u32) void {
 
         applyFrameToTabGroup(entry.wid, target_frame);
     }
+}
+
+/// Whether an app is still resizing one of the layout's windows itself.
+/// Neighbors then track each step directly: an animation restarted on every
+/// app frame eases from scratch each time and trails visibly behind.
+fn followingAppResize(space_key: state_mod.SpaceKey) bool {
+    if (!g_config.follow_app_resizes) return false;
+    for (g_state.windows.items()) |managed_window| {
+        if (!managed_window.space_key.eql(space_key)) continue;
+        if (managed_window.mode != .tiled) continue;
+        if (g_state.geometry.externalChangePending(managed_window.window_id)) return true;
+    }
+    return false;
 }
 
 fn retileAllDisplays() void {

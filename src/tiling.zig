@@ -68,6 +68,13 @@ pub const Event = union(enum) {
     adjust_parent_ratio: struct { space_key: SpaceKey, window_id: WindowId, delta: f64 },
     set_parent_ratio: struct { space_key: SpaceKey, window_id: WindowId, ratio: f64 },
     resize_window: struct { space_key: SpaceKey, window_id: WindowId, delta: f64 },
+    fit_window: struct {
+        space_key: SpaceKey,
+        window_id: WindowId,
+        root_frame: Frame,
+        inner_gap: f64,
+        observed: Frame,
+    },
     mirror: struct { space_key: SpaceKey, axis: Direction },
     equalize: struct { space_key: SpaceKey, ratio: f64 },
     balance: SpaceKey,
@@ -181,6 +188,9 @@ pub fn reduce(model: *Self, event: Event) ?Effect {
         },
         .resize_window => |resize| {
             model.resizeWindow(resize.space_key, resize.window_id, resize.delta);
+        },
+        .fit_window => |fit| {
+            _ = model.fitWindow(fit.space_key, fit.window_id, fit.root_frame, fit.inner_gap, fit.observed);
         },
         .mirror => |operation| model.mirror(operation.space_key, operation.axis),
         .equalize => |operation| model.equalize(operation.space_key, operation.ratio),
@@ -437,6 +447,142 @@ fn resizeWindow(self: *Self, space_key: SpaceKey, window_id: WindowId, delta: f6
     // Ratios describe the first child; growing the second child must subtract.
     const signed_delta = if (self.findBspLeaf(split.first, window_id) != null) delta else -delta;
     split.ratio = clampedRatio(split.ratio + signed_delta);
+}
+
+/// Splits whose boundaries form a leaf's edges. Only the deepest split of each
+/// axis and side owns the edge; an edge without an owner lies on the layout's
+/// outer bounds and cannot move.
+const EdgeOwners = struct {
+    left: ?NodeId = null,
+    right: ?NodeId = null,
+    top: ?NodeId = null,
+    bottom: ?NodeId = null,
+};
+
+/// Target coordinates for owned edges. Null leaves that edge's split alone.
+const EdgeTargets = struct {
+    left: ?f64 = null,
+    right: ?f64 = null,
+    top: ?f64 = null,
+    bottom: ?f64 = null,
+};
+
+/// Move the splits around `window_id` so its tile takes the size of
+/// `observed`. Only size changes are adopted: an app that merely repositions
+/// a tiled window must not drag the layout with it. When the grown or shrunk
+/// edge lies on the layout bounds, the opposite edge absorbs the change, so
+/// an app growing past the screen edge takes the space from its neighbor.
+fn fitWindow(
+    self: *Self,
+    space_key: SpaceKey,
+    window_id: WindowId,
+    root_frame: Frame,
+    inner_gap: f64,
+    observed: Frame,
+) bool {
+    const state = self.layoutState(space_key) orelse return false;
+    if (state.kind != .bsp) return false;
+    const root = state.root orelse return false;
+    const owners = self.findEdgeOwners(root, window_id) orelse return false;
+    const tile = self.findLeafFrame(root, root_frame, inner_gap, window_id).?;
+
+    const horizontal = axisTargets(owners.left != null, owners.right != null, tile.x, tile.width, observed.x, observed.width);
+    const vertical = axisTargets(owners.top != null, owners.bottom != null, tile.y, tile.height, observed.y, observed.height);
+    const targets: EdgeTargets = .{
+        .left = horizontal[0],
+        .right = horizontal[1],
+        .top = vertical[0],
+        .bottom = vertical[1],
+    };
+    if (std.meta.eql(targets, EdgeTargets{})) return false;
+
+    // Walk top-down: an outer split's new ratio changes the frame every
+    // deeper owner's ratio is measured against.
+    var changed = false;
+    var node_id = root;
+    var frame = root_frame;
+    while (true) {
+        const split = switch (self.nodes[node_id]) {
+            .leaf => return changed,
+            .split => |value| value,
+        };
+        const in_first = self.findBspLeaf(split.first, window_id) != null;
+        const target: ?f64 = switch (split.direction) {
+            .horizontal => if (in_first)
+                (if (owners.right == node_id) targets.right else null)
+            else
+                (if (owners.left == node_id) targets.left else null),
+            .vertical => if (in_first)
+                (if (owners.bottom == node_id) targets.bottom else null)
+            else
+                (if (owners.top == node_id) targets.top else null),
+        };
+        if (target) |edge| {
+            const ratio = clampedRatio(ratioForEdge(split, frame, inner_gap, in_first, edge));
+            if (@abs(ratio - split.ratio) > std.math.floatEps(f64)) changed = true;
+            self.nodes[node_id].split.ratio = ratio;
+        }
+        const frames = splitFrames(frame, self.nodes[node_id].split, inner_gap);
+        frame = if (in_first) frames[0] else frames[1];
+        node_id = if (in_first) split.first else split.second;
+    }
+}
+
+fn findEdgeOwners(self: *const Self, root: NodeId, window_id: WindowId) ?EdgeOwners {
+    var owners: EdgeOwners = .{};
+    var node_id = root;
+    while (true) {
+        const split = switch (self.nodes[node_id]) {
+            .leaf => |leaf| return if (leaf.window_id == window_id) owners else null,
+            .split => |value| value,
+        };
+        const in_first = self.findBspLeaf(split.first, window_id) != null;
+        if (!in_first and self.findBspLeaf(split.second, window_id) == null) return null;
+        switch (split.direction) {
+            .horizontal => if (in_first) {
+                owners.right = node_id;
+            } else {
+                owners.left = node_id;
+            },
+            .vertical => if (in_first) {
+                owners.bottom = node_id;
+            } else {
+                owners.top = node_id;
+            },
+        }
+        node_id = if (in_first) split.first else split.second;
+    }
+}
+
+/// Edge targets along one axis, as `{ low, high }`. Returns no targets when
+/// the size is unchanged or neither edge can move.
+fn axisTargets(
+    low_owned: bool,
+    high_owned: bool,
+    tile_low: f64,
+    tile_size: f64,
+    observed_low: f64,
+    observed_size: f64,
+) [2]?f64 {
+    if (@abs(observed_size - tile_size) <= Frame.tolerance) return .{ null, null };
+    const tile_high = tile_low + tile_size;
+    if (low_owned and high_owned) return .{ observed_low, observed_low + observed_size };
+    if (high_owned) return .{ null, tile_low + observed_size };
+    if (low_owned) return .{ tile_high - observed_size, null };
+    return .{ null, null };
+}
+
+/// Ratio placing the boundary of `split` so the child holding the window has
+/// `edge` as its facing edge. Inverts `splitFrames`.
+fn ratioForEdge(split: Split, frame: Frame, inner_gap: f64, in_first: bool, edge: f64) f64 {
+    const half_gap = inner_gap / 2.0;
+    const origin, const extent = switch (split.direction) {
+        .horizontal => .{ frame.x, frame.width },
+        .vertical => .{ frame.y, frame.height },
+    };
+    if (extent <= 0) return split.ratio;
+    const boundary = if (in_first) edge + half_gap else edge - half_gap;
+    return (boundary - origin) / extent;
 }
 
 fn mirror(self: *Self, space_key: SpaceKey, axis: Direction) void {
@@ -1023,6 +1169,76 @@ test "resize ignores missing windows, singleton BSP and monocle layouts" {
             try testing.expectEqualDeep(original, resized);
         }
     }
+}
+
+fn fitTestFrames(model: Self, frame: Frame, gap: f64) ![3]Frame {
+    var entries: std.ArrayList(LayoutEntry) = .empty;
+    defer entries.deinit(testing.allocator);
+    try entries.ensureTotalCapacity(testing.allocator, 3);
+    model.computeLayout(first_space, frame, gap, &entries);
+    var frames: [3]Frame = undefined;
+    for (entries.items) |entry| frames[entry.wid - 1] = entry.frame;
+    return frames;
+}
+
+fn fitEvent(window_id: WindowId, gap: f64, observed: Frame) Event {
+    return .{ .fit_window = .{
+        .space_key = first_space,
+        .window_id = window_id,
+        .root_frame = test_frame,
+        .inner_gap = gap,
+        .observed = observed,
+    } };
+}
+
+test "fit moves the split an app grows or shrinks against" {
+    var model = reduceCopy(.{}, insertEvent(first_space, .bsp, 1)).model;
+    model = reduceCopy(model, insertEvent(first_space, .bsp, 2)).model;
+
+    // Window 2 sits at the right layout edge. Growing left takes from 1.
+    var fitted = reduceCopy(model, fitEvent(2, 10, .{ .x = 275, .y = 0, .width = 725, .height = 800 })).model;
+    var frames = try fitTestFrames(fitted, test_frame, 10);
+    try testing.expectApproxEqAbs(@as(f64, 265), frames[0].width, 0.001);
+    try testing.expectApproxEqAbs(@as(f64, 275), frames[1].x, 0.001);
+    try testing.expectApproxEqAbs(@as(f64, 725), frames[1].width, 0.001);
+
+    // Shrinking from the right layout edge moves the owned left edge, so the
+    // window stays flush with the bounds and window 1 takes the space.
+    fitted = reduceCopy(model, fitEvent(2, 10, .{ .x = 505, .y = 0, .width = 300, .height = 800 })).model;
+    frames = try fitTestFrames(fitted, test_frame, 10);
+    try testing.expectApproxEqAbs(@as(f64, 690), frames[0].width, 0.001);
+    try testing.expectApproxEqAbs(@as(f64, 700), frames[1].x, 0.001);
+    try testing.expectApproxEqAbs(@as(f64, 300), frames[1].width, 0.001);
+}
+
+test "fit adopts both edges through nested splits" {
+    var model = reduceCopy(.{}, insertEvent(first_space, .bsp, 1)).model;
+    model = reduceCopy(model, insertEvent(first_space, .bsp, 2)).model;
+    var insertion = insertEvent(first_space, .bsp, 3);
+    insertion.insert.options.anchor_wid = 2;
+    model = reduceCopy(model, insertion).model;
+
+    // Window 2 is the middle column: the root owns its left edge and the
+    // nested split its right edge, measured against the root's new frame.
+    const observed: Frame = .{ .x = 300, .y = 0, .width = 450, .height = 800 };
+    const fitted = reduceCopy(model, fitEvent(2, 10, observed)).model;
+    const frames = try fitTestFrames(fitted, test_frame, 10);
+    try testing.expect(frames[1].approxEqual(observed, 0.001));
+    try testing.expectApproxEqAbs(@as(f64, 290), frames[0].width, 0.001);
+    try testing.expectApproxEqAbs(@as(f64, 760), frames[2].x, 0.001);
+    try testing.expectApproxEqAbs(@as(f64, 240), frames[2].width, 0.001);
+}
+
+test "fit ignores pure moves and clamps oversized growth" {
+    var model = reduceCopy(.{}, insertEvent(first_space, .bsp, 1)).model;
+    model = reduceCopy(model, insertEvent(first_space, .bsp, 2)).model;
+
+    const moved = reduceCopy(model, fitEvent(2, 0, .{ .x = 300, .y = 0, .width = 500, .height = 800 })).model;
+    try testing.expectEqualDeep(model, moved);
+
+    const grown = reduceCopy(model, fitEvent(2, 0, .{ .x = 0, .y = 0, .width = 1000, .height = 800 })).model;
+    const frames = try fitTestFrames(grown, test_frame, 0);
+    try testing.expectApproxEqAbs(@as(f64, 100), frames[0].width, 0.001);
 }
 
 test "monocle reducer maintains focus order" {
