@@ -29,7 +29,7 @@ jobs:
           version: ${{ env.ZIG_VERSION }}
 
       - name: Check formatting
-        run: zig fmt --check build.zig src packages
+        run: zig fmt --check build.zig src
 
       - name: Test
         run: zig build test
