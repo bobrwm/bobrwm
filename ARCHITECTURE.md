@@ -33,6 +33,19 @@ macOS callbacks ──> observations ──> reducer ──> effects ──> mac
 The main thread owns the model and is the only place where reduction occurs.
 Background AX callbacks may enqueue observations, never mutate model state.
 
+## Native application boundary
+
+Swift owns `NSApplication` and process lifecycle. After AppKit finishes
+launching, the application delegate starts the statically linked Zig core; it
+stops the core from `applicationWillTerminate`. Signals and menu actions ask
+the Swift host to terminate normally rather than stopping AppKit from Zig.
+
+This boundary keeps future settings and onboarding UI in the native app while
+preserving one state owner: all Zig initialization, event draining, reduction,
+effects, IPC, and status-bar callbacks execute on AppKit's main thread. Only
+the dedicated AX observer and IPC transport perform background work, and they
+may only enqueue facts for the main-thread drain.
+
 ## State is truth, intent, or memory
 
 Every field must have one of three meanings:
