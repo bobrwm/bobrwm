@@ -7,14 +7,18 @@ import SwiftUI
 struct WorkspaceInfo: Identifiable {
     let id: UInt8
     let name: String
-    let shortcut: String?
+    let shortcut: Shortcut?
     var applicationNames: [String] = []
     var windowCount: UInt32 = 0
     var isActive = false
     var isFocused = false
 
+    var hasName: Bool {
+        !name.isEmpty && name != "\(id)"
+    }
+
     var label: String {
-        name.isEmpty || name == "\(id)" ? "Workspace \(id)" : name
+        hasName ? name : "Workspace \(id)"
     }
 }
 
@@ -185,6 +189,7 @@ final class SettingsModel: ObservableObject {
         workspaces = identities.map { identity in
             guard let state = previous[identity.id] else { return identity }
             var workspace = identity
+            workspace.applicationNames = state.applicationNames
             workspace.windowCount = state.windowCount
             workspace.isActive = state.isActive
             workspace.isFocused = state.isFocused
@@ -693,7 +698,7 @@ private struct WorkspaceSettingsRow: View {
             HStack(spacing: 6) {
                 Text(workspace.label)
                 if let shortcut = workspace.shortcut {
-                    Text(shortcut).foregroundStyle(.tertiary)
+                    ShortcutView(shortcut: shortcut).foregroundStyle(.tertiary)
                 }
             }
             Text(workspace.applicationNames.isEmpty

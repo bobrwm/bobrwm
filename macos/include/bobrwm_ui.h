@@ -36,15 +36,23 @@ typedef struct {
   void (*open_config)(void);
   bool (*reload_config)(void);
   bool (*set_settings)(const BWSettings *settings);
-  void (*previous_workspace)(void);
-  void (*next_workspace)(void);
   void (*switch_to_workspace)(uint8_t workspace_id);
   void (*quit)(void);
 } BWMenuBarCallbacks;
 
 typedef struct {
+  bool control;
+  bool option;
+  bool shift;
+  bool command;
+} BWModifiers;
+
+typedef struct {
   const char *name;
-  const char *shortcut;
+  // The config's key name ("1", "a", "left", "return", ...), or NULL when the
+  // workspace has no focus keybind.
+  const char *shortcut_key;
+  BWModifiers shortcut_modifiers;
   uint8_t id;
 } BWWorkspace;
 
@@ -58,11 +66,6 @@ typedef struct {
   uint8_t display_order;
 } BWWorkspaceState;
 
-typedef struct {
-  const char *previous_workspace;
-  const char *next_workspace;
-} BWActionShortcuts;
-
 // Swift owns NSApplication. It starts and stops the embedded Zig core from
 // its application delegate, while Zig can request normal AppKit termination.
 int bw_core_start(const char *config_path);
@@ -71,8 +74,7 @@ void bw_app_terminate(void);
 
 void bw_menubar_init(BWMenuBarCallbacks callbacks, const char *config_path);
 void bw_menubar_deinit(void);
-void bw_menubar_set_workspaces(const BWWorkspace *workspaces, size_t count,
-                               BWActionShortcuts shortcuts);
+void bw_menubar_set_workspaces(const BWWorkspace *workspaces, size_t count);
 void bw_menubar_set_state(const BWWorkspaceState *states, size_t count);
 void bw_menubar_set_settings(BWSettings settings);
 void bw_menubar_set_message(const char *message);

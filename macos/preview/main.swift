@@ -1,10 +1,10 @@
-// Offscreen render of the real menu bar views.
+// Offscreen render of the real menu bar UI.
 //
-// `zig build ui-preview` writes light and dark PNGs so the menu can be
-// iterated on without rebuilding bobrwm and interrupting a running window
-// manager. This links MenuRow.swift directly, so what it renders is what
-// ships; only the surrounding menu chrome is faked, since ImageRenderer
-// cannot reproduce AppKit's vibrancy.
+// `zig build ui-preview` writes light and dark PNGs so the UI can be iterated
+// on without rebuilding bobrwm and interrupting a running window manager. The
+// menu is the real NSMenu, popped up for a moment and captured from its own
+// window, so it briefly appears on screen; only the menu bar strip behind the
+// status item is faked.
 
 import AppKit
 import BobrwmUIABI
@@ -13,110 +13,128 @@ import SwiftUI
 struct Sample {
     let id: UInt8
     let name: String
-    let shortcut: String?
+    let shortcut: Shortcut?
     let count: UInt32
     var isActive = false
     var isFocused = false
-    var isHighlighted = false
 }
 
-let samples: [Sample] = [
-    .init(id: 1, name: "term", shortcut: "⌥1", count: 3, isActive: true, isFocused: true),
-    .init(id: 2, name: "web", shortcut: "⌥2", count: 1, isActive: true),
-    .init(id: 3, name: "chat", shortcut: "⌥3", count: 1, isHighlighted: true),
-    .init(id: 4, name: "4", shortcut: "⌥4", count: 0),
-    .init(id: 5, name: "mail", shortcut: "⌥A", count: 1),
-    .init(id: 6, name: "music", shortcut: "⌥S", count: 2),
-    .init(id: 7, name: "7", shortcut: "⌥D", count: 12),
-]
+let sampleCounts: [UInt8: UInt32] = [1: 2, 2: 1, 3: 3]
 
 let sampleApplications: [UInt8: [String]] = [
-    1: ["Ghostty", "Neovim"],
+    1: ["Finder"],
     2: ["Safari"],
-    3: ["Messages"],
-    5: ["Mail"],
-    6: ["Music"],
-    7: ["Finder", "Preview", "Xcode"],
+    3: ["Notes", "Preview"],
 ]
 
-func rowState(_ sample: Sample) -> RowState {
-    let state = RowState()
-    state.windowCount = sample.count
-    state.isActive = sample.isActive
-    state.isFocused = sample.isFocused
-    state.isHighlighted = sample.isHighlighted
-    return state
+/// The built-in defaults: ten unnamed workspaces, ⌥1-⌥9 bound and the tenth
+/// unbound. Workspace 1 is focused and 2 is visible on a second display.
+let samples: [Sample] = (1...10).map { id in
+    Sample(
+        id: id,
+        name: "",
+        shortcut: id < 10 ? .init(key: "\(id)", modifiers: .option) : nil,
+        count: sampleCounts[id] ?? 0,
+        isActive: id <= 2,
+        isFocused: id == 1
+    )
 }
 
-func actionState(highlighted: Bool = false) -> RowState {
-    let state = RowState()
-    state.isHighlighted = highlighted
-    return state
+final class PreviewMenuActions: NSObject, StatusMenuActions {
+    func switchToWorkspace(_ sender: NSMenuItem) {}
+    func retile(_ sender: NSMenuItem) {}
+    func reloadConfig(_ sender: NSMenuItem) {}
+    func openConfig(_ sender: NSMenuItem) {}
+    func showAbout(_ sender: NSMenuItem) {}
+    func showSettings(_ sender: NSMenuItem) {}
+    func quit(_ sender: NSMenuItem) {}
 }
 
 /// Display order can differ from numeric workspace order.
 func makeStatusModel() -> StatusModel {
     let model = StatusModel()
-    model.chips = samples.filter(\.isActive).reversed().map { sample in
-        .init(
-            id: sample.id,
-            label: sample.shortcut.map(shortcutKeyLabel) ?? "\(sample.id)",
-            name: sample.name == "\(sample.id)" ? "" : sample.name,
-            isFocused: sample.isFocused
-        )
-    }
+    model.chips = makeSettingsModel(accessibilityGranted: true).workspaces
+        .filter(\.isActive)
+        .reversed()
+        .map(StatusModel.Chip.init)
     return model
 }
 
-struct MenuPreview: View {
+/// A stand-in strip of system extras so the status item is judged in context.
+struct StatusPreview: View {
     let statusModel: StatusModel
     let scheme: ColorScheme
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 14) {
+        HStack(spacing: 14) {
+            Image(systemName: "wifi")
+            Image(systemName: "battery.75percent")
             StatusBarView(model: statusModel)
-                .background(RoundedRectangle(cornerRadius: 6).fill(.quaternary))
-
-            VStack(alignment: .leading, spacing: 0) {
-                SectionHeader(title: "Workspaces")
-
-                ForEach(samples, id: \.id) { sample in
-                    WorkspaceRow(
-                        state: rowState(sample),
-                        id: sample.id,
-                        name: sample.name,
-                        shortcut: sample.shortcut
-                    )
-                }
-
-                divider
-                ActionRow(state: actionState(), title: "Previous Workspace", shortcut: "⌃←")
-                ActionRow(state: actionState(), title: "Next Workspace", shortcut: "⌃→")
-
-                divider
-                ActionRow(state: actionState(), title: "Retile")
-                ActionRow(state: actionState(), title: "Reload Config")
-                ActionRow(state: actionState(highlighted: true), title: "Open Config File")
-
-                divider
-                ActionRow(state: actionState(), title: "About Bobrwm")
-                ActionRow(state: actionState(), title: "Settings…", shortcut: "⌘,")
-
-                divider
-                ActionRow(state: actionState(), title: "Quit Bobrwm", shortcut: "⌘Q")
-            }
-            .padding(.vertical, 5)
-            .frame(width: 250)
-            .background(RoundedRectangle(cornerRadius: 10, style: .continuous).fill(.background))
+            Image(systemName: "magnifyingglass")
+            Text("Wed 21 Oct  9:41")
         }
-        .padding(20)
+        .font(.system(size: 13))
+        .padding(.horizontal, 12)
+        .frame(height: 30)
         // Opaque: a transparent render composites against whatever the viewer
-        // uses, which makes outlined chips look like they failed to draw.
-        .background(scheme == .dark ? Color.black : Color(white: 0.96))
+        // uses, which hides how the glyphs read on a real menu bar.
+        .background(scheme == .dark ? Color(white: 0.12) : Color(white: 0.92))
     }
+}
 
-    private var divider: some View {
-        Divider().padding(.horizontal, 12).padding(.vertical, 4)
+/// Pops up the real menu and captures its window while tracking. The capture
+/// runs from a timer in the common modes because `popUp` blocks in the menu
+/// tracking run loop until `cancelTracking`.
+@MainActor
+func renderMenu(path: String, appearance: NSAppearance.Name) -> Bool {
+    let model = makeSettingsModel(accessibilityGranted: true)
+    let actions = PreviewMenuActions()
+    let statusMenu = StatusMenu()
+    statusMenu.rebuild(
+        workspaces: model.workspaces,
+        target: actions
+    )
+    NSApplication.shared.appearance = NSAppearance(named: appearance)
+
+    var png: Data?
+    let capture = Timer(timeInterval: 0.3, repeats: false) { _ in
+        defer { statusMenu.menu.cancelTracking() }
+        let menuWindow = NSApplication.shared.windows.first {
+            $0.isVisible && String(describing: type(of: $0)).contains("Menu")
+        }
+        guard let frameView = menuWindow?.contentView?.superview,
+            let rep = frameView.bitmapImageRepForCachingDisplay(in: frameView.bounds)
+        else { return }
+        frameView.cacheDisplay(in: frameView.bounds, to: rep)
+        png = rep.representation(using: .png, properties: [:])
+    }
+    // Highlights a row so the render also shows how badges and counts read
+    // on the selection. Private, but this harness never ships.
+    let highlight = Timer(timeInterval: 0.15, repeats: false) { _ in
+        let selector = Selector(("highlightItem:"))
+        guard statusMenu.menu.responds(to: selector), statusMenu.menu.items.count > 3 else { return }
+        statusMenu.menu.perform(selector, with: statusMenu.menu.items[3])
+    }
+    RunLoop.main.add(highlight, forMode: .common)
+    RunLoop.main.add(capture, forMode: .common)
+
+    // Anchored at the top of the screen so the menu has room to show every
+    // row instead of scrolling.
+    let top = NSScreen.main?.visibleFrame.maxY ?? 800
+    statusMenu.menu.popUp(positioning: nil, at: NSPoint(x: 40, y: top - 10), in: nil)
+    NSApplication.shared.appearance = nil
+
+    guard let png else {
+        FileHandle.standardError.write(Data("menu capture failed: \(path)\n".utf8))
+        return false
+    }
+    do {
+        try png.write(to: URL(fileURLWithPath: path))
+        print(path)
+        return true
+    } catch {
+        FileHandle.standardError.write(Data("write failed: \(path): \(error)\n".utf8))
+        return false
     }
 }
 
@@ -283,15 +301,16 @@ func renderAll(into directory: String) -> Bool {
         ("light", ColorScheme.light, NSAppearance.Name.aqua),
         ("dark", ColorScheme.dark, NSAppearance.Name.darkAqua),
     ] {
-        let menu = MenuPreview(statusModel: makeStatusModel(), scheme: scheme)
+        let status = StatusPreview(statusModel: makeStatusModel(), scheme: scheme)
             .environment(\.colorScheme, scheme)
         // SwiftUI's colorScheme drives Color.background and friends, while
         // NSColor-backed styles resolve against the drawing appearance.
         ok = render(
-            menu,
-            path: "\(directory)/menu-\(suffix).png",
+            status,
+            path: "\(directory)/status-\(suffix).png",
             appearance: appearance
         ) && ok
+        ok = renderMenu(path: "\(directory)/menu-\(suffix).png", appearance: appearance) && ok
         for pane in SettingsPane.allCases {
             ok = renderPane(
                 pane,

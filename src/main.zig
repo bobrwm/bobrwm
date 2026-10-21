@@ -2947,8 +2947,6 @@ fn startCore(config_path_arg: ?[]const u8) !void {
             .open_config = statusBarOpenConfig,
             .reload_config = statusBarReloadConfig,
             .set_settings = statusBarSetSettings,
-            .previous_workspace = statusBarPreviousWorkspace,
-            .next_workspace = statusBarNextWorkspace,
             .switch_to_workspace = statusBarSwitchToWorkspace,
             .quit = statusBarQuit,
         },
@@ -3307,14 +3305,6 @@ fn statusBarSetSettings(settings: *const statusbar.Settings) callconv(.c) bool {
 fn invalidAppSettings() bool {
     notifyConfigReloadFailed("Settings contain an unsupported value");
     return false;
-}
-
-fn statusBarPreviousWorkspace() callconv(.c) void {
-    switchAdjacentWorkspace(.previous);
-}
-
-fn statusBarNextWorkspace() callconv(.c) void {
-    switchAdjacentWorkspace(.next);
 }
 
 fn statusBarSwitchToWorkspace(workspace_id: u8) callconv(.c) void {

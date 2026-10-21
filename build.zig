@@ -243,7 +243,7 @@ pub fn build(b: *std.Build) !void {
     swift_app.addFileArg(b.path("macos/src/main.swift"));
     swift_app.addFileArg(b.path("macos/src/Settings.swift"));
     swift_app.addFileArg(b.path("macos/src/MenuBar.swift"));
-    swift_app.addFileArg(b.path("macos/src/MenuRow.swift"));
+    swift_app.addFileArg(b.path("macos/src/StatusMenu.swift"));
     swift_app.addFileArg(linked_archive);
     swift_app.addFileArg(oslog_object);
     for ([_][]const u8{
@@ -332,9 +332,10 @@ pub fn build(b: *std.Build) !void {
     const run_step = b.step("run", "Run bobrwm");
     run_step.dependOn(&run_cmd.step);
 
-    // Renders the menu bar views to PNGs so the UI can be iterated on without
-    // rebuilding bobrwm and interrupting a running window manager. MenuRow.swift
-    // has no dependency on the C ABI module, so it links standalone.
+    // Renders the menu bar UI to PNGs so it can be iterated on without
+    // rebuilding bobrwm and interrupting a running window manager.
+    // StatusMenu.swift sends actions through a protocol rather than the C ABI
+    // callbacks, so the harness links it without the core.
     const preview_build = b.addSystemCommand(&.{
         "swiftc",
         "-swift-version",
@@ -349,7 +350,7 @@ pub fn build(b: *std.Build) !void {
     }
     const preview_exe = preview_build.addPrefixedOutputFileArg("-o", "bobrwm-ui-preview");
     preview_build.addPrefixedDirectoryArg("-I", b.path("macos/include"));
-    preview_build.addFileArg(b.path("macos/src/MenuRow.swift"));
+    preview_build.addFileArg(b.path("macos/src/StatusMenu.swift"));
     preview_build.addFileArg(b.path("macos/src/Settings.swift"));
     preview_build.addFileArg(b.path("macos/preview/main.swift"));
 
