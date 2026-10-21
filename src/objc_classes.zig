@@ -1,12 +1,13 @@
 //! Runtime-defined Objective-C classes used by bobrwm.
 //!
-//! Two BW* classes are registered with the ObjC runtime via zig-objc's
+//! Three BW* classes are registered with the ObjC runtime via zig-objc's
 //! `allocateClassPair` / `addMethod` helpers:
 //!
 //!   - `BWObserver` — NSWorkspace + NSApplication notification target
 //!   - `BWLaunchGate` — per-pid KVO gate that defers app-launched events
 //!     until the process is finished launching AND has Regular activation
 //!     policy (Electron apps need both).
+//!   - `BWDisplayLinkTarget` — CADisplayLink target that forwards each frame.
 //!
 //! Memory management is MRR (no ARC). Every `alloc/init` pair owns a +1
 //! retain that we balance manually.
@@ -38,6 +39,16 @@ pub fn register(allocator: std.mem.Allocator, callbacks: Callbacks) void {
     g_launch_gates = .init(allocator);
     registerObserver();
     registerLaunchGate();
+}
+
+/// Register `BWDisplayLinkTarget`. Separate from `register` because the first
+/// retile animates before the workspace observers exist.
+pub fn registerDisplayLinkTarget(fired: *const fn (objc.Object) void) void {
+    g_display_link_fired = fired;
+    const NSObject = objc.getClass("NSObject").?;
+    var cls = objc.allocateClassPair(NSObject, "BWDisplayLinkTarget").?;
+    _ = cls.addMethod("displayLinkFired:", displayLinkFired);
+    objc.registerClassPair(cls);
 }
 
 /// Detach every outstanding KVO gate and release application-owned storage.
@@ -189,6 +200,14 @@ fn dropLaunchGate(pid: i32) void {
     app.msgSend(void, "removeObserver:forKeyPath:", .{ gate, nsString("activationPolicy") });
     app.msgSend(void, "release", .{});
     gate.msgSend(void, "release", .{});
+}
+
+// BWDisplayLinkTarget
+
+var g_display_link_fired: *const fn (objc.Object) void = undefined;
+
+fn displayLinkFired(_: c.id, _: c.SEL, link_id: c.id) callconv(.c) void {
+    g_display_link_fired(.{ .value = link_id });
 }
 
 fn nsString(literal: [*:0]const u8) objc.Object {

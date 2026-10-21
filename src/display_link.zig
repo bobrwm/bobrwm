@@ -1,20 +1,19 @@
 //! Display-synchronized frame clock for window animations. Each display with
-//! an in-flight animation gets a CVDisplayLink that fires once per refresh
-//! on a CoreVideo thread. The callback only records when the frame will reach
-//! the screen and signals a DATA_OR dispatch source on the main queue, because
-//! AX writes and animator state belong to the main thread. The source
-//! coalesces signals, so a busy main thread drops frames instead of draining
-//! a backlog of stale ones, and cancelling it guarantees no frame runs after
-//! stop. Animations are sampled at that output time instead of at whenever a
+//! an in-flight animation gets a CADisplayLink from its NSScreen, scheduled
+//! on the main run loop in common modes so frames keep coming while a menu
+//! is tracking. Frames run on the main thread, where AX writes and animator
+//! state belong, and a busy main thread skips refreshes instead of draining
+//! a backlog of stale ones. Animations are sampled at the link's target
+//! timestamp, when the frame will reach the screen, instead of at whenever a
 //! fixed timer happened to fire, so steps are evenly spaced on 60 Hz,
 //! ProMotion, and mixed-rate setups alike.
 //!
-//! CVDisplayLink is deprecated in favour of NSScreen.displayLink, but that
-//! needs macOS 14 and the deployment target is macOS 13.
+//! Memory management is MRR: each running slot owns a +1 retain on its link.
 
 const std = @import("std");
-const c = @import("c");
+const objc = @import("objc");
 const cg_extra = @import("cg_extra");
+const objc_classes = @import("objc_classes.zig");
 const workspace = @import("workspace.zig");
 
 const log = std.log.scoped(.display_link);
@@ -25,16 +24,14 @@ pub const FrameFn = *const fn (display_id: u32, target_ns: i128) void;
 
 const Link = struct {
     display_id: u32 = 0,
-    /// Main thread only; null while stopped.
-    ref: cg_extra.CVDisplayLinkRef = null,
-    /// Main-queue frame source the CoreVideo thread signals. Set before the
-    /// link starts and cleared after it stops, so the callback always sees it.
-    source: c.dispatch_source_t = null,
-    target_host_time: std.atomic.Value(u64) = .init(0),
+    /// +1 retain on the CADisplayLink; null while stopped.
+    ref: ?objc.Object = null,
 };
 
-/// Static storage: the CoreVideo thread and frame sources hold raw pointers
-/// to these slots, so they must never move or be freed.
+/// `NSString * const` exported by Foundation. Declared `extern var` for the
+/// same reason as `NSWorkspaceApplicationKey` in objc_classes.zig.
+extern var NSRunLoopCommonModes: objc.c.id;
+
 var g_links: [workspace.max_displays]Link = @splat(.{});
 var g_on_frame: ?FrameFn = null;
 var g_timebase: cg_extra.mach_timebase_info_data_t = .{ .numer = 0, .denom = 0 };
@@ -43,13 +40,15 @@ pub fn init(on_frame: FrameFn) void {
     g_on_frame = on_frame;
     _ = cg_extra.mach_timebase_info(&g_timebase);
     std.debug.assert(g_timebase.denom != 0);
+    objc_classes.registerDisplayLinkTarget(fired);
 }
 
 /// Monotonic nanoseconds on the display link's clock (mach absolute time,
-/// which pauses during system sleep). Animation start times must use this
-/// clock so they compare against frame target times.
+/// which pauses during system sleep and is what CACurrentMediaTime reports).
+/// Animation start times must use this clock so they compare against frame
+/// target times.
 pub fn nowNs() i128 {
-    return hostTimeToNs(cg_extra.mach_absolute_time());
+    return @divTrunc(@as(i128, cg_extra.mach_absolute_time()) * g_timebase.numer, g_timebase.denom);
 }
 
 /// Start delivering frames for `display_id`. No-op if already running.
@@ -60,46 +59,46 @@ pub fn start(display_id: u32) bool {
         log.warn("no free display link slot display={d}", .{display_id});
         return false;
     };
+    const screen = screenForDisplay(display_id) orelse {
+        log.warn("display link screen missing display={d}", .{display_id});
+        return false;
+    };
 
-    var ref: cg_extra.CVDisplayLinkRef = null;
-    if (cg_extra.CVDisplayLinkCreateWithCGDisplay(display_id, &ref) != cg_extra.kCVReturnSuccess) {
+    // The link retains its target, so the target needs no other owner.
+    const BWDisplayLinkTarget = objc.getClass("BWDisplayLinkTarget").?;
+    const target = BWDisplayLinkTarget.msgSend(objc.Object, "alloc", .{})
+        .msgSend(objc.Object, "init", .{});
+    defer target.msgSend(void, "release", .{});
+
+    const ref = screen.msgSend(objc.Object, "displayLinkWithTarget:selector:", .{
+        target,
+        objc.sel("displayLinkFired:"),
+    });
+    if (ref.value == null) {
         log.warn("display link create failed display={d}", .{display_id});
         return false;
     }
-    const source = c.dispatch_source_create(
-        cg_extra.DISPATCH_SOURCE_TYPE_DATA_OR(),
-        0,
-        0,
-        cg_extra.dispatch_get_main_queue(),
-    ) orelse {
-        log.warn("frame source create failed display={d}", .{display_id});
-        cg_extra.CVDisplayLinkRelease(ref);
-        return false;
-    };
-    c.dispatch_set_context(.{ ._ds = source }, link);
-    c.dispatch_source_set_event_handler_f(source, runFrame);
-    c.dispatch_resume(.{ ._ds = source });
 
-    link.display_id = display_id;
-    link.ref = ref;
-    link.source = source;
-    if (cg_extra.CVDisplayLinkSetOutputCallback(ref, outputCallback, link) != cg_extra.kCVReturnSuccess or
-        cg_extra.CVDisplayLinkStart(ref) != cg_extra.kCVReturnSuccess)
-    {
-        log.warn("display link start failed display={d}", .{display_id});
-        release(link);
-        return false;
-    }
+    const NSRunLoop = objc.getClass("NSRunLoop").?;
+    const run_loop = NSRunLoop.msgSend(objc.Object, "mainRunLoop", .{});
+    ref.msgSend(void, "addToRunLoop:forMode:", .{ run_loop, objc.Object{ .value = NSRunLoopCommonModes } });
+
+    _ = ref.msgSend(objc.Object, "retain", .{});
+    link.* = .{ .display_id = display_id, .ref = ref };
     return true;
 }
 
 /// Stop and release the link for `display_id`. No frame runs after this.
 pub fn stop(display_id: u32) void {
     const link = running(display_id) orelse return;
-    // CVDisplayLinkStop waits for an in-flight output callback, so the
-    // CoreVideo thread is done with the source before it is cancelled.
-    _ = cg_extra.CVDisplayLinkStop(link.ref);
-    release(link);
+    const ref = link.ref.?;
+    link.ref = null;
+
+    // Invalidating removes the link from the run loop. Autorelease rather
+    // than release: stop runs from inside the link's own frame callback when
+    // the last animation lands, and the link must outlive that dispatch.
+    ref.msgSend(void, "invalidate", .{});
+    ref.msgSend(void, "autorelease", .{});
 }
 
 pub fn stopAll() void {
@@ -122,37 +121,33 @@ fn idleSlot() ?*Link {
     return null;
 }
 
-/// Cancelling on the main queue, which runs the handler, means a signal
-/// still pending is dropped rather than delivered to the slot's next display.
-/// GCD keeps the source alive until cancellation completes.
-fn release(link: *Link) void {
-    c.dispatch_source_cancel(link.source);
-    c.dispatch_release(.{ ._ds = link.source });
-    cg_extra.CVDisplayLinkRelease(link.ref);
-    link.source = null;
-    link.ref = null;
+fn screenForDisplay(display_id: u32) ?objc.Object {
+    const NSScreen = objc.getClass("NSScreen").?;
+    const screens = NSScreen.msgSend(objc.Object, "screens", .{});
+    const count = screens.msgSend(usize, "count", .{});
+    const NSString = objc.getClass("NSString").?;
+    const screen_number_key = NSString.msgSend(objc.Object, "stringWithUTF8String:", .{"NSScreenNumber"});
+
+    for (0..count) |i| {
+        const screen = screens.msgSend(objc.Object, "objectAtIndex:", .{i});
+        const description = screen.msgSend(objc.Object, "deviceDescription", .{});
+        const number = description.msgSend(objc.Object, "objectForKey:", .{screen_number_key});
+        if (number.value == null) continue;
+        if (number.msgSend(u32, "unsignedIntValue", .{}) == display_id) return screen;
+    }
+    return null;
 }
 
-fn hostTimeToNs(host_time: u64) i128 {
-    return @divTrunc(@as(i128, host_time) * g_timebase.numer, g_timebase.denom);
-}
+/// Runs on the main thread from the link's run loop source.
+fn fired(ref: objc.Object) void {
+    const link = for (&g_links) |*link| {
+        if (link.ref) |owned| {
+            if (owned.value == ref.value) break link;
+        }
+    } else return;
 
-/// Runs on the CoreVideo display link thread.
-fn outputCallback(
-    _: cg_extra.CVDisplayLinkRef,
-    _: *const cg_extra.CVTimeStamp,
-    output_time: *const cg_extra.CVTimeStamp,
-    _: cg_extra.CVOptionFlags,
-    _: *cg_extra.CVOptionFlags,
-    context: ?*anyopaque,
-) callconv(.c) cg_extra.CVReturn {
-    const link: *Link = @ptrCast(@alignCast(context.?));
-    link.target_host_time.store(output_time.host_time, .release);
-    c.dispatch_source_merge_data(link.source, 1);
-    return cg_extra.kCVReturnSuccess;
-}
-
-fn runFrame(context: ?*anyopaque) callconv(.c) void {
-    const link: *Link = @ptrCast(@alignCast(context.?));
-    g_on_frame.?(link.display_id, hostTimeToNs(link.target_host_time.load(.acquire)));
+    // CFTimeInterval on the CACurrentMediaTime clock, i.e. mach absolute
+    // time in seconds, which is the same clock as nowNs.
+    const target_s = ref.msgSend(f64, "targetTimestamp", .{});
+    g_on_frame.?(link.display_id, @intFromFloat(target_s * std.time.ns_per_s));
 }

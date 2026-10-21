@@ -1,5 +1,5 @@
-//! Hand-written declarations for CoreGraphics, CoreVideo, and libdispatch
-//! symbols that Aro (Zig 0.16's translate-c backend) cannot expose:
+//! Hand-written declarations for CoreGraphics and libdispatch symbols
+//! that Aro (Zig 0.16's translate-c backend) cannot expose:
 //!
 //! - `CGEvent.h` / `CGWindow.h` use Apple blocks syntax that Aro does
 //!   not parse, so they are excluded from `c.h`.
@@ -10,8 +10,8 @@
 //!   sizes are unknown. Re-declaring them as `anyopaque` and casting
 //!   gives a working pointer at link time.
 //!
-//! Linked against the CoreGraphics and CoreVideo frameworks and libdispatch
-//! via libSystem (see build.zig).
+//! Linked against the CoreGraphics framework and libdispatch via
+//! libSystem (see build.zig).
 
 const c = @import("c");
 
@@ -129,7 +129,6 @@ pub extern var _dispatch_main_q: anyopaque;
 pub extern const _dispatch_source_type_timer: anyopaque;
 pub extern const _dispatch_source_type_read: anyopaque;
 pub extern const _dispatch_source_type_vnode: anyopaque;
-pub extern const _dispatch_source_type_data_or: anyopaque;
 
 pub inline fn dispatch_get_main_queue() c.dispatch_queue_t {
     return @ptrCast(&_dispatch_main_q);
@@ -146,61 +145,6 @@ pub inline fn DISPATCH_SOURCE_TYPE_READ() c.dispatch_source_type_t {
 pub inline fn DISPATCH_SOURCE_TYPE_VNODE() c.dispatch_source_type_t {
     return @ptrCast(&_dispatch_source_type_vnode);
 }
-
-pub inline fn DISPATCH_SOURCE_TYPE_DATA_OR() c.dispatch_source_type_t {
-    return @ptrCast(&_dispatch_source_type_data_or);
-}
-
-// CoreVideo — CVDisplayLink.h pulls in CGDirectDisplay.h, which c.h excludes.
-
-pub const CVReturn = i32;
-pub const kCVReturnSuccess: CVReturn = 0;
-pub const CVOptionFlags = u64;
-pub const CVDisplayLinkRef = ?*opaque {};
-
-pub const CVSMPTETime = extern struct {
-    subframes: i16,
-    subframe_divisor: i16,
-    counter: u32,
-    type: u32,
-    flags: u32,
-    hours: i16,
-    minutes: i16,
-    seconds: i16,
-    frames: i16,
-};
-
-pub const CVTimeStamp = extern struct {
-    version: u32,
-    video_time_scale: i32,
-    video_time: i64,
-    /// Mach absolute time (`mach_absolute_time` units).
-    host_time: u64,
-    rate_scalar: f64,
-    video_refresh_period: i64,
-    smpte_time: CVSMPTETime,
-    flags: u64,
-    reserved: u64,
-};
-
-pub const CVDisplayLinkOutputCallback = *const fn (
-    link: CVDisplayLinkRef,
-    now: *const CVTimeStamp,
-    output_time: *const CVTimeStamp,
-    flags_in: CVOptionFlags,
-    flags_out: *CVOptionFlags,
-    context: ?*anyopaque,
-) callconv(.c) CVReturn;
-
-pub extern fn CVDisplayLinkCreateWithCGDisplay(display: u32, link_out: *CVDisplayLinkRef) CVReturn;
-pub extern fn CVDisplayLinkSetOutputCallback(
-    link: CVDisplayLinkRef,
-    callback: CVDisplayLinkOutputCallback,
-    context: ?*anyopaque,
-) CVReturn;
-pub extern fn CVDisplayLinkStart(link: CVDisplayLinkRef) CVReturn;
-pub extern fn CVDisplayLinkStop(link: CVDisplayLinkRef) CVReturn;
-pub extern fn CVDisplayLinkRelease(link: CVDisplayLinkRef) void;
 
 pub const mach_timebase_info_data_t = extern struct {
     numer: u32,
