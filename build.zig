@@ -623,6 +623,20 @@ pub fn build(b: *std.Build) !void {
 
     const run_cli_tests = b.addRunArtifact(cli_tests);
 
+    const lua_sandbox_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/lua_sandbox.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    lua_sandbox_test_mod.addImport("zlua", zlua_mod);
+
+    const lua_sandbox_tests = b.addTest(.{
+        .name = "lua-sandbox-tests",
+        .root_module = lua_sandbox_test_mod,
+    });
+
+    const run_lua_sandbox_tests = b.addRunArtifact(lua_sandbox_tests);
+
     const config_format_test_mod = b.createModule(.{
         .root_source_file = b.path("src/config_format.zig"),
         .target = target,
@@ -656,6 +670,7 @@ pub fn build(b: *std.Build) !void {
     test_step.dependOn(&run_helpgen_tests.step);
     test_step.dependOn(&run_cli_tests.step);
     test_step.dependOn(&run_config_format_tests.step);
+    test_step.dependOn(&run_lua_sandbox_tests.step);
     // Running the generator itself catches doc lookups broken by renamed
     // containers or fields, which the unit tests cannot see.
     test_step.dependOn(&help_strings.run.step);
