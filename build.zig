@@ -250,6 +250,7 @@ pub fn build(b: *std.Build) !void {
         "Carbon",
         "AppKit",
         "CoreFoundation",
+        "CoreVideo",
         "ServiceManagement",
     }) |framework| {
         swift_app.addArgs(&.{ "-framework", framework });

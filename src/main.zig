@@ -2909,11 +2909,7 @@ fn stopCore() void {
     if (coreReached(.ax_observer)) {
         setMouseEventTapEnabled(false);
     }
-    if (g_animator_source) |source| {
-        c.dispatch_source_cancel(source);
-        c.dispatch_release(.{ ._ds = source });
-        g_animator_source = null;
-    }
+    display_link.stopAll();
     deinitMainRunLoopSources();
     if (coreReached(.ax_observer)) {
         ax_observer.deinit();
