@@ -36,6 +36,7 @@ pub fn build(b: *std.Build) !void {
     const target = b.resolveTargetQuery(.{
         .cpu_arch = .aarch64,
         .os_tag = .macos,
+        .os_version_min = .{ .semver = .{ .major = 15, .minor = 0, .patch = 0 } },
     });
     const optimize = b.standardOptimizeOption(.{});
     const app_version = try AppVersion.resolve(b, app_zon_version);
@@ -214,7 +215,7 @@ pub fn build(b: *std.Build) !void {
         "clang",
         "-c",
         "-target",
-        "arm64-apple-macos13.0",
+        "arm64-apple-macos15.0",
         "-isysroot",
         sdk_root,
     });
@@ -226,7 +227,7 @@ pub fn build(b: *std.Build) !void {
         "-swift-version",
         "5",
         "-target",
-        "arm64-apple-macos13.0",
+        "arm64-apple-macos15.0",
         "-module-name",
         "Bobrwm",
         "-sdk",
@@ -339,7 +340,7 @@ pub fn build(b: *std.Build) !void {
         "-swift-version",
         "5",
         "-target",
-        "arm64-apple-macos13.0",
+        "arm64-apple-macos15.0",
         "-sdk",
         swift_sdk_root,
     });
@@ -751,7 +752,7 @@ fn bundleInfoPlist(b: *std.Build, version: std.SemanticVersion) std.Build.LazyPa
         \\    <key>CFBundleVersion</key>
         \\    <string>{[version]s}</string>
         \\    <key>LSMinimumSystemVersion</key>
-        \\    <string>13.0</string>
+        \\    <string>15.0</string>
         \\    <key>LSUIElement</key>
         \\    <true/>
         \\</dict>
