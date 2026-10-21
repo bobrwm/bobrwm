@@ -67,7 +67,7 @@ final class StatusMenu {
         addItem("Open Config File", #selector(StatusMenuActions.openConfig(_:)), nil, target)
         menu.addItem(.separator())
 
-        addItem("About Bobrwm", #selector(StatusMenuActions.showAbout(_:)), nil, target)
+        addItem("About BobrWM", #selector(StatusMenuActions.showAbout(_:)), nil, target)
         addItem(
             "Settings…",
             #selector(StatusMenuActions.showSettings(_:)),
@@ -77,7 +77,7 @@ final class StatusMenu {
         menu.addItem(.separator())
 
         addItem(
-            "Quit Bobrwm",
+            "Quit BobrWM",
             #selector(StatusMenuActions.quit(_:)),
             .init(key: "q", modifiers: .command),
             target
@@ -155,6 +155,65 @@ final class StatusMenu {
 enum KeyLabel: Equatable {
     case text(String)
     case symbol(String)
+}
+
+// Never shown for an accessory app, but its key equivalents still reach the
+// Settings window: without it, Copy, Paste, Undo, and Close do nothing there.
+enum MainMenu {
+    static func make(target: StatusMenuActions) -> NSMenu {
+        let main = NSMenu()
+
+        let app = submenu(of: main, "BobrWM")
+        app.addItem(item("About BobrWM", #selector(StatusMenuActions.showAbout(_:)), "", target))
+        app.addItem(.separator())
+        app.addItem(item("Settings…", #selector(StatusMenuActions.showSettings(_:)), ",", target))
+        app.addItem(.separator())
+        let services = submenu(of: app, "Services")
+        NSApplication.shared.servicesMenu = services
+        app.addItem(.separator())
+        app.addItem(item("Hide BobrWM", #selector(NSApplication.hide(_:)), "h"))
+        let hideOthers = item("Hide Others", #selector(NSApplication.hideOtherApplications(_:)), "h")
+        hideOthers.keyEquivalentModifierMask = [.command, .option]
+        app.addItem(hideOthers)
+        app.addItem(item("Show All", #selector(NSApplication.unhideAllApplications(_:)), ""))
+        app.addItem(.separator())
+        app.addItem(item("Quit BobrWM", #selector(StatusMenuActions.quit(_:)), "q", target))
+
+        let edit = submenu(of: main, "Edit")
+        edit.addItem(item("Undo", Selector(("undo:")), "z"))
+        let redo = item("Redo", Selector(("redo:")), "z")
+        redo.keyEquivalentModifierMask = [.command, .shift]
+        edit.addItem(redo)
+        edit.addItem(.separator())
+        edit.addItem(item("Cut", #selector(NSText.cut(_:)), "x"))
+        edit.addItem(item("Copy", #selector(NSText.copy(_:)), "c"))
+        edit.addItem(item("Paste", #selector(NSText.paste(_:)), "v"))
+        edit.addItem(item("Select All", #selector(NSText.selectAll(_:)), "a"))
+
+        let window = submenu(of: main, "Window")
+        window.addItem(item("Close", #selector(NSWindow.performClose(_:)), "w"))
+        window.addItem(item("Minimize", #selector(NSWindow.performMiniaturize(_:)), "m"))
+        NSApplication.shared.windowsMenu = window
+
+        return main
+    }
+
+    private static func submenu(of parent: NSMenu, _ title: String) -> NSMenu {
+        let menu = NSMenu(title: title)
+        let item = NSMenuItem(title: title, action: nil, keyEquivalent: "")
+        item.submenu = menu
+        parent.addItem(item)
+        return menu
+    }
+
+    // A nil target sends the action down the responder chain.
+    private static func item(
+        _ title: String, _ action: Selector, _ key: String, _ target: AnyObject? = nil
+    ) -> NSMenuItem {
+        let item = NSMenuItem(title: title, action: action, keyEquivalent: key)
+        item.target = target
+        return item
+    }
 }
 
 struct Shortcut {
@@ -310,6 +369,7 @@ struct StatusBarView: View {
         .padding(.horizontal, 6)
         .frame(height: 22)
         .fixedSize(horizontal: true, vertical: false)
+        .accessibilityHidden(true)
     }
 }
 

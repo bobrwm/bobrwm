@@ -26,6 +26,7 @@ final class MenuBarController: NSObject, StatusMenuActions {
         super.init()
 
         statusItem.menu = statusMenu.menu
+        NSApplication.shared.mainMenu = MainMenu.make(target: self)
 
         if let button = statusItem.button {
             button.title = ""
@@ -36,6 +37,7 @@ final class MenuBarController: NSObject, StatusMenuActions {
             statusView.translatesAutoresizingMaskIntoConstraints = true
             statusView.sizingOptions = [.intrinsicContentSize]
             button.addSubview(statusView)
+            button.setAccessibilityLabel("BobrWM")
         }
 
         rebuild()
@@ -43,6 +45,7 @@ final class MenuBarController: NSObject, StatusMenuActions {
 
     func tearDown() {
         settingsWindow.close()
+        NSApplication.shared.mainMenu = nil
         statusItem.menu = nil
         statusView.removeFromSuperview()
         NSStatusBar.system.removeStatusItem(statusItem)
@@ -99,6 +102,8 @@ final class MenuBarController: NSObject, StatusMenuActions {
                 return leftOrder == rightOrder ? $0.id < $1.id : leftOrder < rightOrder
             }
             .map(StatusModel.Chip.init)
+        statusItem.button?.setAccessibilityValue(
+            settingsModel.workspaces.first(where: \.isFocused)?.label)
 
         scheduleResize()
     }
@@ -173,7 +178,7 @@ final class MenuBarController: NSObject, StatusMenuActions {
     // An accessory app is never frontmost, so the panel would open behind
     // the current app without activating first.
     func showAbout(_ sender: NSMenuItem) {
-        NSApplication.shared.activate(ignoringOtherApps: true)
+        NSApplication.shared.activate()
         NSApplication.shared.orderFrontStandardAboutPanel(nil)
     }
     func quit(_ sender: NSMenuItem) { callbacks.quit() }

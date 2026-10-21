@@ -18,7 +18,7 @@ For diffing bobrwm's *internal* state against this OS-side truth, use the siblin
 
 - `wid` is the CG window ID from `kCGWindowNumber`. Treat this as the window identity when debugging bobrwm focus, tiling, and workspace state. It equals `window_id` in `bobrwm query ... --json` output.
 - `pid` and `owner_name` identify the owning process. Multiple distinct windows, including Ghostty native tabs, can share one PID. Dimming overlays belong to bobrwm rather than the target app.
-- `window_kind` is `window` or `dimming_overlay`. Bobrwm-owned layer-0 panels are dimming overlays; bobrwm's elevated tile-preview UI is excluded.
+- `window_kind` is `window` or `dimming_overlay`. BobrWM-owned layer-0 panels are dimming overlays; bobrwm's elevated tile-preview UI is excluded.
 - `cg_order` is the index returned by CG's global window list. Use it to correlate ordering changes, but do not treat its numeric relationship across processes as proof that an AppKit panel is above or below its target.
 - Session-level `pid` is the probe filter. Per-window `pid` is emitted on each window sample so a CG window ID lookup can tell you which process owns it.
 

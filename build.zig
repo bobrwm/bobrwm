@@ -746,7 +746,9 @@ fn bundleInfoPlist(b: *std.Build, version: std.SemanticVersion) std.Build.LazyPa
         \\    <key>CFBundleInfoDictionaryVersion</key>
         \\    <string>6.0</string>
         \\    <key>CFBundleName</key>
-        \\    <string>bobrwm</string>
+        \\    <string>BobrWM</string>
+        \\    <key>CFBundleDisplayName</key>
+        \\    <string>BobrWM</string>
         \\    <key>CFBundlePackageType</key>
         \\    <string>APPL</string>
         \\    <key>CFBundleShortVersionString</key>

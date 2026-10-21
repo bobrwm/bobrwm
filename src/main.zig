@@ -2248,7 +2248,7 @@ fn reloadConfig() bool {
             configured_count,
         });
         next.deinit();
-        notifyConfigReloadFailed("Workspace count changed; restart Bobrwm to apply it");
+        notifyConfigReloadFailed("Workspace count changed; restart BobrWM to apply it");
         return false;
     }
     applyReloadedConfig(next);
@@ -6162,7 +6162,7 @@ fn refreshTabGroupActiveTabsFromSnapshot(on_screen: *const OnScreenWindows) void
         const group = g_state.windowTabGroup(move.leader_window_id) orelse continue;
         const leader = managedWindow(group.leader_window_id) orelse continue;
 
-        // The user can select a tab Bobrwm has never seen: background tabs are
+        // The user can select a tab BobrWM has never seen: background tabs are
         // absent from AXWindows, so they are only discovered as they surface.
         if (managedWindow(move.selected_window_id) == null) {
             const leader_space = managedWindowSpace(leader.wid) orelse continue;

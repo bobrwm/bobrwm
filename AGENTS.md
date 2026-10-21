@@ -99,7 +99,7 @@ const app = NSApplication.msgSend(objc.Object, "sharedApplication", .{});
 _ = app.msgSend(bool, "setActivationPolicy:", .{@as(i64, 1)});
 ```
 
-**Architecture:** Swift runs NSApplication and starts/stops the embedded Zig core through `bobrwm_ui.h`. The AppKit main thread owns Bobrwm state mutation, layout, workspace state, IPC, status bar, and event draining. AX observer callbacks run on a dedicated background observer thread so slow or hung app AX servers cannot stall the main CFRunLoop. Background AX callbacks must only enqueue events or update observer bookkeeping protected by the AX lock; Bobrwm state mutations happen on the main thread during event drain.
+**Architecture:** Swift runs NSApplication and starts/stops the embedded Zig core through `bobrwm_ui.h`. The AppKit main thread owns BobrWM state mutation, layout, workspace state, IPC, status bar, and event draining. AX observer callbacks run on a dedicated background observer thread so slow or hung app AX servers cannot stall the main CFRunLoop. Background AX callbacks must only enqueue events or update observer bookkeeping protected by the AX lock; BobrWM state mutations happen on the main thread during event drain.
 
 ## Menu Bar UI (Swift)
 
@@ -125,7 +125,7 @@ The native app, status item, and menu live in `macos/`. `build.zig` builds Zig a
 
 ## Window Management Invariants
 
-Bobrwm reconciles AX, WindowServer/CG, SkyLight, and internal workspace/layout state. Do not trust one source alone. AX can lag or expose stale native-tab window IDs; CG can retain invisible Electron windows; SkyLight bounds can fail for destroyed windows; internal workspace state can be stale until cleanup runs.
+BobrWM reconciles AX, WindowServer/CG, SkyLight, and internal workspace/layout state. Do not trust one source alone. AX can lag or expose stale native-tab window IDs; CG can retain invisible Electron windows; SkyLight bounds can fail for destroyed windows; internal workspace state can be stale until cleanup runs.
 
 **Visibility and cleanup:**
 - Treat CG on-screen presence as necessary but not always sufficient. Electron apps can keep layer-0 windows around after close-to-background; fully transparent CG windows should not be treated as visible.

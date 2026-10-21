@@ -176,7 +176,6 @@ final class SettingsModel: ObservableObject {
 
     init(configPath: String?) {
         self.configPath = configPath
-        accessibilityGranted = AXIsProcessTrusted()
     }
 
     init(configPath: String?, accessibilityGranted: Bool) {
@@ -240,7 +239,7 @@ final class SettingsModel: ObservableObject {
             "\($0.id):windows=\($0.windowCount):active=\($0.isActive):focused=\($0.isFocused)"
         }.joined(separator: "\n")
         return """
-        Bobrwm \(appVersion)
+        BobrWM \(appVersion)
         Accessibility: \(accessibilityGranted ? "granted" : "required")
         Config: \(configPath == nil ? "built-in defaults" : "config.zon")
         Last reload: \(configStatus.succeeded ? "succeeded" : "failed") — \(configStatus.message)
@@ -357,14 +356,14 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         self.model = model
         tabs = SettingsTabViewController(model: model, actions: actions)
 
-        // Settings open quickly with ⌘, and size themselves to the pane, so
-        // the HIG asks for minimize and zoom to stay disabled.
+        // The HIG keeps minimize and zoom off for settings windows.
         let window = NSWindow(contentViewController: tabs)
         window.styleMask = [.titled, .closable]
         window.toolbarStyle = .preference
         window.isReleasedWhenClosed = false
         super.init(window: window)
         window.delegate = self
+        restorePosition(of: window)
 
         // Debounced so dragging a slider or holding a stepper rewrites
         // config.zon once the value settles rather than on every step.
@@ -384,19 +383,33 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
     func show(pane: SettingsPane? = nil) {
         model.refreshAccessibility()
         if let pane { tabs.select(pane) }
-        if window?.isVisible != true { window?.center() }
         showWindow(nil)
-        NSApplication.shared.activate(ignoringOtherApps: true)
+        NSApplication.shared.activate()
         window?.makeKeyAndOrderFront(nil)
     }
+
+    // Reopens where it was left, like other settings windows. Only the top-left
+    // corner is restored; the height belongs to whichever pane is selected.
+    private func restorePosition(of window: NSWindow) {
+        let size = window.frame.size
+        if window.setFrameUsingName(Self.frameName) {
+            let top = window.frame.maxY
+            window.setFrame(
+                NSRect(x: window.frame.minX, y: top - size.height, width: size.width, height: size.height),
+                display: false)
+        } else {
+            window.center()
+        }
+        window.setFrameAutosaveName(Self.frameName)
+    }
+
+    private static let frameName = "Settings"
 
     func windowDidBecomeKey(_ notification: Notification) {
         model.refreshAccessibility()
     }
 }
 
-/// Toolbar-style tabs give the standard settings chrome: a fixed toolbar that
-/// always shows the selected pane and a window title that follows it.
 final class SettingsTabViewController: NSTabViewController {
     private static let selectedPaneKey = "SettingsSelectedPane"
 
@@ -422,8 +435,6 @@ final class SettingsTabViewController: NSTabViewController {
             addTabViewItem(item)
         }
 
-        // People tend to adjust related settings repeatedly, so reopen on the
-        // pane they used last.
         let saved = UserDefaults.standard.string(forKey: Self.selectedPaneKey)
         select(saved.flatMap(SettingsPane.init(rawValue:)) ?? .general)
     }
@@ -443,29 +454,43 @@ final class SettingsTabViewController: NSTabViewController {
         if let identifier = tabViewItem?.identifier as? String {
             UserDefaults.standard.set(identifier, forKey: Self.selectedPaneKey)
         }
-        fitWindow(to: tabViewItem?.viewController, animate: view.window?.isVisible == true)
     }
 
-    override func preferredContentSizeDidChange(for viewController: NSViewController) {
-        super.preferredContentSizeDidChange(for: viewController)
-        guard selectedTabViewItemIndex >= 0,
-            tabViewItems[selectedTabViewItemIndex].viewController === viewController
-        else { return }
-        fitWindow(to: viewController, animate: view.window?.isVisible == true)
-    }
+    // Left alone, the tab controller snaps the window to the new pane's size.
+    // Settings windows crossfade the panes while the height eases, top edge fixed.
+    override func transition(
+        from fromViewController: NSViewController,
+        to toViewController: NSViewController,
+        options: NSViewController.TransitionOptions = [],
+        completionHandler completion: (() -> Void)? = nil
+    ) {
+        guard let window = view.window, window.isVisible else {
+            super.transition(
+                from: fromViewController, to: toViewController,
+                options: options, completionHandler: completion)
+            return
+        }
 
-    /// Resizes around the top edge so the toolbar stays put while the pane
-    /// below it grows or shrinks.
-    private func fitWindow(to viewController: NSViewController?, animate: Bool) {
-        guard let window = view.window, let viewController else { return }
-        let size = viewController.preferredContentSize
-        guard size.width > 0, size.height > 0 else { return }
-
-        let target = window.frameRect(forContentRect: NSRect(origin: .zero, size: size))
+        let content = NSRect(origin: .zero, size: toViewController.preferredContentSize)
+        let target = window.frameRect(forContentRect: content)
         var frame = window.frame
         frame.origin.y += frame.height - target.height
         frame.size = target.size
-        window.setFrame(frame, display: true, animate: animate)
+
+        // Reduce Motion keeps the crossfade but snaps the size.
+        let reduceMotion = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
+        NSAnimationContext.runAnimationGroup { context in
+            context.duration = window.animationResizeTime(frame)
+            context.allowsImplicitAnimation = true
+            super.transition(
+                from: fromViewController, to: toViewController,
+                options: [.crossfade, .allowUserInteraction], completionHandler: completion)
+            if reduceMotion {
+                window.setFrame(frame, display: true)
+            } else {
+                window.animator().setFrame(frame, display: false)
+            }
+        }
     }
 }
 
@@ -484,8 +509,7 @@ struct SettingsPaneView: View {
             }
         }
         .formStyle(.grouped)
-        // The pane reports its full height so the window can fit it; scrolling
-        // inside a window that already fits would only add a stray scroller.
+        // The window sizes to the pane's full height, so a scroller would be stray.
         .scrollDisabled(true)
         .fixedSize(horizontal: false, vertical: true)
         .frame(width: settingsPaneWidth)
@@ -500,7 +524,7 @@ private struct GeneralPane: View {
         Form {
             ApplyFailureSection(model: model)
             Section {
-                Toggle("Start Bobrwm at login", isOn: $model.settings.startAtLogin)
+                Toggle("Start BobrWM at login", isOn: $model.settings.startAtLogin)
             }
 
             Section {
@@ -515,7 +539,7 @@ private struct GeneralPane: View {
                 Text("Permissions")
             } footer: {
                 if !model.accessibilityGranted {
-                    Text("Bobrwm needs Accessibility access to move and resize windows.")
+                    Text("BobrWM needs Accessibility access to move and resize windows.")
                         .foregroundStyle(.secondary)
                 }
             }
@@ -598,16 +622,16 @@ private struct TilingPane: View {
             }
 
             Section {
-                NumberStepper("Between windows", value: $model.settings.innerGap, in: 0...128, unit: "px")
+                NumberStepper("Between windows", value: $model.settings.innerGap, in: 0...128, unit: "pt")
             } header: {
                 Text("Gaps")
             }
 
             Section {
-                NumberStepper("Top", value: $model.settings.outerGapTop, in: 0...128, unit: "px")
-                NumberStepper("Bottom", value: $model.settings.outerGapBottom, in: 0...128, unit: "px")
-                NumberStepper("Left", value: $model.settings.outerGapLeft, in: 0...128, unit: "px")
-                NumberStepper("Right", value: $model.settings.outerGapRight, in: 0...128, unit: "px")
+                NumberStepper("Top", value: $model.settings.outerGapTop, in: 0...128, unit: "pt")
+                NumberStepper("Bottom", value: $model.settings.outerGapBottom, in: 0...128, unit: "pt")
+                NumberStepper("Left", value: $model.settings.outerGapLeft, in: 0...128, unit: "pt")
+                NumberStepper("Right", value: $model.settings.outerGapRight, in: 0...128, unit: "pt")
             } header: {
                 Text("Screen Edges")
             }
@@ -637,8 +661,7 @@ private struct AppearancePane: View {
             ApplyFailureSection(model: model)
             Section {
                 Toggle("Dim inactive windows", isOn: $model.settings.dimmingEnabled)
-                // The extremes do nothing useful: 0% dims nothing and 100%
-                // blacks windows out entirely.
+                // 0% dims nothing and 100% blacks windows out.
                 PercentSlider("Dimming", value: $model.settings.dimmingLevel, in: 0.05...0.9)
                     .disabled(!settings.dimmingEnabled)
             }
@@ -691,7 +714,7 @@ private struct WorkspaceSettingsRow: View {
                 } else if workspace.isActive {
                     Text("Visible")
                 }
-                Text(windowSummary).monospacedDigit()
+                Text("^[\(workspace.windowCount) window](inflect: true)").monospacedDigit()
             }
             .foregroundStyle(.secondary)
         } label: {
@@ -706,18 +729,9 @@ private struct WorkspaceSettingsRow: View {
                 : workspace.applicationNames.joined(separator: ", "))
         }
     }
-
-    private var windowSummary: String {
-        switch workspace.windowCount {
-        case 0: "—"
-        case 1: "1 window"
-        default: "\(workspace.windowCount) windows"
-        }
-    }
 }
 
-/// Pairs the status color with a symbol so success and failure stay
-/// distinguishable without relying on color alone.
+// The symbol keeps success and failure distinguishable without color.
 private struct StatusLabel: View {
     let title: String
     let succeeded: Bool
@@ -772,17 +786,17 @@ private struct PercentSlider: View {
 
     var body: some View {
         LabeledContent(title) {
-            HStack(spacing: 8) {
-                // Rounded through the binding rather than with `step:`, which
-                // draws a tick for every step and crowds the track.
-                Slider(value: rounded, in: range)
-                    .labelsHidden()
-                    .frame(width: 160)
-                Text(value, format: .percent.precision(.fractionLength(0)))
-                    .monospacedDigit()
-                    .foregroundStyle(.secondary)
-                    .frame(width: 38, alignment: .trailing)
-            }
+            // Rounded through the binding: `step:` draws a tick per step.
+            Slider(value: rounded, in: range)
+                .labelsHidden()
+            // Sized to the widest value so the slider does not shift while dragging.
+            Text(range.upperBound, format: .percent.precision(.fractionLength(0)))
+                .hidden()
+                .overlay(alignment: .trailing) {
+                    Text(value, format: .percent.precision(.fractionLength(0)))
+                }
+                .monospacedDigit()
+                .foregroundStyle(.secondary)
         }
     }
 
@@ -794,8 +808,6 @@ private struct PercentSlider: View {
     }
 }
 
-/// A typed field next to a stepper, the standard macOS pairing: arrows for
-/// small nudges, typing for anything further than a few steps away.
 private struct NumberStepper<Value: BinaryInteger>: View {
     let title: String
     @Binding var value: Value
@@ -818,32 +830,26 @@ private struct NumberStepper<Value: BinaryInteger>: View {
     }
 
     var body: some View {
-        LabeledContent(title) {
-            HStack(spacing: 4) {
-                TextField(title, value: clamped, format: .number)
-                    .textFieldStyle(.roundedBorder)
-                    .labelsHidden()
-                    .multilineTextAlignment(.trailing)
-                    .monospacedDigit()
-                    .frame(width: 56)
-                Text(unit).foregroundStyle(.secondary)
-                Stepper(
-                    title,
-                    value: clamped,
-                    in: Int(range.lowerBound)...Int(range.upperBound),
-                    step: Int(step)
-                )
-                    .labelsHidden()
-            }
+        Stepper(
+            value: clamped,
+            in: Double(range.lowerBound)...Double(range.upperBound),
+            step: Double(step),
+            format: .number.precision(.fractionLength(0))
+        ) {
+            Text("\(title) (\(unit))")
         }
     }
 
-    /// Typed values outside the range snap to the nearest bound instead of
-    /// reaching the core, which would reject the whole settings write.
-    private var clamped: Binding<Int> {
+    // The stock stepper's formatted field needs a floating-point value. Typed
+    // values outside the range snap to a bound, since the core would reject
+    // the whole settings write.
+    private var clamped: Binding<Double> {
         Binding(
-            get: { Int(value) },
-            set: { value = Value(min(max($0, Int(range.lowerBound)), Int(range.upperBound))) }
+            get: { Double(value) },
+            set: {
+                let bounded = min(max($0.rounded(), Double(range.lowerBound)), Double(range.upperBound))
+                value = Value(bounded)
+            }
         )
     }
 }
