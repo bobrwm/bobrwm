@@ -1478,13 +1478,16 @@ fn bw_get_display_frame() shim.bw_frame {
         .h = 0,
     };
 
-    const screen = NSScreen.msgSend(objc.Object, "mainScreen", .{});
-    if (screen.value == null) return .{
+    // screens[0] is the primary display at the CG origin; mainScreen follows
+    // the key window and would flip against the wrong height.
+    const screens = NSScreen.msgSend(objc.Object, "screens", .{});
+    if (screens.msgSend(usize, "count", .{}) == 0) return .{
         .x = 0,
         .y = 0,
         .w = 0,
         .h = 0,
     };
+    const screen = screens.msgSend(objc.Object, "objectAtIndex:", .{@as(usize, 0)});
 
     const visible = screen.msgSend(NSRect, "visibleFrame", .{});
     const full = screen.msgSend(NSRect, "frame", .{});
@@ -2836,6 +2839,12 @@ fn startCore(config_path_arg: ?[]const u8) !void {
     // -- Discover existing windows and tile --
     discoverWindows();
     log.info("discovered {} windows", .{g_state.windows.count});
+
+    // Topology starts focused on the primary display, which may not hold the
+    // frontmost window. Adopt it so focus and dimming start where the user is.
+    if (frontmostApplicationPid()) |pid| {
+        if (focusedWindowIdForPid(pid)) |wid| _ = syncFocusStateForWindowId(wid, .ax);
+    }
     retileAllDisplays();
 
     // Register runtime ObjC classes (BWObserver / BWLaunchGate) before
