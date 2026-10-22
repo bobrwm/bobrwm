@@ -293,7 +293,7 @@ fn rectEql(a: NSRect, b: NSRect) bool {
 }
 
 /// Convert a CG rect (top-left origin) to an NS rect (bottom-left origin),
-/// flipping against the topmost screen edge across all displays.
+/// flipping against the primary screen's top edge.
 fn nsRectFromCg(x: f64, y: f64, width: f64, height: f64) NSRect {
     const fallback: NSRect = .{
         .origin = .{ .x = x, .y = y },
@@ -305,18 +305,12 @@ fn nsRectFromCg(x: f64, y: f64, width: f64, height: f64) NSRect {
     const count = screens.msgSend(usize, "count", .{});
     if (count == 0) return fallback;
 
-    var global_top: f64 = -std.math.inf(f64);
-    var i: usize = 0;
-    while (i < count) : (i += 1) {
-        const screen = screens.msgSend(objc.Object, "objectAtIndex:", .{i});
-        const frame = screen.msgSend(NSRect, "frame", .{});
-        const top = frame.origin.y + frame.size.height;
-        if (top > global_top) global_top = top;
-    }
-
-    std.debug.assert(global_top != -std.math.inf(f64));
+    // CG's origin is the top-left of screens[0], the menu-bar display.
+    const primary = screens.msgSend(objc.Object, "objectAtIndex:", .{@as(usize, 0)});
+    const primary_frame = primary.msgSend(NSRect, "frame", .{});
+    const primary_top = primary_frame.origin.y + primary_frame.size.height;
     return .{
-        .origin = .{ .x = x, .y = global_top - (y + height) },
+        .origin = .{ .x = x, .y = primary_top - (y + height) },
         .size = .{ .width = width, .height = height },
     };
 }

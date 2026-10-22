@@ -1060,23 +1060,19 @@ fn refreshDisplays() void {
         return;
     }
 
-    const main_screen = NSScreen.msgSend(objc.Object, "mainScreen", .{});
-
-    var global_top: f64 = -std.math.inf(f64);
-    var i: usize = 0;
-    while (i < count) : (i += 1) {
-        const screen = screens.msgSend(objc.Object, "objectAtIndex:", .{i});
-        const frame = screen.msgSend(NSRect, "frame", .{});
-        const top = frame.origin.y + frame.size.height;
-        if (top > global_top) global_top = top;
-    }
-    std.debug.assert(global_top != -std.math.inf(f64));
+    // screens[0] carries the menu bar and sits at the CG origin, so its top
+    // edge is the flip axis. The topmost edge across all screens is not: a
+    // display that rises above the primary would shift every frame down.
+    // mainScreen follows the key window, so it is not the primary either.
+    const primary_screen = screens.msgSend(objc.Object, "objectAtIndex:", .{@as(usize, 0)});
+    const primary_frame = primary_screen.msgSend(NSRect, "frame", .{});
+    const primary_top = primary_frame.origin.y + primary_frame.size.height;
 
     const screen_number_key = nsString("NSScreenNumber");
     var next_count: usize = 0;
     var has_primary = false;
 
-    i = 0;
+    var i: usize = 0;
     while (i < count and next_count < g_displays.len) : (i += 1) {
         const screen = screens.msgSend(objc.Object, "objectAtIndex:", .{i});
         const visible = screen.msgSend(NSRect, "visibleFrame", .{});
@@ -1089,18 +1085,18 @@ fn refreshDisplays() void {
 
         const visible_frame: shim.bw_frame = .{
             .x = visible.origin.x,
-            .y = global_top - (visible.origin.y + visible.size.height),
+            .y = primary_top - (visible.origin.y + visible.size.height),
             .w = visible.size.width,
             .h = visible.size.height,
         };
         const full_frame: shim.bw_frame = .{
             .x = full.origin.x,
-            .y = global_top - (full.origin.y + full.size.height),
+            .y = primary_top - (full.origin.y + full.size.height),
             .w = full.size.width,
             .h = full.size.height,
         };
 
-        const is_primary = main_screen.value != null and screen.value == main_screen.value;
+        const is_primary = i == 0;
         if (is_primary) has_primary = true;
 
         g_displays[next_count] = .{
