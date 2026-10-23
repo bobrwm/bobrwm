@@ -90,15 +90,24 @@ pub fn writeFile(path_z: [*:0]const u8, bytes: []const u8) bool {
 }
 
 /// Durably replace a file without exposing a partially-written destination.
-/// The temporary file lives beside the destination so rename stays atomic.
+/// A symlink is resolved first so the link survives and its target is
+/// replaced, and an existing file keeps its permissions. The temporary file
+/// lives beside the target so rename stays atomic.
 pub fn writeFileAtomically(allocator: std.mem.Allocator, path: []const u8, bytes: []const u8) bool {
     std.debug.assert(path.len > 0);
     const path_z = allocator.dupeSentinel(u8, path, 0) catch return false;
     defer allocator.free(path_z);
+
+    // realpath fails for a file that does not exist yet; create it as named.
+    var resolved: [std.c.PATH_MAX]u8 = undefined;
+    const target = std.c.realpath(path_z, &resolved) orelse path_z.ptr;
+    var existing: std.c.Stat = undefined;
+    const mode: ?std.c.mode_t = if (std.c.stat(target, &existing) == 0) existing.mode & 0o7777 else null;
+
     const temporary_path = std.fmt.allocPrintSentinel(
         allocator,
         "{s}.tmp-{d}",
-        .{ path, std.c.getpid() },
+        .{ std.mem.span(target), std.c.getpid() },
         0,
     ) catch return false;
     defer allocator.free(temporary_path);
@@ -109,12 +118,38 @@ pub fn writeFileAtomically(allocator: std.mem.Allocator, path: []const u8, bytes
     defer {
         if (open) _ = std.c.fclose(file);
     }
+    if (mode) |m| {
+        if (std.c.fchmod(fileno(file), m) != 0) return false;
+    }
     if (std.c.fwrite(bytes.ptr, 1, bytes.len, file) != bytes.len) return false;
     if (fflush(file) != 0) return false;
     if (std.c.fsync(fileno(file)) != 0) return false;
     if (std.c.fclose(file) != 0) return false;
     open = false;
-    return std.c.rename(temporary_path.ptr, path_z.ptr) == 0;
+    return std.c.rename(temporary_path.ptr, target) == 0;
+}
+
+test "writeFileAtomically replaces a symlink's target and keeps its mode" {
+    const target: [:0]const u8 = "/tmp/bobrwm_test_atomic_target.zon";
+    const link: [:0]const u8 = "/tmp/bobrwm_test_atomic_link.zon";
+    defer deleteFile(target.ptr);
+    defer deleteFile(link.ptr);
+    deleteFile(link.ptr);
+
+    if (!writeFile(target.ptr, "old")) return error.TestUnexpectedResult;
+    if (std.c.chmod(target.ptr, 0o600) != 0) return error.TestUnexpectedResult;
+    if (std.c.symlink(target.ptr, link.ptr) != 0) return error.TestUnexpectedResult;
+
+    try std.testing.expect(writeFileAtomically(std.testing.allocator, link, "new"));
+
+    var buf: [16]u8 = undefined;
+    try std.testing.expect(std.c.readlink(link.ptr, &buf, buf.len) > 0);
+    const written = readFileAllocSentinel(std.testing.allocator, target.ptr, 16) orelse return error.TestUnexpectedResult;
+    defer std.testing.allocator.free(written);
+    try std.testing.expectEqualStrings("new", written);
+    var st: std.c.Stat = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.stat(target.ptr, &st));
+    try std.testing.expectEqual(@as(std.c.mode_t, 0o600), st.mode & 0o7777);
 }
 
 /// Returns true if `path` exists and is accessible.

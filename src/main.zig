@@ -1411,6 +1411,18 @@ const ConfigRuntime = struct {
         return .{ .arena = arena, .config = config, .keybind_table = keybind_table };
     }
 
+    /// Parse `source` as a reload would. The source is copied into the
+    /// runtime's arena because parsed strings point into it.
+    fn initFromSource(parent_allocator: std.mem.Allocator, path: []const u8, source: [:0]const u8) !ConfigRuntime {
+        var arena = std.heap.ArenaAllocator.init(parent_allocator);
+        errdefer arena.deinit();
+        const allocator = arena.allocator();
+        const owned = try allocator.dupeSentinel(u8, source, 0);
+        const config = config_mod.parseSource(allocator, path, owned) orelse return error.InvalidConfig;
+        const keybind_table = try config_mod.KeybindTable.init(allocator, &config);
+        return .{ .arena = arena, .config = config, .keybind_table = keybind_table };
+    }
+
     fn deinit(self: *ConfigRuntime) void {
         self.arena.deinit();
         self.* = undefined;
@@ -2241,20 +2253,29 @@ fn reloadConfig() bool {
         notifyConfigReloadFailed("Configuration is invalid; previous settings kept");
         return false;
     };
-    const configured_count = config_mod.workspaceCount(&next.config);
-    if (configured_count != workspaceCount()) {
-        log.err("config reload cannot change workspace count ({d} running, {d} configured); restart to apply it", .{
-            workspaceCount(),
-            configured_count,
-        });
+    if (!canApplyLive(&next.config)) {
         next.deinit();
-        notifyConfigReloadFailed("Workspace count changed; restart BobrWM to apply it");
         return false;
     }
     applyReloadedConfig(next);
     statusbar.setConfigStatus(true, "Configuration reloaded successfully");
     return true;
 }
+
+/// The checks a parsed config must pass beyond validation before it can
+/// replace the running one. Reports the failure itself.
+fn canApplyLive(config: *const config_mod.Config) bool {
+    const configured_count = config_mod.workspaceCount(config);
+    if (configured_count == workspaceCount()) return true;
+
+    log.err("config reload cannot change workspace count ({d} running, {d} configured); restart to apply it", .{
+        workspaceCount(),
+        configured_count,
+    });
+    notifyConfigReloadFailed("Workspace count changed; restart BobrWM to apply it");
+    return false;
+}
+
 
 fn configFileChanged() void {
     _ = reloadConfig();
@@ -3294,12 +3315,43 @@ fn statusBarSetSettings(settings: *const statusbar.Settings) callconv(.c) bool {
     };
     next.start_at_login = settings.start_at_login;
 
-    config_mod.saveEditableSettings(g_allocator, path, &g_config, &next) catch |err| {
-        log.err("settings save failed: {}", .{err});
-        notifyConfigReloadFailed("Could not save settings; previous settings kept");
+    return saveSettings(path, &next);
+}
+
+/// Validate the edited config exactly as a reload would before touching the
+/// file, so a rejected change never reaches disk and comes back on restart.
+fn saveSettings(path: []const u8, next: *const config_mod.Config) bool {
+    var arena = std.heap.ArenaAllocator.init(g_allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const path_z = allocator.dupeSentinel(u8, path, 0) catch return settingsSaveFailed(error.OutOfMemory);
+    const original = osutil.readFileAllocSentinel(allocator, path_z, 1024 * 1024) orelse ".{\n}\n";
+    const source = config_mod.editSettingsSource(allocator, original, &g_config, next) catch |err|
+        return settingsSaveFailed(err);
+
+    var candidate = ConfigRuntime.initFromSource(g_allocator, path, source) catch |err|
+        return settingsSaveFailed(err);
+    if (!canApplyLive(&candidate.config)) {
+        candidate.deinit();
         return false;
-    };
-    return reloadConfig();
+    }
+
+    const directory_ok = if (std.fs.path.dirname(path)) |parent| osutil.makePath(allocator, parent) else true;
+    if (!directory_ok or !osutil.writeFileAtomically(allocator, path, source)) {
+        candidate.deinit();
+        return settingsSaveFailed(error.WriteConfigFailed);
+    }
+
+    applyReloadedConfig(candidate);
+    statusbar.setConfigStatus(true, "Settings saved");
+    return true;
+}
+
+fn settingsSaveFailed(err: anyerror) bool {
+    log.err("settings save failed: {}", .{err});
+    notifyConfigReloadFailed("Could not save settings; previous settings kept");
+    return false;
 }
 
 fn invalidAppSettings() bool {

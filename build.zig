@@ -574,6 +574,18 @@ pub fn build(b: *std.Build) !void {
 
     const run_swipe_tests = b.addRunArtifact(swipe_tests);
 
+    const osutil_tests = b.addTest(.{
+        .name = "osutil-tests",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/osutil.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+
+    const run_osutil_tests = b.addRunArtifact(osutil_tests);
+
     const helpgen_tests = b.addTest(.{
         .name = "helpgen-tests",
         .root_module = b.createModule(.{
@@ -630,6 +642,7 @@ pub fn build(b: *std.Build) !void {
     test_step.dependOn(&run_logging_tests.step);
     test_step.dependOn(&run_trace_tests.step);
     test_step.dependOn(&run_swipe_tests.step);
+    test_step.dependOn(&run_osutil_tests.step);
     test_step.dependOn(&run_helpgen_tests.step);
     test_step.dependOn(&run_cli_tests.step);
     test_step.dependOn(&run_config_format_tests.step);

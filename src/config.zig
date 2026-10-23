@@ -1244,7 +1244,13 @@ pub fn loadFromPath(allocator: std.mem.Allocator, path: []const u8) ?Config {
     // into it for string fields. Caller passes an arena allocator whose
     // deinit handles cleanup.
     const source = osutil.readFileAllocSentinel(allocator, path_z, 1024 * 1024) orelse return null;
+    return parseSource(allocator, path, source);
+}
 
+/// Parse and validate config source the way a reload does. `path` only labels
+/// diagnostics. Settings saves go through this too, so the app never rejects
+/// a config that a reload would accept.
+pub fn parseSource(allocator: std.mem.Allocator, path: []const u8, source: [:0]const u8) ?Config {
     // Parse strictly first so unknown fields are diagnosed. Only that error
     // class gets a tolerant retry; invalid values and syntax remain fatal.
     // Config holds slices, so both passes require the allocating parser.
@@ -1287,55 +1293,47 @@ pub fn loadFromPath(allocator: std.mem.Allocator, path: []const u8) ?Config {
     return parsed;
 }
 
-/// Persist the settings exposed by the native app without rewriting unrelated
-/// configuration. Existing top-level values are replaced in place; omitted
-/// values are appended to the root struct. Comments and formatting outside a
-/// changed value remain byte-for-byte intact.
-pub fn saveEditableSettings(
+/// Rewrite `source` with the settings exposed by the native app, leaving
+/// unrelated configuration alone. Existing top-level values are replaced in
+/// place; omitted values are appended to the root struct. Comments and
+/// formatting outside a changed value remain byte-for-byte intact. Allocates
+/// the result in `allocator`, which should be an arena: intermediate copies
+/// are not freed.
+pub fn editSettingsSource(
     allocator: std.mem.Allocator,
-    path: []const u8,
+    original: [:0]const u8,
     previous: *const Config,
     next: *const Config,
-) !void {
-    std.debug.assert(path.len > 0);
+) ![:0]const u8 {
     try validate(next);
-
-    var arena = std.heap.ArenaAllocator.init(allocator);
-    defer arena.deinit();
-    const temporary_allocator = arena.allocator();
-    const path_z = try temporary_allocator.dupeSentinel(u8, path, 0);
-    var source: [:0]const u8 = osutil.readFileAllocSentinel(
-        temporary_allocator,
-        path_z,
-        1024 * 1024,
-    ) orelse ".{\n}\n";
+    var source = original;
 
     if (previous.layout != next.layout) {
-        source = try replaceRootField(temporary_allocator, source, "layout", try enumValue(temporary_allocator, next.layout));
+        source = try replaceRootField(allocator, source, "layout", try enumValue(allocator, next.layout));
     }
     if (previous.bsp_split != next.bsp_split) {
-        source = try replaceRootField(temporary_allocator, source, "bsp_split", try enumValue(temporary_allocator, next.bsp_split));
+        source = try replaceRootField(allocator, source, "bsp_split", try enumValue(allocator, next.bsp_split));
     }
     if (previous.bsp_insert_point != next.bsp_insert_point) {
-        source = try replaceRootField(temporary_allocator, source, "bsp_insert_point", try enumValue(temporary_allocator, next.bsp_insert_point));
+        source = try replaceRootField(allocator, source, "bsp_insert_point", try enumValue(allocator, next.bsp_insert_point));
     }
     if (previous.bsp_split_ratio != next.bsp_split_ratio) {
-        source = try replaceRootField(temporary_allocator, source, "bsp_split_ratio", try numberValue(temporary_allocator, next.bsp_split_ratio));
+        source = try replaceRootField(allocator, source, "bsp_split_ratio", try numberValue(allocator, next.bsp_split_ratio));
     }
     if (previous.new_window_split != next.new_window_split) {
-        source = try replaceRootField(temporary_allocator, source, "new_window_split", try enumValue(temporary_allocator, next.new_window_split));
+        source = try replaceRootField(allocator, source, "new_window_split", try enumValue(allocator, next.new_window_split));
     }
     if (!std.meta.eql(previous.dimmed_inactive, next.dimmed_inactive)) {
-        source = try replaceRootField(temporary_allocator, source, "dimmed_inactive", try std.fmt.allocPrintSentinel(
-            temporary_allocator,
+        source = try replaceRootField(allocator, source, "dimmed_inactive", try std.fmt.allocPrintSentinel(
+            allocator,
             ".{{ .enabled = {}, .level = {d} }}",
             .{ next.dimmed_inactive.enabled, next.dimmed_inactive.level },
             0,
         ));
     }
     if (!std.meta.eql(previous.gaps, next.gaps)) {
-        source = try replaceRootField(temporary_allocator, source, "gaps", try std.fmt.allocPrintSentinel(
-            temporary_allocator,
+        source = try replaceRootField(allocator, source, "gaps", try std.fmt.allocPrintSentinel(
+            allocator,
             ".{{ .inner = {d}, .outer = .{{ .left = {d}, .right = {d}, .top = {d}, .bottom = {d} }} }}",
             .{
                 next.gaps.inner,
@@ -1348,8 +1346,8 @@ pub fn saveEditableSettings(
         ));
     }
     if (!std.meta.eql(previous.animation, next.animation)) {
-        source = try replaceRootField(temporary_allocator, source, "animation", try std.fmt.allocPrintSentinel(
-            temporary_allocator,
+        source = try replaceRootField(allocator, source, "animation", try std.fmt.allocPrintSentinel(
+            allocator,
             ".{{ .enabled = {}, .duration_ms = {d}, .easing = .{s} }}",
             .{ next.animation.enabled, next.animation.duration_ms, @tagName(next.animation.easing) },
             0,
@@ -1357,26 +1355,13 @@ pub fn saveEditableSettings(
     }
     if (previous.start_at_login != next.start_at_login) {
         source = try replaceRootField(
-            temporary_allocator,
+            allocator,
             source,
             "start_at_login",
             if (next.start_at_login) "true" else "false",
         );
     }
-
-    // Parse the exact candidate before replacing the last known-good file.
-    var diagnostics: std.zon.parse.Diagnostics = undefined;
-    const parsed = try std.zon.parse.fromSlice(Config, .{
-        .gpa = temporary_allocator,
-        .arena = temporary_allocator,
-        .source = source,
-        .diagnostics = &diagnostics,
-    });
-    try validate(&parsed);
-    if (std.fs.path.dirname(path)) |parent| {
-        if (!osutil.makePath(temporary_allocator, parent)) return error.CreateConfigDirectoryFailed;
-    }
-    if (!osutil.writeFileAtomically(temporary_allocator, path, source)) return error.WriteConfigFailed;
+    return source;
 }
 
 fn enumValue(allocator: std.mem.Allocator, value: anytype) ![:0]const u8 {
@@ -1406,12 +1391,40 @@ fn replaceRootField(
     }
 
     const line_prefix = if (range.root_close > 0 and source[range.root_close - 1] == '\n') "" else "\n";
+    const comma_at = lastFieldEnd(source, range.root_close);
+    const before = source[0 .. comma_at orelse range.root_close];
+    const between = if (comma_at) |at| source[at..range.root_close] else "";
     return std.fmt.allocPrintSentinel(
         allocator,
-        "{s}{s}    .{s} = {s},\n{s}",
-        .{ source[0..range.root_close], line_prefix, field_name, replacement, source[range.root_close..] },
+        "{s}{s}{s}{s}    .{s} = {s},\n{s}",
+        .{
+            before,
+            if (comma_at != null) "," else "",
+            between,
+            line_prefix,
+            field_name,
+            replacement,
+            source[range.root_close..],
+        },
         0,
     );
+}
+
+/// End of the last root field when it lacks a trailing comma, or null when
+/// the root is empty or already ends in one.
+fn lastFieldEnd(source: [:0]const u8, root_close: usize) ?usize {
+    var tokenizer = std.zig.Tokenizer.init(source);
+    var last: ?std.zig.Token = null;
+    while (true) {
+        const token = tokenizer.next();
+        if (token.tag == .eof or token.loc.start >= root_close) break;
+        last = token;
+    }
+    const token = last orelse return null;
+    return switch (token.tag) {
+        .l_brace, .comma => null,
+        else => token.loc.end,
+    };
 }
 
 fn rootFieldValueRange(source: [:0]const u8, field_name: []const u8) !struct {
@@ -1544,46 +1557,51 @@ test "replaceRootField appends an omitted setting" {
     , replaced);
 }
 
-test "saveEditableSettings preserves unrelated configuration and writes valid ZON" {
-    const path: [:0]const u8 = "/tmp/bobrwm_test_editable_settings.zon";
-    defer osutil.deleteFile(path.ptr);
-    const original =
+test "replaceRootField adds the comma a last field without one needs" {
+    const source: [:0]const u8 = ".{ .layout = .bsp }";
+    const replaced = try replaceRootField(std.testing.allocator, source, "start_at_login", "true");
+    defer std.testing.allocator.free(replaced);
+    try std.testing.expectEqualStrings(
+        \\.{ .layout = .bsp, 
+        \\    .start_at_login = true,
+        \\}
+    , replaced);
+}
+
+test "editSettingsSource preserves unrelated configuration and produces valid ZON" {
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const original: [:0]const u8 =
         \\.{
         \\    // This user-authored section must survive app edits.
         \\    .keybinds = .{
         \\        .{ .key = "f", .mods = .{ .alt = true }, .action = .toggle_fullscreen },
         \\    },
-        \\    .layout = .bsp,
+        \\    .layout = .bsp
         \\}
     ;
-    if (!osutil.writeFile(path.ptr, original)) return error.TestUnexpectedResult;
 
     const previous: Config = .{};
     var next = previous;
     next.layout = .monocle;
     next.gaps.inner = 9;
     next.start_at_login = true;
-    try saveEditableSettings(t.allocator, path, &previous, &next);
-
-    const written = osutil.readFileAllocSentinel(t.allocator, path.ptr, 1024 * 1024) orelse
-        return error.TestUnexpectedResult;
-    defer t.allocator.free(written);
+    const written = try editSettingsSource(arena.allocator(), original, &previous, &next);
     try t.expect(std.mem.indexOf(u8, written, "// This user-authored section must survive app edits.") != null);
 
-    var arena = std.heap.ArenaAllocator.init(t.allocator);
-    defer arena.deinit();
-    var diagnostics: std.zon.parse.Diagnostics = undefined;
-    const parsed = try std.zon.parse.fromSlice(Config, .{
-        .gpa = arena.allocator(),
-        .arena = arena.allocator(),
-        .source = written,
-        .diagnostics = &diagnostics,
-    });
-    try validate(&parsed);
+    const parsed = parseSource(arena.allocator(), "test", written) orelse return error.TestUnexpectedResult;
     try t.expectEqual(tiling.LayoutKind.monocle, parsed.layout);
     try t.expectEqual(@as(u16, 9), parsed.gaps.inner);
     try t.expect(parsed.start_at_login);
     try t.expectEqual(@as(usize, 1), parsed.keybinds.len);
+}
+
+test "parseSource accepts unknown fields like a reload does" {
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const parsed = parseSource(arena.allocator(), "test", ".{ .layout = .monocle, .from_the_future = 1 }") orelse
+        return error.TestUnexpectedResult;
+    try t.expectEqual(tiling.LayoutKind.monocle, parsed.layout);
 }
 
 // Bundle ID helper
