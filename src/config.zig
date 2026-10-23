@@ -119,8 +119,6 @@ pub const Config = struct {
     /// Reload the config whenever this file is saved, including saves through
     /// a symlink. An invalid save keeps the current config, as with the
     /// `reload_config` action.
-    ///
-    /// Note: changing this setting requires a restart.
     auto_reload_config: bool = false,
 
     /// Look up the assigned workspace for a given bundle identifier. `app_rules`
@@ -1353,13 +1351,18 @@ pub fn editSettingsSource(
             0,
         ));
     }
-    if (previous.start_at_login != next.start_at_login) {
-        source = try replaceRootField(
+    if (!std.meta.eql(previous.swipe, next.swipe)) {
+        source = try replaceRootField(allocator, source, "swipe", try std.fmt.allocPrintSentinel(
             allocator,
-            source,
-            "start_at_login",
-            if (next.start_at_login) "true" else "false",
-        );
+            ".{{ .enabled = {}, .reverse = {} }}",
+            .{ next.swipe.enabled, next.swipe.reverse },
+            0,
+        ));
+    }
+    inline for (.{ "focus_follows_mouse", "follow_app_resizes", "start_at_login", "auto_reload_config" }) |field| {
+        if (@field(previous, field) != @field(next, field)) {
+            source = try replaceRootField(allocator, source, field, if (@field(next, field)) "true" else "false");
+        }
     }
     return source;
 }
@@ -1586,6 +1589,8 @@ test "editSettingsSource preserves unrelated configuration and produces valid ZO
     next.layout = .monocle;
     next.gaps.inner = 9;
     next.start_at_login = true;
+    next.swipe.enabled = true;
+    next.focus_follows_mouse = true;
     const written = try editSettingsSource(arena.allocator(), original, &previous, &next);
     try t.expect(std.mem.indexOf(u8, written, "// This user-authored section must survive app edits.") != null);
 
@@ -1593,6 +1598,8 @@ test "editSettingsSource preserves unrelated configuration and produces valid ZO
     try t.expectEqual(tiling.LayoutKind.monocle, parsed.layout);
     try t.expectEqual(@as(u16, 9), parsed.gaps.inner);
     try t.expect(parsed.start_at_login);
+    try t.expect(parsed.swipe.enabled);
+    try t.expect(parsed.focus_follows_mouse);
     try t.expectEqual(@as(usize, 1), parsed.keybinds.len);
 }
 

@@ -109,6 +109,11 @@ struct EditableSettings: Equatable {
     var animationDurationMilliseconds: UInt64 = 200
     var easing: EasingSetting = .easeOut
     var startAtLogin = false
+    var focusFollowsMouse = false
+    var swipeEnabled = false
+    var swipeReversed = false
+    var followAppResizes = false
+    var autoReloadConfig = false
 
     init() {}
 
@@ -129,6 +134,11 @@ struct EditableSettings: Equatable {
         animationDurationMilliseconds = raw.animation_duration_ms
         easing = EasingSetting(rawValue: raw.animation_easing) ?? .easeOut
         startAtLogin = raw.start_at_login
+        focusFollowsMouse = raw.focus_follows_mouse
+        swipeEnabled = raw.swipe_enabled
+        swipeReversed = raw.swipe_reverse
+        followAppResizes = raw.follow_app_resizes
+        autoReloadConfig = raw.auto_reload_config
     }
 
     var abiValue: BWSettings {
@@ -148,7 +158,12 @@ struct EditableSettings: Equatable {
             animation_enabled: animationEnabled,
             animation_duration_ms: animationDurationMilliseconds,
             animation_easing: easing.rawValue,
-            start_at_login: startAtLogin
+            start_at_login: startAtLogin,
+            focus_follows_mouse: focusFollowsMouse,
+            swipe_enabled: swipeEnabled,
+            swipe_reverse: swipeReversed,
+            follow_app_resizes: followAppResizes,
+            auto_reload_config: autoReloadConfig
         )
     }
 }
@@ -528,6 +543,18 @@ private struct GeneralPane: View {
             }
 
             Section {
+                Toggle("Focus follows mouse", isOn: $model.settings.focusFollowsMouse)
+                Toggle("Swipe to switch workspaces", isOn: $model.settings.swipeEnabled)
+                Toggle("Reverse swipe direction", isOn: $model.settings.swipeReversed)
+                    .disabled(!model.settings.swipeEnabled)
+            } header: {
+                Text("Mouse and Trackpad")
+            } footer: {
+                Text("Focus follows mouse focuses a window without raising it. Swiping uses the horizontal Spaces gesture.")
+                    .foregroundStyle(.secondary)
+            }
+
+            Section {
                 LabeledContent("Accessibility") {
                     if model.accessibilityGranted {
                         StatusLabel("Granted", succeeded: true)
@@ -551,6 +578,7 @@ private struct GeneralPane: View {
                         .truncationMode(.middle)
                         .textSelection(.enabled)
                 }
+                Toggle("Reload when the file changes", isOn: $model.settings.autoReloadConfig)
                 LabeledContent("Last reload") {
                     StatusLabel(model.configStatus.message, succeeded: model.configStatus.succeeded)
                         .help(model.configStatus.date.formatted(date: .abbreviated, time: .standard))
@@ -619,6 +647,13 @@ private struct TilingPane: View {
                 .disabled(settings.layout != .bsp)
             } footer: {
                 Text(layoutFooter).foregroundStyle(.secondary)
+            }
+
+            Section {
+                Toggle("Follow app resizes", isOn: $model.settings.followAppResizes)
+            } footer: {
+                Text("When an app resizes its own window, for example to show a sidebar, the neighboring splits make room instead of the window snapping back.")
+                    .foregroundStyle(.secondary)
             }
 
             Section {

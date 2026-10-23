@@ -29,6 +29,11 @@ typedef struct {
   uint64_t animation_duration_ms;
   uint8_t animation_easing;
   bool start_at_login;
+  bool focus_follows_mouse;
+  bool swipe_enabled;
+  bool swipe_reverse;
+  bool follow_app_resizes;
+  bool auto_reload_config;
 } BWSettings;
 
 typedef struct {

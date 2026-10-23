@@ -1357,7 +1357,7 @@ var g_swipe_tap_port: c.CFMachPortRef = null;
 var g_mouse_tap_port: c.CFMachPortRef = null;
 /// Global because its dispatch sources keep a pointer to it after startCore
 /// returns.
-var g_config_watcher: config_watch.Watcher = undefined;
+var g_config_watcher: config_watch.Watcher = .{};
 var g_layout_entries: std.ArrayList(tiling.LayoutEntry) = .empty;
 var g_event_drain_active = false;
 var g_event_overflow_recovery_pending = false;
@@ -2212,6 +2212,7 @@ fn applyReloadedConfig(next: ConfigRuntime) void {
     dim.configure(g_config.dimmed_inactive);
     loginitem.reconcile(g_config.start_at_login);
     configureSwipeEventTap(g_config.swipe.enabled);
+    syncConfigWatcher();
 
     // Preserve BSP topology and runtime split edits for ordinary config saves.
     // Only changing the layout algorithm requires reconstructing state.
@@ -2276,6 +2277,14 @@ fn canApplyLive(config: *const config_mod.Config) bool {
     return false;
 }
 
+fn syncConfigWatcher() void {
+    const path = g_config_path orelse return;
+    if (g_config.auto_reload_config) {
+        g_config_watcher.start(path, configFileChanged);
+    } else {
+        g_config_watcher.stop();
+    }
+}
 
 fn configFileChanged() void {
     _ = reloadConfig();
@@ -2978,9 +2987,7 @@ fn startCore(config_path_arg: ?[]const u8) !void {
     // Watch after the status bar exists: reloads update its menu. Startup can
     // no longer fail past this point, so a failed start never leaves sources
     // pointing at freed config state.
-    if (g_config.auto_reload_config) {
-        if (g_config_path) |path| g_config_watcher.start(path, configFileChanged);
-    }
+    syncConfigWatcher();
 
     log.info("core initialized", .{});
 }
@@ -3314,6 +3321,10 @@ fn statusBarSetSettings(settings: *const statusbar.Settings) callconv(.c) bool {
         .easing = std.enums.fromInt(animation_mod.Easing, settings.animation_easing) orelse return invalidAppSettings(),
     };
     next.start_at_login = settings.start_at_login;
+    next.focus_follows_mouse = settings.focus_follows_mouse;
+    next.swipe = .{ .enabled = settings.swipe_enabled, .reverse = settings.swipe_reverse };
+    next.follow_app_resizes = settings.follow_app_resizes;
+    next.auto_reload_config = settings.auto_reload_config;
 
     return saveSettings(path, &next);
 }

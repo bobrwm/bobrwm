@@ -142,7 +142,7 @@ bobrwm show-config --default --docs > ~/.config/bobrwm/config.zon
 
 Press `Alt+Shift+R` (the default `reload_config` binding) or run
 `bobrwm reload-config` to apply changes without restarting, or set
-`.auto_reload_config = true` and restart to reload on every save. If the file
+`.auto_reload_config = true` to reload on every save. If the file
 contains invalid ZON or values outside the documented bounds, bobrwm keeps the
 last valid configuration and shows a temporary error in its menu-bar item;
 details remain in the error log. `bobrwm reload-config` is silent on success and

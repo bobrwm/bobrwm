@@ -31,6 +31,11 @@ pub const Settings = extern struct {
     animation_duration_ms: u64,
     animation_easing: u8,
     start_at_login: bool,
+    focus_follows_mouse: bool,
+    swipe_enabled: bool,
+    swipe_reverse: bool,
+    follow_app_resizes: bool,
+    auto_reload_config: bool,
 };
 
 /// Application-owned actions invoked by the Swift menu bar on the main thread.
@@ -141,6 +146,11 @@ pub fn updateSettings(config: *const config_mod.Config) void {
         .animation_duration_ms = config.animation.duration_ms,
         .animation_easing = @backingInt(config.animation.easing),
         .start_at_login = config.start_at_login,
+        .focus_follows_mouse = config.focus_follows_mouse,
+        .swipe_enabled = config.swipe.enabled,
+        .swipe_reverse = config.swipe.reverse,
+        .follow_app_resizes = config.follow_app_resizes,
+        .auto_reload_config = config.auto_reload_config,
     });
 }
 
