@@ -1,8 +1,8 @@
 //! macOS status bar (menu bar icon).
 //!
-//! The status item and its menu live in the Swift application under
-//! packages/bobrwm-ui. This module owns the Zig half of the C ABI declared in
-//! packages/bobrwm-ui/include/bobrwm_ui.h and the conversion from workspace
+//! The status item and its menu live in the Swift application in macos/.
+//! This module owns the Zig half of the C ABI declared in
+//! macos/include/bobrwm_ui.h and the conversion from workspace
 //! and keybind state into rows. The ABI structs below mirror that header;
 //! changing one means changing both.
 
@@ -14,23 +14,57 @@ const workspace_mod = @import("workspace.zig");
 
 const log = std.log.scoped(.statusbar);
 
+pub const Settings = extern struct {
+    layout: u8,
+    bsp_split: u8,
+    bsp_insert_point: u8,
+    bsp_split_ratio: f64,
+    new_window_split: u8,
+    dimming_enabled: bool,
+    dimming_level: f32,
+    inner_gap: u16,
+    outer_gap_left: u16,
+    outer_gap_right: u16,
+    outer_gap_top: u16,
+    outer_gap_bottom: u16,
+    animation_enabled: bool,
+    animation_duration_ms: u64,
+    animation_easing: u8,
+    start_at_login: bool,
+    focus_follows_mouse: bool,
+    swipe_enabled: bool,
+    swipe_reverse: bool,
+    follow_app_resizes: bool,
+    auto_reload_config: bool,
+};
+
 /// Application-owned actions invoked by the Swift menu bar on the main thread.
 pub const Callbacks = extern struct {
     retile: *const fn () callconv(.c) void,
     open_config: *const fn () callconv(.c) void,
-    previous_workspace: *const fn () callconv(.c) void,
-    next_workspace: *const fn () callconv(.c) void,
+    reload_config: *const fn () callconv(.c) bool,
+    set_settings: *const fn (*const Settings) callconv(.c) bool,
     switch_to_workspace: *const fn (u8) callconv(.c) void,
     quit: *const fn () callconv(.c) void,
 };
 
 const Workspace = extern struct {
     name: ?[*:0]const u8,
-    shortcut: ?[*:0]const u8,
+    shortcut_key: ?[*:0]const u8,
+    shortcut_modifiers: Modifiers,
     id: u8,
 };
 
+const Modifiers = extern struct {
+    control: bool = false,
+    option: bool = false,
+    shift: bool = false,
+    command: bool = false,
+};
+
 const WorkspaceState = extern struct {
+    process_ids: ?[*]const i32,
+    process_count: usize,
     window_count: u32,
     id: u8,
     is_active: bool,
@@ -46,32 +80,31 @@ pub const ActiveWorkspace = struct {
     y: f64,
 };
 
-const ActionShortcuts = extern struct {
-    previous_workspace: ?[*:0]const u8,
-    next_workspace: ?[*:0]const u8,
+/// Managed application processes for one logical workspace.
+pub const WorkspaceProcesses = struct {
+    workspace_id: u8,
+    process_ids: []const i32,
 };
 
-extern fn bw_menubar_init(callbacks: Callbacks) void;
+extern fn bw_menubar_init(callbacks: Callbacks, config_path: ?[*:0]const u8) void;
 extern fn bw_menubar_deinit() void;
-extern fn bw_menubar_set_workspaces(
-    workspaces: ?[*]const Workspace,
-    count: usize,
-    shortcuts: ActionShortcuts,
-) void;
+extern fn bw_menubar_set_workspaces(workspaces: ?[*]const Workspace, count: usize) void;
 extern fn bw_menubar_set_state(states: ?[*]const WorkspaceState, count: usize) void;
+extern fn bw_menubar_set_settings(settings: Settings) void;
 extern fn bw_menubar_set_message(message: [*:0]const u8) void;
+extern fn bw_menubar_set_config_status(success: bool, message: [*:0]const u8) void;
 
 /// Strings handed across the ABI are borrowed for the duration of the call,
-/// but a whole row array is passed at once, so every name and shortcut in it
-/// has to be alive simultaneously. This module has no allocator, and both are
-/// bounded, so they live in static storage.
+/// but a whole row array is passed at once, so every name and shortcut key in
+/// it has to be alive simultaneously. This module has no allocator, and both
+/// are bounded, so they live in static storage.
 const max_name_bytes = 64;
-/// Four modifier glyphs at 3 bytes each, plus a key glyph, plus the sentinel.
-const max_shortcut_bytes = 24;
+/// The longest key name the config accepts (`escape`, `delete`, `return`)
+/// plus the sentinel.
+const max_key_bytes = 8;
 
 var g_name_storage: [workspace_mod.max_workspaces][max_name_bytes]u8 = undefined;
-var g_shortcut_storage: [workspace_mod.max_workspaces][max_shortcut_bytes]u8 = undefined;
-var g_nav_shortcut_storage: [2][max_shortcut_bytes]u8 = undefined;
+var g_key_storage: [workspace_mod.max_workspaces][max_key_bytes]u8 = undefined;
 
 var g_initialized = false;
 
@@ -79,16 +112,46 @@ var g_initialized = false;
 pub fn init(
     workspace_count: u8,
     config: *const config_mod.Config,
+    config_path: ?[*:0]const u8,
     callbacks: Callbacks,
 ) void {
     std.debug.assert(!g_initialized);
     std.debug.assert(workspace_count > 0 and workspace_count <= workspace_mod.max_workspaces);
 
-    bw_menubar_init(callbacks);
+    bw_menubar_init(callbacks, config_path);
     g_initialized = true;
 
     updateWorkspaceMenu(workspace_count, config);
+    updateSettings(config);
     log.info("status bar created", .{});
+}
+
+/// Publish the editable configuration snapshot to the native app.
+pub fn updateSettings(config: *const config_mod.Config) void {
+    if (!g_initialized) return;
+    bw_menubar_set_settings(.{
+        .layout = @backingInt(config.layout),
+        .bsp_split = @backingInt(config.bsp_split),
+        .bsp_insert_point = @backingInt(config.bsp_insert_point),
+        .bsp_split_ratio = config.bsp_split_ratio,
+        .new_window_split = @backingInt(config.new_window_split),
+        .dimming_enabled = config.dimmed_inactive.enabled,
+        .dimming_level = config.dimmed_inactive.level,
+        .inner_gap = config.gaps.inner,
+        .outer_gap_left = config.gaps.outer.left,
+        .outer_gap_right = config.gaps.outer.right,
+        .outer_gap_top = config.gaps.outer.top,
+        .outer_gap_bottom = config.gaps.outer.bottom,
+        .animation_enabled = config.animation.enabled,
+        .animation_duration_ms = config.animation.duration_ms,
+        .animation_easing = @backingInt(config.animation.easing),
+        .start_at_login = config.start_at_login,
+        .focus_follows_mouse = config.focus_follows_mouse,
+        .swipe_enabled = config.swipe.enabled,
+        .swipe_reverse = config.swipe.reverse,
+        .follow_app_resizes = config.follow_app_resizes,
+        .auto_reload_config = config.auto_reload_config,
+    });
 }
 
 pub fn deinit() void {
@@ -118,31 +181,25 @@ pub fn updateWorkspaceMenu(
         const keybind = config.findKeybind(.focus_workspace, workspace_id);
         rows[index] = .{
             .name = @ptrCast(name_storage),
-            .shortcut = shortcutPtr(keybind, &g_shortcut_storage[index]),
+            .shortcut_key = shortcutKey(keybind, &g_key_storage[index]),
+            .shortcut_modifiers = if (keybind) |bind| shortcutModifiers(bind.mods) else .{},
             .id = workspace_id,
         };
     }
 
-    bw_menubar_set_workspaces(&rows, workspace_count, .{
-        .previous_workspace = shortcutPtr(
-            config.findKeybind(.focus_previous_workspace, 0),
-            &g_nav_shortcut_storage[0],
-        ),
-        .next_workspace = shortcutPtr(
-            config.findKeybind(.focus_next_workspace, 0),
-            &g_nav_shortcut_storage[1],
-        ),
-    });
+    bw_menubar_set_workspaces(&rows, workspace_count);
 }
 
 /// Publish reducer-derived logical workspace state.
 pub fn updateState(
     summaries: []const state_mod.WorkspaceSummary,
     active_workspaces: []const ActiveWorkspace,
+    workspace_processes: []const WorkspaceProcesses,
 ) void {
     if (!g_initialized) return;
     std.debug.assert(summaries.len > 0 and summaries.len <= workspace_mod.max_workspaces);
     std.debug.assert(active_workspaces.len <= workspace_mod.max_displays);
+    std.debug.assert(workspace_processes.len == summaries.len);
 
     var ordered: [workspace_mod.max_displays]ActiveWorkspace = undefined;
     @memcpy(ordered[0..active_workspaces.len], active_workspaces);
@@ -150,6 +207,8 @@ pub fn updateState(
 
     var states: [workspace_mod.max_workspaces]WorkspaceState = undefined;
     for (summaries, 0..) |summary, index| {
+        const processes = workspace_processes[index];
+        std.debug.assert(processes.workspace_id == summary.workspace_id);
         var display_order: u8 = std.math.maxInt(u8);
         for (ordered[0..active_workspaces.len], 0..) |active, order| {
             if (active.workspace_id != summary.workspace_id) continue;
@@ -157,6 +216,8 @@ pub fn updateState(
             break;
         }
         states[index] = .{
+            .process_ids = if (processes.process_ids.len == 0) null else processes.process_ids.ptr,
+            .process_count = processes.process_ids.len,
             .window_count = summary.window_count,
             .id = summary.workspace_id,
             .is_active = summary.is_active,
@@ -175,12 +236,25 @@ pub fn setMessage(message: [*:0]const u8) void {
     bw_menubar_set_message(message);
 }
 
-/// Adapt a keybind to the sentinel pointer the ABI expects. Null means
-/// unbound, which the UI renders as no hint at all.
-fn shortcutPtr(keybind: ?config_mod.Keybind, storage: []u8) ?[*:0]const u8 {
+/// Publish the last configuration reload outcome for Settings.
+pub fn setConfigStatus(success: bool, message: [*:0]const u8) void {
+    if (!g_initialized) return;
+    bw_menubar_set_config_status(success, message);
+}
+
+/// Pass the config's key name through unchanged; the UI owns how keys are
+/// presented. Null means unbound, which the UI renders as no hint at all.
+fn shortcutKey(keybind: ?config_mod.Keybind, storage: []u8) ?[*:0]const u8 {
     const bind = keybind orelse return null;
-    const rendered = bind.displayForm(storage) orelse return null;
-    return rendered.ptr;
+    if (bind.key.len == 0 or bind.key.len >= storage.len) return null;
+
+    @memcpy(storage[0..bind.key.len], bind.key);
+    storage[bind.key.len] = 0;
+    return @ptrCast(storage.ptr);
+}
+
+fn shortcutModifiers(mods: config_mod.Mods) Modifiers {
+    return .{ .control = mods.ctrl, .option = mods.alt, .shift = mods.shift, .command = mods.cmd };
 }
 
 fn sortActiveWorkspaces(active_workspaces: []ActiveWorkspace) void {
@@ -219,6 +293,23 @@ test "workspace ABI name truncation preserves valid UTF-8" {
     try std.testing.expect(std.unicode.utf8ValidateSlice(encoded));
     try std.testing.expectEqual(@as(usize, 62), encoded.len);
     try std.testing.expectEqualSlices(u8, name[0..62], encoded);
+}
+
+test "workspace ABI shortcut carries the key name and modifiers" {
+    var storage: [max_key_bytes]u8 = undefined;
+
+    const bind: config_mod.Keybind = .{
+        .key = "escape",
+        .mods = .{ .ctrl = true, .cmd = true },
+        .action = .focus_workspace,
+    };
+    try std.testing.expectEqualStrings("escape", std.mem.span(shortcutKey(bind, &storage).?));
+    try std.testing.expectEqual(
+        Modifiers{ .control = true, .command = true },
+        shortcutModifiers(bind.mods),
+    );
+
+    try std.testing.expectEqual(@as(?[*:0]const u8, null), shortcutKey(null, &storage));
 }
 
 test "status chips follow display geometry rather than workspace or enumeration order" {

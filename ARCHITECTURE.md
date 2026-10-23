@@ -1,9 +1,9 @@
 # Architecture
 
-Bobrwm is a deterministic state engine surrounded by macOS adapters.
+BobrWM is a deterministic state engine surrounded by macOS adapters.
 
 The operating system is asynchronous, partially observable, and occasionally
-inconsistent. Bobrwm must not spread that nondeterminism through its model.
+inconsistent. BobrWM must not spread that nondeterminism through its model.
 AX, CG, WindowServer, SkyLight, AppKit, timers, and IPC live at the leaves. The
 core consumes explicit facts and produces explicit intent.
 
@@ -51,9 +51,9 @@ may only enqueue facts for the main-thread drain.
 Every field must have one of three meanings:
 
 - **Observed truth** — the latest accepted fact from an authoritative source.
-- **Requested intent** — an operation Bobrwm wants the OS to perform.
+- **Requested intent** — an operation BobrWM wants the OS to perform.
 - **Internal memory** — layout, focus history, configuration, and bookkeeping
-  owned entirely by Bobrwm.
+  owned entirely by BobrWM.
 
 These categories must not be conflated. In particular, requesting a native
 Space switch does not change the observed active Space. Only a later topology
@@ -67,7 +67,7 @@ an arbitrary order.
 
 A configured `WorkspaceId` names one logical workspace across the application.
 It is never scoped to a display. Native Space IDs identify the physical backing
-instances supplied by macOS; they do not create additional Bobrwm workspaces.
+instances supplied by macOS; they do not create additional BobrWM workspaces.
 
 A logical workspace has exactly one current placement: a native Space ID on
 one display. Moving a workspace changes that placement and moves its windows;
@@ -103,7 +103,7 @@ WindowState:
   frame and mode
 ```
 
-Native Space ordinals are local to each display. At startup, Bobrwm assigns the
+Native Space ordinals are local to each display. At startup, BobrWM assigns the
 primary display's Spaces the lowest workspace IDs in native ordinal order, then
 assigns secondary displays in stable display identity order while reserving at
 least one workspace for each. It preserves those bindings by native Space ID
@@ -176,7 +176,7 @@ topology observes C or the deadline fires
   -> observed C, requested none, report failed request B, reconcile from C
 ```
 
-Bobrwm never claims B is active before WindowServer observes B. Focus events,
+BobrWM never claims B is active before WindowServer observes B. Focus events,
 window actions, queued switches, and effect completions are reduced against the
 same transition epoch.
 
@@ -257,4 +257,4 @@ fallback unless it is represented as model state with a transition test. Do
 not preserve two writable representations of the same fact during migration.
 
 The goal is not abstraction for its own sake. The goal is one deterministic
-place where Bobrwm decides what is true and what should happen next.
+place where BobrWM decides what is true and what should happen next.

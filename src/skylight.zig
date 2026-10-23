@@ -177,7 +177,7 @@ pub const SkyLight = struct {
     }
 
     /// Return the frontmost WindowServer window at a global screen point.
-    /// Bobrwm-owned overlay panels are skipped so dimming and drag previews do
+    /// BobrWM-owned overlay panels are skipped so dimming and drag previews do
     /// not hide the managed window beneath them from pointer hit-testing.
     pub fn windowAtPoint(self: *const SkyLight, point: c.CGPoint) ?u32 {
         const find = self.findWindowAndOwner orelse return null;

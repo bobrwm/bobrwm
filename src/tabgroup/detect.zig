@@ -2,7 +2,7 @@
 //! which of them is on screen.
 //!
 //! Every decision here is a pure function over a snapshot of OS facts. Nothing
-//! in this file touches AX, WindowServer, or Bobrwm's state, so the heuristics
+//! in this file touches AX, WindowServer, or BobrWM's state, so the heuristics
 //! can be exercised in tests without a live desktop — which matters because
 //! they are heuristics, and the interesting cases (a floating app whose windows
 //! stack at identical frames) are the ones that are painful to reproduce by

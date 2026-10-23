@@ -238,11 +238,12 @@ pub fn build(b: *std.Build) !void {
     }
     if (optimize != .debug) swift_app.addArg("-O");
     // Carries both bobrwm_ui.h and the modulemap that makes it importable.
-    swift_app.addPrefixedDirectoryArg("-I", b.path("packages/bobrwm-ui/include"));
+    swift_app.addPrefixedDirectoryArg("-I", b.path("macos/include"));
     const app_exe = swift_app.addPrefixedOutputFileArg("-o", server_exe_name);
-    swift_app.addFileArg(b.path("packages/bobrwm-ui/src/main.swift"));
-    swift_app.addFileArg(b.path("packages/bobrwm-ui/src/MenuBar.swift"));
-    swift_app.addFileArg(b.path("packages/bobrwm-ui/src/MenuRow.swift"));
+    swift_app.addFileArg(b.path("macos/src/main.swift"));
+    swift_app.addFileArg(b.path("macos/src/Settings.swift"));
+    swift_app.addFileArg(b.path("macos/src/MenuBar.swift"));
+    swift_app.addFileArg(b.path("macos/src/StatusMenu.swift"));
     swift_app.addFileArg(linked_archive);
     swift_app.addFileArg(oslog_object);
     for ([_][]const u8{
@@ -331,9 +332,10 @@ pub fn build(b: *std.Build) !void {
     const run_step = b.step("run", "Run bobrwm");
     run_step.dependOn(&run_cmd.step);
 
-    // Renders the menu bar views to PNGs so the UI can be iterated on without
-    // rebuilding bobrwm and interrupting a running window manager. MenuRow.swift
-    // has no dependency on the C ABI module, so it links standalone.
+    // Renders the menu bar UI to PNGs so it can be iterated on without
+    // rebuilding bobrwm and interrupting a running window manager.
+    // StatusMenu.swift sends actions through a protocol rather than the C ABI
+    // callbacks, so the harness links it without the core.
     const preview_build = b.addSystemCommand(&.{
         "swiftc",
         "-swift-version",
@@ -347,8 +349,10 @@ pub fn build(b: *std.Build) !void {
         preview_build.setEnvironmentVariable("DEVELOPER_DIR", developer_dir);
     }
     const preview_exe = preview_build.addPrefixedOutputFileArg("-o", "bobrwm-ui-preview");
-    preview_build.addFileArg(b.path("packages/bobrwm-ui/src/MenuRow.swift"));
-    preview_build.addFileArg(b.path("packages/bobrwm-ui/preview/main.swift"));
+    preview_build.addPrefixedDirectoryArg("-I", b.path("macos/include"));
+    preview_build.addFileArg(b.path("macos/src/StatusMenu.swift"));
+    preview_build.addFileArg(b.path("macos/src/Settings.swift"));
+    preview_build.addFileArg(b.path("macos/preview/main.swift"));
 
     const preview_run = std.Build.Step.Run.create(b, "render ui preview");
     preview_run.has_side_effects = true;
@@ -570,6 +574,18 @@ pub fn build(b: *std.Build) !void {
 
     const run_swipe_tests = b.addRunArtifact(swipe_tests);
 
+    const osutil_tests = b.addTest(.{
+        .name = "osutil-tests",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/osutil.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+
+    const run_osutil_tests = b.addRunArtifact(osutil_tests);
+
     const helpgen_tests = b.addTest(.{
         .name = "helpgen-tests",
         .root_module = b.createModule(.{
@@ -626,6 +642,7 @@ pub fn build(b: *std.Build) !void {
     test_step.dependOn(&run_logging_tests.step);
     test_step.dependOn(&run_trace_tests.step);
     test_step.dependOn(&run_swipe_tests.step);
+    test_step.dependOn(&run_osutil_tests.step);
     test_step.dependOn(&run_helpgen_tests.step);
     test_step.dependOn(&run_cli_tests.step);
     test_step.dependOn(&run_config_format_tests.step);
@@ -742,7 +759,9 @@ fn bundleInfoPlist(b: *std.Build, version: std.SemanticVersion) std.Build.LazyPa
         \\    <key>CFBundleInfoDictionaryVersion</key>
         \\    <string>6.0</string>
         \\    <key>CFBundleName</key>
-        \\    <string>bobrwm</string>
+        \\    <string>BobrWM</string>
+        \\    <key>CFBundleDisplayName</key>
+        \\    <string>BobrWM</string>
         \\    <key>CFBundlePackageType</key>
         \\    <string>APPL</string>
         \\    <key>CFBundleShortVersionString</key>

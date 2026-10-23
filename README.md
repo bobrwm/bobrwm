@@ -22,7 +22,7 @@ a detour through System Settings.
 The cask tracks `main`: every push publishes a fresh build and updates the
 cask, so `brew upgrade` picks it up. There are no tagged releases to wait for.
 
-Bobrwm is still in early development. To build it yourself, see
+BobrWM is still in early development. To build it yourself, see
 [Development](#development); `zig build` produces `zig-out/Bobrwm.app`.
 
 ### Upgrading from the formula
@@ -90,7 +90,7 @@ your config; there is no launchd agent to install by hand.
 
 The window manager sends logs to macOS unified logging and stderr. Both
 destinations honor the configured log level, including debug in optimized
-builds. Stream all Bobrwm records with:
+builds. Stream all BobrWM records with:
 
 ```bash
 log stream --level debug --predicate 'subsystem == "com.bobrwm.bobrwm"'
@@ -142,7 +142,7 @@ bobrwm show-config --default --docs > ~/.config/bobrwm/config.zon
 
 Press `Alt+Shift+R` (the default `reload_config` binding) or run
 `bobrwm reload-config` to apply changes without restarting, or set
-`.auto_reload_config = true` and restart to reload on every save. If the file
+`.auto_reload_config = true` to reload on every save. If the file
 contains invalid ZON or values outside the documented bounds, bobrwm keeps the
 last valid configuration and shows a temporary error in its menu-bar item;
 details remain in the error log. `bobrwm reload-config` is silent on success and
@@ -152,7 +152,7 @@ exits non-zero with an error message when the new config cannot be loaded.
 
 Each bobrwm workspace is assigned to exactly one ordinary Mission Control
 Space across all displays. At startup, the primary display receives the lowest
-workspace numbers in native ordinal order, so Bobrwm workspace 1 maps to its
+workspace numbers in native ordinal order, so BobrWM workspace 1 maps to its
 native Space 1. Secondary displays follow in stable display order, with at
 least one workspace reserved for each. After startup, each workspace keeps its
 Space: switching, moving windows, and disconnecting or reconnecting a monitor
@@ -162,8 +162,8 @@ windows macOS piles onto another workspace are sent back to their own. A
 reconnected monitor that comes back with a fresh Space takes over the
 highest-numbered workspace of a display that has several.
 
-Configure at least as many ordinary Mission Control Spaces in total as Bobrwm
-workspaces, with at least one on every managed display. Bobrwm creates missing
+Configure at least as many ordinary Mission Control Spaces in total as BobrWM
+workspaces, with at least one on every managed display. BobrWM creates missing
 Spaces on the primary display. It removes extra Spaces only when they are empty
 and hold no workspace; extras that still have windows stay, unnumbered, because
 destroying them would make macOS merge their windows into another workspace. It
@@ -173,9 +173,9 @@ Space creation or deletion.
 Full-screen application spaces are ignored when assigning workspace numbers,
 but are crossed when switching. Switching uses the
 high-velocity synthetic Dock gesture pioneered by InstantSpaceSwitcher;
-on macOS 27 and later, Bobrwm also supplies the serialized IOHID payload now
+on macOS 27 and later, BobrWM also supplies the serialized IOHID payload now
 required by Dock. Window moves and topology queries use private, undocumented
-APIs. Either path can break on a future macOS release. Bobrwm waits for the
+APIs. Either path can break on a future macOS release. BobrWM waits for the
 native transition to settle, then reconciles the landed Space against
 WindowServer without injecting a second gesture from stale intermediate state.
 Rapid switch requests are serialized at native Space-change confirmations;
@@ -193,13 +193,13 @@ Enable trackpad workspace switching in the main bobrwm config:
 },
 ```
 
-Bobrwm intercepts macOS's native horizontal Spaces gesture and immediately
+BobrWM intercepts macOS's native horizontal Spaces gesture and immediately
 requests the adjacent bobrwm workspace. The finger count comes from **System
 Settings → Trackpad → More Gestures → Swipe between full-screen applications**;
 it is not duplicated in bobrwm's config. Vertical Mission Control and App
 Exposé gestures pass through unchanged.
 
-Bobrwm starts the listener itself and uses its existing Accessibility grant.
+BobrWM starts the listener itself and uses its existing Accessibility grant.
 Horizontal gestures are consumed for their complete lifetime. At the first or
 last bobrwm workspace no switch occurs; that boundary gesture cannot safely be
 handed back to the Dock after its opening events were already suppressed.
