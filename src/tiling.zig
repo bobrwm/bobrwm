@@ -52,6 +52,11 @@ pub const Event = union(enum) {
         window_id: WindowId,
         options: InsertOptions,
     },
+    reinsert_window: struct {
+        space_key: SpaceKey,
+        window_id: WindowId,
+        options: InsertOptions,
+    },
     swap_layouts: struct { first_key: SpaceKey, second_key: SpaceKey },
     rekey_layout: struct { source_key: SpaceKey, target_key: SpaceKey },
     set_active: struct { space_key: SpaceKey, window_id: WindowId },
@@ -134,7 +139,7 @@ node_occupied: [max_nodes]bool = @splat(false),
 node_count: u16 = 0,
 
 /// Apply `event` to `model` in place and return a rejection, if any. Only
-/// insert, move and swap can fail partway, so only they snapshot the 50 KiB
+/// insert, reinsert, move and swap can fail partway, so only they snapshot the 50 KiB
 /// table to roll back; every other event mutates without copying.
 pub fn reduce(model: *Self, event: Event) ?Effect {
     switch (event) {
@@ -158,6 +163,18 @@ pub fn reduce(model: *Self, event: Event) ?Effect {
             ) catch |err| {
                 model.* = original;
                 return rejectionEffect(movement.target_key, movement.window_id, err);
+            };
+        },
+        .reinsert_window => |insertion| {
+            if (!model.contains(insertion.space_key, insertion.window_id)) {
+                return rejectionEffect(insertion.space_key, insertion.window_id, error.WindowMissing);
+            }
+            const original = model.*;
+            const kind = model.layoutKind(insertion.space_key).?;
+            model.remove(insertion.space_key, insertion.window_id);
+            model.insert(insertion.space_key, kind, insertion.window_id, insertion.options) catch |err| {
+                model.* = original;
+                return rejectionEffect(insertion.space_key, insertion.window_id, err);
             };
         },
         .swap_layouts => |swap| {
@@ -288,6 +305,13 @@ pub fn entryAtPoint(
     if (state.kind != .bsp) return null;
     const root = state.root orelse return null;
     return self.bspEntryAtPoint(root, frame, inner_gap, point_x, point_y, excluded_window_id);
+}
+
+/// Project one BSP tile without allocating the complete layout.
+pub fn frameForWindow(self: *const Self, space_key: SpaceKey, frame: Frame, inner_gap: f64, window_id: WindowId) ?Frame {
+    const state = self.layoutState(space_key) orelse return null;
+    if (state.kind != .bsp) return null;
+    return self.findLeafFrame(state.root orelse return null, frame, inner_gap, window_id);
 }
 
 /// Return the number of unique window identities owned by all layouts.
