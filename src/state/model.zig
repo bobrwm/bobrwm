@@ -528,7 +528,8 @@ pub const PointerDragState = struct {
     candidate_window_id: ?WindowId = null,
     active_window_id: ?WindowId = null,
     should_reconcile_on_drop: bool = false,
-    is_window_move: bool = false,
+    initial_frame: ?window_mod.Window.Frame = null,
+    kind: enum { unknown, move, resize } = .unknown,
 };
 
 pub const DragPreviewState = struct {
@@ -1108,7 +1109,11 @@ pub const Event = union(enum) {
     request_window_move: WindowMoveRequest,
     pointer_down: ?WindowId,
     pointer_dragged,
-    pointer_geometry_reconcile_requested: struct { window_id: WindowId, is_move: bool },
+    pointer_geometry_reconcile_requested: struct {
+        window_id: WindowId,
+        frame: window_mod.Window.Frame,
+        is_move: bool,
+    },
     drag_preview_observed: struct {
         source_window_id: WindowId,
         pointer_x: f64,
