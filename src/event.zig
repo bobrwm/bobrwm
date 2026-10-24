@@ -29,6 +29,7 @@ pub const EventKind = enum(u8) {
     focus_retry_observed = 47,
     focus_retry_unanswered = 48,
     window_readiness_observed = 49,
+    app_windows_observed = 50,
 
     hk_focus_workspace = 20,
     hk_move_to_workspace = 21,
