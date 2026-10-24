@@ -2,7 +2,8 @@
 //!
 //! The window manager computes preview frames in CG coordinates (top-left origin),
 //! while AppKit expects NS coordinates (bottom-left origin). This module performs
-//! that conversion and owns a lazily created borderless panel.
+//! that conversion and owns a lazily created borderless panel. AppKit animates
+//! the panel independently of AX window writes so a slow app cannot stall it.
 
 const std = @import("std");
 const objc = @import("objc");
@@ -28,7 +29,9 @@ const preview_frame_default: NSRect = .{
     .size = .{ .width = 100, .height = 100 },
 };
 const preview_corner_radius: f64 = 10;
-const preview_border_width: f64 = 3;
+const preview_border_width: f64 = 1.5;
+const preview_move_duration: f64 = 0.20;
+const preview_fade_duration: f64 = 0.12;
 const ns_window_style_mask_borderless: usize = 0;
 const ns_backing_store_buffered: usize = 2;
 const ns_window_collection_behavior_can_join_all_spaces: usize = 1 << 0;
@@ -36,23 +39,80 @@ const ns_window_collection_behavior_transient: usize = 1 << 3;
 const ns_window_collection_behavior_full_screen_auxiliary: usize = 1 << 8;
 
 var g_tile_preview_panel: ?objc.Object = null;
+var g_visible = false;
+// A fade-out completion must not hide a preview shown again in the meantime.
+var g_generation: u64 = 0;
+const HideCompletion = objc.Block(struct { generation: u64 }, .{}, void);
 
 pub fn show(x: f64, y: f64, width: f64, height: f64) void {
     if (width <= 0 or height <= 0) return;
 
     const panel = ensurePanel() orelse return;
     const frame = nsRectFromCg(x, y, width, height);
-    panel.msgSend(void, "setFrame:display:", .{ frame, true });
+    g_generation +%= 1;
+    const was_visible = g_visible;
+    g_visible = true;
+    const reduce_motion = reduceMotion();
+    if (!was_visible) {
+        // Start locally, not at the last drag's destination (possibly on
+        // another display). The small expansion makes entry feel immediate.
+        const inset = if (reduce_motion) 0 else @min(@as(f64, 6), @min(width, height) / 4);
+        const initial: NSRect = .{
+            .origin = .{ .x = frame.origin.x + inset, .y = frame.origin.y + inset },
+            .size = .{ .width = width - 2 * inset, .height = height - 2 * inset },
+        };
+        panel.msgSend(void, "setFrame:display:", .{ initial, true });
+        panel.msgSend(void, "setAlphaValue:", .{@as(f64, 0)});
+        panel.msgSend(void, "orderFront:", .{objc.Object{ .value = null }});
+    }
 
-    const nil_object: objc.Object = .{ .value = null };
-    panel.msgSend(void, "orderFront:", .{nil_object});
+    _ = beginAnimation(if (reduce_motion) 0 else preview_move_duration);
+    const animator = panel.msgSend(objc.Object, "animator", .{});
+    animator.msgSend(void, "setFrame:display:", .{ frame, true });
+    animator.msgSend(void, "setAlphaValue:", .{@as(f64, 1)});
+    objc.getClass("NSAnimationContext").?.msgSend(void, "endGrouping", .{});
 }
 
 pub fn hide() void {
-    if (g_tile_preview_panel) |panel| {
-        const nil_object: objc.Object = .{ .value = null };
-        panel.msgSend(void, "orderOut:", .{nil_object});
+    if (!g_visible) return;
+    const panel = g_tile_preview_panel orelse return;
+    g_visible = false;
+    g_generation +%= 1;
+    if (reduceMotion()) {
+        panel.msgSend(void, "orderOut:", .{objc.Object{ .value = null }});
+        return;
     }
+    const context = beginAnimation(preview_fade_duration);
+    var completion = HideCompletion.init(.{ .generation = g_generation }, finishHide);
+    context.msgSend(void, "setCompletionHandler:", .{&completion});
+    panel.msgSend(objc.Object, "animator", .{}).msgSend(void, "setAlphaValue:", .{@as(f64, 0)});
+    objc.getClass("NSAnimationContext").?.msgSend(void, "endGrouping", .{});
+}
+
+fn finishHide(completion: *const HideCompletion.Context) callconv(.c) void {
+    if (completion.generation != g_generation or g_visible) return;
+    if (g_tile_preview_panel) |panel| {
+        panel.msgSend(void, "orderOut:", .{objc.Object{ .value = null }});
+    }
+}
+
+fn reduceMotion() bool {
+    const workspace = objc.getClass("NSWorkspace").?.msgSend(objc.Object, "sharedWorkspace", .{});
+    return workspace.msgSend(bool, "accessibilityDisplayShouldReduceMotion", .{});
+}
+
+fn beginAnimation(duration: f64) objc.Object {
+    const NSAnimationContext = objc.getClass("NSAnimationContext").?;
+    NSAnimationContext.msgSend(void, "beginGrouping", .{});
+    const context = NSAnimationContext.msgSend(objc.Object, "currentContext", .{});
+    context.msgSend(void, "setDuration:", .{duration});
+    const timing = objc.getClass("CAMediaTimingFunction").?.msgSend(
+        objc.Object,
+        "functionWithControlPoints::::",
+        .{ @as(f32, 0.22), @as(f32, 1), @as(f32, 0.36), @as(f32, 1) },
+    );
+    context.msgSend(void, "setTimingFunction:", .{timing});
+    return context;
 }
 
 fn ensurePanel() ?objc.Object {
@@ -104,7 +164,7 @@ fn ensurePanel() ?objc.Object {
             const border_color = NSColor.msgSend(
                 objc.Object,
                 "colorWithSRGBRed:green:blue:alpha:",
-                .{ @as(f64, 0.13), @as(f64, 0.62), @as(f64, 1.0), @as(f64, 0.95) },
+                .{ @as(f64, 0.13), @as(f64, 0.62), @as(f64, 1.0), @as(f64, 0.75) },
             );
             if (border_color.value != null) {
                 if (border_color.msgSend(?*anyopaque, "CGColor", .{})) |cg_color| {
@@ -115,7 +175,7 @@ fn ensurePanel() ?objc.Object {
             const background_color = NSColor.msgSend(
                 objc.Object,
                 "colorWithSRGBRed:green:blue:alpha:",
-                .{ @as(f64, 0.13), @as(f64, 0.62), @as(f64, 1.0), @as(f64, 0.18) },
+                .{ @as(f64, 0.13), @as(f64, 0.62), @as(f64, 1.0), @as(f64, 0.06) },
             );
             if (background_color.value != null) {
                 if (background_color.msgSend(?*anyopaque, "CGColor", .{})) |cg_color| {
