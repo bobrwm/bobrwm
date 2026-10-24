@@ -1289,7 +1289,7 @@ var g_config_runtime: ?ConfigRuntime = null;
 var g_config_path: ?[:0]const u8 = null;
 var g_mouse_down_location: c.CGPoint = .{ .x = 0, .y = 0 };
 var g_mouse_move_location: c.CGPoint = .{ .x = 0, .y = 0 };
-var g_mouse_drag_event_emitted = false;
+var g_mouse_drag_location: c.CGPoint = .{ .x = 0, .y = 0 };
 var g_focus_follows_mouse: focus_follows_mouse.State = .{};
 
 fn workspaceCount() u8 {
@@ -2377,19 +2377,17 @@ fn hotkeyTapCallback(
 
     if (event_type == c.kCGEventLeftMouseDown) {
         g_mouse_down_location = cg_extra.CGEventGetLocation(event);
-        g_mouse_drag_event_emitted = false;
+        g_mouse_drag_location = g_mouse_down_location;
         bw_hotkey_mouse_down();
         return event;
     }
     if (event_type == c.kCGEventLeftMouseDragged) {
-        if (!g_mouse_drag_event_emitted) {
-            g_mouse_drag_event_emitted = true;
-            bw_hotkey_mouse_dragged();
-        }
+        g_mouse_drag_location = cg_extra.CGEventGetLocation(event);
+        bw_hotkey_mouse_dragged();
         return event;
     }
     if (event_type == c.kCGEventLeftMouseUp) {
-        g_mouse_drag_event_emitted = false;
+        g_mouse_drag_location = cg_extra.CGEventGetLocation(event);
         bw_hotkey_mouse_up();
         return event;
     }
@@ -2729,6 +2727,17 @@ export fn bw_emit_event(kind: u8, pid: i32, wid: u32) void {
         .pid = pid,
         .wid = wid,
     };
+    switch (event.kind) {
+        .mouse_down => {
+            event.mouse_x = g_mouse_down_location.x;
+            event.mouse_y = g_mouse_down_location.y;
+        },
+        .mouse_dragged, .mouse_up => {
+            event.mouse_x = g_mouse_drag_location.x;
+            event.mouse_y = g_mouse_drag_location.y;
+        },
+        else => {},
+    }
 
     c.os_unfair_lock_lock(&g_ring_lock);
     event.enqueued_ns = @truncate(nanoTimestamp());
@@ -2786,8 +2795,8 @@ fn bw_hotkey_mouse_up() void {
     bw_emit_event(shim.BW_EVENT_MOUSE_UP, 0, 0);
 }
 
-/// Mark the first actual pointer-drag event separately from mouse-down. A
-/// click held while bobrwm retiles is not a user geometry change.
+/// Pointer samples drive targeting after geometry confirms a window move;
+/// a click held while bobrwm retiles is not a user geometry change.
 fn bw_hotkey_mouse_dragged() void {
     bw_emit_event(shim.BW_EVENT_MOUSE_DRAGGED, 0, 0);
 }
@@ -3633,7 +3642,7 @@ fn contentFrame(display: shim.bw_frame, outer: config_mod.OuterGaps) window_mod.
 }
 
 fn updateWindowMovePreview(wid: u32) void {
-    if (g_config.layout != .bsp) {
+    if (g_config.layout != .bsp or !g_state.pointer_drag.is_window_move) {
         clearDragPreview();
         return;
     }
@@ -3665,30 +3674,12 @@ fn updateWindowMovePreview(wid: u32) void {
         return;
     };
 
-    const center_x = win.frame.x + win.frame.width / 2.0;
-    const center_y = win.frame.y + win.frame.height / 2.0;
-    const target_entry = g_state.layout.entryAtPoint(
-        space.key,
-        display_frame,
-        displayInnerGap(space.display_id),
-        center_x,
-        center_y,
-        wid,
-    );
-
-    if (target_entry) |entry| {
-        dispatchStateEvent(.{ .drag_preview_observed = .{
-            .source_window_id = wid,
-            .target_window_id = entry.wid,
-            .target_frame = entry.frame,
-        } });
-        return;
-    }
-
     dispatchStateEvent(.{ .drag_preview_observed = .{
         .source_window_id = wid,
-        .target_window_id = null,
-        .target_frame = null,
+        .pointer_x = g_mouse_drag_location.x,
+        .pointer_y = g_mouse_drag_location.y,
+        .layout_frame = display_frame,
+        .inner_gap = displayInnerGap(space.display_id),
     } });
 }
 
@@ -3876,9 +3867,10 @@ fn handleEvent(ev: *const event_mod.Event) void {
         },
         .mouse_down => {
             cancelPendingMouseFocus(true, true);
-            dispatchStateEvent(.{ .pointer_down = managedWindowAtPoint(g_mouse_down_location) });
+            dispatchStateEvent(.{ .pointer_down = managedWindowAtPoint(.{ .x = ev.mouse_x, .y = ev.mouse_y }) });
         },
         .mouse_dragged => {
+            g_mouse_drag_location = .{ .x = ev.mouse_x, .y = ev.mouse_y };
             dispatchStateEvent(.pointer_dragged);
             // A drag emits one of these per pointer sample. Only the moment
             // ownership changes carries information; repeating it for every
@@ -3888,8 +3880,15 @@ fn handleEvent(ev: *const event_mod.Event) void {
                 g_logged_drag_window_id = claimed;
                 if (claimed != 0) log.debug("geometry: pointer drag claimed wid={d}", .{claimed});
             }
+            if (claimed != 0) updateWindowMovePreview(g_state.windowTabLeader(claimed));
         },
         .mouse_up => {
+            g_mouse_drag_location = .{ .x = ev.mouse_x, .y = ev.mouse_y };
+            // Use the release position, not the last AX sample or the last
+            // painted frame: a quick edge-to-center flick changes the action.
+            if (g_state.pointer_drag.active_window_id) |wid| {
+                updateWindowMovePreview(g_state.windowTabLeader(wid));
+            }
             dispatchStateEvent(.pointer_up);
             // Arm the drag log for the next drag, so dragging the same window
             // twice in a row still records the second one.
@@ -5019,7 +5018,10 @@ fn executeWindowGeometryObserved(
         if (managedWindow(layout_wid)) |win| {
             const space = managedWindowSpace(win.wid) orelse return;
             if (win.mode == .tiled and !win.is_fullscreen and spaceVisible(space)) {
-                dispatchStateEvent(.{ .pointer_geometry_reconcile_requested = observation.window_id });
+                dispatchStateEvent(.{ .pointer_geometry_reconcile_requested = .{
+                    .window_id = observation.window_id,
+                    .is_move = observation.is_move,
+                } });
             }
         }
     }

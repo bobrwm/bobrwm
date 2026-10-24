@@ -256,9 +256,11 @@ pub fn reduce(model: *Model, event: Event) Transition {
         .request_window_move => |request| command_reducer.reduceWindowMoveRequest(&transition, request),
         .pointer_down => |candidate_window_id| pointer_reducer.reducePointerDown(&transition, candidate_window_id),
         .pointer_dragged => pointer_reducer.reducePointerDragged(&transition),
-        .pointer_geometry_reconcile_requested => |window_id| {
-            if (transition.model.pointer_drag.active_window_id == window_id) {
+        .pointer_geometry_reconcile_requested => |observation| {
+            if (transition.model.pointer_drag.active_window_id == observation.window_id) {
                 transition.model.pointer_drag.should_reconcile_on_drop = true;
+                transition.model.pointer_drag.is_window_move = observation.is_move;
+                if (!observation.is_move) pointer_reducer.clearDragPreview(&transition);
             }
         },
         .drag_preview_observed => |observation| pointer_reducer.reduceDragPreviewObserved(&transition, observation),
@@ -2586,40 +2588,140 @@ test "display settle timer is reducer owned" {
     try testing.expectEqual(std.meta.Tag(Effect).display_resettle_due, std.meta.activeTag(transition.effects[0]));
 }
 
-test "pointer drop swaps layout inside the reducer" {
+test "pointer zones preview and commit swaps or directional insertion" {
     const testing = std.testing;
+    const Frame = window_mod.Window.Frame;
+    const key: SpaceKey = .{ .id = 1 };
+    const root: Frame = .{ .x = 40, .y = 80, .width = 1200, .height = 600 };
     var catalog: SpaceCatalog = .{};
-    catalog.add(.{ .key = .{ .id = 1 }, .workspace_id = 1, .display_id = 11 });
-    var model = reduceCopy(.{}, .{ .replace_space_catalog = &catalog }).model;
-    model = reduceCopy(model, .{ .adopt_window = .{
-        .window_id = 100,
-        .process_id = 42,
-        .space_key = .{ .id = 1 },
-        .frame = .{ .x = 0, .y = 0, .width = 500, .height = 500 },
-        .layout = testLayoutInsertion(.bsp),
-    } }).model;
-    model = reduceCopy(model, .{ .adopt_window = .{
-        .window_id = 200,
-        .process_id = 43,
-        .space_key = .{ .id = 1 },
-        .frame = .{ .x = 500, .y = 0, .width = 500, .height = 500 },
-        .layout = testLayoutInsertion(.bsp),
-    } }).model;
+    catalog.add(.{ .key = key, .workspace_id = 1, .display_id = 11 });
+    const model = try testing.allocator.create(Model);
+    defer testing.allocator.destroy(model);
+    model.* = .{};
+    _ = reduce(model, .{ .replace_space_catalog = &catalog });
+    for ([_]WindowId{ 100, 200, 300 }) |wid| {
+        var insertion = testLayoutInsertion(.bsp);
+        if (wid == 300) {
+            insertion.options.anchor_wid = 200;
+            insertion.options.split_mode = .vertical;
+            insertion.options.split_ratio = 0.4;
+        }
+        _ = reduce(model, .{
+            .adopt_window = .{
+                .window_id = wid,
+                .process_id = 42,
+                .space_key = key,
+                // Deliberately unrelated to the pointer and projected target:
+                // targeting must not use the dragged window's center.
+                .frame = .{ .x = 40, .y = 80, .width = 594, .height = 600 },
+                .layout = insertion,
+            },
+        });
+    }
 
-    model = reduceCopy(model, .{ .pointer_down = 100 }).model;
-    model = reduceCopy(model, .pointer_dragged).model;
-    var transition = reduceCopy(model, .{ .drag_preview_observed = .{
+    _ = reduce(model, .{ .pointer_down = 100 });
+    _ = reduce(model, .pointer_dragged);
+    const drag_event: Event = .{ .drag_preview_observed = .{
         .source_window_id = 100,
-        .target_window_id = 200,
-        .target_frame = .{ .x = 500, .y = 0, .width = 500, .height = 500 },
-    } });
-    try testing.expectEqual(std.meta.Tag(Effect).show_drag_preview, std.meta.activeTag(transition.effects[0]));
+        .pointer_x = 943,
+        .pointer_y = 197,
+        .layout_frame = root,
+        .inner_gap = 12,
+    } };
+    // Selecting text does not become a window drop just because the pointer
+    // crosses a neighboring tile. Resizing must not enable it either.
+    var transition = reduce(model, drag_event);
+    try testing.expectEqual(@as(u8, 0), transition.effect_count);
+    _ = reduce(model, .{ .pointer_geometry_reconcile_requested = .{ .window_id = 100, .is_move = false } });
+    _ = reduce(model, drag_event);
+    try testing.expect(!model.drag_preview.is_visible);
 
-    transition = reduceCopy(transition.model, .pointer_up);
-    try testing.expectEqual(@as(?WindowId, 200), transition.model.layout.firstWid(.{ .id = 1 }));
-    try testing.expect(!transition.model.pointer_drag.is_down);
-    try testing.expectEqual(std.meta.Tag(Effect).hide_drag_preview, std.meta.activeTag(transition.effects[0]));
-    try testing.expectEqual(@as(WindowId, 100), transition.effects[1].pointer_drag_completed.swapped_window_ids.?.first);
+    _ = reduce(model, .{ .pointer_geometry_reconcile_requested = .{ .window_id = 100, .is_move = true } });
+    const baseline = try testing.allocator.create(Model);
+    defer testing.allocator.destroy(baseline);
+    baseline.* = model.*;
+    const cases = [_]struct { nx: f64, ny: f64, direction: ?FocusDirection }{
+        .{ .nx = 0.5, .ny = 0.5, .direction = null },
+        .{ .nx = 0.25, .ny = 0.25, .direction = null },
+        .{ .nx = 0.749, .ny = 0.5, .direction = null },
+        .{ .nx = 0.75, .ny = 0.5, .direction = .right },
+        .{ .nx = 0.249, .ny = 0.5, .direction = .left },
+        .{ .nx = 0.5, .ny = 0.249, .direction = .up },
+        .{ .nx = 0.5, .ny = 0.25, .direction = null },
+        .{ .nx = 0.5, .ny = 0.749, .direction = null },
+        .{ .nx = 0.5, .ny = 0.75, .direction = .down },
+        .{ .nx = 0.93, .ny = 0.14, .direction = .right },
+        .{ .nx = 0.7, .ny = 0.1, .direction = .up },
+        .{ .nx = 0.1, .ny = 0.8, .direction = .left },
+        .{ .nx = 0.2, .ny = 0.95, .direction = .down },
+    };
+    var entries: std.ArrayList(tiling_mod.LayoutEntry) = .empty;
+    defer entries.deinit(testing.allocator);
+    try entries.ensureTotalCapacity(testing.allocator, 3);
+    for (cases) |case| {
+        model.* = baseline.*;
+        var event = drag_event;
+        event.drag_preview_observed.pointer_x = 646 + 594 * case.nx;
+        event.drag_preview_observed.pointer_y = 80 + 234 * case.ny;
+        // Change zones on the same target, not just between target IDs.
+        _ = reduce(model, drag_event);
+        transition = reduce(model, event);
+        try testing.expectEqual(@as(?WindowId, 200), transition.model.drag_preview.target_window_id);
+        try testing.expectEqual(case.direction, transition.model.drag_preview.direction);
+        const expected: Frame = if (case.direction) |side| switch (side) {
+            .left => .{ .x = 40, .y = 80, .width = 594, .height = 234 },
+            .right => .{ .x = 646, .y = 80, .width = 594, .height = 234 },
+            .up => .{ .x = 40, .y = 80, .width = 1200, .height = 111 },
+            .down => .{ .x = 40, .y = 203, .width = 1200, .height = 111 },
+        } else .{ .x = 646, .y = 80, .width = 594, .height = 234 };
+        try testing.expect(expected.approxEqual(transition.model.drag_preview.frame.?, 0.001));
+        if (case.direction != null) {
+            try testing.expectEqual(std.meta.Tag(Effect).show_drag_preview, std.meta.activeTag(transition.effects[0]));
+            try testing.expect(expected.approxEqual(transition.effects[0].show_drag_preview, 0.001));
+        }
+        transition = reduce(model, .pointer_up);
+        entries.clearRetainingCapacity();
+        transition.model.layout.computeLayout(key, root, 12, &entries);
+        try testing.expectEqual(@as(usize, 3), entries.items.len);
+        for (entries.items) |entry| {
+            if (entry.wid == 100) try testing.expect(expected.approxEqual(entry.frame, 0.001));
+        }
+        try testing.expect(!transition.model.pointer_drag.is_down);
+        try testing.expectEqual(std.meta.Tag(Effect).hide_drag_preview, std.meta.activeTag(transition.effects[0]));
+        try testing.expect(transition.effects[1].pointer_drag_completed.should_retile);
+        try testing.expectEqual(case.direction == null, transition.effects[1].pointer_drag_completed.swapped_window_ids != null);
+    }
+
+    // A different target must be the insertion anchor, not the first leaf.
+    model.* = baseline.*;
+    var lower_event = drag_event;
+    lower_event.drag_preview_observed.pointer_y = 340;
+    transition = reduce(model, lower_event);
+    const lower_half: Frame = .{ .x = 40, .y = 326, .width = 1200, .height = 171 };
+    try testing.expectEqual(@as(?WindowId, 300), model.drag_preview.target_window_id);
+    try testing.expect(lower_half.approxEqual(model.drag_preview.frame.?, 0.001));
+    _ = reduce(model, .pointer_up);
+    try testing.expect(lower_half.approxEqual(model.layout.frameForWindow(key, root, 12, 100).?, 0.001));
+
+    // Releasing in the center after an edge hover must swap, not insert.
+    model.* = baseline.*;
+    var edge_event = drag_event;
+    edge_event.drag_preview_observed.pointer_y = 90;
+    _ = reduce(model, edge_event);
+    _ = reduce(model, drag_event);
+    transition = reduce(model, .pointer_up);
+    try testing.expect(transition.effects[1].pointer_drag_completed.swapped_window_ids != null);
+
+    model.* = baseline.*;
+    transition = reduce(model, drag_event);
+    var gap_event = drag_event;
+    gap_event.drag_preview_observed.pointer_x = 640;
+    transition = reduce(model, gap_event);
+    try testing.expect(!transition.model.drag_preview.is_visible);
+    transition = reduce(model, .pointer_up);
+    try testing.expectEqual(@as(?WindowId, 100), transition.model.layout.firstWid(key));
+    try testing.expect(transition.effects[0].pointer_drag_completed.swapped_window_ids == null);
+    try testing.expectEqual(@as(u8, 0), reduce(model, drag_event).effect_count);
 }
 
 test "directional commands resolve focus and layout in the reducer" {

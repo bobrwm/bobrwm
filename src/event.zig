@@ -53,4 +53,8 @@ pub const Event = extern struct {
     wid: u32,
     /// Monotonic publication time; zero when the producer does not set it.
     enqueued_ns: i64 = 0,
+    /// Keep release coordinates with the event, even if another pointer
+    /// sample arrives before the main-thread drain processes it.
+    mouse_x: f64 = 0,
+    mouse_y: f64 = 0,
 };
