@@ -258,9 +258,17 @@ pub fn reduce(model: *Model, event: Event) Transition {
         .pointer_dragged => pointer_reducer.reducePointerDragged(&transition),
         .pointer_geometry_reconcile_requested => |observation| {
             if (transition.model.pointer_drag.active_window_id == observation.window_id) {
-                transition.model.pointer_drag.should_reconcile_on_drop = true;
-                transition.model.pointer_drag.is_window_move = observation.is_move;
-                if (!observation.is_move) pointer_reducer.clearDragPreview(&transition);
+                const drag = &transition.model.pointer_drag;
+                drag.should_reconcile_on_drop = true;
+                // Edge resizing also emits AXMoved. Compare against the
+                // mouse-down size and latch resize until the next gesture,
+                // even if later samples return to the original dimensions.
+                if (!observation.is_move or !drag.initial_frame.?.sizeApproxEqual(observation.frame, window_mod.Window.Frame.tolerance)) {
+                    drag.kind = .resize;
+                } else if (drag.kind == .unknown) {
+                    drag.kind = .move;
+                }
+                if (drag.kind == .resize) pointer_reducer.clearDragPreview(&transition);
             }
         },
         .drag_preview_observed => |observation| pointer_reducer.reduceDragPreviewObserved(&transition, observation),
@@ -2632,11 +2640,23 @@ test "pointer zones preview and commit swaps or directional insertion" {
     // crosses a neighboring tile. Resizing must not enable it either.
     var transition = reduce(model, drag_event);
     try testing.expectEqual(@as(u8, 0), transition.effect_count);
-    _ = reduce(model, .{ .pointer_geometry_reconcile_requested = .{ .window_id = 100, .is_move = false } });
+    const moved_frame: Frame = .{ .x = 70, .y = 110, .width = 594, .height = 600 };
+    _ = reduce(model, .{ .pointer_geometry_reconcile_requested = .{ .window_id = 100, .frame = moved_frame, .is_move = false } });
     _ = reduce(model, drag_event);
     try testing.expect(!model.drag_preview.is_visible);
 
-    _ = reduce(model, .{ .pointer_geometry_reconcile_requested = .{ .window_id = 100, .is_move = true } });
+    // AXMoved can follow AXResized in the same edge-resize gesture. It
+    // must not re-enable a drop, even when the pointer crosses a target.
+    _ = reduce(model, .{ .pointer_geometry_reconcile_requested = .{ .window_id = 100, .frame = moved_frame, .is_move = true } });
+    _ = reduce(model, drag_event);
+    try testing.expect(!model.drag_preview.is_visible);
+    _ = reduce(model, .pointer_up);
+    try testing.expectEqual(@as(?WindowId, 100), model.layout.firstWid(key));
+
+    // A new gesture may move normally after a resize has completed.
+    _ = reduce(model, .{ .pointer_down = 100 });
+    _ = reduce(model, .pointer_dragged);
+    _ = reduce(model, .{ .pointer_geometry_reconcile_requested = .{ .window_id = 100, .frame = moved_frame, .is_move = true } });
     const baseline = try testing.allocator.create(Model);
     defer testing.allocator.destroy(baseline);
     baseline.* = model.*;
@@ -2722,6 +2742,32 @@ test "pointer zones preview and commit swaps or directional insertion" {
     try testing.expectEqual(@as(?WindowId, 100), transition.model.layout.firstWid(key));
     try testing.expect(transition.effects[0].pointer_drag_completed.swapped_window_ids == null);
     try testing.expectEqual(@as(u8, 0), reduce(model, drag_event).effect_count);
+
+    // A move notification carrying a size change is still a resize. Cover
+    // width and height separately, both sides of the rounding tolerance,
+    // and cancellation of an already visible move preview.
+    for ([_]Frame{
+        .{ .x = 42, .y = 80, .width = 592, .height = 600 },
+        .{ .x = 40, .y = 82, .width = 594, .height = 598 },
+        .{ .x = 70, .y = 110, .width = 595, .height = 601 },
+    }, 0..) |frame, index| {
+        model.* = baseline.*;
+        _ = reduce(model, drag_event);
+        try testing.expect(model.drag_preview.is_visible);
+        _ = reduce(model, .{ .pointer_geometry_reconcile_requested = .{
+            .window_id = 100,
+            .frame = frame,
+            .is_move = true,
+        } });
+        _ = reduce(model, drag_event);
+        const is_resize = index < 2;
+        try testing.expectEqual(!is_resize, model.drag_preview.is_visible);
+        _ = reduce(model, .{ .pointer_geometry_reconcile_requested = .{ .window_id = 100, .frame = moved_frame, .is_move = true } });
+        _ = reduce(model, drag_event);
+        try testing.expectEqual(!is_resize, model.drag_preview.is_visible);
+        _ = reduce(model, .pointer_up);
+        try testing.expectEqual(@as(?WindowId, if (is_resize) 100 else 200), model.layout.firstWid(key));
+    }
 }
 
 test "directional commands resolve focus and layout in the reducer" {

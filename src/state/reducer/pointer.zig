@@ -18,7 +18,8 @@ pub fn removeWindowFromPointerState(transition: *Transition, window_id: WindowId
     if (transition.model.pointer_drag.active_window_id == window_id) {
         transition.model.pointer_drag.active_window_id = null;
         transition.model.pointer_drag.should_reconcile_on_drop = false;
-        transition.model.pointer_drag.is_window_move = false;
+        transition.model.pointer_drag.initial_frame = null;
+        transition.model.pointer_drag.kind = .unknown;
     }
     if (transition.model.drag_preview.source_window_id == window_id or
         transition.model.drag_preview.target_window_id == window_id)
@@ -29,12 +30,11 @@ pub fn removeWindowFromPointerState(transition: *Transition, window_id: WindowId
 
 pub fn reducePointerDown(transition: *Transition, candidate_window_id: ?WindowId) void {
     clearDragPreview(transition);
+    const candidate = if (candidate_window_id) |window_id| transition.model.window(window_id) else null;
     transition.model.pointer_drag = .{
         .is_down = true,
-        .candidate_window_id = if (candidate_window_id) |window_id|
-            if (transition.model.window(window_id) != null) window_id else null
-        else
-            null,
+        .candidate_window_id = if (candidate) |window| window.window_id else null,
+        .initial_frame = if (candidate) |window| window.frame else null,
     };
 }
 
@@ -51,7 +51,7 @@ pub fn reduceDragPreviewObserved(
     const active = transition.model.pointer_drag.active_window_id orelse return;
     // Pointer drags also include text selection and resizing. Only a real
     // window move, confirmed by geometry, may change the layout on release.
-    if (!transition.model.pointer_drag.is_window_move or
+    if (transition.model.pointer_drag.kind != .move or
         transition.model.windowTabLeader(active) != observation.source_window_id)
     {
         clearDragPreview(transition);

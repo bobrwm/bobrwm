@@ -30,7 +30,7 @@ const preview_frame_default: NSRect = .{
 };
 const preview_corner_radius: f64 = 10;
 const preview_border_width: f64 = 1.5;
-const preview_move_duration: f64 = 0.20;
+const preview_move_duration: f64 = 0.12;
 const preview_fade_duration: f64 = 0.12;
 const ns_window_style_mask_borderless: usize = 0;
 const ns_backing_store_buffered: usize = 2;
@@ -50,7 +50,10 @@ pub fn show(x: f64, y: f64, width: f64, height: f64) void {
     const panel = ensurePanel() orelse return;
     const frame = nsRectFromCg(x, y, width, height);
     g_generation +%= 1;
-    const was_visible = g_visible;
+    // A hide request leaves the panel visible until its fade completes.
+    // Crossing a gap must retarget that visible frame, not teleport to a
+    // fresh entry at the next target and reset its opacity to zero.
+    const was_visible = panel.msgSend(bool, "isVisible", .{});
     g_visible = true;
     const reduce_motion = reduceMotion();
     if (!was_visible) {

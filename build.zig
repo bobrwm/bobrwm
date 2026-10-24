@@ -571,6 +571,24 @@ pub fn build(b: *std.Build) !void {
 
     const run_trace_tests = b.addRunArtifact(trace_tests);
 
+    const ax_snapshot_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/ax_snapshot.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    ax_snapshot_test_mod.addImport("c", c_mod);
+    ax_snapshot_test_mod.addImport("cg_extra", cg_extra_mod);
+    ax_snapshot_test_mod.linkFramework("ApplicationServices", .{});
+    ax_snapshot_test_mod.linkFramework("CoreFoundation", .{});
+    ax_snapshot_test_mod.addSystemFrameworkPath(.{ .cwd_relative = sdk_frameworks });
+    ax_snapshot_test_mod.addLibraryPath(.{ .cwd_relative = sdk_lib });
+    const ax_snapshot_tests = b.addTest(.{
+        .name = "ax-snapshot-tests",
+        .root_module = ax_snapshot_test_mod,
+    });
+    const run_ax_snapshot_tests = b.addRunArtifact(ax_snapshot_tests);
+
     const swipe_test_mod = b.createModule(.{
         .root_source_file = b.path("src/swipe.zig"),
         .target = target,
@@ -665,6 +683,7 @@ pub fn build(b: *std.Build) !void {
     test_step.dependOn(&run_dim_tests.step);
     test_step.dependOn(&run_logging_tests.step);
     test_step.dependOn(&run_trace_tests.step);
+    test_step.dependOn(&run_ax_snapshot_tests.step);
     test_step.dependOn(&run_swipe_tests.step);
     test_step.dependOn(&run_osutil_tests.step);
     test_step.dependOn(&run_helpgen_tests.step);
