@@ -89,10 +89,8 @@ pub fn writeFile(path_z: [*:0]const u8, bytes: []const u8) bool {
     return n == bytes.len;
 }
 
-/// Durably replace a file without exposing a partially-written destination.
-/// A symlink is resolved first so the link survives and its target is
-/// replaced, and an existing file keeps its permissions. The temporary file
-/// lives beside the target so rename stays atomic.
+/// Durably replace a file without exposing a partial write. Symlinks survive
+/// and the file keeps its permissions.
 pub fn writeFileAtomically(allocator: std.mem.Allocator, path: []const u8, bytes: []const u8) bool {
     std.debug.assert(path.len > 0);
     const path_z = allocator.dupeSentinel(u8, path, 0) catch return false;

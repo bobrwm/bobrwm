@@ -1,8 +1,7 @@
 import AppKit
 import SwiftUI
 
-/// Actions the status menu sends. An @objc protocol rather than the controller
-/// itself so the preview harness can build the same menu without the core.
+/// A protocol so the preview harness can build the menu without the core.
 @objc protocol StatusMenuActions: AnyObject {
     func switchToWorkspace(_ sender: NSMenuItem)
     func retile(_ sender: NSMenuItem)
@@ -151,14 +150,13 @@ final class StatusMenu {
     }
 }
 
-/// Letters and digits read as text; every other key is an SF Symbol.
 enum KeyLabel: Equatable {
     case text(String)
     case symbol(String)
 }
 
-// Never shown for an accessory app, but its key equivalents still reach the
-// Settings window: without it, Copy, Paste, Undo, and Close do nothing there.
+// Never shown for an accessory app, but without it the Settings window has no
+// Copy, Paste, Undo, or Close shortcuts.
 enum MainMenu {
     static func make(target: StatusMenuActions) -> NSMenu {
         let main = NSMenu()
@@ -206,7 +204,6 @@ enum MainMenu {
         return menu
     }
 
-    // A nil target sends the action down the responder chain.
     private static func item(
         _ title: String, _ action: Selector, _ key: String, _ target: AnyObject? = nil
     ) -> NSMenuItem {
@@ -286,8 +283,7 @@ enum WorkspaceBadge {
         let isFocused = workspace.isFocused
         let isVisible = workspace.isActive && !isFocused
 
-        // A template, so AppKit tints it for the appearance and the highlight;
-        // alpha carries the focused, visible, and idle states.
+        // A template so AppKit tints it; alpha carries the state.
         let image = NSImage(size: NSSize(width: 19, height: 16), flipped: false) { rect in
             let path = NSBezierPath(
                 roundedRect: rect.insetBy(dx: 0.5, dy: 0.5), xRadius: 4, yRadius: 4)

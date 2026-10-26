@@ -1411,8 +1411,7 @@ const ConfigRuntime = struct {
         return .{ .arena = arena, .config = config, .keybind_table = keybind_table };
     }
 
-    /// Parse `source` as a reload would. The source is copied into the
-    /// runtime's arena because parsed strings point into it.
+    // Copies `source` into the arena because parsed strings point into it.
     fn initFromSource(parent_allocator: std.mem.Allocator, path: []const u8, source: [:0]const u8) !ConfigRuntime {
         var arena = std.heap.ArenaAllocator.init(parent_allocator);
         errdefer arena.deinit();
@@ -2218,7 +2217,7 @@ fn applyReloadedConfig(next: ConfigRuntime) void {
     // Only changing the layout algorithm requires reconstructing state.
     if (layout_changed) rebuildTilingStatesForConfig();
     statusbar.updateWorkspaceMenu(workspaceCount(), &g_config);
-    statusbar.updateSettings(&g_config);
+    statusbar.updateSettings(g_allocator, &g_config);
     updateStatusBar();
     retile();
     if (dim.enabled) pushDimSnapshot();
@@ -2263,8 +2262,7 @@ fn reloadConfig() bool {
     return true;
 }
 
-/// The checks a parsed config must pass beyond validation before it can
-/// replace the running one. Reports the failure itself.
+// Reports the failure itself.
 fn canApplyLive(config: *const config_mod.Config) bool {
     const configured_count = config_mod.workspaceCount(config);
     if (configured_count == workspaceCount()) return true;
@@ -2977,9 +2975,11 @@ fn startCore(config_path_arg: ?[]const u8) !void {
             .open_config = statusBarOpenConfig,
             .reload_config = statusBarReloadConfig,
             .set_settings = statusBarSetSettings,
+            .set_app_rules = statusBarSetAppRules,
             .switch_to_workspace = statusBarSwitchToWorkspace,
             .quit = statusBarQuit,
         },
+        g_allocator,
     );
     g_core_stage = .statusbar;
     updateStatusBar();
@@ -3329,8 +3329,8 @@ fn statusBarSetSettings(settings: *const statusbar.Settings) callconv(.c) bool {
     return saveSettings(path, &next);
 }
 
-/// Validate the edited config exactly as a reload would before touching the
-/// file, so a rejected change never reaches disk and comes back on restart.
+// Validates like a reload before writing, so a rejected change never reaches
+// disk and comes back on restart.
 fn saveSettings(path: []const u8, next: *const config_mod.Config) bool {
     var arena = std.heap.ArenaAllocator.init(g_allocator);
     defer arena.deinit();
@@ -3363,6 +3363,32 @@ fn settingsSaveFailed(err: anyerror) bool {
     log.err("settings save failed: {}", .{err});
     notifyConfigReloadFailed("Could not save settings; previous settings kept");
     return false;
+}
+
+fn statusBarSetAppRules(rows: ?[*]const statusbar.AppRule, count: usize) callconv(.c) bool {
+    const path = g_config_path orelse {
+        notifyConfigReloadFailed("Configuration path is unavailable");
+        return false;
+    };
+    var arena = std.heap.ArenaAllocator.init(g_allocator);
+    defer arena.deinit();
+
+    const rules = arena.allocator().alloc(config_mod.AppRule, count) catch |err| return settingsSaveFailed(err);
+    if (count > 0) {
+        for (rows.?[0..count], rules) |row, *rule| {
+            rule.* = .{
+                .app_id = std.mem.span(row.app_id),
+                .workspace = if (row.workspace == 0) null else row.workspace,
+                .float = row.floating,
+            };
+        }
+    }
+
+    // The list already includes the deprecated assignments.
+    var next = g_config;
+    next.app_rules = rules;
+    next.workspace_assignments = &.{};
+    return saveSettings(path, &next);
 }
 
 fn invalidAppSettings() bool {

@@ -36,11 +36,19 @@ typedef struct {
   bool auto_reload_config;
 } BWSettings;
 
+// One per-app rule. `workspace` is 0 when the rule does not pin a workspace.
+typedef struct {
+  const char *app_id;
+  uint8_t workspace;
+  bool floating;
+} BWAppRule;
+
 typedef struct {
   void (*retile)(void);
   void (*open_config)(void);
   bool (*reload_config)(void);
   bool (*set_settings)(const BWSettings *settings);
+  bool (*set_app_rules)(const BWAppRule *rules, size_t count);
   void (*switch_to_workspace)(uint8_t workspace_id);
   void (*quit)(void);
 } BWMenuBarCallbacks;
@@ -54,8 +62,7 @@ typedef struct {
 
 typedef struct {
   const char *name;
-  // The config's key name ("1", "a", "left", "return", ...), or NULL when the
-  // workspace has no focus keybind.
+  // The config's key name ("1", "a", "left"), or NULL when unbound.
   const char *shortcut_key;
   BWModifiers shortcut_modifiers;
   uint8_t id;
@@ -82,6 +89,7 @@ void bw_menubar_deinit(void);
 void bw_menubar_set_workspaces(const BWWorkspace *workspaces, size_t count);
 void bw_menubar_set_state(const BWWorkspaceState *states, size_t count);
 void bw_menubar_set_settings(BWSettings settings);
+void bw_menubar_set_app_rules(const BWAppRule *rules, size_t count);
 void bw_menubar_set_message(const char *message);
 void bw_menubar_set_config_status(bool success, const char *message);
 

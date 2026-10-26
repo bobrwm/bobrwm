@@ -1245,9 +1245,8 @@ pub fn loadFromPath(allocator: std.mem.Allocator, path: []const u8) ?Config {
     return parseSource(allocator, path, source);
 }
 
-/// Parse and validate config source the way a reload does. `path` only labels
-/// diagnostics. Settings saves go through this too, so the app never rejects
-/// a config that a reload would accept.
+/// Parse and validate config source as a reload does. `path` only labels
+/// diagnostics.
 pub fn parseSource(allocator: std.mem.Allocator, path: []const u8, source: [:0]const u8) ?Config {
     // Parse strictly first so unknown fields are diagnosed. Only that error
     // class gets a tolerant retry; invalid values and syntax remain fatal.
@@ -1291,11 +1290,8 @@ pub fn parseSource(allocator: std.mem.Allocator, path: []const u8, source: [:0]c
     return parsed;
 }
 
-/// Rewrite `source` with the settings exposed by the native app, leaving
-/// unrelated configuration alone. Existing top-level values are replaced in
-/// place; omitted values are appended to the root struct. Comments and
-/// formatting outside a changed value remain byte-for-byte intact. Allocates
-/// the result in `allocator`, which should be an arena: intermediate copies
+/// Rewrite the settings the native app edits, leaving the rest of `source`
+/// byte-for-byte intact. `allocator` should be an arena: intermediate copies
 /// are not freed.
 pub fn editSettingsSource(
     allocator: std.mem.Allocator,
@@ -1364,7 +1360,54 @@ pub fn editSettingsSource(
             source = try replaceRootField(allocator, source, field, if (@field(next, field)) "true" else "false");
         }
     }
+    if (!appRulesEqual(previous.app_rules, next.app_rules) or
+        previous.workspace_assignments.len != next.workspace_assignments.len)
+    {
+        source = try replaceRootField(allocator, source, "app_rules", try appRulesValue(allocator, next.app_rules));
+        if (next.workspace_assignments.len == 0) {
+            source = try removeRootField(allocator, source, "workspace_assignments");
+        }
+    }
     return source;
+}
+
+/// `app_rules` plus any deprecated `workspace_assignments` entry no rule covers.
+pub fn effectiveAppRules(allocator: std.mem.Allocator, config: *const Config) ![]AppRule {
+    var rules: std.ArrayList(AppRule) = .empty;
+    errdefer rules.deinit(allocator);
+    try rules.appendSlice(allocator, config.app_rules);
+    for (config.workspace_assignments) |assignment| {
+        const covered = for (config.app_rules) |rule| {
+            if (std.mem.eql(u8, rule.app_id, assignment.app_id)) break true;
+        } else false;
+        if (!covered) try rules.append(allocator, .{ .app_id = assignment.app_id, .workspace = assignment.workspace });
+    }
+    return rules.toOwnedSlice(allocator);
+}
+
+fn appRulesEqual(a: []const AppRule, b: []const AppRule) bool {
+    if (a.len != b.len) return false;
+    for (a, b) |left, right| {
+        if (!std.mem.eql(u8, left.app_id, right.app_id)) return false;
+        if (left.workspace != right.workspace or left.float != right.float) return false;
+    }
+    return true;
+}
+
+fn appRulesValue(allocator: std.mem.Allocator, rules: []const AppRule) ![:0]const u8 {
+    if (rules.len == 0) return allocator.dupeSentinel(u8, ".{}", 0);
+
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    errdefer out.deinit();
+    try out.writer.writeAll(".{\n");
+    for (rules) |rule| {
+        try out.writer.print("        .{{ .app_id = \"{f}\"", .{std.zig.fmtString(rule.app_id)});
+        if (rule.workspace) |workspace_id| try out.writer.print(", .workspace = {d}", .{workspace_id});
+        if (rule.float) try out.writer.writeAll(", .float = true");
+        try out.writer.writeAll(" },\n");
+    }
+    try out.writer.writeAll("    }");
+    return out.toOwnedSliceSentinel(0);
 }
 
 fn enumValue(allocator: std.mem.Allocator, value: anytype) ![:0]const u8 {
@@ -1413,8 +1456,29 @@ fn replaceRootField(
     );
 }
 
-/// End of the last root field when it lacks a trailing comma, or null when
-/// the root is empty or already ends in one.
+/// Drop a top-level field, and its line when it has one to itself.
+fn removeRootField(allocator: std.mem.Allocator, source: [:0]const u8, field_name: []const u8) ![:0]const u8 {
+    const range = try rootFieldValueRange(source, field_name);
+    if (range.value_start == null) return source;
+
+    var end = range.value_end;
+    while (end < source.len and (source[end] == ' ' or source[end] == '\t')) end += 1;
+    if (end < source.len and source[end] == ',') end += 1;
+    var start = range.field_start;
+    var line_start = start;
+    while (line_start > 0 and (source[line_start - 1] == ' ' or source[line_start - 1] == '\t')) line_start -= 1;
+    var line_end = end;
+    while (line_end < source.len and (source[line_end] == ' ' or source[line_end] == '\t')) line_end += 1;
+    const owns_line = (line_start == 0 or source[line_start - 1] == '\n') and
+        (line_end == source.len or source[line_end] == '\n');
+    if (owns_line) {
+        start = line_start;
+        end = if (line_end < source.len) line_end + 1 else line_end;
+    }
+    return std.fmt.allocPrintSentinel(allocator, "{s}{s}", .{ source[0..start], source[end..] }, 0);
+}
+
+/// Where a comma is missing after the last root field, if anywhere.
 fn lastFieldEnd(source: [:0]const u8, root_close: usize) ?usize {
     var tokenizer = std.zig.Tokenizer.init(source);
     var last: ?std.zig.Token = null;
@@ -1431,6 +1495,7 @@ fn lastFieldEnd(source: [:0]const u8, root_close: usize) ?usize {
 }
 
 fn rootFieldValueRange(source: [:0]const u8, field_name: []const u8) !struct {
+    field_start: usize = 0,
     value_start: ?usize,
     value_end: usize,
     root_close: usize,
@@ -1468,6 +1533,7 @@ fn rootFieldValueRange(source: [:0]const u8, field_name: []const u8) !struct {
             },
             .period => {
                 if (!root_opened or brace_depth != 1 or bracket_depth != 0 or paren_depth != 0) continue;
+                const field_start = token.loc.start;
                 const name = tokenizer.next();
                 if (name.tag != .identifier) {
                     updateDepths(name.tag, &brace_depth, &bracket_depth, &paren_depth);
@@ -1487,10 +1553,10 @@ fn rootFieldValueRange(source: [:0]const u8, field_name: []const u8) !struct {
                     const next = tokenizer.next();
                     if (next.tag == .eof) return error.InvalidConfigSyntax;
                     if (next.tag == .comma and value_braces == 0 and value_brackets == 0 and value_parens == 0) {
-                        return .{ .value_start = value.loc.start, .value_end = value_end, .root_close = 0 };
+                        return .{ .field_start = field_start, .value_start = value.loc.start, .value_end = value_end, .root_close = 0 };
                     }
                     if (next.tag == .r_brace and value_braces == 0 and value_brackets == 0 and value_parens == 0) {
-                        return .{ .value_start = value.loc.start, .value_end = value_end, .root_close = next.loc.start };
+                        return .{ .field_start = field_start, .value_start = value.loc.start, .value_end = value_end, .root_close = next.loc.start };
                     }
                     updateDepths(next.tag, &value_braces, &value_brackets, &value_parens);
                     value_end = next.loc.end;
@@ -1601,6 +1667,40 @@ test "editSettingsSource preserves unrelated configuration and produces valid ZO
     try t.expect(parsed.swipe.enabled);
     try t.expect(parsed.focus_follows_mouse);
     try t.expectEqual(@as(usize, 1), parsed.keybinds.len);
+}
+
+test "editSettingsSource writes app rules and drops the deprecated alias" {
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const original: [:0]const u8 =
+        \\.{
+        \\    // Keep this.
+        \\    .workspace_assignments = .{
+        \\        .{ .app_id = "com.apple.mail", .workspace = 3 },
+        \\    },
+        \\    .layout = .bsp,
+        \\}
+    ;
+    const previous = parseSource(arena.allocator(), "test", original) orelse return error.TestUnexpectedResult;
+
+    var next = previous;
+    next.app_rules = try effectiveAppRules(arena.allocator(), &previous);
+    try t.expectEqual(@as(usize, 1), next.app_rules.len);
+    next.workspace_assignments = &.{};
+    next.app_rules = &.{
+        next.app_rules[0],
+        .{ .app_id = "com.example.\"quoted\"", .float = true },
+    };
+
+    const written = try editSettingsSource(arena.allocator(), original, &previous, &next);
+    try t.expect(std.mem.indexOf(u8, written, "// Keep this.") != null);
+    try t.expect(std.mem.indexOf(u8, written, "workspace_assignments") == null);
+
+    const parsed = parseSource(arena.allocator(), "test", written) orelse return error.TestUnexpectedResult;
+    try t.expectEqual(@as(usize, 2), parsed.app_rules.len);
+    try t.expectEqual(@as(?u8, 3), parsed.workspaceForApp("com.apple.mail"));
+    try t.expect(parsed.shouldFloatApp("com.example.\"quoted\""));
+    try t.expectEqual(tiling.LayoutKind.bsp, parsed.layout);
 }
 
 test "parseSource accepts unknown fields like a reload does" {

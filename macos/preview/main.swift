@@ -1,10 +1,5 @@
-// Offscreen render of the real menu bar UI.
-//
-// `zig build ui-preview` writes light and dark PNGs so the UI can be iterated
-// on without rebuilding bobrwm and interrupting a running window manager. The
-// menu is the real NSMenu, popped up for a moment and captured from its own
-// window, so it briefly appears on screen; only the menu bar strip behind the
-// status item is faked.
+// Renders the real menu bar UI to light and dark PNGs for `zig build ui-preview`.
+// The menu flashes on screen while it is captured.
 
 import AppKit
 import BobrwmUIABI
@@ -27,8 +22,7 @@ let sampleApplications: [UInt8: [String]] = [
     3: ["Notes", "Preview"],
 ]
 
-/// The built-in defaults: ten unnamed workspaces, ⌥1-⌥9 bound and the tenth
-/// unbound. Workspace 1 is focused and 2 is visible on a second display.
+// The built-in defaults: ten unnamed workspaces, the first nine bound.
 let samples: [Sample] = (1...10).map { id in
     Sample(
         id: id,
@@ -60,7 +54,6 @@ func makeStatusModel() -> StatusModel {
     return model
 }
 
-/// A stand-in strip of system extras so the status item is judged in context.
 struct StatusPreview: View {
     let statusModel: StatusModel
     let scheme: ColorScheme
@@ -76,15 +69,12 @@ struct StatusPreview: View {
         .font(.system(size: 13))
         .padding(.horizontal, 12)
         .frame(height: 30)
-        // Opaque: a transparent render composites against whatever the viewer
-        // uses, which hides how the glyphs read on a real menu bar.
+        // Opaque, so the render reads like a real menu bar in any viewer.
         .background(scheme == .dark ? Color(white: 0.12) : Color(white: 0.92))
     }
 }
 
-/// Pops up the real menu and captures its window while tracking. The capture
-/// runs from a timer in the common modes because `popUp` blocks in the menu
-/// tracking run loop until `cancelTracking`.
+// `popUp` blocks until `cancelTracking`, so the capture runs from a timer.
 @MainActor
 func renderMenu(path: String, appearance: NSAppearance.Name) -> Bool {
     let model = makeSettingsModel(accessibilityGranted: true)
@@ -96,20 +86,25 @@ func renderMenu(path: String, appearance: NSAppearance.Name) -> Bool {
     )
     NSApplication.shared.appearance = NSAppearance(named: appearance)
 
+    // The menu window can take a few ticks to appear.
     var png: Data?
-    let capture = Timer(timeInterval: 0.3, repeats: false) { _ in
-        defer { statusMenu.menu.cancelTracking() }
+    var attempts = 0
+    let capture = Timer(timeInterval: 0.1, repeats: true) { timer in
+        attempts += 1
         let menuWindow = NSApplication.shared.windows.first {
             $0.isVisible && String(describing: type(of: $0)).contains("Menu")
         }
-        guard let frameView = menuWindow?.contentView?.superview,
+        if attempts >= 3, let frameView = menuWindow?.contentView?.superview,
             let rep = frameView.bitmapImageRepForCachingDisplay(in: frameView.bounds)
-        else { return }
-        frameView.cacheDisplay(in: frameView.bounds, to: rep)
-        png = rep.representation(using: .png, properties: [:])
+        {
+            frameView.cacheDisplay(in: frameView.bounds, to: rep)
+            png = rep.representation(using: .png, properties: [:])
+        }
+        guard png != nil || attempts >= 20 else { return }
+        timer.invalidate()
+        statusMenu.menu.cancelTracking()
     }
-    // Highlights a row so the render also shows how badges and counts read
-    // on the selection. Private, but this harness never ships.
+    // Private API, but this harness never ships.
     let highlight = Timer(timeInterval: 0.15, repeats: false) { _ in
         let selector = Selector(("highlightItem:"))
         guard statusMenu.menu.responds(to: selector), statusMenu.menu.items.count > 3 else { return }
@@ -118,8 +113,7 @@ func renderMenu(path: String, appearance: NSAppearance.Name) -> Bool {
     RunLoop.main.add(highlight, forMode: .common)
     RunLoop.main.add(capture, forMode: .common)
 
-    // Anchored at the top of the screen so the menu has room to show every
-    // row instead of scrolling.
+    // From the top of the screen so the menu does not scroll.
     let top = NSScreen.main?.visibleFrame.maxY ?? 800
     statusMenu.menu.popUp(positioning: nil, at: NSPoint(x: 40, y: top - 10), in: nil)
     NSApplication.shared.appearance = nil
@@ -155,6 +149,16 @@ func makeSettingsModel(accessibilityGranted: Bool) -> SettingsModel {
             displayOrder: $0.isActive ? $0.id : UInt8.max
         ))
     }))
+    model.setAppRules([
+        AppRule(appID: "com.apple.Safari", workspace: 2),
+        AppRule(appID: "com.apple.Notes", workspace: 3),
+        AppRule(appID: "com.apple.mail", workspace: 4),
+        AppRule(appID: "com.apple.iCal", workspace: 5),
+        AppRule(appID: "com.apple.Music", workspace: 6),
+        AppRule(appID: "com.apple.systempreferences", floats: true),
+        AppRule(appID: "com.apple.calculator", floats: true),
+        AppRule(appID: "com.apple.ActivityMonitor", workspace: 3, floats: true),
+    ])
     return model
 }
 
@@ -245,7 +249,9 @@ func renderPane(
     scheme: ColorScheme,
     appearance: NSAppearance.Name
 ) -> Bool {
-    let view = SettingsPaneView(pane: pane, model: model, actions: .preview)
+    let selection = AppRuleSelection()
+    selection.workspace = ["com.apple.Notes"]
+    let view = SettingsPaneView(pane: pane, model: model, actions: .preview, appRuleSelection: selection)
         .environment(\.colorScheme, scheme)
     let probe = NSHostingController(rootView: view)
     let size = probe.sizeThatFits(in: NSSize(width: settingsPaneWidth, height: 10_000))

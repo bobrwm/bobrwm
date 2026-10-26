@@ -57,8 +57,7 @@ pub const Watcher = struct {
         self.rearmFileSource(self.last_seen);
     }
 
-    /// Stop watching. A settle timer already in flight sees `is_running` and
-    /// does nothing, so no reload runs after this returns.
+    /// Stop watching. A settle timer still in flight then does nothing.
     pub fn stop(self: *Watcher) void {
         if (!self.is_running) return;
         if (self.dir_source != null) cancelSource(self.dir_source);

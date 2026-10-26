@@ -128,6 +128,10 @@ final class MenuBarController: NSObject, StatusMenuActions {
         settingsModel.setSettings(settings)
     }
 
+    func setAppRules(_ rules: [AppRule]) {
+        settingsModel.setAppRules(rules)
+    }
+
     private func applicationName(_ processID: Int32) -> String {
         let application = NSRunningApplication(processIdentifier: processID)
         return application?.localizedName
@@ -163,9 +167,7 @@ final class MenuBarController: NSObject, StatusMenuActions {
         statusItem.length = width
     }
 
-    /// Builds from the settings model's copy, which carries the last runtime
-    /// state over, so a config reload does not blank the rows until the next
-    /// state push.
+    // The settings model keeps runtime state across reloads.
     private func rebuild() {
         statusMenu.rebuild(workspaces: settingsModel.workspaces, target: self)
     }
@@ -257,6 +259,20 @@ public func menuBarSetState(_ states: UnsafePointer<BWWorkspaceState>?, _ count:
 @_cdecl("bw_menubar_set_settings")
 public func menuBarSetSettings(_ settings: BWSettings) {
     controller?.setSettings(settings)
+}
+
+@_cdecl("bw_menubar_set_app_rules")
+public func menuBarSetAppRules(_ rules: UnsafePointer<BWAppRule>?, _ count: Int) {
+    guard let controller else { return }
+
+    let buffer = UnsafeBufferPointer(start: rules, count: count)
+    controller.setAppRules(buffer.map { row in
+        AppRule(
+            appID: String(cString: row.app_id),
+            workspace: row.workspace == 0 ? nil : row.workspace,
+            floats: row.floating
+        )
+    })
 }
 
 @_cdecl("bw_menubar_set_message")

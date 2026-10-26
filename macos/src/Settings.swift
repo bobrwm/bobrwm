@@ -168,6 +168,14 @@ struct EditableSettings: Equatable {
     }
 }
 
+struct AppRule: Identifiable, Equatable {
+    let appID: String
+    var workspace: UInt8?
+    var floats = false
+
+    var id: String { appID }
+}
+
 final class SettingsModel: ObservableObject {
     struct ConfigStatus {
         var succeeded: Bool
@@ -181,6 +189,8 @@ final class SettingsModel: ObservableObject {
     /// The values the core last confirmed. `settings` differs from this only
     /// while an edit is waiting to be applied or after an apply failed.
     @Published private(set) var appliedSettings = EditableSettings()
+    @Published var appRules: [AppRule] = []
+    @Published private(set) var appliedAppRules: [AppRule] = []
     @Published private(set) var configStatus = ConfigStatus(
         succeeded: true,
         message: "Configuration loaded",
@@ -235,14 +245,20 @@ final class SettingsModel: ObservableObject {
         self.settings = applied
     }
 
+    func setAppRules(_ rules: [AppRule]) {
+        appliedAppRules = rules
+        appRules = rules
+    }
+
     /// True when the last apply was rejected and the shown values no longer
     /// match what is running.
     var applyFailed: Bool {
-        !configStatus.succeeded && settings != appliedSettings
+        !configStatus.succeeded && (settings != appliedSettings || appRules != appliedAppRules)
     }
 
     func revertSettings() {
         settings = appliedSettings
+        appRules = appliedAppRules
     }
 
     func refreshAccessibility() {
@@ -272,6 +288,7 @@ struct SettingsActions {
     private let openConfigAction: () -> Void
     private let reloadConfigAction: () -> Void
     private let saveSettingsAction: (EditableSettings) -> Bool
+    private let saveAppRulesAction: ([AppRule]) -> Bool
     private let focusWorkspaceAction: (UInt8) -> Void
 
     init(callbacks: BWMenuBarCallbacks) {
@@ -281,6 +298,15 @@ struct SettingsActions {
             var raw = settings.abiValue
             return withUnsafePointer(to: &raw) { callbacks.set_settings($0) }
         }
+        saveAppRulesAction = { rules in
+            // The C array only borrows these for the call.
+            let ids = rules.map { strdup($0.appID) }
+            defer { ids.forEach { free($0) } }
+            let rows = zip(rules, ids).map { rule, id in
+                BWAppRule(app_id: UnsafePointer(id), workspace: rule.workspace ?? 0, floating: rule.floats)
+            }
+            return rows.withUnsafeBufferPointer { callbacks.set_app_rules($0.baseAddress, $0.count) }
+        }
         focusWorkspaceAction = { callbacks.switch_to_workspace($0) }
     }
 
@@ -288,11 +314,13 @@ struct SettingsActions {
         openConfig: @escaping () -> Void,
         reloadConfig: @escaping () -> Void,
         saveSettings: @escaping (EditableSettings) -> Bool,
+        saveAppRules: @escaping ([AppRule]) -> Bool,
         focusWorkspace: @escaping (UInt8) -> Void
     ) {
         openConfigAction = openConfig
         reloadConfigAction = reloadConfig
         saveSettingsAction = saveSettings
+        saveAppRulesAction = saveAppRules
         focusWorkspaceAction = focusWorkspace
     }
 
@@ -300,12 +328,14 @@ struct SettingsActions {
         openConfig: {},
         reloadConfig: {},
         saveSettings: { _ in true },
+        saveAppRules: { _ in true },
         focusWorkspace: { _ in }
     )
 
     func openConfig() { openConfigAction() }
     func reloadConfig() { reloadConfigAction() }
     func saveSettings(_ settings: EditableSettings) -> Bool { saveSettingsAction(settings) }
+    func saveAppRules(_ rules: [AppRule]) -> Bool { saveAppRulesAction(rules) }
     func focusWorkspace(_ id: UInt8) { focusWorkspaceAction(id) }
 
     func revealConfig(path: String?) {
@@ -335,6 +365,7 @@ enum SettingsPane: String, CaseIterable, Identifiable {
     case general
     case tiling
     case appearance
+    case apps
     case workspaces
 
     var id: Self { self }
@@ -344,6 +375,7 @@ enum SettingsPane: String, CaseIterable, Identifiable {
         case .general: "General"
         case .tiling: "Tiling"
         case .appearance: "Appearance"
+        case .apps: "Apps"
         case .workspaces: "Workspaces"
         }
     }
@@ -353,6 +385,7 @@ enum SettingsPane: String, CaseIterable, Identifiable {
         case .general: "gearshape"
         case .tiling: "rectangle.split.2x2"
         case .appearance: "paintbrush"
+        case .apps: "square.grid.3x3"
         case .workspaces: "rectangle.3.group"
         }
     }
@@ -366,12 +399,13 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
     private let model: SettingsModel
     private let tabs: SettingsTabViewController
     private var applySubscription: AnyCancellable?
+    private var appRulesSubscription: AnyCancellable?
 
     init(model: SettingsModel, actions: SettingsActions) {
         self.model = model
         tabs = SettingsTabViewController(model: model, actions: actions)
 
-        // The HIG keeps minimize and zoom off for settings windows.
+        // HIG: no minimize or zoom for settings windows.
         let window = NSWindow(contentViewController: tabs)
         window.styleMask = [.titled, .closable]
         window.toolbarStyle = .preference
@@ -388,6 +422,12 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
                 guard let model, settings != model.appliedSettings else { return }
                 _ = actions.saveSettings(settings)
             }
+        appRulesSubscription = model.$appRules
+            .debounce(for: .milliseconds(350), scheduler: RunLoop.main)
+            .sink { [weak model] rules in
+                guard let model, rules != model.appliedAppRules else { return }
+                _ = actions.saveAppRules(rules)
+            }
     }
 
     @available(*, unavailable)
@@ -403,8 +443,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         window?.makeKeyAndOrderFront(nil)
     }
 
-    // Reopens where it was left, like other settings windows. Only the top-left
-    // corner is restored; the height belongs to whichever pane is selected.
+    // Only the top-left is restored; the selected pane decides the height.
     private func restorePosition(of window: NSWindow) {
         let size = window.frame.size
         if window.setFrameUsingName(Self.frameName) {
@@ -471,8 +510,7 @@ final class SettingsTabViewController: NSTabViewController {
         }
     }
 
-    // Left alone, the tab controller snaps the window to the new pane's size.
-    // Settings windows crossfade the panes while the height eases, top edge fixed.
+    // The tab controller snaps the window to the new size; animate it instead.
     override func transition(
         from fromViewController: NSViewController,
         to toViewController: NSViewController,
@@ -513,6 +551,8 @@ struct SettingsPaneView: View {
     let pane: SettingsPane
     @ObservedObject var model: SettingsModel
     let actions: SettingsActions
+    // Lives here so the selection survives pane rebuilds.
+    var appRuleSelection = AppRuleSelection()
 
     var body: some View {
         Group {
@@ -520,14 +560,28 @@ struct SettingsPaneView: View {
             case .general: GeneralPane(model: model, actions: actions)
             case .tiling: TilingPane(model: model)
             case .appearance: AppearancePane(model: model)
+            case .apps: AppsPane(model: model, selection: appRuleSelection)
             case .workspaces: WorkspacesPane(workspaces: model.workspaces)
             }
         }
         .formStyle(.grouped)
-        // The window sizes to the pane's full height, so a scroller would be stray.
-        .scrollDisabled(true)
-        .fixedSize(horizontal: false, vertical: true)
+        // Not scrollDisabled, which also disables scrolling inside the pane.
+        .scrollBounceBehavior(.basedOnSize)
+        .modifier(PaneHeight(pane: pane))
         .frame(width: settingsPaneWidth)
+    }
+}
+
+// Apps grows with every rule, so it caps its height and scrolls.
+private struct PaneHeight: ViewModifier {
+    let pane: SettingsPane
+
+    func body(content: Content) -> some View {
+        if pane == .apps {
+            content.frame(maxHeight: 560)
+        } else {
+            content.fixedSize(horizontal: false, vertical: true)
+        }
     }
 }
 
@@ -721,6 +775,206 @@ private struct AppearancePane: View {
     }
 }
 
+final class AppRuleSelection: ObservableObject {
+    @Published var workspace: Set<String> = []
+    @Published var floating: Set<String> = []
+}
+
+private struct AppsPane: View {
+    @ObservedObject var model: SettingsModel
+    @ObservedObject var selection: AppRuleSelection
+
+    var body: some View {
+        Form {
+            ApplyFailureSection(model: model)
+            Section {
+                if !pinned.isEmpty {
+                    Table(pinned, selection: $selection.workspace) {
+                        TableColumn("App") { rule in
+                            AppRuleLabel(appID: rule.appID)
+                        }
+                        TableColumn("Workspace") { rule in
+                            Picker("Workspace", selection: workspaceBinding(rule.appID)) {
+                                ForEach(model.workspaces) { Text($0.label).tag($0.id) }
+                            }
+                            .labelsHidden()
+                            .buttonStyle(.borderless)
+                        }
+                        .width(140)
+                    }
+                    .onDeleteCommand { unpin(selection.workspace) }
+                    .frame(height: fittedTableHeight(rows: pinned.count, header: true))
+                }
+                AddRemoveButtons(
+                    excluded: Set(pinned.map(\.appID)),
+                    canRemove: !selection.workspace.isEmpty,
+                    add: { update($0) { $0.workspace = $0.workspace ?? 1 } },
+                    remove: { unpin(selection.workspace) }
+                )
+            } header: {
+                Text("Open on a Workspace")
+            }
+
+            Section {
+                if !floating.isEmpty {
+                    Table(floating, selection: $selection.floating) {
+                        TableColumn("App") { rule in
+                            AppRuleLabel(appID: rule.appID)
+                        }
+                    }
+                    .tableColumnHeaders(.hidden)
+                    .onDeleteCommand { unfloat(selection.floating) }
+                    .frame(height: fittedTableHeight(rows: floating.count, header: false))
+                }
+                AddRemoveButtons(
+                    excluded: Set(floating.map(\.appID)),
+                    canRemove: !selection.floating.isEmpty,
+                    add: { update($0) { $0.floats = true } },
+                    remove: { unfloat(selection.floating) }
+                )
+            } header: {
+                Text("Always Float")
+            } footer: {
+                Text("Rules apply to windows an app opens from now on.")
+                    .foregroundStyle(.secondary)
+            }
+        }
+    }
+
+    private var pinned: [AppRule] { model.appRules.filter { $0.workspace != nil } }
+    private var floating: [AppRule] { model.appRules.filter(\.floats) }
+
+    private func workspaceBinding(_ appID: String) -> Binding<UInt8> {
+        Binding(
+            get: { model.appRules.first { $0.appID == appID }?.workspace ?? 1 },
+            set: { workspace in update(appID) { $0.workspace = workspace } }
+        )
+    }
+
+    private func update(_ appID: String, _ change: (inout AppRule) -> Void) {
+        if let index = model.appRules.firstIndex(where: { $0.appID == appID }) {
+            change(&model.appRules[index])
+        } else {
+            var rule = AppRule(appID: appID)
+            change(&rule)
+            model.appRules.append(rule)
+        }
+    }
+
+    private func unpin(_ appIDs: Set<String>) {
+        clear(appIDs) { $0.workspace = nil }
+        selection.workspace.removeAll()
+    }
+
+    private func unfloat(_ appIDs: Set<String>) {
+        clear(appIDs) { $0.floats = false }
+        selection.floating.removeAll()
+    }
+
+    private func clear(_ appIDs: Set<String>, _ change: (inout AppRule) -> Void) {
+        for index in model.appRules.indices where appIDs.contains(model.appRules[index].appID) {
+            change(&model.appRules[index])
+        }
+        model.appRules.removeAll { $0.workspace == nil && !$0.floats }
+    }
+}
+
+// A Table inside a Form gets no scroll events, so it is sized to show every
+// row: AppKit's 28pt header and 24pt rows.
+private func fittedTableHeight(rows: Int, header: Bool) -> CGFloat {
+    (header ? 28 : 0) + CGFloat(rows) * 24
+}
+
+private struct AppRuleLabel: View {
+    let appID: String
+
+    var body: some View {
+        let app = InstalledApp(bundleID: appID)
+        Label {
+            Text(app.name)
+        } icon: {
+            Image(nsImage: app.icon)
+        }
+    }
+}
+
+private struct AddRemoveButtons: View {
+    let excluded: Set<String>
+    let canRemove: Bool
+    let add: (String) -> Void
+    let remove: () -> Void
+
+    var body: some View {
+        HStack(spacing: 2) {
+            Menu {
+                ForEach(InstalledApp.running.filter { !excluded.contains($0.bundleID) }) { app in
+                    Button {
+                        add(app.bundleID)
+                    } label: {
+                        Label { Text(app.name) } icon: { Image(nsImage: app.icon) }
+                    }
+                }
+                Divider()
+                Button("Other…") {
+                    if let bundleID = InstalledApp.choose(), !excluded.contains(bundleID) {
+                        add(bundleID)
+                    }
+                }
+            } label: {
+                Image(systemName: "plus")
+            }
+            .menuStyle(.borderlessButton)
+            .menuIndicator(.hidden)
+            .fixedSize()
+            .help("Add an app")
+
+            Button(action: remove) {
+                Image(systemName: "minus")
+            }
+            .buttonStyle(.borderless)
+            .disabled(!canRemove)
+            .help("Remove the selected apps")
+
+            Spacer()
+        }
+    }
+}
+
+struct InstalledApp: Identifiable {
+    let bundleID: String
+    let name: String
+    let icon: NSImage
+
+    var id: String { bundleID }
+
+    init(bundleID: String) {
+        self.bundleID = bundleID
+        let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleID)
+        name = url.map { FileManager.default.displayName(atPath: $0.path) } ?? bundleID
+        icon = url.map { NSWorkspace.shared.icon(forFile: $0.path) }
+            ?? NSWorkspace.shared.icon(for: .application)
+        icon.size = NSSize(width: 16, height: 16)
+    }
+
+    static var running: [InstalledApp] {
+        let own = Bundle.main.bundleIdentifier
+        let ids = Set(NSWorkspace.shared.runningApplications.compactMap { app in
+            app.activationPolicy == .regular ? app.bundleIdentifier : nil
+        })
+        return ids.filter { $0 != own }
+            .map(InstalledApp.init(bundleID:))
+            .sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+    }
+
+    static func choose() -> String? {
+        let panel = NSOpenPanel()
+        panel.allowedContentTypes = [.application]
+        panel.directoryURL = URL(fileURLWithPath: "/Applications")
+        guard panel.runModal() == .OK, let url = panel.url else { return nil }
+        return Bundle(url: url)?.bundleIdentifier
+    }
+}
+
 private struct WorkspacesPane: View {
     let workspaces: [WorkspaceInfo]
 
@@ -824,7 +1078,7 @@ private struct PercentSlider: View {
             // Rounded through the binding: `step:` draws a tick per step.
             Slider(value: rounded, in: range)
                 .labelsHidden()
-            // Sized to the widest value so the slider does not shift while dragging.
+            // Reserves the widest value so the slider doesn't shift while dragging.
             Text(range.upperBound, format: .percent.precision(.fractionLength(0)))
                 .hidden()
                 .overlay(alignment: .trailing) {
@@ -875,9 +1129,8 @@ private struct NumberStepper<Value: BinaryInteger>: View {
         }
     }
 
-    // The stock stepper's formatted field needs a floating-point value. Typed
-    // values outside the range snap to a bound, since the core would reject
-    // the whole settings write.
+    // The stepper's text field needs a Double. Clamped, since the core rejects
+    // the whole write for one out-of-range value.
     private var clamped: Binding<Double> {
         Binding(
             get: { Double(value) },

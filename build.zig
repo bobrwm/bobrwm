@@ -332,10 +332,8 @@ pub fn build(b: *std.Build) !void {
     const run_step = b.step("run", "Run bobrwm");
     run_step.dependOn(&run_cmd.step);
 
-    // Renders the menu bar UI to PNGs so it can be iterated on without
-    // rebuilding bobrwm and interrupting a running window manager.
-    // StatusMenu.swift sends actions through a protocol rather than the C ABI
-    // callbacks, so the harness links it without the core.
+    // Renders the UI to PNGs without the core, so it can be iterated on without
+    // restarting the running window manager.
     const preview_build = b.addSystemCommand(&.{
         "swiftc",
         "-swift-version",

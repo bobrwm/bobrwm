@@ -44,8 +44,16 @@ pub const Callbacks = extern struct {
     open_config: *const fn () callconv(.c) void,
     reload_config: *const fn () callconv(.c) bool,
     set_settings: *const fn (*const Settings) callconv(.c) bool,
+    set_app_rules: *const fn (?[*]const AppRule, usize) callconv(.c) bool,
     switch_to_workspace: *const fn (u8) callconv(.c) void,
     quit: *const fn () callconv(.c) void,
+};
+
+pub const AppRule = extern struct {
+    app_id: [*:0]const u8,
+    /// 0 when the rule does not pin a workspace.
+    workspace: u8,
+    floating: bool,
 };
 
 const Workspace = extern struct {
@@ -91,6 +99,7 @@ extern fn bw_menubar_deinit() void;
 extern fn bw_menubar_set_workspaces(workspaces: ?[*]const Workspace, count: usize) void;
 extern fn bw_menubar_set_state(states: ?[*]const WorkspaceState, count: usize) void;
 extern fn bw_menubar_set_settings(settings: Settings) void;
+extern fn bw_menubar_set_app_rules(rules: ?[*]const AppRule, count: usize) void;
 extern fn bw_menubar_set_message(message: [*:0]const u8) void;
 extern fn bw_menubar_set_config_status(success: bool, message: [*:0]const u8) void;
 
@@ -114,6 +123,7 @@ pub fn init(
     config: *const config_mod.Config,
     config_path: ?[*:0]const u8,
     callbacks: Callbacks,
+    allocator: std.mem.Allocator,
 ) void {
     std.debug.assert(!g_initialized);
     std.debug.assert(workspace_count > 0 and workspace_count <= workspace_mod.max_workspaces);
@@ -122,13 +132,14 @@ pub fn init(
     g_initialized = true;
 
     updateWorkspaceMenu(workspace_count, config);
-    updateSettings(config);
+    updateSettings(allocator, config);
     log.info("status bar created", .{});
 }
 
 /// Publish the editable configuration snapshot to the native app.
-pub fn updateSettings(config: *const config_mod.Config) void {
+pub fn updateSettings(allocator: std.mem.Allocator, config: *const config_mod.Config) void {
     if (!g_initialized) return;
+    updateAppRules(allocator, config) catch |err| log.warn("app rules not published: {}", .{err});
     bw_menubar_set_settings(.{
         .layout = @backingInt(config.layout),
         .bsp_split = @backingInt(config.bsp_split),
@@ -152,6 +163,23 @@ pub fn updateSettings(config: *const config_mod.Config) void {
         .follow_app_resizes = config.follow_app_resizes,
         .auto_reload_config = config.auto_reload_config,
     });
+}
+
+fn updateAppRules(allocator: std.mem.Allocator, config: *const config_mod.Config) !void {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+
+    const rules = try config_mod.effectiveAppRules(scratch, config);
+    const rows = try scratch.alloc(AppRule, rules.len);
+    for (rules, rows) |rule, *row| {
+        row.* = .{
+            .app_id = try scratch.dupeSentinel(u8, rule.app_id, 0),
+            .workspace = rule.workspace orelse 0,
+            .floating = rule.float,
+        };
+    }
+    bw_menubar_set_app_rules(rows.ptr, rows.len);
 }
 
 pub fn deinit() void {
@@ -242,8 +270,7 @@ pub fn setConfigStatus(success: bool, message: [*:0]const u8) void {
     bw_menubar_set_config_status(success, message);
 }
 
-/// Pass the config's key name through unchanged; the UI owns how keys are
-/// presented. Null means unbound, which the UI renders as no hint at all.
+/// The config's key name, or null when unbound.
 fn shortcutKey(keybind: ?config_mod.Keybind, storage: []u8) ?[*:0]const u8 {
     const bind = keybind orelse return null;
     if (bind.key.len == 0 or bind.key.len >= storage.len) return null;
