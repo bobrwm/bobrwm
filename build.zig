@@ -112,6 +112,15 @@ pub fn build(b: *std.Build) !void {
     const objc_dep = b.dependency("zig_objc", .{ .target = target, .optimize = optimize });
     const objc_mod = objc_dep.module("objc");
 
+    // Pin the Lua version so script semantics don't follow ziglua's default.
+    const zlua_dep = b.dependency("zlua", .{
+        .target = target,
+        .optimize = optimize,
+        .lang = .lua55,
+    });
+    const zlua_mod = zlua_dep.module("zlua");
+    const lua_lib = linkedLibrary(zlua_mod);
+
     // Translate the aggregated C header surface (ApplicationServices,
     // dispatch, pthread, os/lock) once via the build system, replacing
     // the per-file `@cImport` blocks deprecated in Zig 0.16.
@@ -165,6 +174,7 @@ pub fn build(b: *std.Build) !void {
     const app_module_dependencies: AppModuleDependencies = .{
         .build_options = build_options_mod,
         .objc = objc_mod,
+        .zlua = zlua_mod,
         .c_mod = c_mod,
         .cg_extra = cg_extra_mod,
         .sdk_include = sdk_include,
@@ -245,6 +255,8 @@ pub fn build(b: *std.Build) !void {
     swift_app.addFileArg(b.path("macos/src/MenuBar.swift"));
     swift_app.addFileArg(b.path("macos/src/StatusMenu.swift"));
     swift_app.addFileArg(linked_archive);
+    // Not folded into the core archive.
+    if (lua_lib) |lib| swift_app.addFileArg(lib.getEmittedBin());
     swift_app.addFileArg(oslog_object);
     for ([_][]const u8{
         "ApplicationServices",
@@ -611,6 +623,20 @@ pub fn build(b: *std.Build) !void {
 
     const run_cli_tests = b.addRunArtifact(cli_tests);
 
+    const lua_sandbox_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/lua_sandbox.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    lua_sandbox_test_mod.addImport("zlua", zlua_mod);
+
+    const lua_sandbox_tests = b.addTest(.{
+        .name = "lua-sandbox-tests",
+        .root_module = lua_sandbox_test_mod,
+    });
+
+    const run_lua_sandbox_tests = b.addRunArtifact(lua_sandbox_tests);
+
     const config_format_test_mod = b.createModule(.{
         .root_source_file = b.path("src/config_format.zig"),
         .target = target,
@@ -644,6 +670,7 @@ pub fn build(b: *std.Build) !void {
     test_step.dependOn(&run_helpgen_tests.step);
     test_step.dependOn(&run_cli_tests.step);
     test_step.dependOn(&run_config_format_tests.step);
+    test_step.dependOn(&run_lua_sandbox_tests.step);
     // Running the generator itself catches doc lookups broken by renamed
     // containers or fields, which the unit tests cannot see.
     test_step.dependOn(&help_strings.run.step);
@@ -680,9 +707,20 @@ const HelpStrings = struct {
     run: *std.Build.Step.Run,
 };
 
+/// The library `module` links, or null before ziglua's lazy fetch completes
+/// (where `Dependency.artifact` would panic).
+fn linkedLibrary(module: *std.Build.Module) ?*std.Build.Step.Compile {
+    for (module.link_objects.items) |link_object| switch (link_object) {
+        .other_step => |compile| return compile,
+        else => {},
+    };
+    return null;
+}
+
 const AppModuleDependencies = struct {
     build_options: *std.Build.Module,
     objc: *std.Build.Module,
+    zlua: *std.Build.Module,
     c_mod: *std.Build.Module,
     cg_extra: *std.Build.Module,
     sdk_include: []const u8,
@@ -697,6 +735,7 @@ const AppModuleDependencies = struct {
 fn configureAppModule(module: *std.Build.Module, dependencies: AppModuleDependencies) void {
     module.addImport("build_options", dependencies.build_options);
     module.addImport("objc", dependencies.objc);
+    module.addImport("zlua", dependencies.zlua);
     module.addImport("c", dependencies.c_mod);
     module.addImport("cg_extra", dependencies.cg_extra);
 
