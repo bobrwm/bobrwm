@@ -26,15 +26,16 @@ const file_events: c_int = c.DISPATCH_VNODE_DELETE | c.DISPATCH_VNODE_WRITE |
 const dir_events: c_int = c.DISPATCH_VNODE_WRITE;
 
 /// Sources and the settle timer run on the main queue, which owns config
-/// state, so `reload` may mutate it directly. Once started, the watcher runs
-/// for the rest of the process.
+/// state, so `reload` may mutate it directly.
 pub const Watcher = struct {
-    path: [:0]const u8,
-    reload: *const fn () void,
+    path: [:0]const u8 = "",
+    reload: *const fn () void = undefined,
+    is_running: bool = false,
+    dir_source: c.dispatch_source_t = null,
     file_source: c.dispatch_source_t = null,
     /// The file `file_source` watches; non-null exactly when it is armed.
     watched_file: ?Snapshot = null,
-    last_seen: ?Snapshot,
+    last_seen: ?Snapshot = null,
     settle_pending: bool = false,
 
     /// Start watching `path`. The sources keep a pointer to `self`, so it
@@ -42,16 +43,29 @@ pub const Watcher = struct {
     /// best effort: failures are logged and leave manual reload as the only
     /// way to apply changes.
     pub fn start(self: *Watcher, path: [:0]const u8, reload: *const fn () void) void {
-        self.* = .{ .path = path, .reload = reload, .last_seen = snapshot(path) };
+        if (self.is_running) return;
+        self.* = .{ .path = path, .reload = reload, .is_running = true, .last_seen = snapshot(path) };
 
         var dir_buf: [std.fs.max_path_bytes]u8 = undefined;
         const dir = std.fs.path.dirname(path) orelse ".";
         const dir_z = std.fmt.bufPrintSentinel(&dir_buf, "{s}", .{dir}, 0) catch "";
-        if (self.watch(dir_z, dir_events) == null) {
+        self.dir_source = self.watch(dir_z, dir_events);
+        if (self.dir_source == null) {
             log.warn("cannot watch {s}; config changes need a manual reload", .{dir});
         }
 
         self.rearmFileSource(self.last_seen);
+    }
+
+    /// Stop watching. A settle timer still in flight then does nothing.
+    pub fn stop(self: *Watcher) void {
+        if (!self.is_running) return;
+        if (self.dir_source != null) cancelSource(self.dir_source);
+        if (self.file_source != null) cancelSource(self.file_source);
+        self.dir_source = null;
+        self.file_source = null;
+        self.watched_file = null;
+        self.is_running = false;
     }
 
     fn watch(self: *Watcher, path: [*:0]const u8, mask: c_int) c.dispatch_source_t {
@@ -91,6 +105,7 @@ pub const Watcher = struct {
 
     fn settle(self: *Watcher) void {
         self.settle_pending = false;
+        if (!self.is_running) return;
 
         const current = snapshot(self.path);
         self.rearmFileSource(current);

@@ -4,7 +4,7 @@ description: "Introspects and cross-checks the running bobrwm daemon: IPC querie
 compatibility: "macOS only. Requires a running bobrwm daemon for IPC queries; compare_state additionally needs the probing-windows skill and Xcode CLI tools."
 ---
 
-# Bobrwm State
+# BobrWM State
 
 bobrwm reconciles four state sources — AX, WindowServer/CG, SkyLight, and its internal workspace/layout state — and most bugs appear as divergence between them (see `AGENTS.md` → "Window Management Invariants"). This skill covers reading the daemon side and diffing it against OS truth. Use the sibling `probing-windows` skill for OS-side timelines (probe over time) and event triggering.
 

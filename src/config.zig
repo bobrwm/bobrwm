@@ -119,8 +119,6 @@ pub const Config = struct {
     /// Reload the config whenever this file is saved, including saves through
     /// a symlink. An invalid save keeps the current config, as with the
     /// `reload_config` action.
-    ///
-    /// Note: changing this setting requires a restart.
     auto_reload_config: bool = false,
 
     /// Look up the assigned workspace for a given bundle identifier. `app_rules`
@@ -334,88 +332,7 @@ pub const Keybind = struct {
     /// Argument for actions that take one, such as a workspace or display
     /// number. Ignored by other actions.
     arg: u8 = 0,
-
-    /// Render the bind the way macOS menus write it: ⌃⌥⇧⌘ in that order, then
-    /// the key. Writes into caller storage because the menu bar passes a whole
-    /// row array across the C ABI at once and has no allocator. Returns null
-    /// when the result would not fit, which the UI renders as no hint at all.
-    pub fn displayForm(self: Keybind, storage: []u8) ?[:0]const u8 {
-        var pos: usize = 0;
-        const modifiers = [_]struct { bool, []const u8 }{
-            .{ self.mods.ctrl, "⌃" },
-            .{ self.mods.alt, "⌥" },
-            .{ self.mods.shift, "⇧" },
-            .{ self.mods.cmd, "⌘" },
-        };
-        for (modifiers) |modifier| {
-            if (!modifier[0]) continue;
-            if (pos + modifier[1].len >= storage.len) return null;
-            @memcpy(storage[pos..][0..modifier[1].len], modifier[1]);
-            pos += modifier[1].len;
-        }
-
-        const key = keyGlyph(self.key);
-        if (pos + key.len >= storage.len) return null;
-        // toUpper only touches ASCII a-z, so multi-byte glyphs pass through.
-        for (key, 0..) |char, offset| storage[pos + offset] = std.ascii.toUpper(char);
-        pos += key.len;
-
-        storage[pos] = 0;
-        return storage[0..pos :0];
-    }
 };
-
-fn keyGlyph(key: []const u8) []const u8 {
-    const glyphs = [_]struct { []const u8, []const u8 }{
-        .{ "return", "↩" },
-        .{ "tab", "⇥" },
-        .{ "space", "␣" },
-        .{ "delete", "⌫" },
-        .{ "escape", "⎋" },
-        .{ "left", "←" },
-        .{ "right", "→" },
-        .{ "up", "↑" },
-        .{ "down", "↓" },
-    };
-    for (glyphs) |glyph| {
-        if (std.mem.eql(u8, key, glyph[0])) return glyph[1];
-    }
-    return key;
-}
-
-test "displayForm renders modifiers in macOS order" {
-    var storage: [24]u8 = undefined;
-
-    const alt_one: Keybind = .{ .key = "1", .mods = .{ .alt = true }, .action = .focus_workspace };
-    try std.testing.expectEqualStrings("⌥1", alt_one.displayForm(&storage).?);
-
-    const all_mods: Keybind = .{
-        .key = "r",
-        .mods = .{ .alt = true, .shift = true, .cmd = true, .ctrl = true },
-        .action = .reload_config,
-    };
-    try std.testing.expectEqualStrings("⌃⌥⇧⌘R", all_mods.displayForm(&storage).?);
-}
-
-test "displayForm maps named keys to glyphs and uppercases letters" {
-    var storage: [24]u8 = undefined;
-
-    const ctrl_left: Keybind = .{
-        .key = "left",
-        .mods = .{ .ctrl = true },
-        .action = .focus_previous_workspace,
-    };
-    try std.testing.expectEqualStrings("⌃←", ctrl_left.displayForm(&storage).?);
-
-    const alt_a: Keybind = .{ .key = "a", .mods = .{ .alt = true }, .action = .focus_workspace };
-    try std.testing.expectEqualStrings("⌥A", alt_a.displayForm(&storage).?);
-}
-
-test "displayForm returns null when the result would not fit" {
-    var tiny: [2]u8 = undefined;
-    const alt_one: Keybind = .{ .key = "1", .mods = .{ .alt = true }, .action = .focus_workspace };
-    try std.testing.expectEqual(@as(?[:0]const u8, null), alt_one.displayForm(&tiny));
-}
 
 test "findKeybind prefers config entries over defaults" {
     const overrides = [_]Keybind{
@@ -1325,7 +1242,12 @@ pub fn loadFromPath(allocator: std.mem.Allocator, path: []const u8) ?Config {
     // into it for string fields. Caller passes an arena allocator whose
     // deinit handles cleanup.
     const source = osutil.readFileAllocSentinel(allocator, path_z, 1024 * 1024) orelse return null;
+    return parseSource(allocator, path, source);
+}
 
+/// Parse and validate config source as a reload does. `path` only labels
+/// diagnostics.
+pub fn parseSource(allocator: std.mem.Allocator, path: []const u8, source: [:0]const u8) ?Config {
     // Parse strictly first so unknown fields are diagnosed. Only that error
     // class gets a tolerant retry; invalid values and syntax remain fatal.
     // Config holds slices, so both passes require the allocating parser.
@@ -1366,6 +1288,427 @@ pub fn loadFromPath(allocator: std.mem.Allocator, path: []const u8) ?Config {
         parsed.workspace_assignments.len,
     });
     return parsed;
+}
+
+/// Rewrite the settings the native app edits, leaving the rest of `source`
+/// byte-for-byte intact. `allocator` should be an arena: intermediate copies
+/// are not freed.
+pub fn editSettingsSource(
+    allocator: std.mem.Allocator,
+    original: [:0]const u8,
+    previous: *const Config,
+    next: *const Config,
+) ![:0]const u8 {
+    try validate(next);
+    var source = original;
+
+    if (previous.layout != next.layout) {
+        source = try replaceRootField(allocator, source, "layout", try enumValue(allocator, next.layout));
+    }
+    if (previous.bsp_split != next.bsp_split) {
+        source = try replaceRootField(allocator, source, "bsp_split", try enumValue(allocator, next.bsp_split));
+    }
+    if (previous.bsp_insert_point != next.bsp_insert_point) {
+        source = try replaceRootField(allocator, source, "bsp_insert_point", try enumValue(allocator, next.bsp_insert_point));
+    }
+    if (previous.bsp_split_ratio != next.bsp_split_ratio) {
+        source = try replaceRootField(allocator, source, "bsp_split_ratio", try numberValue(allocator, next.bsp_split_ratio));
+    }
+    if (previous.new_window_split != next.new_window_split) {
+        source = try replaceRootField(allocator, source, "new_window_split", try enumValue(allocator, next.new_window_split));
+    }
+    if (!std.meta.eql(previous.dimmed_inactive, next.dimmed_inactive)) {
+        source = try replaceRootField(allocator, source, "dimmed_inactive", try std.fmt.allocPrintSentinel(
+            allocator,
+            ".{{ .enabled = {}, .level = {d} }}",
+            .{ next.dimmed_inactive.enabled, next.dimmed_inactive.level },
+            0,
+        ));
+    }
+    if (!std.meta.eql(previous.gaps, next.gaps)) {
+        source = try replaceRootField(allocator, source, "gaps", try std.fmt.allocPrintSentinel(
+            allocator,
+            ".{{ .inner = {d}, .outer = .{{ .left = {d}, .right = {d}, .top = {d}, .bottom = {d} }} }}",
+            .{
+                next.gaps.inner,
+                next.gaps.outer.left,
+                next.gaps.outer.right,
+                next.gaps.outer.top,
+                next.gaps.outer.bottom,
+            },
+            0,
+        ));
+    }
+    if (!std.meta.eql(previous.animation, next.animation)) {
+        source = try replaceRootField(allocator, source, "animation", try std.fmt.allocPrintSentinel(
+            allocator,
+            ".{{ .enabled = {}, .duration_ms = {d}, .easing = .{s} }}",
+            .{ next.animation.enabled, next.animation.duration_ms, @tagName(next.animation.easing) },
+            0,
+        ));
+    }
+    if (!std.meta.eql(previous.swipe, next.swipe)) {
+        source = try replaceRootField(allocator, source, "swipe", try std.fmt.allocPrintSentinel(
+            allocator,
+            ".{{ .enabled = {}, .reverse = {} }}",
+            .{ next.swipe.enabled, next.swipe.reverse },
+            0,
+        ));
+    }
+    inline for (.{ "focus_follows_mouse", "follow_app_resizes", "start_at_login", "auto_reload_config" }) |field| {
+        if (@field(previous, field) != @field(next, field)) {
+            source = try replaceRootField(allocator, source, field, if (@field(next, field)) "true" else "false");
+        }
+    }
+    if (!appRulesEqual(previous.app_rules, next.app_rules) or
+        previous.workspace_assignments.len != next.workspace_assignments.len)
+    {
+        source = try replaceRootField(allocator, source, "app_rules", try appRulesValue(allocator, next.app_rules));
+        if (next.workspace_assignments.len == 0) {
+            source = try removeRootField(allocator, source, "workspace_assignments");
+        }
+    }
+    return source;
+}
+
+/// `app_rules` plus any deprecated `workspace_assignments` entry no rule covers.
+pub fn effectiveAppRules(allocator: std.mem.Allocator, config: *const Config) ![]AppRule {
+    var rules: std.ArrayList(AppRule) = .empty;
+    errdefer rules.deinit(allocator);
+    try rules.appendSlice(allocator, config.app_rules);
+    for (config.workspace_assignments) |assignment| {
+        const covered = for (config.app_rules) |rule| {
+            if (std.mem.eql(u8, rule.app_id, assignment.app_id)) break true;
+        } else false;
+        if (!covered) try rules.append(allocator, .{ .app_id = assignment.app_id, .workspace = assignment.workspace });
+    }
+    return rules.toOwnedSlice(allocator);
+}
+
+fn appRulesEqual(a: []const AppRule, b: []const AppRule) bool {
+    if (a.len != b.len) return false;
+    for (a, b) |left, right| {
+        if (!std.mem.eql(u8, left.app_id, right.app_id)) return false;
+        if (left.workspace != right.workspace or left.float != right.float) return false;
+    }
+    return true;
+}
+
+fn appRulesValue(allocator: std.mem.Allocator, rules: []const AppRule) ![:0]const u8 {
+    if (rules.len == 0) return allocator.dupeSentinel(u8, ".{}", 0);
+
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    errdefer out.deinit();
+    try out.writer.writeAll(".{\n");
+    for (rules) |rule| {
+        try out.writer.print("        .{{ .app_id = \"{f}\"", .{std.zig.fmtString(rule.app_id)});
+        if (rule.workspace) |workspace_id| try out.writer.print(", .workspace = {d}", .{workspace_id});
+        if (rule.float) try out.writer.writeAll(", .float = true");
+        try out.writer.writeAll(" },\n");
+    }
+    try out.writer.writeAll("    }");
+    return out.toOwnedSliceSentinel(0);
+}
+
+fn enumValue(allocator: std.mem.Allocator, value: anytype) ![:0]const u8 {
+    return std.fmt.allocPrintSentinel(allocator, ".{s}", .{@tagName(value)}, 0);
+}
+
+fn numberValue(allocator: std.mem.Allocator, value: anytype) ![:0]const u8 {
+    return std.fmt.allocPrintSentinel(allocator, "{d}", .{value}, 0);
+}
+
+fn replaceRootField(
+    allocator: std.mem.Allocator,
+    source: [:0]const u8,
+    field_name: []const u8,
+    replacement: []const u8,
+) ![:0]const u8 {
+    std.debug.assert(field_name.len > 0);
+    std.debug.assert(replacement.len > 0);
+    const range = try rootFieldValueRange(source, field_name);
+    if (range.value_start) |value_start| {
+        return std.fmt.allocPrintSentinel(
+            allocator,
+            "{s}{s}{s}",
+            .{ source[0..value_start], replacement, source[range.value_end..] },
+            0,
+        );
+    }
+
+    const line_prefix = if (range.root_close > 0 and source[range.root_close - 1] == '\n') "" else "\n";
+    const comma_at = lastFieldEnd(source, range.root_close);
+    const before = source[0 .. comma_at orelse range.root_close];
+    const between = if (comma_at) |at| source[at..range.root_close] else "";
+    return std.fmt.allocPrintSentinel(
+        allocator,
+        "{s}{s}{s}{s}    .{s} = {s},\n{s}",
+        .{
+            before,
+            if (comma_at != null) "," else "",
+            between,
+            line_prefix,
+            field_name,
+            replacement,
+            source[range.root_close..],
+        },
+        0,
+    );
+}
+
+/// Drop a top-level field, and its line when it has one to itself.
+fn removeRootField(allocator: std.mem.Allocator, source: [:0]const u8, field_name: []const u8) ![:0]const u8 {
+    const range = try rootFieldValueRange(source, field_name);
+    if (range.value_start == null) return source;
+
+    var end = range.value_end;
+    while (end < source.len and (source[end] == ' ' or source[end] == '\t')) end += 1;
+    if (end < source.len and source[end] == ',') end += 1;
+    var start = range.field_start;
+    var line_start = start;
+    while (line_start > 0 and (source[line_start - 1] == ' ' or source[line_start - 1] == '\t')) line_start -= 1;
+    var line_end = end;
+    while (line_end < source.len and (source[line_end] == ' ' or source[line_end] == '\t')) line_end += 1;
+    const owns_line = (line_start == 0 or source[line_start - 1] == '\n') and
+        (line_end == source.len or source[line_end] == '\n');
+    if (owns_line) {
+        start = line_start;
+        end = if (line_end < source.len) line_end + 1 else line_end;
+    }
+    return std.fmt.allocPrintSentinel(allocator, "{s}{s}", .{ source[0..start], source[end..] }, 0);
+}
+
+/// Where a comma is missing after the last root field, if anywhere.
+fn lastFieldEnd(source: [:0]const u8, root_close: usize) ?usize {
+    var tokenizer = std.zig.Tokenizer.init(source);
+    var last: ?std.zig.Token = null;
+    while (true) {
+        const token = tokenizer.next();
+        if (token.tag == .eof or token.loc.start >= root_close) break;
+        last = token;
+    }
+    const token = last orelse return null;
+    return switch (token.tag) {
+        .l_brace, .comma => null,
+        else => token.loc.end,
+    };
+}
+
+fn rootFieldValueRange(source: [:0]const u8, field_name: []const u8) !struct {
+    field_start: usize = 0,
+    value_start: ?usize,
+    value_end: usize,
+    root_close: usize,
+} {
+    var tokenizer = std.zig.Tokenizer.init(source);
+    var brace_depth: usize = 0;
+    var bracket_depth: usize = 0;
+    var paren_depth: usize = 0;
+    var root_opened = false;
+    var root_close: ?usize = null;
+
+    while (true) {
+        const token = tokenizer.next();
+        if (token.tag == .eof) break;
+        switch (token.tag) {
+            .l_brace => {
+                brace_depth += 1;
+                root_opened = true;
+            },
+            .r_brace => {
+                if (brace_depth == 0) return error.InvalidConfigSyntax;
+                if (brace_depth == 1 and bracket_depth == 0 and paren_depth == 0) {
+                    root_close = token.loc.start;
+                    break;
+                }
+                brace_depth -= 1;
+            },
+            .l_bracket => bracket_depth += 1,
+            .r_bracket => if (bracket_depth > 0) {
+                bracket_depth -= 1;
+            },
+            .l_paren => paren_depth += 1,
+            .r_paren => if (paren_depth > 0) {
+                paren_depth -= 1;
+            },
+            .period => {
+                if (!root_opened or brace_depth != 1 or bracket_depth != 0 or paren_depth != 0) continue;
+                const field_start = token.loc.start;
+                const name = tokenizer.next();
+                if (name.tag != .identifier) {
+                    updateDepths(name.tag, &brace_depth, &bracket_depth, &paren_depth);
+                    continue;
+                }
+                if (!std.mem.eql(u8, source[name.loc.start..name.loc.end], field_name)) continue;
+                const equal = tokenizer.next();
+                if (equal.tag != .equal) continue;
+                const value = tokenizer.next();
+                if (value.tag == .eof) return error.InvalidConfigSyntax;
+                var value_end = value.loc.end;
+                var value_braces: usize = 0;
+                var value_brackets: usize = 0;
+                var value_parens: usize = 0;
+                updateDepths(value.tag, &value_braces, &value_brackets, &value_parens);
+                while (true) {
+                    const next = tokenizer.next();
+                    if (next.tag == .eof) return error.InvalidConfigSyntax;
+                    if (next.tag == .comma and value_braces == 0 and value_brackets == 0 and value_parens == 0) {
+                        return .{ .field_start = field_start, .value_start = value.loc.start, .value_end = value_end, .root_close = 0 };
+                    }
+                    if (next.tag == .r_brace and value_braces == 0 and value_brackets == 0 and value_parens == 0) {
+                        return .{ .field_start = field_start, .value_start = value.loc.start, .value_end = value_end, .root_close = next.loc.start };
+                    }
+                    updateDepths(next.tag, &value_braces, &value_brackets, &value_parens);
+                    value_end = next.loc.end;
+                }
+            },
+            else => {},
+        }
+    }
+    return .{ .value_start = null, .value_end = 0, .root_close = root_close orelse return error.InvalidConfigSyntax };
+}
+
+fn updateDepths(
+    tag: std.zig.Token.Tag,
+    braces: *usize,
+    brackets: *usize,
+    parens: *usize,
+) void {
+    switch (tag) {
+        .l_brace => braces.* += 1,
+        .r_brace => if (braces.* > 0) {
+            braces.* -= 1;
+        },
+        .l_bracket => brackets.* += 1,
+        .r_bracket => if (brackets.* > 0) {
+            brackets.* -= 1;
+        },
+        .l_paren => parens.* += 1,
+        .r_paren => if (parens.* > 0) {
+            parens.* -= 1;
+        },
+        else => {},
+    }
+}
+
+test "replaceRootField preserves unrelated source and nested commas" {
+    const source: [:0]const u8 =
+        \\.{
+        \\    // keep this comment
+        \\    .gaps = .{ .inner = 4, .outer = .{ .left = 2 } },
+        \\    .layout = .bsp,
+        \\}
+    ;
+    const replaced = try replaceRootField(std.testing.allocator, source, "gaps", ".{ .inner = 8 }");
+    defer std.testing.allocator.free(replaced);
+    try std.testing.expectEqualStrings(
+        \\.{
+        \\    // keep this comment
+        \\    .gaps = .{ .inner = 8 },
+        \\    .layout = .bsp,
+        \\}
+    , replaced);
+}
+
+test "replaceRootField appends an omitted setting" {
+    const source: [:0]const u8 =
+        \\.{
+        \\    .layout = .bsp,
+        \\}
+    ;
+    const replaced = try replaceRootField(std.testing.allocator, source, "start_at_login", "true");
+    defer std.testing.allocator.free(replaced);
+    try std.testing.expectEqualStrings(
+        \\.{
+        \\    .layout = .bsp,
+        \\    .start_at_login = true,
+        \\}
+    , replaced);
+}
+
+test "replaceRootField adds the comma a last field without one needs" {
+    const source: [:0]const u8 = ".{ .layout = .bsp }";
+    const replaced = try replaceRootField(std.testing.allocator, source, "start_at_login", "true");
+    defer std.testing.allocator.free(replaced);
+    try std.testing.expectEqualStrings(
+        \\.{ .layout = .bsp, 
+        \\    .start_at_login = true,
+        \\}
+    , replaced);
+}
+
+test "editSettingsSource preserves unrelated configuration and produces valid ZON" {
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const original: [:0]const u8 =
+        \\.{
+        \\    // This user-authored section must survive app edits.
+        \\    .keybinds = .{
+        \\        .{ .key = "f", .mods = .{ .alt = true }, .action = .toggle_fullscreen },
+        \\    },
+        \\    .layout = .bsp
+        \\}
+    ;
+
+    const previous: Config = .{};
+    var next = previous;
+    next.layout = .monocle;
+    next.gaps.inner = 9;
+    next.start_at_login = true;
+    next.swipe.enabled = true;
+    next.focus_follows_mouse = true;
+    const written = try editSettingsSource(arena.allocator(), original, &previous, &next);
+    try t.expect(std.mem.indexOf(u8, written, "// This user-authored section must survive app edits.") != null);
+
+    const parsed = parseSource(arena.allocator(), "test", written) orelse return error.TestUnexpectedResult;
+    try t.expectEqual(tiling.LayoutKind.monocle, parsed.layout);
+    try t.expectEqual(@as(u16, 9), parsed.gaps.inner);
+    try t.expect(parsed.start_at_login);
+    try t.expect(parsed.swipe.enabled);
+    try t.expect(parsed.focus_follows_mouse);
+    try t.expectEqual(@as(usize, 1), parsed.keybinds.len);
+}
+
+test "editSettingsSource writes app rules and drops the deprecated alias" {
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const original: [:0]const u8 =
+        \\.{
+        \\    // Keep this.
+        \\    .workspace_assignments = .{
+        \\        .{ .app_id = "com.apple.mail", .workspace = 3 },
+        \\    },
+        \\    .layout = .bsp,
+        \\}
+    ;
+    const previous = parseSource(arena.allocator(), "test", original) orelse return error.TestUnexpectedResult;
+
+    var next = previous;
+    next.app_rules = try effectiveAppRules(arena.allocator(), &previous);
+    try t.expectEqual(@as(usize, 1), next.app_rules.len);
+    next.workspace_assignments = &.{};
+    next.app_rules = &.{
+        next.app_rules[0],
+        .{ .app_id = "com.example.\"quoted\"", .float = true },
+    };
+
+    const written = try editSettingsSource(arena.allocator(), original, &previous, &next);
+    try t.expect(std.mem.indexOf(u8, written, "// Keep this.") != null);
+    try t.expect(std.mem.indexOf(u8, written, "workspace_assignments") == null);
+
+    const parsed = parseSource(arena.allocator(), "test", written) orelse return error.TestUnexpectedResult;
+    try t.expectEqual(@as(usize, 2), parsed.app_rules.len);
+    try t.expectEqual(@as(?u8, 3), parsed.workspaceForApp("com.apple.mail"));
+    try t.expect(parsed.shouldFloatApp("com.example.\"quoted\""));
+    try t.expectEqual(tiling.LayoutKind.bsp, parsed.layout);
+}
+
+test "parseSource accepts unknown fields like a reload does" {
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const parsed = parseSource(arena.allocator(), "test", ".{ .layout = .monocle, .from_the_future = 1 }") orelse
+        return error.TestUnexpectedResult;
+    try t.expectEqual(tiling.LayoutKind.monocle, parsed.layout);
 }
 
 // Bundle ID helper

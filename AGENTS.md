@@ -99,22 +99,25 @@ const app = NSApplication.msgSend(objc.Object, "sharedApplication", .{});
 _ = app.msgSend(bool, "setActivationPolicy:", .{@as(i64, 1)});
 ```
 
-**Architecture:** Swift runs NSApplication and starts/stops the embedded Zig core through `bobrwm_ui.h`. The AppKit main thread owns Bobrwm state mutation, layout, workspace state, IPC, status bar, and event draining. AX observer callbacks run on a dedicated background observer thread so slow or hung app AX servers cannot stall the main CFRunLoop. Background AX callbacks must only enqueue events or update observer bookkeeping protected by the AX lock; Bobrwm state mutations happen on the main thread during event drain.
+**Architecture:** Swift runs NSApplication and starts/stops the embedded Zig core through `bobrwm_ui.h`. The AppKit main thread owns BobrWM state mutation, layout, workspace state, IPC, status bar, and event draining. AX observer callbacks run on a dedicated background observer thread so slow or hung app AX servers cannot stall the main CFRunLoop. Background AX callbacks must only enqueue events or update observer bookkeeping protected by the AX lock; BobrWM state mutations happen on the main thread during event drain.
 
 ## Menu Bar UI (Swift)
 
-The native app, status item, and menu live in `packages/bobrwm-ui/`. `build.zig` builds Zig as a static core, then uses `swiftc` and Apple's linker to produce the app executable. No Xcode project or bundled dylib is needed; the Swift runtime is OS-provided (`/usr/lib/swift`). Swift owns AppKit lifecycle while Zig keeps the main-thread event drain and window-manager state.
+The native app, status item, and menu live in `macos/`. `build.zig` builds Zig as a static core, then uses `swiftc` and Apple's linker to produce the app executable. No Xcode project or bundled dylib is needed; the Swift runtime is OS-provided (`/usr/lib/swift`). Swift owns AppKit lifecycle while Zig keeps the main-thread event drain and window-manager state.
 
-**ABI:** `packages/bobrwm-ui/include/bobrwm_ui.h` is the single source of truth for core lifecycle and menu calls. Swift imports it through `module.modulemap` so its structs get guaranteed C layout; `src/statusbar.zig` mirrors the menu structs with `extern struct`. Changing a declaration means changing both sides. Strings are borrowed for the duration of the call, so `statusbar.zig` keeps names and shortcuts in static storage — a whole row array crosses at once and every pointer in it must be live simultaneously.
+**ABI:** `macos/include/bobrwm_ui.h` is the single source of truth for core lifecycle and menu calls. Swift imports it through `module.modulemap` so its structs get guaranteed C layout; `src/statusbar.zig` mirrors the menu structs with `extern struct`. Changing a declaration means changing both sides. Strings are borrowed for the duration of the call, so `statusbar.zig` keeps names and shortcuts in static storage — a whole row array crosses at once and every pointer in it must be live simultaneously.
 
-**Split:** `bw_menubar_set_workspaces` rebuilds the menu and is for identity (names, keybinds). `bw_menubar_set_state` updates counts and active/focused in place and is safe while the menu is open. Focus moves while the menu is open, so never route it through the rebuild path.
+**Split:** `bw_menubar_set_workspaces` rebuilds the menu and is for identity (names, keybinds). `bw_menubar_set_state` updates apps, counts, and active/focused in place and is safe while the menu is open. Focus moves while the menu is open, so never route it through the rebuild path.
 
-**Preview:** `zig build ui-preview` renders the real views to `zig-out/ui-preview/menu-{light,dark}.png`. `MenuRow.swift` has no dependency on the C ABI module, so the harness in `packages/bobrwm-ui/preview/` links it standalone. Use it to iterate on the design instead of rebuilding bobrwm and asking the operator to screenshot, which disrupts their running window manager. It cannot reproduce AppKit's menu vibrancy or real menu bar width — confirm those with `zig build run`.
+**Preview:** `zig build ui-preview` writes `zig-out/ui-preview/menu-{light,dark}.png`, `status-{light,dark}.png`, and the settings panes. The menu PNG is the real `NSMenu`: the harness pops it up for a moment and captures its window in-process, so no screen-recording permission is needed but it does flash on screen. `StatusMenu.swift` sends actions through the `StatusMenuActions` protocol instead of the C ABI callbacks, so the harness in `macos/preview/` builds the same menu without the core. Use it to iterate on the design instead of rebuilding bobrwm and asking the operator to screenshot, which disrupts their running window manager. The capture cannot show menu vibrancy or the real menu bar — confirm those with `zig build run`.
 
 **Gotchas:**
 - `NSHostingView` applies model changes on the next runloop turn. Measuring `fittingSize` inline after mutating an `ObservableObject` reports the *previous* content's width and SwiftUI renders truncated. Defer the measure, and keep `.fixedSize` on content that must never compress.
 - Do not constrain the status item's hosting view to its button: the button's width comes from `statusItem.length`, which is set from the view's fitting size, so pinning the edges feeds that measurement back into itself.
-- `NSMenuItem` with a custom `view` does not fire its action and gets no highlight drawing. Both are hand-rolled in `MenuRowHostView` (mouse-up → `cancelTracking` + `performActionForItem`) and via `NSMenuDelegate.menu(_:willHighlight:)`, which unlike mouse tracking also covers keyboard navigation.
+- Build the menu from stock `NSMenuItem`s, not custom `view`s. Custom views lose action dispatch, highlight drawing, and keyboard navigation, and can only approximate the system's row metrics, which change between macOS releases. Shortcut hints go through `keyEquivalent`: the ABI carries the config's key name and modifier flags, and `Shortcut` maps them to AppKit and to SF Symbols (`option`, `arrow.left`, ...), so presentation lives in Swift. Do not hard-code key glyphs. The core's event tap consumes bound keys first, so they never fire twice.
+- macOS 27 hides `NSMenuItem.image` by default. The workspace badge is the only focus indicator, so it sets `preferredImageVisibility = .visible`; other items should not depend on an icon. The badge is a drawn template image rather than an SF Symbol: the symbol squares have tight corners and a heavy outline, and the template keeps AppKit's tinting for appearance and highlight.
+- Trailing detail (the window count) sits on a shared right tab stop in `attributedTitle`; AppKit still recolors attributed titles on highlight.
+- Do not put `.scrollDisabled(true)` on a settings pane: it disables every scroll view inside, including tables, and a child cannot re-enable it. The panes use `.scrollBounceBehavior(.basedOnSize)` so the form never bounces while tables still scroll.
 - `.primary`/`.secondary` are NSColor-backed and resolve against the drawing appearance, not SwiftUI's `colorScheme`. Offscreen renders must set an `NSAppearance` explicitly.
 
 ## User-Facing Docs
@@ -123,7 +126,7 @@ The native app, status item, and menu live in `packages/bobrwm-ui/`. `build.zig`
 
 ## Window Management Invariants
 
-Bobrwm reconciles AX, WindowServer/CG, SkyLight, and internal workspace/layout state. Do not trust one source alone. AX can lag or expose stale native-tab window IDs; CG can retain invisible Electron windows; SkyLight bounds can fail for destroyed windows; internal workspace state can be stale until cleanup runs.
+BobrWM reconciles AX, WindowServer/CG, SkyLight, and internal workspace/layout state. Do not trust one source alone. AX can lag or expose stale native-tab window IDs; CG can retain invisible Electron windows; SkyLight bounds can fail for destroyed windows; internal workspace state can be stale until cleanup runs.
 
 **Visibility and cleanup:**
 - Treat CG on-screen presence as necessary but not always sufficient. Electron apps can keep layer-0 windows around after close-to-background; fully transparent CG windows should not be treated as visible.
