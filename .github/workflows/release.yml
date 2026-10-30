@@ -37,8 +37,9 @@ jobs:
         env:
           RELEASE_TAG: ${{ github.event.release.tag_name }}
         run: |
+          # Tip builds are named by commit, so packagers can find a commit's build.
           if [[ "$GITHUB_EVENT_NAME" == "push" ]]; then
-            version="tip-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+            version="tip-${GITHUB_SHA}"
             build_version=
           else
             version="$RELEASE_TAG"
@@ -210,7 +211,8 @@ jobs:
             --notes 'Latest continuous build from main.' \
             --prerelease \
             --target "$GITHUB_SHA"
-          gh release upload tip "$ARTIFACT_PATH" "$ARTIFACT_PATH.sha256"
+          # A rerun of the same commit replaces its build.
+          gh release upload tip "$ARTIFACT_PATH" "$ARTIFACT_PATH.sha256" --clobber
 
       - name: Upload binary to release
         if: github.event_name == 'release'
