@@ -237,8 +237,11 @@ pub fn build(b: *std.Build) !void {
         swift_app.setEnvironmentVariable("DEVELOPER_DIR", developer_dir);
     }
     if (optimize != .debug) swift_app.addArg("-O");
-    // Carries both bobrwm_ui.h and the modulemap that makes it importable.
+    // Include paths do not track their contents in the Run cache. Track the
+    // ABI files explicitly so header-only edits rebuild the Swift shell.
     swift_app.addPrefixedDirectoryArg("-I", b.path("macos/include"));
+    swift_app.addFileInput(b.path("macos/include/bobrwm_ui.h"));
+    swift_app.addFileInput(b.path("macos/include/module.modulemap"));
     const app_exe = swift_app.addPrefixedOutputFileArg("-o", server_exe_name);
     swift_app.addFileArg(b.path("macos/src/main.swift"));
     swift_app.addFileArg(b.path("macos/src/Settings.swift"));
@@ -348,6 +351,8 @@ pub fn build(b: *std.Build) !void {
     }
     const preview_exe = preview_build.addPrefixedOutputFileArg("-o", "bobrwm-ui-preview");
     preview_build.addPrefixedDirectoryArg("-I", b.path("macos/include"));
+    preview_build.addFileInput(b.path("macos/include/bobrwm_ui.h"));
+    preview_build.addFileInput(b.path("macos/include/module.modulemap"));
     preview_build.addFileArg(b.path("macos/src/StatusMenu.swift"));
     preview_build.addFileArg(b.path("macos/src/Settings.swift"));
     preview_build.addFileArg(b.path("macos/preview/main.swift"));
