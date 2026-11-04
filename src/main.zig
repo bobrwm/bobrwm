@@ -728,7 +728,7 @@ fn syncFocusStateForWindowId(focused_wid: u32, source: FocusEventSource) bool {
     return true;
 }
 
-/// Focus the latest managed window entered by the pointer. Mouse moves are
+/// Focus the latest window entered by the pointer. Mouse moves are
 /// coalesced by the event tap, then hit-tested against WindowServer z-order.
 fn focusWindowUnderMouse() void {
     var hovered_wid = g_focus_follows_mouse.eventWindowId();
@@ -753,34 +753,78 @@ fn focusWindowUnderMouse() void {
         .entered => cancelPendingMouseFocus(true, false),
     }
 
-    const hovered = managedWindow(hovered_wid) orelse return;
-    const leader = managedWindow(g_state.windowTabLeader(hovered_wid)) orelse return;
-    const space = managedWindowSpace(leader.wid) orelse return;
-    if (!spaceVisible(space)) return;
+    const pid = mouseFocusTargetPid(hovered_wid) orelse return;
 
-    beginMouseFocus(hovered);
+    beginMouseFocus(pid, hovered_wid);
 }
 
-fn beginMouseFocus(hovered: window_mod.Window) void {
-    if (g_last_focused_pid == hovered.pid and g_last_focused_window_id == hovered.wid) {
+/// Resolve unmanaged windows through WindowServer, not the tiling catalog.
+/// Desktop surfaces and invisible windows must never receive hover focus.
+fn mouseFocusTargetPid(wid: u32) ?i32 {
+    if (managedWindow(wid)) |window| {
+        const space = managedWindowSpace(g_state.windowTabLeader(wid)) orelse return null;
+        return if (spaceVisible(space)) window.pid else null;
+    }
+
+    const options = cg_extra.kCGWindowListOptionIncludingWindow | cg_extra.kCGWindowListExcludeDesktopElements;
+    trace.countWindowList();
+    const list = cg_extra.CGWindowListCopyWindowInfo(options, wid) orelse return null;
+    defer c.CFRelease(@ptrCast(list));
+    if (c.CFArrayGetCount(list) == 0) return null;
+    const info: c.CFDictionaryRef = @ptrCast(c.CFArrayGetValueAtIndex(list, 0) orelse return null);
+
+    const on_screen = c.CFDictionaryGetValue(info, cg_extra.kCGWindowIsOnscreen) orelse return null;
+    const level = c.CFDictionaryGetValue(info, cg_extra.kCGWindowLayer) orelse return null;
+    const owner = c.CFDictionaryGetValue(info, cg_extra.kCGWindowOwnerPID) orelse return null;
+    var layer: i32 = 0;
+    var pid: i32 = 0;
+    if (c.CFNumberGetValue(@ptrCast(level), c.kCFNumberSInt32Type, &layer) == 0 or
+        c.CFNumberGetValue(@ptrCast(owner), c.kCFNumberSInt32Type, &pid) == 0) return null;
+
+    // Targeted queries can include hidden windows. Menus and tooltips must
+    // also stay ineligible: making them key interrupts menu tracking.
+    if (pid <= 0 or c.CFBooleanGetValue(@ptrCast(on_screen)) == 0 or
+        !cgWindowInfoVisible(info) or layer >= c.CGWindowLevelForKey(c.kCGPopUpMenuWindowLevelKey)) return null;
+    return pid;
+}
+
+/// AX cannot query our own process. Use AppKit for local key-window state,
+/// and bound remote queries so a hung app cannot stall pointer handling.
+fn mouseFocusedWindowId(pid: i32) u32 {
+    if (pid == std.c.getpid()) {
+        const cls = objc.getClass("NSApplication") orelse return 0;
+        const app = cls.msgSend(objc.Object, "sharedApplication", .{});
+        const window = app.msgSend(objc.Object, "keyWindow", .{});
+        if (window.value == null) return 0;
+        return @intCast(window.msgSend(i64, "windowNumber", .{}));
+    }
+    return axFocusedWindow(pid, 0.04);
+}
+
+fn beginMouseFocus(pid: i32, wid: u32) void {
+    // Unmanaged apps need not have AX observers. Refresh OS focus so returning
+    // from one cannot be mistaken for hovering the last managed focus again.
+    const previous_pid = frontmostApplicationPid() orelse 0;
+    const previous_wid = if (previous_pid == pid) mouseFocusedWindowId(pid) else 0;
+    if (previous_pid == pid and previous_wid == wid) {
         return;
     }
 
     var psn: skylight.ProcessSerialNumber = .{ .high = 0, .low = 0 };
-    if (GetProcessForPID(hovered.pid, &psn) != 0) {
-        mouseFocusFailed(hovered.wid, "GetProcessForPID", false);
+    if (GetProcessForPID(pid, &psn) != 0) {
+        mouseFocusFailed(wid, "GetProcessForPID", false);
         return;
     }
 
-    if (g_last_focused_pid == hovered.pid and g_last_focused_window_id != 0) {
-        if (!postSameProcessFocusEvent(&psn, g_last_focused_window_id, 0x02)) {
-            mouseFocusFailed(hovered.wid, "previous-window event", false);
+    if (previous_pid == pid and previous_wid != 0) {
+        if (!postSameProcessFocusEvent(&psn, previous_wid, 0x02)) {
+            mouseFocusFailed(wid, "previous-window event", false);
             return;
         }
         const intent = g_focus_follows_mouse.beginIntent(
-            hovered.pid,
-            hovered.wid,
-            g_last_focused_window_id,
+            pid,
+            wid,
+            previous_wid,
             .handoff,
         );
         log.debug("focus follows mouse intent={d} handoff previous={d} target={d}", .{
@@ -793,8 +837,8 @@ fn beginMouseFocus(hovered: window_mod.Window) void {
     }
 
     const intent = g_focus_follows_mouse.beginIntent(
-        hovered.pid,
-        hovered.wid,
+        pid,
+        wid,
         0,
         .awaiting_confirmation,
     );
@@ -809,11 +853,7 @@ fn mouseFocusBlocked() bool {
 
 fn mouseFocusIntentEligible(intent: focus_follows_mouse.Intent) bool {
     if (mouseFocusBlocked() or !g_focus_follows_mouse.isHovered(intent.window_id)) return false;
-    const window = managedWindow(intent.window_id) orelse return false;
-    if (window.pid != intent.process_id) return false;
-    const leader = managedWindow(g_state.windowTabLeader(intent.window_id)) orelse return false;
-    const space = managedWindowSpace(leader.wid) orelse return false;
-    return spaceVisible(space);
+    return (mouseFocusTargetPid(intent.window_id) orelse return false) == intent.process_id;
 }
 
 fn cancelPendingMouseFocus(restore_handoff: bool, rearm: bool) void {
@@ -894,6 +934,14 @@ fn mouseFocusDeadlineFired(context: ?*anyopaque) callconv(.c) void {
             submitMouseFocus(intent, &psn, true);
         },
         .awaiting_confirmation => {
+            // Accessory and ignored apps may have no AX observer to confirm
+            // success. Check actual focus before treating silence as failure.
+            if (frontmostApplicationPid() == intent.process_id and
+                mouseFocusedWindowId(intent.process_id) == intent.window_id)
+            {
+                _ = confirmMouseFocus(intent.process_id, intent.window_id);
+                return;
+            }
             log.debug("focus follows mouse intent={d} confirmation timed out wid={d}", .{
                 intent.generation,
                 intent.window_id,

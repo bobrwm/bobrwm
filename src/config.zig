@@ -21,7 +21,8 @@ pub const Config = struct {
     /// This also drops the default `reload_config` shortcut, so use
     /// `bobrwm reload-config` unless you bind `reload_config` yourself.
     disable_default_keybinds: bool = false,
-    /// Focus a managed window without raising it when the pointer enters it.
+    /// Focus a window without raising it when the pointer enters it, including
+    /// floating windows and windows excluded from tiling.
     focus_follows_mouse: bool = false,
     /// Map a key and modifiers to an action.
     ///
