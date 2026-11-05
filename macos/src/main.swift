@@ -21,13 +21,26 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
             return
         }
         coreStarted = true
+        for name in [NSMenu.didBeginTrackingNotification, NSMenu.didEndTrackingNotification] {
+            NotificationCenter.default.addObserver(
+                self,
+                selector: #selector(menuTrackingChanged(_:)),
+                name: name,
+                object: nil
+            )
+        }
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        NotificationCenter.default.removeObserver(self)
         if coreStarted {
             bw_core_stop()
             coreStarted = false
         }
+    }
+
+    @objc private func menuTrackingChanged(_ notification: Notification) {
+        bw_core_menu_tracking_changed(notification.name == NSMenu.didBeginTrackingNotification)
     }
 
     private static func configPath() -> String? {

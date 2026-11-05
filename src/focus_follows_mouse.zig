@@ -1,6 +1,40 @@
-//! Allocation-free pointer-focus coalescing and confirmation intent state.
+//! Allocation-free pointer-focus eligibility, coalescing, and confirmation state.
 
 const std = @import("std");
+
+/// Workspace-aware visibility for managed windows, or WindowServer facts for
+/// unmanaged surfaces. Missing AX details leave hover focus available.
+pub const TargetObservation = struct {
+    process_id: i32,
+    is_visible: bool,
+    kind: enum { managed, normal, floating, menu, desktop },
+    arc_overlay: ?ArcOverlayObservation = null,
+};
+
+/// Arc's PiP exposes a floating AXSystemDialog without normal window chrome.
+pub const ArcOverlayObservation = struct {
+    is_system_dialog: bool,
+    is_modal: bool = false,
+    has_real_window_signal: bool = false,
+};
+
+/// Decide hover eligibility from observations without querying or focusing macOS.
+pub fn targetProcessId(observation: TargetObservation) ?i32 {
+    if (observation.process_id <= 0 or !observation.is_visible) return null;
+    switch (observation.kind) {
+        .managed, .normal => return observation.process_id,
+        // System surfaces are not application focus targets. Activating them
+        // can switch the foreground app or interrupt native menu tracking.
+        .menu, .desktop => return null,
+        .floating => {},
+    }
+
+    const overlay = observation.arc_overlay orelse return observation.process_id;
+    return if (overlay.is_system_dialog and !overlay.is_modal and !overlay.has_real_window_signal)
+        null
+    else
+        observation.process_id;
+}
 
 /// Convert CoreGraphics' signed event field to a valid WindowServer ID.
 pub fn normalizeEventWindowId(value: i64) ?u32 {
@@ -156,6 +190,51 @@ pub const State = struct {
         return generation;
     }
 };
+
+test "hover targets require visible windows and reject system surfaces" {
+    for ([_]@FieldType(TargetObservation, "kind"){ .managed, .normal, .floating }) |kind| {
+        var observation: TargetObservation = .{ .process_id = 42, .is_visible = true, .kind = kind };
+        try std.testing.expectEqual(@as(?i32, 42), targetProcessId(observation));
+        observation.is_visible = false;
+        try std.testing.expectEqual(@as(?i32, null), targetProcessId(observation));
+        observation.is_visible = true;
+        observation.process_id = 0;
+        try std.testing.expectEqual(@as(?i32, null), targetProcessId(observation));
+        observation.process_id = -1;
+        try std.testing.expectEqual(@as(?i32, null), targetProcessId(observation));
+    }
+    for ([_]@FieldType(TargetObservation, "kind"){ .menu, .desktop }) |kind| {
+        try std.testing.expectEqual(@as(?i32, null), targetProcessId(.{
+            .process_id = 42,
+            .is_visible = true,
+            .kind = kind,
+        }));
+    }
+}
+
+test "only passive floating Arc system dialogs are excluded from hover focus" {
+    var observation: TargetObservation = .{
+        .process_id = 73,
+        .is_visible = true,
+        .kind = .floating,
+        .arc_overlay = .{ .is_system_dialog = true },
+    };
+    try std.testing.expectEqual(@as(?i32, null), targetProcessId(observation));
+
+    // Other subroles, modal dialogs, and real windows must remain focusable.
+    for ([_]ArcOverlayObservation{
+        .{ .is_system_dialog = false },
+        .{ .is_system_dialog = true, .is_modal = true },
+        .{ .is_system_dialog = true, .has_real_window_signal = true },
+    }) |overlay| {
+        observation.arc_overlay = overlay;
+        try std.testing.expectEqual(@as(?i32, 73), targetProcessId(observation));
+    }
+
+    // Other apps and unavailable AX observations must not be excluded.
+    observation.arc_overlay = null;
+    try std.testing.expectEqual(@as(?i32, 73), targetProcessId(observation));
+}
 
 test "mouse moves coalesce until consumed" {
     var state: State = .{};

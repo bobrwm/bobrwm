@@ -643,6 +643,11 @@ pub const WindowTabDetachment = struct {
     layout: ?LayoutInsertion = null,
 };
 
+pub const MenuTracking = struct {
+    process_id: i32,
+    depth: u32 = 1,
+};
+
 pub const Model = struct {
     spaces: SpaceCatalog = .{},
     windows: WindowCatalog = .{},
@@ -669,6 +674,7 @@ pub const Model = struct {
     bsp_insert_point: tiling_mod.InsertionPointPolicy = .focused,
     pointer_drag: PointerDragState = .{},
     drag_preview: DragPreviewState = .{},
+    menu_tracking: ?MenuTracking = null,
     swipe: swipe.State = .{},
     retile_request: RetileRequest = .{},
     cleanup_request: CleanupRequest = .{},
@@ -1113,6 +1119,11 @@ pub const Event = union(enum) {
     },
     clear_drag_preview,
     pointer_up,
+    menu_tracking_observed: struct {
+        process_id: i32,
+        is_open: bool,
+    },
+    process_terminated: i32,
     request_retile_all_displays,
     request_retile_display: DisplayId,
     flush_retile_requests,
@@ -1235,6 +1246,7 @@ pub const Effect = union(enum) {
     show_drag_preview: window_mod.Window.Frame,
     hide_drag_preview,
     pointer_drag_completed: PointerDragCompletion,
+    cancel_mouse_focus,
     retile_requested: RetileRequest,
     cleanup_requested: CleanupRequest,
     cleanup_request_overflow: i32,

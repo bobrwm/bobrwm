@@ -264,6 +264,8 @@ pub fn reduce(model: *Model, event: Event) Transition {
         .drag_preview_observed => |observation| pointer_reducer.reduceDragPreviewObserved(&transition, observation),
         .clear_drag_preview => pointer_reducer.clearDragPreview(&transition),
         .pointer_up => pointer_reducer.reducePointerUp(&transition),
+        .menu_tracking_observed => |observation| pointer_reducer.reduceMenuTrackingObserved(&transition, observation),
+        .process_terminated => |process_id| pointer_reducer.reduceProcessTerminated(&transition, process_id),
         .request_retile_all_displays => {
             transition.model.retile_request.all_displays = true;
             transition.model.retile_request.display_count = 0;
@@ -2584,6 +2586,41 @@ test "display settle timer is reducer owned" {
     transition = reduceCopy(transition.model, .{ .display_resettle_timer_fired = 500 });
     try testing.expect(!transition.model.hasDisplayResettleScheduled());
     try testing.expectEqual(std.meta.Tag(Effect).display_resettle_due, std.meta.activeTag(transition.effects[0]));
+}
+
+test "nested menus suspend hover focus until the owning app finishes tracking" {
+    const testing = std.testing;
+    var transition = reduceCopy(.{}, .{ .menu_tracking_observed = .{ .process_id = 42, .is_open = true } });
+    try testing.expect(transition.model.menu_tracking != null);
+    try testing.expectEqual(@as(u8, 1), transition.effect_count);
+    try testing.expectEqual(std.meta.Tag(Effect).cancel_mouse_focus, std.meta.activeTag(transition.effects[0]));
+    transition = reduceCopy(transition.model, .{ .menu_tracking_observed = .{ .process_id = 42, .is_open = true } });
+    try testing.expectEqual(@as(u8, 0), transition.effect_count);
+    transition = reduceCopy(transition.model, .{ .menu_tracking_observed = .{ .process_id = 42, .is_open = false } });
+    try testing.expect(transition.model.menu_tracking != null);
+    transition = reduceCopy(transition.model, .{ .menu_tracking_observed = .{ .process_id = 73, .is_open = false } });
+    try testing.expect(transition.model.menu_tracking != null);
+    transition = reduceCopy(transition.model, .{ .menu_tracking_observed = .{ .process_id = 42, .is_open = false } });
+    try testing.expect(transition.model.menu_tracking == null);
+    transition = reduceCopy(transition.model, .{ .menu_tracking_observed = .{ .process_id = 42, .is_open = false } });
+    try testing.expect(transition.model.menu_tracking == null);
+
+    // A missing close must not keep hover focus disabled after the app exits.
+    transition = reduceCopy(transition.model, .{ .menu_tracking_observed = .{ .process_id = 73, .is_open = true } });
+    transition = reduceCopy(transition.model, .{ .process_terminated = 42 });
+    try testing.expect(transition.model.menu_tracking != null);
+    transition = reduceCopy(transition.model, .{ .process_terminated = 73 });
+    try testing.expect(transition.model.menu_tracking == null);
+}
+
+test "late menu closes from a previous app cannot resume hover focus" {
+    const testing = std.testing;
+    var transition = reduceCopy(.{}, .{ .menu_tracking_observed = .{ .process_id = 42, .is_open = true } });
+    transition = reduceCopy(transition.model, .{ .menu_tracking_observed = .{ .process_id = 73, .is_open = true } });
+    transition = reduceCopy(transition.model, .{ .menu_tracking_observed = .{ .process_id = 42, .is_open = false } });
+    try testing.expectEqual(@as(i32, 73), transition.model.menu_tracking.?.process_id);
+    transition = reduceCopy(transition.model, .{ .menu_tracking_observed = .{ .process_id = 73, .is_open = false } });
+    try testing.expect(transition.model.menu_tracking == null);
 }
 
 test "pointer drop swaps layout inside the reducer" {
