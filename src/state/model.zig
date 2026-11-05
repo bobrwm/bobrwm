@@ -1052,6 +1052,9 @@ pub const Event = union(enum) {
         is_visible: bool,
     },
     deferred_window_promotion_failed: WindowId,
+    // WindowServer or AX reported the window gone, so neither queue can ever
+    // promote it and polling it would only spend AX calls until expiry.
+    window_candidate_destroyed: WindowId,
     untrack_window_candidates_for_process: i32,
     track_app_launch_retry: ProcessRetry,
     untrack_app_launch_retry: i32,

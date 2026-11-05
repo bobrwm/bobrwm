@@ -1219,6 +1219,24 @@ fn inferDisplayIdForWindow(wid: u32) ?u32 {
     return displayIdForFrame(frame);
 }
 
+/// Whether WindowServer still knows `wid`, on any Space and on- or off-screen.
+/// SkyLight bounds cannot answer this: they also fail for windows still under
+/// construction. An unreadable answer counts as present so a transient CG
+/// failure never drops a live candidate.
+fn windowServerHasWindow(wid: u32) bool {
+    std.debug.assert(wid != 0);
+
+    // The CG API reads raw CGWindowID values, so the array has no callbacks.
+    var values = [_]?*const anyopaque{@ptrFromInt(wid)};
+    const window_ids = c.CFArrayCreate(null, &values, 1, null) orelse return true;
+    defer c.CFRelease(@ptrCast(window_ids));
+
+    trace.countWindowList();
+    const descriptions = cg_extra.CGWindowListCreateDescriptionFromArray(window_ids) orelse return true;
+    defer c.CFRelease(@ptrCast(descriptions));
+    return c.CFArrayGetCount(descriptions) > 0;
+}
+
 /// Live WindowServer bounds for a window. `Window.frame` records bobrwm's last
 /// accepted target or adopted user/external geometry; callers that need what
 /// is physically visible now must still ask WindowServer.
@@ -3819,6 +3837,12 @@ fn handleEvent(ev: *const event_mod.Event) void {
             if (g_focus_follows_mouse.intent) |intent| {
                 if (intent.window_id == ev.wid) cancelPendingMouseFocus(true, false);
             }
+            // removeWindow only covers managed windows; a window still
+            // waiting on readiness must leave the poll queues too. AX element
+            // lifetime can diverge from the CG window, so confirm first.
+            if (!windowServerHasWindow(ev.wid)) {
+                dispatchStateEvent(.{ .window_candidate_destroyed = ev.wid });
+            }
             removeWindow(ev.wid);
             retile();
         },
@@ -5636,6 +5660,13 @@ fn processPendingRoleWindows() void {
     const started_ns = nanoTimestamp();
     for (candidates.items()) |candidate| {
         if (nanoTimestamp() - started_ns >= role_poll_work_budget_ms * std.time.ns_per_ms) return;
+        // A destroyed window is not in AXWindows either, so the role query
+        // would report it pending until the budget runs out.
+        if (!windowServerHasWindow(candidate.window_id)) {
+            log.debug("pending-role: window gone pid={d} wid={d}", .{ candidate.process_id, candidate.window_id });
+            dispatchStateEvent(.{ .window_candidate_destroyed = candidate.window_id });
+            continue;
+        }
         dispatchStateEvent(.{ .pending_role_observed = .{
             .window_id = candidate.window_id,
             .readiness = windowRoleStateWithMessagingTimeout(candidate.process_id, candidate.window_id),
@@ -5646,6 +5677,11 @@ fn processPendingRoleWindows() void {
 fn processDeferredWindowCandidates() void {
     const candidates = g_state.deferred_window_candidates;
     for (candidates.items()) |candidate| {
+        if (!windowServerHasWindow(candidate.window_id)) {
+            log.debug("deferred-window: window gone pid={d} wid={d}", .{ candidate.process_id, candidate.window_id });
+            dispatchStateEvent(.{ .window_candidate_destroyed = candidate.window_id });
+            continue;
+        }
         dispatchStateEvent(.{ .deferred_window_observed = .{
             .window_id = candidate.window_id,
             .readiness = windowRoleState(candidate.process_id, candidate.window_id),
