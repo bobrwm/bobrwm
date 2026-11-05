@@ -206,6 +206,7 @@ pub fn reduce(model: *Model, event: Event) Transition {
         },
         .deferred_window_observed => |observation| discovery_reducer.reduceDeferredWindowObserved(&transition, observation),
         .deferred_window_promotion_failed => |window_id| discovery_reducer.reduceDeferredWindowPromotionFailed(&transition, window_id),
+        .window_candidate_destroyed => |window_id| discovery_reducer.reduceWindowCandidateDestroyed(&transition, window_id),
         .untrack_window_candidates_for_process => |process_id| {
             transition.model.pending_role_windows.removeProcess(process_id);
             transition.model.deferred_window_candidates.removeProcess(process_id);
@@ -2553,6 +2554,35 @@ test "window discovery retries are reducer owned" {
     transition = reduceCopy(transition.model, .{ .deferred_window_promotion_failed = candidate.window_id });
     try testing.expect(!transition.model.hasDeferredWindowCandidate(candidate.window_id));
     try testing.expectEqual(DeferredWindowExpiryReason.unsettled_bounds, transition.effects[0].deferred_window_expired.reason);
+}
+
+test "destroyed window candidates leave both queues without expiring" {
+    const testing = std.testing;
+    var catalog: SpaceCatalog = .{};
+    catalog.add(.{ .key = .{ .id = 1 }, .workspace_id = 1, .display_id = 11 });
+    var model = reduceCopy(.{}, .{ .replace_space_catalog = &catalog }).model;
+    const candidate: WindowCandidate = .{
+        .process_id = 42,
+        .window_id = 100,
+        .space_key = .{ .id = 1 },
+        .attempts_remaining = 5,
+    };
+    const survivor: WindowCandidate = .{
+        .process_id = 42,
+        .window_id = 101,
+        .space_key = .{ .id = 1 },
+        .attempts_remaining = 5,
+    };
+
+    model = reduceCopy(model, .{ .track_pending_role_window = candidate }).model;
+    model = reduceCopy(model, .{ .track_deferred_window_candidate = candidate }).model;
+    model = reduceCopy(model, .{ .track_pending_role_window = survivor }).model;
+
+    const transition = reduceCopy(model, .{ .window_candidate_destroyed = candidate.window_id });
+    try testing.expectEqual(@as(u8, 0), transition.effect_count);
+    try testing.expect(!transition.model.hasPendingRoleWindow(candidate.window_id));
+    try testing.expect(!transition.model.hasDeferredWindowCandidate(candidate.window_id));
+    try testing.expect(transition.model.hasPendingRoleWindow(survivor.window_id));
 }
 
 test "process retry outcomes are reducer owned" {

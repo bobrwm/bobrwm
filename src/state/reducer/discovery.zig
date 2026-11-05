@@ -88,6 +88,13 @@ pub fn reduceDeferredWindowPromotionFailed(transition: *Transition, window_id: W
     expireOrDecrementDeferredWindow(transition, candidate, .unsettled_bounds);
 }
 
+/// Drop a destroyed window from both candidate queues without an expiry
+/// effect: a window that no longer exists did not fail readiness.
+pub fn reduceWindowCandidateDestroyed(transition: *Transition, window_id: WindowId) void {
+    _ = transition.model.pending_role_windows.remove(window_id);
+    _ = transition.model.deferred_window_candidates.remove(window_id);
+}
+
 pub fn expireOrDecrementDeferredWindow(
     transition: *Transition,
     candidate: *WindowCandidate,

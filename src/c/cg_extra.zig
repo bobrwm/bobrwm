@@ -101,6 +101,10 @@ pub extern fn CGWindowListCopyWindowInfo(
     relative_to_window: CGWindowID,
 ) c.CFArrayRef;
 
+/// `window_array` holds raw CGWindowID values, not CFNumbers. The result
+/// omits windows WindowServer no longer knows, on any Space.
+pub extern fn CGWindowListCreateDescriptionFromArray(window_array: c.CFArrayRef) c.CFArrayRef;
+
 // CGDirectDisplay.h — excluded from c.h (Aro can't parse the full header).
 // Only the UUID accessor is needed: a per-display identity that survives
 // unplug/replug and sleep/wake, unlike CGDirectDisplayID which macOS reassigns.
