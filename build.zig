@@ -559,6 +559,28 @@ pub fn build(b: *std.Build) !void {
 
     const run_trace_tests = b.addRunArtifact(trace_tests);
 
+    // window_server.zig queries the live WindowServer through CoreGraphics;
+    // its test skips when no session is available.
+    const window_server_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/window_server.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    window_server_test_mod.addImport("c", c_mod);
+    window_server_test_mod.addImport("cg_extra", cg_extra_mod);
+    window_server_test_mod.linkFramework("CoreGraphics", .{});
+    window_server_test_mod.linkFramework("CoreFoundation", .{});
+    window_server_test_mod.addSystemFrameworkPath(.{ .cwd_relative = sdk_frameworks });
+    window_server_test_mod.addLibraryPath(.{ .cwd_relative = sdk_lib });
+
+    const window_server_tests = b.addTest(.{
+        .name = "window-server-tests",
+        .root_module = window_server_test_mod,
+    });
+
+    const run_window_server_tests = b.addRunArtifact(window_server_tests);
+
     const swipe_test_mod = b.createModule(.{
         .root_source_file = b.path("src/swipe.zig"),
         .target = target,
@@ -639,6 +661,7 @@ pub fn build(b: *std.Build) !void {
     test_step.dependOn(&run_dim_tests.step);
     test_step.dependOn(&run_logging_tests.step);
     test_step.dependOn(&run_trace_tests.step);
+    test_step.dependOn(&run_window_server_tests.step);
     test_step.dependOn(&run_swipe_tests.step);
     test_step.dependOn(&run_osutil_tests.step);
     test_step.dependOn(&run_helpgen_tests.step);
