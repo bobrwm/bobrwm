@@ -1,4 +1,4 @@
-//! Pointer-drag state transitions.
+//! Pointer interaction and menu-tracking state transitions.
 
 const invariants = @import("../invariants.zig");
 const model_mod = @import("../model.zig");
@@ -7,6 +7,31 @@ const layout_reducer = @import("layout.zig");
 const Event = model_mod.Event;
 const Transition = model_mod.Transition;
 const WindowId = model_mod.WindowId;
+
+pub fn reduceMenuTrackingObserved(transition: *Transition, observation: @FieldType(Event, "menu_tracking_observed")) void {
+    if (observation.process_id <= 0) return;
+    if (observation.is_open) {
+        if (transition.model.menu_tracking) |*tracking| {
+            if (tracking.process_id == observation.process_id) {
+                tracking.depth +|= 1;
+                return;
+            }
+        }
+        // Only one app owns menu tracking. A new owner supersedes old state;
+        // delayed closes from the previous app must not unblock the new menu.
+        transition.model.menu_tracking = .{ .process_id = observation.process_id };
+        transition.addEffect(.cancel_mouse_focus);
+    } else if (transition.model.menu_tracking) |*tracking| {
+        if (tracking.process_id != observation.process_id) return;
+        tracking.depth -= 1;
+        if (tracking.depth == 0) transition.model.menu_tracking = null;
+    }
+}
+
+pub fn reduceProcessTerminated(transition: *Transition, process_id: i32) void {
+    const tracking = transition.model.menu_tracking orelse return;
+    if (tracking.process_id == process_id) transition.model.menu_tracking = null;
+}
 
 pub fn removeWindowFromPointerState(transition: *Transition, window_id: WindowId) void {
     if (transition.model.pointer_drag.candidate_window_id == window_id) {

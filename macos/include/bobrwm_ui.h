@@ -82,6 +82,8 @@ typedef struct {
 // its application delegate, while Zig can request normal AppKit termination.
 int bw_core_start(const char *config_path);
 void bw_core_stop(void);
+// Main-thread observation for this process, which cannot observe itself via AX.
+void bw_core_menu_tracking_changed(bool is_open);
 void bw_app_terminate(void);
 
 void bw_menubar_init(BWMenuBarCallbacks callbacks, const char *config_path);

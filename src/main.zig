@@ -763,7 +763,11 @@ fn focusWindowUnderMouse() void {
 fn mouseFocusTargetPid(wid: u32) ?i32 {
     if (managedWindow(wid)) |window| {
         const space = managedWindowSpace(g_state.windowTabLeader(wid)) orelse return null;
-        return if (spaceVisible(space)) window.pid else null;
+        return focus_follows_mouse.targetProcessId(.{
+            .process_id = window.pid,
+            .is_visible = spaceVisible(space),
+            .kind = .managed,
+        });
     }
 
     const options = cg_extra.kCGWindowListOptionIncludingWindow | cg_extra.kCGWindowListExcludeDesktopElements;
@@ -781,11 +785,44 @@ fn mouseFocusTargetPid(wid: u32) ?i32 {
     if (c.CFNumberGetValue(@ptrCast(level), c.kCFNumberSInt32Type, &layer) == 0 or
         c.CFNumberGetValue(@ptrCast(owner), c.kCFNumberSInt32Type, &pid) == 0) return null;
 
-    // Targeted queries can include hidden windows. Menus and tooltips must
-    // also stay ineligible: making them key interrupts menu tracking.
-    if (pid <= 0 or c.CFBooleanGetValue(@ptrCast(on_screen)) == 0 or
-        !cgWindowInfoVisible(info) or layer >= c.CGWindowLevelForKey(c.kCGPopUpMenuWindowLevelKey)) return null;
-    return pid;
+    var observation: focus_follows_mouse.TargetObservation = .{
+        .process_id = pid,
+        .is_visible = c.CFBooleanGetValue(@ptrCast(on_screen)) != 0 and cgWindowInfoVisible(info),
+        .kind = if (layer < c.CGWindowLevelForKey(c.kCGNormalWindowLevelKey))
+            .desktop
+        else if (layer >= c.CGWindowLevelForKey(c.kCGMainMenuWindowLevelKey))
+            .menu
+        else if (layer == c.CGWindowLevelForKey(c.kCGFloatingWindowLevelKey))
+            .floating
+        else
+            .normal,
+    };
+    // Reject from cheap CG facts before asking an app's AX server for details.
+    if (focus_follows_mouse.targetProcessId(observation) == null) return null;
+    if (observation.kind == .floating) observation.arc_overlay = observeArcOverlay(pid, wid);
+    return focus_follows_mouse.targetProcessId(observation);
+}
+
+/// Only Arc needs the additional AX observation; other apps' floating panels
+/// do not need a remote query. Unknown details leave hover focus available.
+fn observeArcOverlay(pid: i32, wid: u32) ?focus_follows_mouse.ArcOverlayObservation {
+    var bundle_buf: [256]u8 = undefined;
+    const bundle_id = config_mod.getAppBundleId(pid, &bundle_buf) orelse return null;
+    if (!std.mem.eql(u8, bundle_id, "company.thebrowser.Browser")) return null;
+
+    const win = ax_mod.findWindowWithMessagingTimeout(pid, wid, 0.04) orelse return null;
+    defer c.CFRelease(@ptrCast(win));
+    const ax = ensureAxStrings() orelse return null;
+    const subrole = copyAxAttribute(win, ax.subrole_attr) orelse return null;
+    defer c.CFRelease(subrole);
+    var observation: focus_follows_mouse.ArcOverlayObservation = .{
+        .is_system_dialog = c.CFEqual(subrole, @ptrCast(ax.system_dialog_subrole)) != 0,
+    };
+    if (observation.is_system_dialog) {
+        observation.is_modal = axBooleanAttributeTrue(win, ax.modal_attr);
+        if (!observation.is_modal) observation.has_real_window_signal = windowHasRealWindowSignal(win, ax);
+    }
+    return observation;
 }
 
 /// AX cannot query our own process. Use AppKit for local key-window state,
@@ -848,6 +885,7 @@ fn beginMouseFocus(pid: i32, wid: u32) void {
 fn mouseFocusBlocked() bool {
     return !g_config.focus_follows_mouse or
         g_state.isWorkspaceTransitionActive() or
+        g_state.menu_tracking != null or
         g_state.pointer_drag.is_down;
 }
 
@@ -858,7 +896,8 @@ fn mouseFocusIntentEligible(intent: focus_follows_mouse.Intent) bool {
 
 fn cancelPendingMouseFocus(restore_handoff: bool, rearm: bool) void {
     const intent = g_focus_follows_mouse.cancelIntent() orelse return;
-    if (restore_handoff and intent.phase == .handoff and intent.previous_window_id != 0) {
+    // Do not inject an activation even to restore focus while a menu owns it.
+    if (restore_handoff and g_state.menu_tracking == null and intent.phase == .handoff and intent.previous_window_id != 0) {
         var psn: skylight.ProcessSerialNumber = .{ .high = 0, .low = 0 };
         if (GetProcessForPID(intent.process_id, &psn) == 0 and
             !postSameProcessFocusEvent(&psn, intent.previous_window_id, 0x01))
@@ -2004,33 +2043,32 @@ fn windowHasRealWindowSignal(win: c.AXUIElementRef, ax: *const AxStrings) bool {
     std.debug.assert(win != null);
     std.debug.assert(ax.modal_attr != null);
 
-    if (axAttributePresent(win, ax.close_button_attr)) return true;
-    if (axAttributePresent(win, ax.minimize_button_attr)) return true;
-    if (axAttributePresent(win, ax.zoom_button_attr)) return true;
-    if (axAttributePresent(win, ax.fullscreen_button_attr)) return true;
-    if (axBooleanAttributeTrue(win, ax.main_attr)) return true;
-    if (axBooleanAttributeTrue(win, ax.focused_attr)) return true;
-    return false;
+    for ([_]c.CFStringRef{ ax.close_button_attr, ax.minimize_button_attr, ax.zoom_button_attr, ax.fullscreen_button_attr }) |attr| {
+        if (axAttributePresent(win, attr)) return true;
+    }
+    return axBooleanAttributeTrue(win, ax.main_attr) or axBooleanAttributeTrue(win, ax.focused_attr);
+}
+
+/// Returns a retained attribute value; the caller must release it.
+fn copyAxAttribute(win: c.AXUIElementRef, attr: c.CFStringRef) c.CFTypeRef {
+    var value: c.CFTypeRef = null;
+    trace.countAx();
+    const err = c.AXUIElementCopyAttributeValue(win, attr, &value);
+    return if (err == c.kAXErrorSuccess) value else null;
 }
 
 /// True when the AX attribute exists and is non-null on the element.
 fn axAttributePresent(win: c.AXUIElementRef, attr: c.CFStringRef) bool {
-    var value: c.CFTypeRef = null;
-    trace.countAx();
-    const err = c.AXUIElementCopyAttributeValue(win, attr, &value);
-    if (err != c.kAXErrorSuccess or value == null) return false;
-    c.CFRelease(value.?);
+    const value = copyAxAttribute(win, attr) orelse return false;
+    c.CFRelease(value);
     return true;
 }
 
 /// True when the AX attribute is a CFBoolean set to true.
 fn axBooleanAttributeTrue(win: c.AXUIElementRef, attr: c.CFStringRef) bool {
-    var value: c.CFTypeRef = null;
-    trace.countAx();
-    const err = c.AXUIElementCopyAttributeValue(win, attr, &value);
-    if (err != c.kAXErrorSuccess or value == null) return false;
-    defer c.CFRelease(value.?);
-    return c.CFEqual(value.?, @ptrCast(c.kCFBooleanTrue)) != 0;
+    const value = copyAxAttribute(win, attr) orelse return false;
+    defer c.CFRelease(value);
+    return c.CFEqual(value, @ptrCast(c.kCFBooleanTrue)) != 0;
 }
 
 fn windowMayRemainManaged(pid: i32, wid: u32) bool {
@@ -2767,6 +2805,15 @@ fn deinitMainRunLoopSources() void {
 }
 
 // Event bridge (called from ObjC shim)
+
+// AX cannot observe this process. AppKit publishes our own menu lifecycle on
+// the main thread so suspension takes effect before menu tracking continues.
+export fn bw_core_menu_tracking_changed(is_open: bool) void {
+    dispatchStateEvent(.{ .menu_tracking_observed = .{
+        .process_id = std.c.getpid(),
+        .is_open = is_open,
+    } });
+}
 
 // Thread-safe: AX observer callbacks run on per-app background threads
 // and push events here.  The os_unfair_lock serialises concurrent pushes
@@ -3789,6 +3836,7 @@ fn handleEvent(ev: *const event_mod.Event) void {
         },
         .app_terminated => {
             log.debug("app terminated pid={}", .{ev.pid});
+            dispatchStateEvent(.{ .process_terminated = ev.pid });
             if (g_focus_follows_mouse.intent) |intent| {
                 if (intent.process_id == ev.pid) cancelPendingMouseFocus(false, false);
             }
@@ -3948,6 +3996,15 @@ fn handleEvent(ev: *const event_mod.Event) void {
             processDeferredWindowCandidates();
         },
         .mouse_moved => focusWindowUnderMouse(),
+        .menu_opened, .menu_closed => {
+            dispatchStateEvent(.{ .menu_tracking_observed = .{
+                .process_id = ev.pid,
+                .is_open = ev.kind == .menu_opened,
+            } });
+            log.debug("menu tracking pid={d} open={} active={}", .{
+                ev.pid, ev.kind == .menu_opened, g_state.menu_tracking != null,
+            });
+        },
         .app_visibility_changed => g_dim_dirty = true,
         .window_moved, .window_resized => {
             // Every animation tick sets the AX frame, which echoes back here
@@ -4875,6 +4932,7 @@ fn executeStateEffect(effect: state_mod.Effect) void {
         .window_moved => |move| executeWindowMoved(move),
         .show_drag_preview => |frame| tile_preview.show(frame.x, frame.y, frame.width, frame.height),
         .hide_drag_preview => tile_preview.hide(),
+        .cancel_mouse_focus => cancelPendingMouseFocus(false, true),
         .pointer_drag_completed => |completion| {
             if (completion.swapped_window_ids) |swapped| {
                 log.debug("window move swap wid={d} target={d}", .{ swapped.first, swapped.second });

@@ -34,6 +34,7 @@ pub const AxStrings = struct {
     children_attr: c.CFStringRef,
     tabs_attr: c.CFStringRef,
     tab_group_role: c.CFStringRef,
+    system_dialog_subrole: c.CFStringRef,
 };
 
 var g_strings: ?AxStrings = null;
@@ -75,6 +76,7 @@ pub fn strings() ?*const AxStrings {
         "AXChildren",
         "AXTabs",
         "AXTabGroup",
+        "AXSystemDialog",
     };
     var refs: [names.len]c.CFStringRef = undefined;
 
@@ -113,6 +115,7 @@ pub fn strings() ?*const AxStrings {
         .children_attr = refs[21],
         .tabs_attr = refs[22],
         .tab_group_role = refs[23],
+        .system_dialog_subrole = refs[24],
     };
     return &g_strings.?;
 }
@@ -120,6 +123,7 @@ pub fn strings() ?*const AxStrings {
 pub fn deinitStrings() void {
     if (g_strings) |s| {
         const refs = [_]c.CFStringRef{
+            s.system_dialog_subrole,
             s.tab_group_role,
             s.tabs_attr,
             s.children_attr,

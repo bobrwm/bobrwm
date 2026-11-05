@@ -53,6 +53,8 @@ const AxObserverStrings = struct {
     destroyed_notification: c.CFStringRef,
     miniaturized_notification: c.CFStringRef,
     deminiaturized_notification: c.CFStringRef,
+    menu_opened_notification: c.CFStringRef,
+    menu_closed_notification: c.CFStringRef,
 };
 
 // Shared state — protected by g_ax_lock when accessed from both threads.
@@ -109,6 +111,8 @@ fn ensureAxObserverStrings() ?*const AxObserverStrings {
         "AXUIElementDestroyed",
         "AXWindowMiniaturized",
         "AXWindowDeminiaturized",
+        "AXMenuOpened",
+        "AXMenuClosed",
     };
     var refs: [names.len]c.CFStringRef = undefined;
 
@@ -131,6 +135,8 @@ fn ensureAxObserverStrings() ?*const AxObserverStrings {
         .destroyed_notification = refs[5],
         .miniaturized_notification = refs[6],
         .deminiaturized_notification = refs[7],
+        .menu_opened_notification = refs[8],
+        .menu_closed_notification = refs[9],
     };
     return &g_ax_observer_strings.?;
 }
@@ -138,6 +144,8 @@ fn ensureAxObserverStrings() ?*const AxObserverStrings {
 fn deinitAxObserverStrings() void {
     if (g_ax_observer_strings) |strings| {
         const refs = [_]c.CFStringRef{
+            strings.menu_closed_notification,
+            strings.menu_opened_notification,
             strings.deminiaturized_notification,
             strings.miniaturized_notification,
             strings.destroyed_notification,
@@ -746,6 +754,17 @@ fn axNotificationHandler(
     const pid = refconPid(refcon);
     var wid = refconWid(refcon);
 
+    // Menu elements need not have a CG window ID. Publish only the observation;
+    // the main-thread reducer owns nesting and hover-focus suspension.
+    if (isNotification(notification, strings.menu_opened_notification)) {
+        shim.bw_emit_event(shim.BW_EVENT_MENU_OPENED, pid, 0);
+        return;
+    }
+    if (isNotification(notification, strings.menu_closed_notification)) {
+        shim.bw_emit_event(shim.BW_EVENT_MENU_CLOSED, pid, 0);
+        return;
+    }
+
     if (isNotification(notification, strings.window_created_notification)) {
         // App-level: wid is 0 in refcon, resolve from the new element.
         _ = _AXUIElementGetWindow(element, &wid);
@@ -792,6 +811,8 @@ fn registerAppLevelAXNotifications(observer: c.AXObserverRef, app: c.AXUIElement
     if (add_err != c.kAXErrorSuccess) return false;
 
     _ = c.AXObserverAddNotification(observer, app, strings.focused_window_changed_notification, app_refcon);
+    _ = c.AXObserverAddNotification(observer, app, strings.menu_opened_notification, app_refcon);
+    _ = c.AXObserverAddNotification(observer, app, strings.menu_closed_notification, app_refcon);
     return true;
 }
 
