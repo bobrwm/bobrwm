@@ -33,6 +33,7 @@ const geometry_mod = @import("geometry.zig");
 const spsc_queue = @import("spsc_queue.zig");
 const trace = @import("trace.zig");
 const focus_follows_mouse = @import("focus_follows_mouse.zig");
+const window_server = @import("window_server.zig");
 
 extern fn _AXUIElementGetWindow(element: c.AXUIElementRef, wid: *u32) c.AXError;
 
@@ -1308,22 +1309,14 @@ fn inferDisplayIdForWindow(wid: u32) ?u32 {
     return displayIdForFrame(frame);
 }
 
-/// Whether WindowServer still knows `wid`, on any Space and on- or off-screen.
-/// SkyLight bounds cannot answer this: they also fail for windows still under
-/// construction. An unreadable answer counts as present so a transient CG
-/// failure never drops a live candidate.
+/// Whether WindowServer still knows `wid`. An unreadable answer counts as
+/// present so a transient CG failure never drops a live window.
 fn windowServerHasWindow(wid: u32) bool {
     std.debug.assert(wid != 0);
-
-    // The CG API reads raw CGWindowID values, so the array has no callbacks.
-    var values = [_]?*const anyopaque{@ptrFromInt(wid)};
-    const window_ids = c.CFArrayCreate(null, &values, 1, null) orelse return true;
-    defer c.CFRelease(@ptrCast(window_ids));
-
     trace.countWindowList();
-    const descriptions = cg_extra.CGWindowListCreateDescriptionFromArray(window_ids) orelse return true;
-    defer c.CFRelease(@ptrCast(descriptions));
-    return c.CFArrayGetCount(descriptions) > 0;
+    var existing_buffer: [1]u32 = undefined;
+    const existing = window_server.existingWindowIds(&.{wid}, &existing_buffer) orelse return true;
+    return existing.len > 0;
 }
 
 /// Live WindowServer bounds for a window. `Window.frame` records bobrwm's last
@@ -6550,6 +6543,7 @@ fn executeWindowRemoved(removal: @FieldType(state_mod.Effect, "window_removed"))
     g_animator.cancel(removal.window_id);
     ax_mod.invalidateWindow(removal.window_id);
     ax_writer.forgetWindow(removal.window_id);
+    ax_observer.forgetWindowIfGone(removal.process_id, removal.window_id);
 }
 
 fn reconcileTabGroupAfterRemoval(

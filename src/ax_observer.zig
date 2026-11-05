@@ -11,11 +11,14 @@ const objc = @import("objc");
 const c = @import("c");
 const cg_extra = @import("cg_extra");
 const shim = @import("shim_api.zig");
+const window_server = @import("window_server.zig");
 
 extern fn _AXUIElementGetWindow(element: c.AXUIElementRef, wid: *u32) c.AXError;
 
 const max_observed_apps: usize = 128;
-const max_known_windows_per_app: usize = 256;
+// Live windows per app, not lifetime windows: gone entries are pruned before
+// the list counts as full.
+const max_known_windows_per_app: usize = 384;
 const observe_retry_interval_ms: u64 = 100;
 const observe_retry_attempts_max: u8 = 50;
 const window_scan_interval_ms: u64 = 500;
@@ -24,11 +27,16 @@ const wid_retry_delay_ms: u64 = 50;
 const wid_retry_attempts_max: u8 = 60;
 const max_wid_retry_contexts: usize = max_observed_apps * 8;
 
+comptime {
+    std.debug.assert(max_known_windows_per_app <= window_server.max_batch);
+}
+
 const AppObserverEntry = struct {
     pid: i32 = 0,
     observer: c.AXObserverRef = null,
     known_window_count: u32 = 0,
     known_windows: [max_known_windows_per_app]u32 = @splat(0),
+    has_warned_full: bool = false,
 };
 
 const ObserveRetryEntry = struct {
@@ -60,7 +68,9 @@ const AxObserverStrings = struct {
 // Shared state — protected by g_ax_lock when accessed from both threads.
 //
 // The background thread (notification callbacks) reads/writes:
-//   - entry.known_windows, entry.known_window_count  (via appTrackWindow/appUntrackWindow)
+//   - entry.known_windows, entry.known_window_count  (via appTrackWindow/appUntrackWindow,
+//                                                     pruneGoneWindows when full)
+//   - entry.has_warned_full
 //   - g_wid_retry_contexts                           (via acquireWidRetryCtx)
 //
 // The main thread reads/writes all of the above plus:
@@ -340,32 +350,117 @@ fn appObserverExists(pid: i32) bool {
     return appObserverIndex(pid) != null;
 }
 
+/// Forget a window the manager removed, once WindowServer confirms it is gone.
+/// A minimized or hidden window is unmanaged too but keeps its slot: its
+/// deminiaturize notification is what brings it back.
+pub fn forgetWindowIfGone(pid: i32, wid: u32) void {
+    std.debug.assert(pid > 0);
+    std.debug.assert(wid != 0);
+
+    // Most removals follow app termination or a destroy notification, which
+    // already dropped the entry; skip the WindowServer round trip for those.
+    const is_known = blk: {
+        c.os_unfair_lock_lock(&g_ax_lock);
+        defer c.os_unfair_lock_unlock(&g_ax_lock);
+        const index = appObserverIndex(pid) orelse break :blk false;
+        const entry = &g_app_observers[index];
+        break :blk std.mem.findScalar(u32, entry.known_windows[0..entry.known_window_count], wid) != null;
+    };
+    if (!is_known) return;
+
+    var existing_buffer: [1]u32 = undefined;
+    const existing = window_server.existingWindowIds(&.{wid}, &existing_buffer) orelse return;
+    if (existing.len > 0) return;
+    appUntrackWindow(pid, wid);
+}
+
+const TrackResult = enum { added, known, full, unobserved };
+
 /// Track a window ID in an app's known-windows set.
-/// Returns true if the window was newly added, false if already tracked or at capacity.
+/// Returns true if the window was newly added, false if already tracked or at
+/// capacity. A full set first drops windows WindowServer no longer has.
 ///
-/// Thread-safety: acquires g_ax_lock internally.
+/// Thread-safety: acquires g_ax_lock internally, never across the prune query.
 fn appTrackWindow(pid: i32, wid: u32) bool {
     if (wid == 0) return false;
 
+    switch (appTrackWindowOnce(pid, wid)) {
+        .added => return true,
+        .known, .unobserved => return false,
+        .full => {},
+    }
+    pruneGoneWindows(pid);
+    switch (appTrackWindowOnce(pid, wid)) {
+        .added => return true,
+        .known, .unobserved => return false,
+        .full => {
+            warnKnownWindowsFull(pid, wid);
+            return false;
+        },
+    }
+}
+
+fn appTrackWindowOnce(pid: i32, wid: u32) TrackResult {
     c.os_unfair_lock_lock(&g_ax_lock);
     defer c.os_unfair_lock_unlock(&g_ax_lock);
 
-    const index = appObserverIndex(pid) orelse return false;
+    const index = appObserverIndex(pid) orelse return .unobserved;
     var entry = &g_app_observers[index];
 
     const known_windows = entry.known_windows[0..entry.known_window_count];
-    if (std.mem.findScalar(u32, known_windows, wid) != null) return false;
+    if (std.mem.findScalar(u32, known_windows, wid) != null) return .known;
+    if (entry.known_window_count == max_known_windows_per_app) return .full;
 
-    if (entry.known_window_count < max_known_windows_per_app) {
-        entry.known_windows[entry.known_window_count] = wid;
-        entry.known_window_count += 1;
-        return true;
+    entry.known_windows[entry.known_window_count] = wid;
+    entry.known_window_count += 1;
+    return .added;
+}
+
+/// Drop known windows WindowServer no longer has. Destroy notifications can be
+/// missed (close-to-background apps, native-tab ID swaps, ghosts reaped by
+/// cleanup), and each one left behind would hold a slot for the app's life.
+///
+/// Thread-safety: snapshots under g_ax_lock, queries WindowServer without it.
+fn pruneGoneWindows(pid: i32) void {
+    var window_ids: [max_known_windows_per_app]u32 = undefined;
+    var window_count: usize = 0;
+    {
+        c.os_unfair_lock_lock(&g_ax_lock);
+        defer c.os_unfair_lock_unlock(&g_ax_lock);
+        const index = appObserverIndex(pid) orelse return;
+        const entry = &g_app_observers[index];
+        window_count = entry.known_window_count;
+        @memcpy(window_ids[0..window_count], entry.known_windows[0..window_count]);
     }
 
-    log.warn("appTrackWindow: capacity exhausted pid={d} wid={d} limit={d}", .{
+    var existing_buffer: [max_known_windows_per_app]u32 = undefined;
+    const existing = window_server.existingWindowIds(window_ids[0..window_count], &existing_buffer) orelse return;
+
+    var pruned_count: usize = 0;
+    for (window_ids[0..window_count]) |wid| {
+        if (std.mem.findScalar(u32, existing, wid) != null) continue;
+        appUntrackWindow(pid, wid);
+        pruned_count += 1;
+    }
+    log.debug("known windows pruned pid={d} pruned={d} live={d}", .{ pid, pruned_count, existing.len });
+}
+
+/// Warn once per observed app: every later window from it is also untracked,
+/// and repeating the line for each would bury the first one.
+fn warnKnownWindowsFull(pid: i32, wid: u32) void {
+    const should_warn = blk: {
+        c.os_unfair_lock_lock(&g_ax_lock);
+        defer c.os_unfair_lock_unlock(&g_ax_lock);
+        const index = appObserverIndex(pid) orelse break :blk false;
+        const entry = &g_app_observers[index];
+        if (entry.has_warned_full) break :blk false;
+        entry.has_warned_full = true;
+        break :blk true;
+    };
+    if (!should_warn) return;
+    log.warn("known windows full of live windows pid={d} wid={d} limit={d}; new windows are not observed", .{
         pid, wid, max_known_windows_per_app,
     });
-    return false;
 }
 
 /// Remove a window ID from an app's known-windows set.
