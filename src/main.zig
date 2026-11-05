@@ -63,7 +63,9 @@ pub const std_options = std.Options{
 const log = std.log.scoped(.bobrwm);
 
 const EventQueue = spsc_queue.Queue(event_mod.Event, 1024);
-const state_effect_queue_capacity = 64;
+// Effects raised inside an effect handler wait until it returns, and one
+// cleanup pass can remove every managed window with one effect each.
+const state_effect_queue_capacity = state_mod.max_managed_windows + 64;
 const StateEffectQueue = spsc_queue.Queue(state_mod.Effect, state_effect_queue_capacity);
 
 /// Poll cadence for windows that are waiting on role readiness or visibility.
@@ -4843,6 +4845,7 @@ fn executeStateEffect(effect: state_mod.Effect) void {
             rejection.window_id,
             @tagName(rejection.reason),
         }),
+        .window_removed => |removal| executeWindowRemoved(removal),
         .workspace_transition_started => |transition| executeWorkspaceTransitionStarted(transition),
         .workspace_transition_settled => |settlement| executeWorkspaceTransitionSettled(settlement),
         .move_native_window => |pending| executeNativeWindowMove(pending),
@@ -6529,16 +6532,24 @@ fn joinTabGroup(pid: i32, sibling_wid: u32, new_wid: u32, new_frame: window_mod.
 
 fn removeWindow(wid: u32) void {
     const win = managedWindow(wid) orelse return;
-    const space = managedWindowSpace(win.wid) orelse return;
+    if (managedWindowSpace(win.wid) == null) return;
     const tab_group = g_state.windowTabGroup(wid);
-    g_animator.cancel(wid);
-    ax_mod.invalidateWindow(wid);
-    ax_writer.forgetWindow(wid);
     removeWindowIdentity(wid);
 
+    // Inline rather than in window_removed: the surviving tabs' active state
+    // must be settled before the caller's next decision, and an effect raised
+    // inside another effect would run only after that handler returns.
     if (tab_group) |group| reconcileTabGroupAfterRemoval(&group, wid);
+}
 
-    _ = focusedWorkspaceWindow(space);
+/// Release platform state keyed by a removed window's ID. Runs late when the
+/// removal happened inside another effect handler, so skip a window that was
+/// adopted again under the same ID in between: the state is its own again.
+fn executeWindowRemoved(removal: @FieldType(state_mod.Effect, "window_removed")) void {
+    if (managedWindow(removal.window_id) != null) return;
+    g_animator.cancel(removal.window_id);
+    ax_mod.invalidateWindow(removal.window_id);
+    ax_writer.forgetWindow(removal.window_id);
 }
 
 fn reconcileTabGroupAfterRemoval(

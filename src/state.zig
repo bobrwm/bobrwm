@@ -567,6 +567,12 @@ test "window catalog owns identity and Space membership" {
     try testing.expect(removed.model.window(102) == null);
     try testing.expect(removed.model.geometry.get(102) == null);
     try testing.expectEqual(@as(u16, 1), removed.model.windows.count);
+    try testing.expectEqual(@as(u8, 1), removed.effect_count);
+    try testing.expectEqual(@as(WindowId, 102), removed.effects[0].window_removed.window_id);
+    try testing.expectEqual(@as(i32, 1002), removed.effects[0].window_removed.process_id);
+
+    const unknown = reduceCopy(removed.model, .{ .remove_window = 102 });
+    try testing.expectEqual(@as(u8, 0), unknown.effect_count);
 }
 
 test "window lifecycle transitions update catalog geometry focus and layout atomically" {

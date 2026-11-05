@@ -1186,6 +1186,13 @@ pub const Effect = union(enum) {
         window_id: WindowId,
         reason: WindowCatalogRejectionReason,
     },
+    // The window left the catalog. Platform state keyed by its ID (animation,
+    // AX element caches, queued writes) belongs to the shell, so the reducer
+    // hands release over here instead of each removal path doing it.
+    window_removed: struct {
+        window_id: WindowId,
+        process_id: i32,
+    },
     workspace_transition_started: WorkspaceTransition,
     workspace_transition_settled: WorkspaceTransitionSettlement,
     move_native_window: PendingNativeWindowMove,
