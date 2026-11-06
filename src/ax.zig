@@ -1,11 +1,14 @@
 //! Shared Accessibility (AX) helpers: the interned CFString attribute cache
-//! and main-thread window lookups. Every call into AX here is synchronous IPC
+//! and main-thread window lookups. Element-only queries use no shared state.
+//! Every call into AX here is synchronous IPC
 //! to the target app. Geometry writes live in ax_writer.zig, off the main
 //! thread.
 
 const std = @import("std");
 const c = @import("c");
 const trace = @import("trace.zig");
+const shim = @import("shim_api.zig");
+const osutil = @import("osutil.zig");
 
 extern fn _AXUIElementGetWindow(element: c.AXUIElementRef, wid: *u32) c.AXError;
 
@@ -49,7 +52,12 @@ fn releaseAxString(value: c.CFStringRef) void {
 /// Lazily create (and cache) the interned AX attribute strings.
 pub fn strings() ?*const AxStrings {
     if (g_strings) |*s| return s;
+    g_strings = createStrings() orelse return null;
+    return &g_strings.?;
+}
 
+/// Create independently owned strings; safe for jobs that outlive the main cache.
+pub fn createStrings() ?AxStrings {
     const names = [_][*:0]const u8{
         "AXFocusedWindow",
         "AXWindows",
@@ -88,7 +96,7 @@ pub fn strings() ?*const AxStrings {
         };
     }
 
-    g_strings = .{
+    return .{
         .focused_window_attr = refs[0],
         .windows_attr = refs[1],
         .size_attr = refs[2],
@@ -114,41 +122,45 @@ pub fn strings() ?*const AxStrings {
         .tabs_attr = refs[22],
         .tab_group_role = refs[23],
     };
-    return &g_strings.?;
 }
 
 pub fn deinitStrings() void {
     if (g_strings) |s| {
-        const refs = [_]c.CFStringRef{
-            s.tab_group_role,
-            s.tabs_attr,
-            s.children_attr,
-            s.focused_attr,
-            s.fullscreen_button_attr,
-            s.zoom_button_attr,
-            s.minimize_button_attr,
-            s.close_button_attr,
-            s.enhanced_ui_attr,
-            s.modal_attr,
-            s.unknown_subrole,
-            s.dialog_subrole,
-            s.floating_window_subrole,
-            s.standard_window_subrole,
-            s.subrole_attr,
-            s.unknown_role,
-            s.window_role,
-            s.role_attr,
-            s.main_attr,
-            s.raise_action,
-            s.position_attr,
-            s.size_attr,
-            s.windows_attr,
-            s.focused_window_attr,
-        };
-        for (refs) |value| {
-            releaseAxString(value);
-        }
+        freeStrings(s);
         g_strings = null;
+    }
+}
+
+/// Release one independently owned string set, exactly once.
+pub fn freeStrings(s: AxStrings) void {
+    const refs = [_]c.CFStringRef{
+        s.tab_group_role,
+        s.tabs_attr,
+        s.children_attr,
+        s.focused_attr,
+        s.fullscreen_button_attr,
+        s.zoom_button_attr,
+        s.minimize_button_attr,
+        s.close_button_attr,
+        s.enhanced_ui_attr,
+        s.modal_attr,
+        s.unknown_subrole,
+        s.dialog_subrole,
+        s.floating_window_subrole,
+        s.standard_window_subrole,
+        s.subrole_attr,
+        s.unknown_role,
+        s.window_role,
+        s.role_attr,
+        s.main_attr,
+        s.raise_action,
+        s.position_attr,
+        s.size_attr,
+        s.windows_attr,
+        s.focused_window_attr,
+    };
+    for (refs) |value| {
+        releaseAxString(value);
     }
 }
 
@@ -160,22 +172,11 @@ pub fn isTrusted() bool {
 /// Resolve a window id to its AX element by scanning the app's window list.
 /// The returned element is retained; the caller must CFRelease it.
 pub fn findWindow(pid: i32, target_wid: u32) ?c.AXUIElementRef {
-    return findWindowWithTimeout(pid, target_wid, null);
-}
-
-/// Resolve a window id while bounding messages sent through temporary AX elements.
-pub fn findWindowWithMessagingTimeout(pid: i32, target_wid: u32, timeout_seconds: f32) ?c.AXUIElementRef {
-    std.debug.assert(timeout_seconds > 0);
-    return findWindowWithTimeout(pid, target_wid, timeout_seconds);
-}
-
-fn findWindowWithTimeout(pid: i32, target_wid: u32, timeout_seconds: ?f32) ?c.AXUIElementRef {
     std.debug.assert(pid > 0);
     std.debug.assert(target_wid > 0);
 
     const app = c.AXUIElementCreateApplication(pid) orelse return null;
     defer c.CFRelease(@ptrCast(app));
-    if (timeout_seconds) |seconds| _ = c.AXUIElementSetMessagingTimeout(app, seconds);
 
     const ax = strings() orelse return null;
     const windows_attr = ax.windows_attr;
@@ -200,7 +201,6 @@ fn findWindowWithTimeout(pid: i32, target_wid: u32, timeout_seconds: ?f32) ?c.AX
         if (wid != target_wid) continue;
 
         _ = c.CFRetain(@ptrCast(win));
-        if (timeout_seconds) |seconds| _ = c.AXUIElementSetMessagingTimeout(win, seconds);
         return win;
     }
 
@@ -367,4 +367,121 @@ pub fn tabCount(pid: i32, wid: u32) usize {
     }
 
     return 0;
+}
+
+/// Classify an already resolved element without caches or main-thread tracing.
+/// Activation policy belongs to the caller: this preserves only the AX policy.
+pub fn manageStateForElement(win: c.AXUIElementRef, ax: *const AxStrings) u8 {
+    // Modal panels can otherwise satisfy the top-level dialog heuristic.
+    const is_modal = axBooleanAttributeTrue(win, ax.modal_attr) orelse return shim.BW_MANAGE_PENDING;
+    if (is_modal) return shim.BW_MANAGE_REJECT;
+
+    var role_any: c.CFTypeRef = null;
+    const role_err = c.AXUIElementCopyAttributeValue(win, ax.role_attr, &role_any);
+    defer if (role_any) |value| c.CFRelease(value);
+    if (role_err != c.kAXErrorSuccess or role_any == null) return shim.BW_MANAGE_PENDING;
+    const is_window = c.CFEqual(role_any, @ptrCast(ax.window_role)) != 0;
+    const is_unknown_role = c.CFEqual(role_any, @ptrCast(ax.unknown_role)) != 0;
+    if (!is_window) return if (is_unknown_role) shim.BW_MANAGE_PENDING else shim.BW_MANAGE_REJECT;
+
+    var subrole_any: c.CFTypeRef = null;
+    const subrole_err = c.AXUIElementCopyAttributeValue(win, ax.subrole_attr, &subrole_any);
+    defer if (subrole_any) |value| c.CFRelease(value);
+    if (subrole_err != c.kAXErrorSuccess or subrole_any == null) return shim.BW_MANAGE_PENDING;
+    if (c.CFEqual(subrole_any, @ptrCast(ax.unknown_subrole)) != 0) return shim.BW_MANAGE_PENDING;
+    if (c.CFEqual(subrole_any, @ptrCast(ax.standard_window_subrole)) != 0) return shim.BW_MANAGE_READY;
+
+    // Electron and IDE top-level windows sometimes use these subroles, but
+    // chrome-less autocomplete popups must not be admitted along with them.
+    const is_dialog_like = c.CFEqual(subrole_any, @ptrCast(ax.floating_window_subrole)) != 0 or
+        c.CFEqual(subrole_any, @ptrCast(ax.dialog_subrole)) != 0;
+    if (is_dialog_like) {
+        const real_window = windowHasRealWindowSignal(win, ax) orelse return shim.BW_MANAGE_PENDING;
+        if (real_window) return shim.BW_MANAGE_READY;
+    }
+    return shim.BW_MANAGE_REJECT;
+}
+
+/// Title-bar buttons or main/focus distinguish real windows from transient chrome.
+fn windowHasRealWindowSignal(win: c.AXUIElementRef, ax: *const AxStrings) ?bool {
+    var incomplete = false;
+    for ([_]c.CFStringRef{ ax.close_button_attr, ax.minimize_button_attr, ax.zoom_button_attr, ax.fullscreen_button_attr }) |attr| {
+        const present = axAttributePresent(win, attr) orelse {
+            incomplete = true;
+            continue;
+        };
+        if (present) return true;
+    }
+    for ([_]c.CFStringRef{ ax.main_attr, ax.focused_attr }) |attr| {
+        const enabled = axBooleanAttributeTrue(win, attr) orelse {
+            incomplete = true;
+            continue;
+        };
+        if (enabled) return true;
+    }
+    return if (incomplete) null else false;
+}
+
+/// Element-only query; deliberately does not update main-thread AX counters.
+fn axAttributePresent(win: c.AXUIElementRef, attr: c.CFStringRef) ?bool {
+    var value: c.CFTypeRef = null;
+    const err = c.AXUIElementCopyAttributeValue(win, attr, &value);
+    defer if (value) |ref| c.CFRelease(ref);
+    if (err == c.kAXErrorAttributeUnsupported or err == c.kAXErrorNoValue) return false;
+    if (err != c.kAXErrorSuccess) return null;
+    return value != null;
+}
+
+/// A failed read is unknown, not proof that a real window has no title bar.
+fn axBooleanAttributeTrue(win: c.AXUIElementRef, attr: c.CFStringRef) ?bool {
+    var value: c.CFTypeRef = null;
+    const err = c.AXUIElementCopyAttributeValue(win, attr, &value);
+    defer if (value) |ref| c.CFRelease(ref);
+    if (err == c.kAXErrorAttributeUnsupported or err == c.kAXErrorNoValue) return false;
+    if (err != c.kAXErrorSuccess or value == null) return null;
+    return c.CFEqual(value, @ptrCast(c.kCFBooleanTrue)) != 0;
+}
+
+/// Native tab count, or null when transport/children queries are inconclusive.
+/// Unlike tabCount, this worker-safe query never resolves through shared caches.
+pub fn tabCountForElement(win: c.AXUIElementRef, ax: *const AxStrings, timeout_seconds: f32, deadline_ns: i128) ?usize {
+    if (osutil.nanoTimestamp() >= deadline_ns) return null;
+    var children: c.CFArrayRef = null;
+    const err = c.AXUIElementCopyAttributeValue(win, ax.children_attr, @ptrCast(&children));
+    defer if (children) |ref| c.CFRelease(@ptrCast(ref));
+    if (err != c.kAXErrorSuccess or children == null) return null;
+    if (c.CFGetTypeID(@ptrCast(children)) != c.CFArrayGetTypeID()) return null;
+
+    var inconclusive = false;
+    var i: c.CFIndex = 0;
+    while (i < c.CFArrayGetCount(children)) : (i += 1) {
+        // A normal title bar has few direct children. Treat unusually broad
+        // trees as unknown rather than monopolizing this app's read queue.
+        if (i >= 128 or osutil.nanoTimestamp() >= deadline_ns) return null;
+        const child: c.AXUIElementRef = @ptrCast(c.CFArrayGetValueAtIndex(children, i) orelse {
+            inconclusive = true;
+            continue;
+        });
+        _ = c.AXUIElementSetMessagingTimeout(child, timeout_seconds);
+        var role: c.CFTypeRef = null;
+        const role_err = c.AXUIElementCopyAttributeValue(child, ax.role_attr, &role);
+        defer if (role) |ref| c.CFRelease(ref);
+        if (role_err != c.kAXErrorSuccess or role == null) {
+            inconclusive = true;
+            continue;
+        }
+        if (c.CFEqual(role, @ptrCast(ax.tab_group_role)) == 0) continue;
+
+        if (osutil.nanoTimestamp() >= deadline_ns) return null;
+        var tabs: c.CFArrayRef = null;
+        const tabs_err = c.AXUIElementCopyAttributeValue(child, ax.tabs_attr, @ptrCast(&tabs));
+        defer if (tabs) |ref| c.CFRelease(@ptrCast(ref));
+        // Some ordinary tab groups do not expose AXTabs; that is not a timeout.
+        if (tabs_err == c.kAXErrorAttributeUnsupported or tabs_err == c.kAXErrorNoValue) continue;
+        if (tabs_err != c.kAXErrorSuccess or tabs == null) return null;
+        if (c.CFGetTypeID(@ptrCast(tabs)) != c.CFArrayGetTypeID()) return null;
+        const total = c.CFArrayGetCount(tabs);
+        return if (inconclusive or total < 0) null else @intCast(total);
+    }
+    return if (inconclusive) null else 0;
 }
