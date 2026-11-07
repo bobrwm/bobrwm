@@ -171,6 +171,31 @@ pub fn makePath(allocator: std.mem.Allocator, path: []const u8) bool {
     return pathExists(path_z);
 }
 
+// Process identity
+
+/// Start time of a running process in microseconds since the epoch, or null
+/// when the PID has no process. The kernel reuses PIDs, but never a PID and
+/// start time pair, so the two together name one process.
+pub fn processStartTimeUs(pid: i32) ?u64 {
+    std.debug.assert(pid > 0);
+
+    // sysctl answers for every user's processes; proc_pidinfo refuses other
+    // users. kinfo_proc is 648 bytes and starts with kp_proc.p_starttime.
+    const ctl_kern: c_int = 1;
+    const kern_proc: c_int = 14;
+    const kern_proc_pid: c_int = 1;
+    const mib = [_]c_int{ ctl_kern, kern_proc, kern_proc_pid, pid };
+    var info: [648]u8 align(@alignOf(std.c.timeval)) = undefined;
+    var info_len: usize = info.len;
+    if (std.c.sysctl(&mib, mib.len, &info, &info_len, null, 0) != 0) return null;
+
+    // A missing PID succeeds with nothing written.
+    if (info_len < @sizeOf(std.c.timeval)) return null;
+    const start: *const std.c.timeval = @ptrCast(&info);
+    if (start.sec < 0 or start.usec < 0) return null;
+    return @as(u64, @intCast(start.sec)) * std.time.us_per_s + @as(u64, @intCast(start.usec));
+}
+
 // App metadata
 
 /// Look up the bundle identifier for a PID via NSRunningApplication.
@@ -195,4 +220,14 @@ pub fn appBundleId(pid: i32, buf: []u8) ?[]const u8 {
     const copy_len = @min(bundle_id.len, buf.len);
     @memcpy(buf[0..copy_len], bundle_id[0..copy_len]);
     return buf[0..copy_len];
+}
+
+test "process start time is stable for a live PID and null for a missing one" {
+    const pid = std.c.getpid();
+    const first = processStartTimeUs(pid) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(first, processStartTimeUs(pid));
+    try std.testing.expect(first > 0);
+
+    // macOS PIDs never exceed PID_MAX, 99999.
+    try std.testing.expectEqual(@as(?u64, null), processStartTimeUs(99_999_999));
 }

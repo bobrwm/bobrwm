@@ -14,6 +14,7 @@ pub const max_managed_windows = window_catalog_mod.max_managed_windows;
 pub const max_pending_focus_entries = 16;
 pub const max_pending_window_candidates = 256;
 pub const max_process_retries = 64;
+pub const max_tracked_processes = 256;
 pub const max_cleanup_processes = 16;
 pub const max_spaces_per_display = topology_mod.max_spaces_per_display;
 pub const max_workspace_focus_history = 32;
@@ -523,6 +524,54 @@ pub const ProcessRetries = struct {
     }
 };
 
+/// One process: the kernel reuses PIDs but never a PID and start time pair.
+pub const ProcessIdentity = struct {
+    process_id: i32,
+    started_at_us: u64,
+};
+
+pub const ProcessTable = struct {
+    entries: [max_tracked_processes]ProcessIdentity = undefined,
+    count: u16 = 0,
+
+    pub fn items(self: *const ProcessTable) []const ProcessIdentity {
+        return self.entries[0..self.count];
+    }
+
+    pub fn get(self: *const ProcessTable, process_id: i32) ?ProcessIdentity {
+        const index = self.findIndex(process_id) orelse return null;
+        return self.entries[index];
+    }
+
+    /// Insert or replace the entry for the PID. False when the table is full.
+    pub fn put(self: *ProcessTable, identity: ProcessIdentity) bool {
+        if (self.findIndex(identity.process_id)) |index| {
+            self.entries[index] = identity;
+            return true;
+        }
+        if (self.count == self.entries.len) return false;
+
+        self.entries[self.count] = identity;
+        self.count += 1;
+        return true;
+    }
+
+    pub fn remove(self: *ProcessTable, process_id: i32) ?ProcessIdentity {
+        const index = self.findIndex(process_id) orelse return null;
+        const removed = self.entries[index];
+        self.count -= 1;
+        self.entries[index] = self.entries[self.count];
+        return removed;
+    }
+
+    fn findIndex(self: *const ProcessTable, process_id: i32) ?usize {
+        for (self.items(), 0..) |identity, index| {
+            if (identity.process_id == process_id) return index;
+        }
+        return null;
+    }
+};
+
 pub const PointerDragState = struct {
     is_down: bool = false,
     candidate_window_id: ?WindowId = null,
@@ -668,6 +717,7 @@ pub const Model = struct {
     deferred_window_candidates: WindowCandidates = .{},
     app_launch_retries: ProcessRetries = .{},
     focus_retries: ProcessRetries = .{},
+    processes: ProcessTable = .{},
     display_resettle_due_at_ms: ?TimestampMs = null,
     display_resettle_cause: DisplayReconcileCause = .display_change,
     bsp_split_mode: tiling_mod.SplitMode = .auto,
@@ -1063,7 +1113,6 @@ pub const Event = union(enum) {
     window_candidate_destroyed: WindowId,
     untrack_window_candidates_for_process: i32,
     track_app_launch_retry: ProcessRetry,
-    untrack_app_launch_retry: i32,
     app_launch_retry_timer_fired: i32,
     track_focus_retry: ProcessRetry,
     untrack_focus_retry: i32,
@@ -1071,6 +1120,9 @@ pub const Event = union(enum) {
         process_id: i32,
         focused_window_id: WindowId,
     },
+    // The shell found the process alive. A known PID with a new start time
+    // was reused, so its previous process ended without a termination event.
+    process_observed: ProcessIdentity,
     display_changed: struct {
         at_ms: TimestampMs,
         resettle_at_ms: TimestampMs,
@@ -1245,6 +1297,12 @@ pub const Effect = union(enum) {
         window_id: WindowId,
     },
     focus_retry_expired: i32,
+    // The process ended. Release shell state keyed by its PID.
+    process_ended: i32,
+    // The PID now names a new process. Release the old process's state, then
+    // bring the new one up as a fresh launch.
+    process_replaced: i32,
+    process_table_full: ProcessIdentity,
     display_resettle_due,
     reconcile_displays,
     focus_window: FocusWindowEffect,

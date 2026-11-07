@@ -1461,6 +1461,7 @@ var g_config_watcher: config_watch.Watcher = .{};
 var g_layout_entries: std.ArrayList(tiling.LayoutEntry) = .empty;
 var g_event_drain_active = false;
 var g_event_overflow_recovery_pending = false;
+var g_has_warned_process_table_full = false;
 var g_on_screen_truncation_logged = false;
 
 var g_animator: animation_mod.Animator = undefined;
@@ -3842,6 +3843,7 @@ fn handleEvent(ev: *const event_mod.Event) void {
         // -- Window / app events --
         .app_launched => {
             log.debug("app launched pid={}", .{ev.pid});
+            observeProcess(ev.pid);
             discoverWindows();
             ax_observer.observeApp(ev.pid);
             trackAppLaunchRetry(ev.pid);
@@ -3850,15 +3852,6 @@ fn handleEvent(ev: *const event_mod.Event) void {
         .app_terminated => {
             log.debug("app terminated pid={}", .{ev.pid});
             dispatchStateEvent(.{ .process_terminated = ev.pid });
-            if (g_focus_follows_mouse.intent) |intent| {
-                if (intent.process_id == ev.pid) cancelPendingMouseFocus(false, false);
-            }
-            removeWorkspaceApplication(ev.pid);
-            untrackAppLaunchRetry(ev.pid);
-            untrackFocusRetry(ev.pid);
-            ax_writer.forgetApp(ev.pid);
-            ax_observer.unobserveApp(ev.pid);
-            removeAppWindows(ev.pid);
             retile();
         },
         .window_focused => {
@@ -4923,6 +4916,15 @@ fn executeStateEffect(effect: state_mod.Effect) void {
             reconcileFocusedWindow(resolved.process_id, resolved.window_id);
         },
         .focus_retry_expired => |process_id| log.debug("focus-retry: gave up pid={d}", .{process_id}),
+        .process_ended => |process_id| releaseProcess(process_id),
+        .process_replaced => |process_id| executeProcessReplaced(process_id),
+        .process_table_full => |identity| if (!g_has_warned_process_table_full) {
+            g_has_warned_process_table_full = true;
+            log.warn("process table full limit={d} pid={d}; reused PIDs of untracked processes go undetected", .{
+                state_mod.max_tracked_processes,
+                identity.process_id,
+            });
+        },
         .display_resettle_due => {
             log.debug("display resettle", .{});
             reconcileDisplays(g_state.display_resettle_cause);
@@ -5702,11 +5704,6 @@ fn trackAppLaunchRetry(pid: i32) void {
     } });
 }
 
-fn untrackAppLaunchRetry(pid: i32) void {
-    std.debug.assert(pid > 0);
-    dispatchStateEvent(.{ .untrack_app_launch_retry = pid });
-}
-
 fn processAppLaunchRetries() void {
     const retries = g_state.app_launch_retries;
     for (retries.items()) |retry| {
@@ -5926,9 +5923,12 @@ fn discoverWindowsImpl(should_refresh_tabs: bool) usize {
         // Observe the owning app even if this specific window is not yet
         // manageable (for example AX role/subrole is still pending).
         if (!already_observed) {
+            // A Space landing defers per-app setup to stay fast. Launch
+            // events and regular discovery identify these processes.
             if (should_refresh_tabs) {
                 ax_observer.observeAppDeferred(info.pid);
             } else {
+                observeProcess(info.pid);
                 ax_observer.observeApp(info.pid);
             }
             if (observed_pid_count < observed_pids.len) {
@@ -6577,6 +6577,42 @@ fn reconcileGroupActiveAfterRemoval(member_window_id: u32, pid: i32) void {
     setTabGroupActive(active);
 }
 
+/// Report a live process so the reducer can tell a reused PID from a known
+/// process. A process that already exited is skipped; its termination
+/// notification is on the way.
+fn observeProcess(pid: i32) void {
+    std.debug.assert(pid > 0);
+    const started_at_us = osutil.processStartTimeUs(pid) orelse return;
+    dispatchStateEvent(.{ .process_observed = .{
+        .process_id = pid,
+        .started_at_us = started_at_us,
+    } });
+}
+
+/// Release shell state keyed by an ended process's PID.
+fn releaseProcess(pid: i32) void {
+    std.debug.assert(pid > 0);
+    if (g_focus_follows_mouse.intent) |intent| {
+        if (intent.process_id == pid) cancelPendingMouseFocus(false, false);
+    }
+    removeWorkspaceApplication(pid);
+    ax_writer.forgetApp(pid);
+    ax_observer.unobserveApp(pid);
+    removeAppWindows(pid);
+}
+
+/// The old process's observer is dead and blocks observing the new one, and
+/// its windows are gone. Inside another effect handler, discovery may already
+/// have adopted the new process's windows; they leave with the old ones, so
+/// the launch retry rediscovers them.
+fn executeProcessReplaced(pid: i32) void {
+    log.info("process replaced pid={d}; the previous process ended unreported", .{pid});
+    releaseProcess(pid);
+    ax_observer.observeApp(pid);
+    trackAppLaunchRetry(pid);
+    retile();
+}
+
 fn removeAppWindows(pid: i32) void {
     untrackWindowCandidatesForPid(pid);
     clearDragPreview();
@@ -6631,9 +6667,10 @@ fn removeStoppedAppWindows() bool {
         };
         const pid = stopped_pid orelse return removed_any;
 
-        ax_writer.forgetApp(pid);
-        ax_observer.unobserveApp(pid);
-        removeAppWindows(pid);
+        // Top level only: inside an effect handler the release would wait
+        // and this loop would find the same PID forever.
+        std.debug.assert(!g_state_effect_drain_active);
+        dispatchStateEvent(.{ .process_terminated = pid });
         removed_any = true;
     }
 }
