@@ -94,6 +94,10 @@ const display_settle_delay_ms: u64 = 250;
 const native_space_capacity_settle_attempts: u8 = 20;
 const native_space_capacity_poll_delay_us: c_uint = 25_000;
 const native_space_topology_poll_interval_ms: u64 = 1000;
+/// Termination notifications can be lost; a missed one keeps a dead app's
+/// windows and observer until this sweep. Each check costs under a
+/// microsecond per process, but nothing needs a faster repair.
+const process_sweep_interval_ms: u64 = 60_000;
 const DisplayInfo = struct {
     id: u32,
     /// Stable per-display identity (CGDisplayCreateUUIDFromDisplayID) used to
@@ -1452,6 +1456,7 @@ var g_observation_generation: u32 = 0;
 /// when it is set, so mouse moves and animation echoes skip the window-list copy.
 var g_dim_dirty: bool = false;
 var g_native_space_topology_poll_source: c.dispatch_source_t = null;
+var g_process_sweep_source: c.dispatch_source_t = null;
 var g_tap_port: c.CFMachPortRef = null;
 var g_swipe_tap_port: c.CFMachPortRef = null;
 var g_mouse_tap_port: c.CFMachPortRef = null;
@@ -2449,6 +2454,41 @@ fn setNativeSpaceTopologyPolling(enabled: bool) void {
     g_native_space_topology_poll_source = source;
 }
 
+fn setProcessSweep(enabled: bool) void {
+    if (!enabled) {
+        if (g_process_sweep_source) |source| {
+            c.dispatch_source_cancel(source);
+            c.dispatch_release(.{ ._ds = source });
+            g_process_sweep_source = null;
+        }
+        return;
+    }
+
+    if (g_process_sweep_source != null) return;
+
+    const source = c.dispatch_source_create(
+        cg_extra.DISPATCH_SOURCE_TYPE_TIMER(),
+        0,
+        0,
+        cg_extra.dispatch_get_main_queue(),
+    ) orelse return;
+    const interval_ns = process_sweep_interval_ms * c.NSEC_PER_MSEC;
+    c.dispatch_source_set_timer(
+        source,
+        c.dispatch_time(c.DISPATCH_TIME_NOW, @intCast(interval_ns)),
+        interval_ns,
+        5 * c.NSEC_PER_SEC,
+    );
+    c.dispatch_source_set_event_handler_f(source, processSweepTimerTick);
+    c.dispatch_resume(.{ ._ds = source });
+    g_process_sweep_source = source;
+}
+
+fn processSweepTimerTick(context: ?*anyopaque) callconv(.c) void {
+    _ = context;
+    bw_emit_event(shim.BW_EVENT_PROCESS_SWEEP_DUE, 0, 0);
+}
+
 fn modsFromEventFlags(flags: c.CGEventFlags) u8 {
     var mods: u8 = 0;
     if ((flags & c.kCGEventFlagMaskAlternate) != 0) mods |= shim.BW_MOD_ALT;
@@ -3069,6 +3109,7 @@ fn startCore(config_path_arg: ?[]const u8) !void {
     setupHotkeyEventTap();
     setMouseEventTapEnabled(g_config.focus_follows_mouse);
     setNativeSpaceTopologyPolling(true);
+    setProcessSweep(true);
     try g_ipc_transport.start(g_ipc.fd, signalWaker);
     g_core_stage = .ipc_transport;
     refreshRolePolling();
@@ -3113,6 +3154,7 @@ fn stopCore() void {
     }
     setRolePolling(false);
     setNativeSpaceTopologyPolling(false);
+    setProcessSweep(false);
     if (coreReached(.ax_observer)) {
         setMouseEventTapEnabled(false);
     }
@@ -3263,7 +3305,7 @@ fn recoverFromEventOverflow() void {
     g_focus_follows_mouse.reset();
     dispatchStateEvent(.{ .geometry = .clear_intents });
 
-    _ = removeStoppedAppWindows();
+    _ = sweepProcesses();
     discoverWindows();
     refreshTabGroupActiveTabs();
     reconcileVisibleFramesFromWindowServer();
@@ -3972,6 +4014,7 @@ fn handleEvent(ev: *const event_mod.Event) void {
             processPendingFocusQueue();
         },
         .native_topology_poll_tick => reconcileNativeSpaceTopologyIfNeeded(),
+        .process_sweep_due => if (sweepProcesses()) retile(),
         .native_observation_due => {
             if (processDueNativeStateObservation()) return;
             // A replaced timer's fire must not re-arm: the current timer already
@@ -5923,12 +5966,10 @@ fn discoverWindowsImpl(should_refresh_tabs: bool) usize {
         // Observe the owning app even if this specific window is not yet
         // manageable (for example AX role/subrole is still pending).
         if (!already_observed) {
-            // A Space landing defers per-app setup to stay fast. Launch
-            // events and regular discovery identify these processes.
+            observeProcess(info.pid);
             if (should_refresh_tabs) {
                 ax_observer.observeAppDeferred(info.pid);
             } else {
-                observeProcess(info.pid);
                 ax_observer.observeApp(info.pid);
             }
             if (observed_pid_count < observed_pids.len) {
@@ -6582,7 +6623,7 @@ fn reconcileGroupActiveAfterRemoval(member_window_id: u32, pid: i32) void {
 /// notification is on the way.
 fn observeProcess(pid: i32) void {
     std.debug.assert(pid > 0);
-    const started_at_us = osutil.processStartTimeUs(pid) orelse return;
+    const started_at_us = (osutil.processStartTimeUs(pid) catch return) orelse return;
     dispatchStateEvent(.{ .process_observed = .{
         .process_id = pid,
         .started_at_us = started_at_us,
@@ -6601,10 +6642,9 @@ fn releaseProcess(pid: i32) void {
     removeAppWindows(pid);
 }
 
-/// The old process's observer is dead and blocks observing the new one, and
-/// its windows are gone. Inside another effect handler, discovery may already
-/// have adopted the new process's windows; they leave with the old ones, so
-/// the launch retry rediscovers them.
+/// The old process's windows and observer died with it. Inside another
+/// effect handler, discovery may already have adopted the new process's
+/// windows; they leave with the old ones, so the launch retry rediscovers them.
 fn executeProcessReplaced(pid: i32) void {
     log.info("process replaced pid={d}; the previous process ended unreported", .{pid});
     releaseProcess(pid);
@@ -6642,37 +6682,40 @@ fn removeAppWindows(pid: i32) void {
     }
 }
 
-fn isAppRunning(pid: i32) ?bool {
-    std.debug.assert(pid > 0);
-    const NSRunningApplication = objc.getClass("NSRunningApplication") orelse return null;
-    const app = NSRunningApplication.msgSend(objc.Object, "runningApplicationWithProcessIdentifier:", .{pid});
-    return app.value != null;
-}
-
-/// Recover app-termination notifications lost to event-ring overflow. Find one
-/// stopped process at a time so catalog mutation never overlaps iteration.
-fn removeStoppedAppWindows() bool {
-    var removed_any = false;
-    while (true) {
-        const stopped_pid: ?i32 = blk: {
-            for (g_state.windows.items()) |managed_window| {
-                const win = managed_window.snapshot();
-                const running = isAppRunning(win.pid) orelse {
-                    log.warn("event overflow: cannot query running applications; skipping termination recovery", .{});
-                    return removed_any;
-                };
-                if (!running) break :blk win.pid;
-            }
-            break :blk null;
-        };
-        const pid = stopped_pid orelse return removed_any;
-
-        // Top level only: inside an effect handler the release would wait
-        // and this loop would find the same PID forever.
-        std.debug.assert(!g_state_effect_drain_active);
-        dispatchStateEvent(.{ .process_terminated = pid });
-        removed_any = true;
+/// Report every process the manager holds state for as alive or gone, so a
+/// termination lost to event overflow or a missed notification still releases
+/// the app. Windows of processes the table could not hold count through their
+/// owning PID. True when a process ended.
+fn sweepProcesses() bool {
+    // Snapshot first: each report can shrink the table and window catalog.
+    var process_ids: [state_mod.max_tracked_processes + state_mod.max_managed_windows]i32 = undefined;
+    var process_count: usize = 0;
+    for (g_state.processes.items()) |identity| {
+        process_ids[process_count] = identity.process_id;
+        process_count += 1;
     }
+    for (g_state.windows.items()) |managed_window| {
+        if (std.mem.findScalar(i32, process_ids[0..process_count], managed_window.process_id) != null) continue;
+        process_ids[process_count] = managed_window.process_id;
+        process_count += 1;
+    }
+
+    var has_ended = false;
+    for (process_ids[0..process_count]) |pid| {
+        // A failed query proves nothing; the next sweep asks again.
+        const lookup = osutil.processStartTimeUs(pid) catch continue;
+        const started_at_us = lookup orelse {
+            log.debug("process sweep: pid={d} is gone", .{pid});
+            dispatchStateEvent(.{ .process_terminated = pid });
+            has_ended = true;
+            continue;
+        };
+        dispatchStateEvent(.{ .process_observed = .{
+            .process_id = pid,
+            .started_at_us = started_at_us,
+        } });
+    }
+    return has_ended;
 }
 
 /// Remove stale or ineligible managed windows for a single app process.

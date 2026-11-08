@@ -10,6 +10,7 @@ const log = std.log.scoped(.ax_observer);
 const objc = @import("objc");
 const c = @import("c");
 const cg_extra = @import("cg_extra");
+const osutil = @import("osutil.zig");
 const shim = @import("shim_api.zig");
 const window_server = @import("window_server.zig");
 
@@ -33,6 +34,8 @@ comptime {
 
 const AppObserverEntry = struct {
     pid: i32 = 0,
+    // Start time of the process the observer was created for.
+    started_at_us: u64 = 0,
     observer: c.AXObserverRef = null,
     known_window_count: u32 = 0,
     known_windows: [max_known_windows_per_app]u32 = @splat(0),
@@ -305,7 +308,7 @@ pub fn observeApp(pid: i32) void {
 /// Queue observer setup after latency-sensitive workspace landing work.
 pub fn observeAppDeferred(pid: i32) void {
     std.debug.assert(pid > 0);
-    if (appObserverExists(pid)) return;
+    if (hasCurrentObserver(pid)) return;
     scheduleObserveRetry(pid, window_scan_interval_ms);
 }
 
@@ -348,6 +351,16 @@ fn appObserverIndex(pid: i32) ?u32 {
 
 fn appObserverExists(pid: i32) bool {
     return appObserverIndex(pid) != null;
+}
+
+/// The PID's observer belongs to the process running under it now. A PID
+/// reused after a lost termination keeps the dead process's observer, which
+/// never fires again, so it must not count as observed.
+fn hasCurrentObserver(pid: i32) bool {
+    const index = appObserverIndex(pid) orelse return false;
+    // An unanswered query trusts the observer it has.
+    const started_at_us = (osutil.processStartTimeUs(pid) catch return true) orelse return false;
+    return g_app_observers[index].started_at_us == started_at_us;
 }
 
 /// Forget a window the manager removed, once WindowServer confirms it is gone.
@@ -514,7 +527,7 @@ fn isAppRunning(pid: i32) bool {
 
 fn shouldDropObserveRetryEntry(pid: i32) bool {
     if (!isAppRunning(pid)) return true;
-    return appObserverExists(pid);
+    return hasCurrentObserver(pid);
 }
 
 fn observeRetrySourceTick(context: ?*anyopaque) callconv(.c) void {
@@ -549,7 +562,7 @@ fn processObserveRetryTick() void {
 }
 
 fn scheduleObserveRetry(pid: i32, initial_delay_ms: u64) void {
-    if (appObserverExists(pid)) return;
+    if (hasCurrentObserver(pid)) return;
 
     if (observeRetryIndex(pid)) |existing| {
         g_observe_retry_entries[existing].attempts_remaining = observe_retry_attempts_max;
@@ -970,7 +983,15 @@ fn removeAppObserverAtIndex(index: u32) void {
 }
 
 fn tryObserveApp(pid: i32) bool {
-    if (appObserverExists(pid)) return true;
+    // A gone process has nothing to observe; the retry tick drops it. An
+    // unanswered query keeps whatever observer exists.
+    const lookup = osutil.processStartTimeUs(pid) catch return appObserverExists(pid);
+    const started_at_us = lookup orelse return false;
+    if (appObserverIndex(pid)) |index| {
+        if (g_app_observers[index].started_at_us == started_at_us) return true;
+        log.info("AX observer replaced pid={d}; the observed process ended unreported", .{pid});
+        removeAppObserverAtIndex(index);
+    }
     if (g_app_observer_count >= max_observed_apps) return false;
     if (g_ax_thread_runloop == null) return false;
 
@@ -1006,6 +1027,7 @@ fn tryObserveApp(pid: i32) bool {
     c.os_unfair_lock_lock(&g_ax_lock);
     g_app_observers[g_app_observer_count] = .{
         .pid = pid,
+        .started_at_us = started_at_us,
         .observer = observer_ref,
     };
     g_app_observer_count += 1;

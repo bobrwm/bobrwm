@@ -174,27 +174,81 @@ pub fn makePath(allocator: std.mem.Allocator, path: []const u8) bool {
 // Process identity
 
 /// Start time of a running process in microseconds since the epoch, or null
-/// when the PID has no process. The kernel reuses PIDs, but never a PID and
-/// start time pair, so the two together name one process.
-pub fn processStartTimeUs(pid: i32) ?u64 {
+/// when the PID has no live process. The kernel reuses PIDs, but never a PID
+/// and start time pair, so the two together name one process. A failed query
+/// is an error, not null, so callers never release a live process over it.
+pub fn processStartTimeUs(pid: i32) error{QueryFailed}!?u64 {
     std.debug.assert(pid > 0);
 
-    // sysctl answers for every user's processes; proc_pidinfo refuses other
-    // users. kinfo_proc is 648 bytes and starts with kp_proc.p_starttime.
+    // proc_pidinfo costs ~0.6us against sysctl's ~10us, but refuses other
+    // users' processes and exited ones awaiting reap.
+    var info: ProcBsdInfo = undefined;
+    const info_size: c_int = @sizeOf(ProcBsdInfo);
+    if (proc_pidinfo(pid, proc_pidtbsdinfo, 0, &info, info_size) == info_size) {
+        return info.start_tvsec * std.time.us_per_s + info.start_tvusec;
+    }
+    return sysctlStartTimeUs(pid);
+}
+
+fn sysctlStartTimeUs(pid: i32) error{QueryFailed}!?u64 {
     const ctl_kern: c_int = 1;
     const kern_proc: c_int = 14;
     const kern_proc_pid: c_int = 1;
     const mib = [_]c_int{ ctl_kern, kern_proc, kern_proc_pid, pid };
+
+    // kinfo_proc is 648 bytes. It starts with kp_proc.p_starttime, a
+    // timeval, and kp_proc.p_stat sits at byte 36.
     var info: [648]u8 align(@alignOf(std.c.timeval)) = undefined;
     var info_len: usize = info.len;
-    if (std.c.sysctl(&mib, mib.len, &info, &info_len, null, 0) != 0) return null;
+    if (std.c.sysctl(&mib, mib.len, &info, &info_len, null, 0) != 0) return error.QueryFailed;
 
     // A missing PID succeeds with nothing written.
-    if (info_len < @sizeOf(std.c.timeval)) return null;
+    if (info_len == 0) return null;
+    if (info_len != info.len) return error.QueryFailed;
+
+    // An exited process lingers as a zombie until its parent reaps it.
+    const p_stat_offset = 36;
+    const szomb: u8 = 5;
+    if (info[p_stat_offset] == szomb) return null;
+
     const start: *const std.c.timeval = @ptrCast(&info);
-    if (start.sec < 0 or start.usec < 0) return null;
+    if (start.sec < 0 or start.usec < 0) return error.QueryFailed;
     return @as(u64, @intCast(start.sec)) * std.time.us_per_s + @as(u64, @intCast(start.usec));
 }
+
+// <sys/proc_info.h>
+const proc_pidtbsdinfo: c_int = 3;
+const ProcBsdInfo = extern struct {
+    flags: u32,
+    status: u32,
+    xstatus: u32,
+    pid: u32,
+    ppid: u32,
+    uid: u32,
+    gid: u32,
+    ruid: u32,
+    rgid: u32,
+    svuid: u32,
+    svgid: u32,
+    rfu_1: u32,
+    comm: [16]u8,
+    name: [32]u8,
+    nfiles: u32,
+    pgid: u32,
+    pjobc: u32,
+    e_tdev: u32,
+    e_tpgid: u32,
+    nice: i32,
+    start_tvsec: u64,
+    start_tvusec: u64,
+};
+
+comptime {
+    std.debug.assert(@sizeOf(ProcBsdInfo) == 136);
+    std.debug.assert(@offsetOf(ProcBsdInfo, "start_tvsec") == 120);
+}
+
+extern "c" fn proc_pidinfo(pid: c_int, flavor: c_int, arg: u64, buffer: ?*anyopaque, buffer_size: c_int) c_int;
 
 // App metadata
 
@@ -224,10 +278,36 @@ pub fn appBundleId(pid: i32, buf: []u8) ?[]const u8 {
 
 test "process start time is stable for a live PID and null for a missing one" {
     const pid = std.c.getpid();
-    const first = processStartTimeUs(pid) orelse return error.TestUnexpectedResult;
-    try std.testing.expectEqual(first, processStartTimeUs(pid));
+    const first = (try processStartTimeUs(pid)) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(?u64, first), try processStartTimeUs(pid));
     try std.testing.expect(first > 0);
 
     // macOS PIDs never exceed PID_MAX, 99999.
-    try std.testing.expectEqual(@as(?u64, null), processStartTimeUs(99_999_999));
+    try std.testing.expectEqual(@as(?u64, null), try processStartTimeUs(99_999_999));
+}
+
+test "both process start time sources agree" {
+    const pid = std.c.getpid();
+    try std.testing.expectEqual(try processStartTimeUs(pid), try sysctlStartTimeUs(pid));
+
+    // launchd runs as root, which proc_pidinfo refuses.
+    try std.testing.expect((try processStartTimeUs(1)) != null);
+}
+
+test "a zombie process has no start time" {
+    const libc = struct {
+        extern "c" fn fork() std.c.pid_t;
+        extern "c" fn usleep(microseconds: c_uint) c_int;
+    };
+    const child = libc.fork();
+    if (child == 0) std.c._exit(0);
+    try std.testing.expect(child > 0);
+    defer _ = std.c.waitpid(child, null, 0);
+
+    // Unreaped, the child stays a zombie; give it time to exit.
+    var attempts: u32 = 0;
+    while ((try processStartTimeUs(child)) != null) : (attempts += 1) {
+        if (attempts == 200) return error.TestUnexpectedResult;
+        _ = libc.usleep(5 * std.time.us_per_ms);
+    }
 }
