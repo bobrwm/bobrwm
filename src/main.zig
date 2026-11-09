@@ -77,6 +77,14 @@ const role_poll_interval_ms: u64 = 100;
 /// Keep one slow app AX server from monopolizing the main event drain.
 const role_poll_ax_timeout_s: f32 = 0.025;
 const role_poll_work_budget_ms: i128 = 30;
+/// Bounds every other readiness query. Slow apps (Electron at startup)
+/// answer AX in 50-200ms; a hung one would hold AX's default 6s per message,
+/// and readiness sends up to six.
+const readiness_ax_timeout_s: f32 = 0.25;
+/// A hung app is skipped this long after a readiness query times out, so it
+/// costs one stall per backoff instead of one per poll tick.
+const ax_hang_backoff_ms: i128 = 2000;
+const max_ax_hangs = 16;
 /// Retry budget for deferred candidates before they are dropped or fall back.
 /// Electron-family apps can take multiple seconds before publishing stable AX roles.
 const role_poll_attempts_max: u8 = 50;
@@ -1388,6 +1396,9 @@ var g_workspace_application_inventory_count: usize = 0;
 var g_state_effect_queue: StateEffectQueue = .{};
 var g_window_removal_queue: WindowRemovalQueue = .{};
 var g_state_effect_drain_active = false;
+var g_ax_hangs: [max_ax_hangs]AxHang = @splat(.{});
+var g_role_poll_cursor: usize = 0;
+var g_deferred_poll_cursor: usize = 0;
 var g_displays: [workspace_mod.max_displays]DisplayInfo = undefined;
 var g_display_count: usize = 0;
 var g_workspace_observer: ?objc.Object = null;
@@ -1982,11 +1993,66 @@ fn postSameProcessFocusEvent(
     return post_event(psn, &event) == 0;
 }
 
-fn manageStateForWindow(pid: i32, wid: u32) u8 {
-    return manageStateForWindowWithMessagingTimeout(pid, wid, null);
+const AxHang = struct {
+    process_id: i32 = 0,
+    until_ns: i128 = 0,
+};
+
+fn isAxBackedOff(pid: i32) bool {
+    const now_ns = nanoTimestamp();
+    for (g_ax_hangs) |hang| {
+        if (hang.process_id == pid and hang.until_ns > now_ns) return true;
+    }
+    return false;
 }
 
-fn manageStateForWindowWithMessagingTimeout(pid: i32, wid: u32, timeout_seconds: ?f32) u8 {
+/// Reuse the PID's slot, else the one expiring first: expired and unused
+/// slots sort before every live backoff.
+fn backOffAx(pid: i32) void {
+    std.debug.assert(pid > 0);
+    var slot = &g_ax_hangs[0];
+    for (&g_ax_hangs) |*hang| {
+        if (hang.process_id == pid) {
+            slot = hang;
+            break;
+        }
+        if (hang.until_ns < slot.until_ns) slot = hang;
+    }
+    slot.* = .{
+        .process_id = pid,
+        .until_ns = nanoTimestamp() + ax_hang_backoff_ms * std.time.ns_per_ms,
+    };
+}
+
+/// Readiness for discovery, cleanup, and the deferred poll. Pending while the
+/// app is backed off as hung: discovery then queues the window, and cleanup
+/// keeps it, both of which a later poll revisits.
+fn manageStateForWindow(pid: i32, wid: u32) u8 {
+    std.debug.assert(pid > 0);
+    if (isAxBackedOff(pid)) return shim.BW_MANAGE_PENDING;
+
+    const started_ns = nanoTimestamp();
+    const state = manageStateForWindowWithMessagingTimeout(pid, wid, readiness_ax_timeout_s, true);
+
+    // Pending after a full timeout means a message went unanswered. A slow
+    // app that answered every message got a verdict, however long it took.
+    const elapsed_ns = nanoTimestamp() - started_ns;
+    const timeout_ns: i128 = @intFromFloat(readiness_ax_timeout_s * std.time.ns_per_s);
+    if (state == shim.BW_MANAGE_PENDING and elapsed_ns >= timeout_ns) {
+        log.debug("readiness: pid={d} wid={d} timed out after {d}ms; backing off", .{
+            pid, wid, @divTrunc(elapsed_ns, std.time.ns_per_ms),
+        });
+        backOffAx(pid);
+    }
+    return state;
+}
+
+fn manageStateForWindowWithMessagingTimeout(
+    pid: i32,
+    wid: u32,
+    timeout_seconds: f32,
+    should_try_focused: bool,
+) u8 {
     std.debug.assert(pid > 0);
     std.debug.assert(wid > 0);
 
@@ -1995,10 +2061,11 @@ fn manageStateForWindowWithMessagingTimeout(pid: i32, wid: u32, timeout_seconds:
     // Remote-hosted panels (open/save dialogs) can be the app's focused window
     // without appearing in AXWindows; without the focused-window fallback they
     // stay PENDING and never reach the AXModal rejection below.
-    const win = if (timeout_seconds) |seconds|
-        ax_mod.findWindowWithMessagingTimeout(pid, wid, seconds)
+    const listed = ax_mod.findWindowWithMessagingTimeout(pid, wid, timeout_seconds);
+    const win = listed orelse if (should_try_focused)
+        ax_mod.focusedWindowIfMatches(pid, wid, timeout_seconds)
     else
-        findAxWindow(pid, wid) orelse ax_mod.focusedWindowIfMatches(pid, wid);
+        null;
     const win_ref = win orelse return shim.BW_MANAGE_PENDING;
     defer c.CFRelease(@ptrCast(win_ref));
 
@@ -4229,7 +4296,7 @@ fn windowRoleState(pid: i32, wid: u32) WindowRoleState {
 }
 
 fn windowRoleStateWithMessagingTimeout(pid: i32, wid: u32) WindowRoleState {
-    const raw_state = manageStateForWindowWithMessagingTimeout(pid, wid, role_poll_ax_timeout_s);
+    const raw_state = manageStateForWindowWithMessagingTimeout(pid, wid, role_poll_ax_timeout_s, false);
     return windowRoleStateFromRaw(pid, wid, raw_state);
 }
 
@@ -5820,9 +5887,20 @@ fn untrackWindowCandidatesForPid(pid: i32) void {
 
 fn processPendingRoleWindows() void {
     const candidates = g_state.pending_role_windows;
+    const items = candidates.items();
+    if (items.len == 0) return;
+
+    // The budget can end a pass early. Resume where it stopped so windows late
+    // in the queue are polled too, not only the slow ones at its head.
+    const first = g_role_poll_cursor % items.len;
     const started_ns = nanoTimestamp();
-    for (candidates.items()) |candidate| {
-        if (nanoTimestamp() - started_ns >= role_poll_work_budget_ms * std.time.ns_per_ms) return;
+    for (0..items.len) |offset| {
+        if (nanoTimestamp() - started_ns >= role_poll_work_budget_ms * std.time.ns_per_ms) {
+            g_role_poll_cursor = first + offset;
+            return;
+        }
+        const candidate = items[(first + offset) % items.len];
+
         // A destroyed window is not in AXWindows either, so the role query
         // would report it pending until the budget runs out.
         if (!windowServerHasWindow(candidate.window_id)) {
@@ -5830,6 +5908,8 @@ fn processPendingRoleWindows() void {
             dispatchStateEvent(.{ .window_candidate_destroyed = candidate.window_id });
             continue;
         }
+        // Polling a hung app would spend an attempt without an answer.
+        if (isAxBackedOff(candidate.process_id)) continue;
         dispatchStateEvent(.{ .pending_role_observed = .{
             .window_id = candidate.window_id,
             .readiness = windowRoleStateWithMessagingTimeout(candidate.process_id, candidate.window_id),
@@ -5839,12 +5919,26 @@ fn processPendingRoleWindows() void {
 
 fn processDeferredWindowCandidates() void {
     const candidates = g_state.deferred_window_candidates;
-    for (candidates.items()) |candidate| {
+    const items = candidates.items();
+    if (items.len == 0) return;
+
+    // Same budget and resume point as the role poll: a query can take up to
+    // the readiness timeout before its app is backed off.
+    const first = g_deferred_poll_cursor % items.len;
+    const started_ns = nanoTimestamp();
+    for (0..items.len) |offset| {
+        if (nanoTimestamp() - started_ns >= role_poll_work_budget_ms * std.time.ns_per_ms) {
+            g_deferred_poll_cursor = first + offset;
+            return;
+        }
+        const candidate = items[(first + offset) % items.len];
+
         if (!windowServerHasWindow(candidate.window_id)) {
             log.debug("deferred-window: window gone pid={d} wid={d}", .{ candidate.process_id, candidate.window_id });
             dispatchStateEvent(.{ .window_candidate_destroyed = candidate.window_id });
             continue;
         }
+        if (isAxBackedOff(candidate.process_id)) continue;
         dispatchStateEvent(.{ .deferred_window_observed = .{
             .window_id = candidate.window_id,
             .readiness = windowRoleState(candidate.process_id, candidate.window_id),

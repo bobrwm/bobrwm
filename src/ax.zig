@@ -198,13 +198,14 @@ fn findWindowWithTimeout(pid: i32, target_wid: u32, timeout_seconds: ?f32) ?c.AX
         const win_any = c.CFArrayGetValueAtIndex(windows_ref, i) orelse continue;
         const win: c.AXUIElementRef = @ptrCast(win_any);
 
+        // Elements copied out of the list do not inherit the app's timeout.
+        if (timeout_seconds) |seconds| _ = c.AXUIElementSetMessagingTimeout(win, seconds);
         var wid: u32 = 0;
         trace.countAx();
         if (_AXUIElementGetWindow(win, &wid) != c.kAXErrorSuccess) continue;
         if (wid != target_wid) continue;
 
         _ = c.CFRetain(@ptrCast(win));
-        if (timeout_seconds) |seconds| _ = c.AXUIElementSetMessagingTimeout(win, seconds);
         return win;
     }
 
@@ -297,12 +298,14 @@ pub fn deinitElementCache() void {
 /// scan in findWindow misses them. Returns the element only when its window id
 /// matches `target_wid`. The returned element is retained; the caller must
 /// CFRelease it.
-pub fn focusedWindowIfMatches(pid: i32, target_wid: u32) ?c.AXUIElementRef {
+pub fn focusedWindowIfMatches(pid: i32, target_wid: u32, timeout_seconds: f32) ?c.AXUIElementRef {
     std.debug.assert(pid > 0);
     std.debug.assert(target_wid > 0);
+    std.debug.assert(timeout_seconds > 0);
 
     const app = c.AXUIElementCreateApplication(pid) orelse return null;
     defer c.CFRelease(@ptrCast(app));
+    _ = c.AXUIElementSetMessagingTimeout(app, timeout_seconds);
 
     const ax = strings() orelse return null;
     var focused: c.AXUIElementRef = null;
@@ -310,6 +313,7 @@ pub fn focusedWindowIfMatches(pid: i32, target_wid: u32) ?c.AXUIElementRef {
     const err = c.AXUIElementCopyAttributeValue(app, ax.focused_window_attr, @ptrCast(&focused));
     if (err != c.kAXErrorSuccess or focused == null) return null;
     const focused_ref = focused orelse return null;
+    _ = c.AXUIElementSetMessagingTimeout(focused_ref, timeout_seconds);
 
     var wid: u32 = 0;
     trace.countAx();
