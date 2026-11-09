@@ -65,9 +65,12 @@ const log = std.log.scoped(.bobrwm);
 
 const EventQueue = spsc_queue.Queue(event_mod.Event, 1024);
 // Effects raised inside an effect handler wait until it returns, and one
-// cleanup pass can remove every managed window with one effect each.
-const state_effect_queue_capacity = state_mod.max_managed_windows + 64;
-const StateEffectQueue = spsc_queue.Queue(state_mod.Effect, state_effect_queue_capacity);
+// cleanup pass can remove every managed window with a window_removed each.
+// Those wait in their own 8-byte slots so the 192-byte general queue stays
+// small: a removal burst costs ~9 KiB of slots instead of ~200 KiB.
+const StateEffectQueue = spsc_queue.Queue(state_mod.Effect, 64);
+const WindowRemoval = @FieldType(state_mod.Effect, "window_removed");
+const WindowRemovalQueue = spsc_queue.Queue(WindowRemoval, state_mod.max_managed_windows + 64);
 
 /// Poll cadence for windows that are waiting on role readiness or visibility.
 const role_poll_interval_ms: u64 = 100;
@@ -1383,6 +1386,7 @@ const WorkspaceApplication = struct {
 var g_workspace_application_inventory: [max_workspace_application_inventory]WorkspaceApplication = undefined;
 var g_workspace_application_inventory_count: usize = 0;
 var g_state_effect_queue: StateEffectQueue = .{};
+var g_window_removal_queue: WindowRemovalQueue = .{};
 var g_state_effect_drain_active = false;
 var g_displays: [workspace_mod.max_displays]DisplayInfo = undefined;
 var g_display_count: usize = 0;
@@ -4769,7 +4773,11 @@ fn dispatchStateEvent(event: state_mod.Event) void {
     g_dim_dirty = true;
 
     for (transition.effects[0..transition.effect_count]) |effect| {
-        if (!g_state_effect_queue.push(effect)) @panic("state effect queue overflow");
+        const is_queued = switch (effect) {
+            .window_removed => |removal| g_window_removal_queue.push(removal),
+            else => g_state_effect_queue.push(effect),
+        };
+        if (!is_queued) @panic("state effect queue overflow");
     }
 
     drainStateEffects();
@@ -4781,8 +4789,16 @@ fn drainStateEffects() void {
     g_state_effect_drain_active = true;
     defer g_state_effect_drain_active = false;
 
-    while (g_state_effect_queue.pop()) |effect| {
-        executeStateEffect(effect);
+    // Removals release per-window shell state, which nothing else reads once
+    // the window left the catalog, so running them after the other effects
+    // is safe.
+    while (true) {
+        if (g_state_effect_queue.pop()) |effect| {
+            executeStateEffect(effect);
+            continue;
+        }
+        const removal = g_window_removal_queue.pop() orelse break;
+        executeWindowRemoved(removal);
     }
     refreshRolePolling();
     scheduleNativeObservation();
@@ -4874,7 +4890,7 @@ fn executeStateEffect(effect: state_mod.Effect) void {
             rejection.window_id,
             @tagName(rejection.reason),
         }),
-        .window_removed => |removal| executeWindowRemoved(removal),
+        .window_removed => unreachable, // Queued and run apart, see drainStateEffects.
         .workspace_transition_started => |transition| executeWorkspaceTransitionStarted(transition),
         .workspace_transition_settled => |settlement| executeWorkspaceTransitionSettled(settlement),
         .move_native_window => |pending| executeNativeWindowMove(pending),
@@ -6579,7 +6595,7 @@ fn removeWindow(wid: u32) void {
 /// Release platform state keyed by a removed window's ID. Runs late when the
 /// removal happened inside another effect handler, so skip a window that was
 /// adopted again under the same ID in between: the state is its own again.
-fn executeWindowRemoved(removal: @FieldType(state_mod.Effect, "window_removed")) void {
+fn executeWindowRemoved(removal: WindowRemoval) void {
     if (managedWindow(removal.window_id) != null) return;
     g_animator.cancel(removal.window_id);
     ax_mod.invalidateWindow(removal.window_id);
