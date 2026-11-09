@@ -473,6 +473,15 @@ pub const WindowCandidates = struct {
     }
 };
 
+/// Fixed-capacity discovery queue. A full one drops the new entry: the next
+/// discovery or focus event tracks that window or process again.
+pub const DiscoveryQueue = enum {
+    pending_role_windows,
+    deferred_window_candidates,
+    app_launch_retries,
+    focus_retries,
+};
+
 pub const ProcessRetry = struct {
     process_id: i32,
     attempts_remaining: u8,
@@ -1297,6 +1306,7 @@ pub const Effect = union(enum) {
         window_id: WindowId,
     },
     focus_retry_expired: i32,
+    discovery_queue_full: DiscoveryQueue,
     // The process ended. Release shell state keyed by its PID.
     process_ended: i32,
     // The PID now names a new process. Release the old process's state, then

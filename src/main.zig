@@ -1471,6 +1471,7 @@ var g_layout_entries: std.ArrayList(tiling.LayoutEntry) = .empty;
 var g_event_drain_active = false;
 var g_event_overflow_recovery_pending = false;
 var g_has_warned_process_table_full = false;
+var g_warned_full_discovery_queues: std.EnumSet(state_mod.DiscoveryQueue) = .empty;
 var g_on_screen_truncation_logged = false;
 
 var g_animator: animation_mod.Animator = undefined;
@@ -4975,6 +4976,10 @@ fn executeStateEffect(effect: state_mod.Effect) void {
             reconcileFocusedWindow(resolved.process_id, resolved.window_id);
         },
         .focus_retry_expired => |process_id| log.debug("focus-retry: gave up pid={d}", .{process_id}),
+        .discovery_queue_full => |queue| if (!g_warned_full_discovery_queues.contains(queue)) {
+            g_warned_full_discovery_queues.insert(queue);
+            log.warn("discovery queue {s} full; dropping new entries until it drains", .{@tagName(queue)});
+        },
         .process_ended => |process_id| releaseProcess(process_id),
         .process_replaced => |process_id| executeProcessReplaced(process_id),
         .process_table_full => |identity| if (!g_has_warned_process_table_full) {

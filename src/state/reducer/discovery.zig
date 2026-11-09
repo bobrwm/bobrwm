@@ -4,6 +4,7 @@ const model_mod = @import("../model.zig");
 const workspace_reducer = @import("workspace.zig");
 
 const DeferredWindowExpiryReason = model_mod.DeferredWindowExpiryReason;
+const DiscoveryQueue = model_mod.DiscoveryQueue;
 const Event = model_mod.Event;
 const ProcessRetries = model_mod.ProcessRetries;
 const ProcessRetry = model_mod.ProcessRetry;
@@ -18,7 +19,7 @@ pub fn reducePendingRoleTracked(transition: *Transition, candidate: WindowCandid
         return;
     }
     if (!transition.model.pending_role_windows.track(candidate, true)) {
-        @panic("pending role window capacity exceeded");
+        transition.addEffect(.{ .discovery_queue_full = .pending_role_windows });
     }
 }
 
@@ -56,7 +57,7 @@ pub fn reduceDeferredWindowTracked(transition: *Transition, candidate: WindowCan
         return;
     }
     if (!transition.model.deferred_window_candidates.track(candidate, false)) {
-        @panic("deferred window candidate capacity exceeded");
+        transition.addEffect(.{ .discovery_queue_full = .deferred_window_candidates });
     }
 }
 
@@ -111,9 +112,14 @@ pub fn expireOrDecrementDeferredWindow(
     } });
 }
 
-pub fn reduceProcessRetryTracked(retries: *ProcessRetries, retry: ProcessRetry) void {
+pub fn reduceProcessRetryTracked(
+    transition: *Transition,
+    retries: *ProcessRetries,
+    queue: DiscoveryQueue,
+    retry: ProcessRetry,
+) void {
     if (retry.process_id <= 0 or retry.attempts_remaining == 0) return;
-    if (!retries.track(retry)) @panic("process retry capacity exceeded");
+    if (!retries.track(retry)) transition.addEffect(.{ .discovery_queue_full = queue });
 }
 
 pub fn reduceAppLaunchRetryTimer(transition: *Transition, process_id: i32) void {

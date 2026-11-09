@@ -65,6 +65,7 @@ pub const WindowReadiness = model_mod.WindowReadiness;
 pub const WindowCandidate = model_mod.WindowCandidate;
 pub const ProcessRetry = model_mod.ProcessRetry;
 pub const ProcessIdentity = model_mod.ProcessIdentity;
+pub const DiscoveryQueue = model_mod.DiscoveryQueue;
 pub const RetileRequest = model_mod.RetileRequest;
 pub const CleanupRequest = model_mod.CleanupRequest;
 pub const LayoutRebuild = model_mod.LayoutRebuild;
@@ -214,9 +215,19 @@ pub fn reduce(model: *Model, event: Event) Transition {
             transition.model.pending_role_windows.removeProcess(process_id);
             transition.model.deferred_window_candidates.removeProcess(process_id);
         },
-        .track_app_launch_retry => |retry| discovery_reducer.reduceProcessRetryTracked(&transition.model.app_launch_retries, retry),
+        .track_app_launch_retry => |retry| discovery_reducer.reduceProcessRetryTracked(
+            &transition,
+            &transition.model.app_launch_retries,
+            .app_launch_retries,
+            retry,
+        ),
         .app_launch_retry_timer_fired => |process_id| discovery_reducer.reduceAppLaunchRetryTimer(&transition, process_id),
-        .track_focus_retry => |retry| discovery_reducer.reduceProcessRetryTracked(&transition.model.focus_retries, retry),
+        .track_focus_retry => |retry| discovery_reducer.reduceProcessRetryTracked(
+            &transition,
+            &transition.model.focus_retries,
+            .focus_retries,
+            retry,
+        ),
         .untrack_focus_retry => |process_id| {
             _ = transition.model.focus_retries.remove(process_id);
         },
@@ -2590,6 +2601,50 @@ test "destroyed window candidates leave both queues without expiring" {
     try testing.expect(!transition.model.hasPendingRoleWindow(candidate.window_id));
     try testing.expect(!transition.model.hasDeferredWindowCandidate(candidate.window_id));
     try testing.expect(transition.model.hasPendingRoleWindow(survivor.window_id));
+}
+
+test "full discovery queues drop new entries instead of panicking" {
+    const testing = std.testing;
+    var catalog: SpaceCatalog = .{};
+    catalog.add(.{ .key = .{ .id = 1 }, .workspace_id = 1, .display_id = 11 });
+    var model = reduceCopy(.{}, .{ .replace_space_catalog = &catalog }).model;
+
+    for (0..model_mod.max_pending_window_candidates) |index| {
+        const candidate: WindowCandidate = .{
+            .process_id = 42,
+            .window_id = @intCast(index + 1),
+            .space_key = .{ .id = 1 },
+            .attempts_remaining = 5,
+        };
+        _ = reduce(&model, .{ .track_pending_role_window = candidate });
+        _ = reduce(&model, .{ .track_deferred_window_candidate = candidate });
+    }
+    for (0..model_mod.max_process_retries) |index| {
+        _ = reduce(&model, .{ .track_focus_retry = .{
+            .process_id = @intCast(index + 1),
+            .attempts_remaining = 3,
+        } });
+    }
+
+    const extra: WindowCandidate = .{
+        .process_id = 42,
+        .window_id = 9_000,
+        .space_key = .{ .id = 1 },
+        .attempts_remaining = 5,
+    };
+    var transition = reduceCopy(model, .{ .track_pending_role_window = extra });
+    try testing.expectEqual(DiscoveryQueue.pending_role_windows, transition.effects[0].discovery_queue_full);
+    try testing.expect(!transition.model.hasPendingRoleWindow(extra.window_id));
+
+    transition = reduceCopy(model, .{ .track_deferred_window_candidate = extra });
+    try testing.expectEqual(DiscoveryQueue.deferred_window_candidates, transition.effects[0].discovery_queue_full);
+
+    transition = reduceCopy(model, .{ .track_focus_retry = .{ .process_id = 9_000, .attempts_remaining = 3 } });
+    try testing.expectEqual(DiscoveryQueue.focus_retries, transition.effects[0].discovery_queue_full);
+
+    // A tracked entry still updates in place when the queue is full.
+    transition = reduceCopy(model, .{ .track_focus_retry = .{ .process_id = 1, .attempts_remaining = 7 } });
+    try testing.expectEqual(@as(u8, 0), transition.effect_count);
 }
 
 test "process retry outcomes are reducer owned" {

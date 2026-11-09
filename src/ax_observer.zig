@@ -19,7 +19,7 @@ extern fn _AXUIElementGetWindow(element: c.AXUIElementRef, wid: *u32) c.AXError;
 const max_observed_apps: usize = 128;
 // Live windows per app, not lifetime windows: gone entries are pruned before
 // the list counts as full.
-const max_known_windows_per_app: usize = 384;
+const max_known_windows_per_app: usize = 256;
 const observe_retry_interval_ms: u64 = 100;
 const observe_retry_attempts_max: u8 = 50;
 const window_scan_interval_ms: u64 = 500;
