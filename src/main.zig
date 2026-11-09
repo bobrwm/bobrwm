@@ -5890,10 +5890,18 @@ fn processPendingRoleWindows() void {
     const items = candidates.items();
     if (items.len == 0) return;
 
+    const started_ns = nanoTimestamp();
+    var window_ids: [candidates.entries.len]u32 = undefined;
+    for (items, 0..) |candidate, index| window_ids[index] = candidate.window_id;
+    var existing_buffer: [candidates.entries.len]u32 = undefined;
+    // One allocating WindowServer query per snapshot, not per candidate.
+    // An unreadable answer keeps every candidate until the next pass.
+    trace.countWindowList();
+    const existing = window_server.existingWindowIds(window_ids[0..items.len], &existing_buffer) orelse window_ids[0..items.len];
+
     // The budget can end a pass early. Resume where it stopped so windows late
     // in the queue are polled too, not only the slow ones at its head.
     const first = g_role_poll_cursor % items.len;
-    const started_ns = nanoTimestamp();
     for (0..items.len) |offset| {
         if (nanoTimestamp() - started_ns >= role_poll_work_budget_ms * std.time.ns_per_ms) {
             g_role_poll_cursor = first + offset;
@@ -5903,7 +5911,7 @@ fn processPendingRoleWindows() void {
 
         // A destroyed window is not in AXWindows either, so the role query
         // would report it pending until the budget runs out.
-        if (!windowServerHasWindow(candidate.window_id)) {
+        if (std.mem.findScalar(u32, existing, candidate.window_id) == null) {
             log.debug("pending-role: window gone pid={d} wid={d}", .{ candidate.process_id, candidate.window_id });
             dispatchStateEvent(.{ .window_candidate_destroyed = candidate.window_id });
             continue;
@@ -5922,10 +5930,16 @@ fn processDeferredWindowCandidates() void {
     const items = candidates.items();
     if (items.len == 0) return;
 
+    const started_ns = nanoTimestamp();
+    var window_ids: [candidates.entries.len]u32 = undefined;
+    for (items, 0..) |candidate, index| window_ids[index] = candidate.window_id;
+    var existing_buffer: [candidates.entries.len]u32 = undefined;
+    trace.countWindowList();
+    const existing = window_server.existingWindowIds(window_ids[0..items.len], &existing_buffer) orelse window_ids[0..items.len];
+
     // Same budget and resume point as the role poll: a query can take up to
     // the readiness timeout before its app is backed off.
     const first = g_deferred_poll_cursor % items.len;
-    const started_ns = nanoTimestamp();
     for (0..items.len) |offset| {
         if (nanoTimestamp() - started_ns >= role_poll_work_budget_ms * std.time.ns_per_ms) {
             g_deferred_poll_cursor = first + offset;
@@ -5933,7 +5947,7 @@ fn processDeferredWindowCandidates() void {
         }
         const candidate = items[(first + offset) % items.len];
 
-        if (!windowServerHasWindow(candidate.window_id)) {
+        if (std.mem.findScalar(u32, existing, candidate.window_id) == null) {
             log.debug("deferred-window: window gone pid={d} wid={d}", .{ candidate.process_id, candidate.window_id });
             dispatchStateEvent(.{ .window_candidate_destroyed = candidate.window_id });
             continue;
