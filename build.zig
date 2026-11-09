@@ -576,6 +576,21 @@ pub fn build(b: *std.Build) !void {
 
     const run_trace_tests = b.addRunArtifact(trace_tests);
 
+    // watchdog.zig is pure Zig over libc like trace.zig.
+    const watchdog_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/watchdog.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+
+    const watchdog_tests = b.addTest(.{
+        .name = "watchdog-tests",
+        .root_module = watchdog_test_mod,
+    });
+
+    const run_watchdog_tests = b.addRunArtifact(watchdog_tests);
+
     // window_server.zig queries the live WindowServer through CoreGraphics;
     // its test skips when no session is available.
     const window_server_test_mod = b.createModule(.{
@@ -692,6 +707,7 @@ pub fn build(b: *std.Build) !void {
     test_step.dependOn(&run_dim_tests.step);
     test_step.dependOn(&run_logging_tests.step);
     test_step.dependOn(&run_trace_tests.step);
+    test_step.dependOn(&run_watchdog_tests.step);
     test_step.dependOn(&run_window_server_tests.step);
     test_step.dependOn(&run_swipe_tests.step);
     test_step.dependOn(&run_osutil_tests.step);

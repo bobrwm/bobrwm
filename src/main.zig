@@ -32,6 +32,7 @@ const ax_writer = @import("ax_writer.zig");
 const geometry_mod = @import("geometry.zig");
 const spsc_queue = @import("spsc_queue.zig");
 const trace = @import("trace.zig");
+const watchdog = @import("watchdog.zig");
 const focus_follows_mouse = @import("focus_follows_mouse.zig");
 const window_server = @import("window_server.zig");
 
@@ -3182,6 +3183,7 @@ fn startCore(config_path_arg: ?[]const u8) !void {
     setMouseEventTapEnabled(g_config.focus_follows_mouse);
     setNativeSpaceTopologyPolling(true);
     setProcessSweep(true);
+    watchdog.start();
     try g_ipc_transport.start(g_ipc.fd, signalWaker);
     g_core_stage = .ipc_transport;
     refreshRolePolling();
@@ -3227,6 +3229,7 @@ fn stopCore() void {
     setRolePolling(false);
     setNativeSpaceTopologyPolling(false);
     setProcessSweep(false);
+    watchdog.stop();
     if (coreReached(.ax_observer)) {
         setMouseEventTapEnabled(false);
     }
@@ -3280,9 +3283,13 @@ fn bw_drain_events() void {
     defer g_event_drain_active = false;
 
     const drain_span = trace.begin("drain");
+    const drain_scope = watchdog.begin("drain", 0, 0);
+    defer watchdog.end(drain_scope);
 
     if (!nativeSwitchPending()) {
+        const tabs_scope = watchdog.begin("refresh tab groups", 0, 0);
         refreshTabGroupActiveTabs();
+        watchdog.end(tabs_scope);
     }
 
     var handled: u32 = 0;
@@ -3331,7 +3338,9 @@ fn bw_drain_events() void {
 /// Separate time queued behind earlier work from the event's own cost.
 fn handleTracedEvent(ev: *const event_mod.Event) void {
     const span = trace.beginWindow(@tagName(ev.kind), ev.pid, ev.wid);
+    const scope = watchdog.begin(@tagName(ev.kind), ev.pid, ev.wid);
     handleEvent(ev);
+    watchdog.end(scope);
 
     const elapsed_us = span.elapsedUs();
     const spent = span.cost();
@@ -3503,6 +3512,8 @@ fn drainIpcRequests() void {
 // state mutations are safe here. Keeping them in the application root makes
 // the UI adapter depend only on the callbacks it is given.
 fn statusBarRetile() callconv(.c) void {
+    const scope = watchdog.begin("menu retile", 0, 0);
+    defer watchdog.end(scope);
     retile();
 }
 
@@ -3621,6 +3632,8 @@ fn invalidAppSettings() bool {
 
 fn statusBarSwitchToWorkspace(workspace_id: u8) callconv(.c) void {
     if (workspace_id == 0 or workspace_id > workspaceCount()) return;
+    const scope = watchdog.begin("menu switch workspace", 0, 0);
+    defer watchdog.end(scope);
     switchWorkspace(workspace_id);
 }
 

@@ -12,6 +12,7 @@ const c = @import("c");
 const cg_extra = @import("cg_extra");
 const osutil = @import("osutil.zig");
 const shim = @import("shim_api.zig");
+const watchdog = @import("watchdog.zig");
 const window_server = @import("window_server.zig");
 
 extern fn _AXUIElementGetWindow(element: c.AXUIElementRef, wid: *u32) c.AXError;
@@ -532,6 +533,9 @@ fn shouldDropObserveRetryEntry(pid: i32) bool {
 
 fn observeRetrySourceTick(context: ?*anyopaque) callconv(.c) void {
     _ = context;
+    // Main queue: observer setup messages the app over AX.
+    const scope = watchdog.begin("ax observe retry", 0, 0);
+    defer watchdog.end(scope);
     processObserveRetryTick();
 }
 
@@ -607,6 +611,8 @@ fn cancelObserveRetry(pid: i32) void {
 
 fn windowScanSourceTick(context: ?*anyopaque) callconv(.c) void {
     _ = context;
+    const scope = watchdog.begin("ax window scan", 0, 0);
+    defer watchdog.end(scope);
     processWindowScanTick();
 }
 
