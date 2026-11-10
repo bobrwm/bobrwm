@@ -48,6 +48,7 @@ const Slot = struct {
     generation: u32 = 0,
     pending: std.EnumSet(Job) = .empty,
     is_scheduled: bool = false,
+    queue_users: usize = 0,
     queue: c.dispatch_queue_t = null,
 };
 
@@ -97,6 +98,33 @@ pub fn forget(pid: i32) void {
     }
 }
 
+/// Get the app's queue for delayed callbacks. Call releaseQueue when the last
+/// callback is done using it. Until then, no other process can take its slot.
+pub fn retainQueue(pid: i32) ?c.dispatch_queue_t {
+    std.debug.assert(pid > 0);
+    c.os_unfair_lock_lock(&g_lock);
+    defer c.os_unfair_lock_unlock(&g_lock);
+
+    const index = slotForPid(pid) orelse return null;
+    const slot = &g_slots[index];
+    slot.queue_users += 1;
+    return slot.queue;
+}
+
+/// Allow the queue's slot to be reused once no callback needs it.
+pub fn releaseQueue(queue: c.dispatch_queue_t) void {
+    c.os_unfair_lock_lock(&g_lock);
+    defer c.os_unfair_lock_unlock(&g_lock);
+
+    for (&g_slots) |*slot| {
+        if (slot.queue != queue) continue;
+        std.debug.assert(slot.queue_users > 0);
+        slot.queue_users -= 1;
+        return;
+    }
+    unreachable;
+}
+
 /// Caller holds g_lock. Prefers a free slot; an idle one held by another
 /// live app is taken only when none is free, at the cost of that app's
 /// per-slot state.
@@ -105,7 +133,7 @@ fn slotForPid(pid: i32) ?usize {
     var idle: ?usize = null;
     for (&g_slots, 0..) |*slot, index| {
         if (slot.pid == pid) return index;
-        if (slot.is_scheduled) continue;
+        if (slot.is_scheduled or slot.queue_users > 0) continue;
         if (free == null and slot.pid == 0) free = index;
         if (idle == null) idle = index;
     }
@@ -121,29 +149,34 @@ fn slotForPid(pid: i32) ?usize {
     return index;
 }
 
-/// Run every job pending for one slot. Runs on that slot's serial queue.
+/// Run the jobs waiting now. Let delayed callbacks run before starting any
+/// jobs added while these jobs were running.
 fn drainSlot(context: ?*anyopaque) callconv(.c) void {
     const index = @intFromPtr(context) - 1;
     const slot = &g_slots[index];
 
-    while (true) {
-        c.os_unfair_lock_lock(&g_lock);
-        const pending = slot.pending;
-        slot.pending = .empty;
-        if (pending.count() == 0) {
-            slot.is_scheduled = false;
-            c.os_unfair_lock_unlock(&g_lock);
-            return;
-        }
-        const app: App = .{ .pid = slot.pid, .index = index, .generation = slot.generation };
+    c.os_unfair_lock_lock(&g_lock);
+    const pending = slot.pending;
+    slot.pending = .empty;
+    if (pending.count() == 0) {
+        slot.is_scheduled = false;
         c.os_unfair_lock_unlock(&g_lock);
-
-        var jobs = pending.iterator();
-        while (jobs.next()) |job| {
-            const handler = g_handlers.get(job) orelse continue;
-            handler(app);
-        }
+        return;
     }
+    const app: App = .{ .pid = slot.pid, .index = index, .generation = slot.generation };
+    c.os_unfair_lock_unlock(&g_lock);
+
+    var jobs = pending.iterator();
+    while (jobs.next()) |job| {
+        const handler = g_handlers.get(job) orelse continue;
+        handler(app);
+    }
+
+    c.os_unfair_lock_lock(&g_lock);
+    defer c.os_unfair_lock_unlock(&g_lock);
+    if (slot.pending.count() > 0) {
+        c.dispatch_async_f(slot.queue, context, drainSlot);
+    } else slot.is_scheduled = false;
 }
 
 test "pending jobs coalesce and a forgotten pid gets a new generation" {
@@ -198,4 +231,67 @@ test "pending jobs coalesce and a forgotten pid gets a new generation" {
     Probe.finishRun();
     try testing.expectEqual(@as(u32, 3), Probe.runs);
     try testing.expect(Probe.last.generation != first.generation);
+}
+
+test "callbacks run between jobs and keep their queue until they are done" {
+    const Probe = struct {
+        var started: c.dispatch_semaphore_t = null;
+        var gate: c.dispatch_semaphore_t = null;
+        var other_done: c.dispatch_semaphore_t = null;
+        var done: c.dispatch_semaphore_t = null;
+        var runs: u32 = 0;
+        var runs_at_callback: u32 = 0;
+
+        fn handler(app: App) void {
+            if (runs == 0) {
+                _ = c.dispatch_semaphore_signal(started);
+                _ = c.dispatch_semaphore_wait(gate, c.DISPATCH_TIME_FOREVER);
+            }
+            runs += 1;
+            if (runs < 4) {
+                _ = submit(app.pid, .scan);
+            } else _ = c.dispatch_semaphore_signal(done);
+        }
+
+        fn callback(_: ?*anyopaque) callconv(.c) void {
+            runs_at_callback = runs;
+        }
+
+        fn otherHandler(_: App) void {
+            _ = c.dispatch_semaphore_signal(other_done);
+        }
+    };
+    Probe.started = c.dispatch_semaphore_create(0);
+    Probe.gate = c.dispatch_semaphore_create(0);
+    Probe.other_done = c.dispatch_semaphore_create(0);
+    Probe.done = c.dispatch_semaphore_create(0);
+    defer for ([_]c.dispatch_semaphore_t{ Probe.started, Probe.gate, Probe.other_done, Probe.done }) |semaphore| {
+        c.dispatch_release(.{ ._dsema = semaphore });
+    };
+
+    const pid = 5001;
+    const queue = retainQueue(pid) orelse return error.TestUnexpectedResult;
+    defer releaseQueue(queue);
+    setHandler(.scan, Probe.handler);
+    setHandler(.query_retry, Probe.otherHandler);
+    try std.testing.expect(submit(pid, .scan));
+    _ = c.dispatch_semaphore_wait(Probe.started, c.DISPATCH_TIME_FOREVER);
+    c.dispatch_async_f(queue, null, Probe.callback);
+
+    // A blocked app must not stop a different app's jobs.
+    const other_submitted = submit(5002, .query_retry);
+    const other_result = c.dispatch_semaphore_wait(Probe.other_done, c.dispatch_time(c.DISPATCH_TIME_NOW, std.time.ns_per_s));
+    _ = c.dispatch_semaphore_signal(Probe.gate);
+    _ = c.dispatch_semaphore_wait(Probe.done, c.DISPATCH_TIME_FOREVER);
+    try std.testing.expect(other_submitted);
+    try std.testing.expectEqual(@as(c_long, 0), other_result);
+    try std.testing.expectEqual(@as(u32, 1), Probe.runs_at_callback);
+
+    // Wait until the last job has fully returned. The queue must keep its
+    // slot even when no jobs are running, until we call releaseQueue.
+    c.dispatch_sync_f(queue, null, Probe.callback);
+    forget(pid);
+    const replacement = retainQueue(pid) orelse return error.TestUnexpectedResult;
+    defer releaseQueue(replacement);
+    try std.testing.expect(queue != replacement);
 }

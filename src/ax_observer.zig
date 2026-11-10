@@ -54,6 +54,7 @@ const WidRetryContext = struct {
     in_use: bool = false,
     observer: c.AXObserverRef = null,
     element: c.AXUIElementRef = null,
+    queue: c.dispatch_queue_t = null,
     pid: i32 = 0,
     attempts_remaining: u8 = 0,
 };
@@ -770,17 +771,34 @@ fn runScan(app: app_queue.App) void {
 /// Acquire a WID retry context from the fixed-size pool.
 ///
 /// Thread-safety: acquires g_ax_lock internally.
-fn acquireWidRetryCtx() ?*WidRetryContext {
+fn acquireWidRetryCtx(observer: c.AXObserverRef, element: c.AXUIElementRef, pid: i32) ?*WidRetryContext {
     c.os_unfair_lock_lock(&g_ax_lock);
     defer c.os_unfair_lock_unlock(&g_ax_lock);
 
     if (!g_is_running) return null;
     for (&g_wid_retry_contexts) |*ctx| {
+        if (!ctx.in_use or ctx.observer != observer or ctx.pid != pid) continue;
+        // AX can report the same new window more than once before it has an ID.
+        // Checking whether these are the same window does not contact the app.
+        if (c.CFEqual(@ptrCast(ctx.element), @ptrCast(element)) != 0) return null;
+    }
+    for (&g_wid_retry_contexts) |*ctx| {
         if (ctx.in_use) continue;
-        ctx.* = .{ .in_use = true };
+        const queue = app_queue.retainQueue(pid) orelse return null;
+        _ = c.CFRetain(@ptrCast(observer));
+        _ = c.CFRetain(@ptrCast(element));
+        ctx.* = .{
+            .in_use = true,
+            .observer = observer,
+            .element = element,
+            .queue = queue,
+            .pid = pid,
+            .attempts_remaining = wid_retry_attempts_max,
+        };
         c.dispatch_group_enter(g_wid_retry_group);
         return ctx;
     }
+    log.warn("AX window-id retry pool exhausted pid={d} limit={d}", .{ pid, max_wid_retry_contexts });
     return null;
 }
 
@@ -795,6 +813,7 @@ fn releaseWidRetryCtx(ctx: *WidRetryContext) void {
     if (ctx.element != null) {
         c.CFRelease(@ptrCast(ctx.element));
     }
+    app_queue.releaseQueue(ctx.queue);
     ctx.* = .{};
     c.dispatch_group_leave(g_wid_retry_group);
 }
@@ -844,7 +863,7 @@ fn retryResolveWid(context: ?*anyopaque) callconv(.c) void {
     ctx.attempts_remaining -= 1;
     c.dispatch_after_f(
         c.dispatch_time(c.DISPATCH_TIME_NOW, @as(i64, @intCast(wid_retry_delay_ms)) * c.NSEC_PER_MSEC),
-        widRetryQueue(),
+        ctx.queue,
         ctx,
         retryResolveWid,
     );
@@ -857,36 +876,13 @@ fn isObserverCurrent(pid: i32, observer: c.AXObserverRef) bool {
     return g_app_observers[index].observer == observer;
 }
 
-/// Each retry sends one short AX message, so a shared background queue is
-/// enough; it keeps them off both the main thread and the AX thread.
-fn widRetryQueue() c.dispatch_queue_t {
-    return c.dispatch_get_global_queue(c.QOS_CLASS_USER_INITIATED, 0);
-}
-
 fn scheduleWidResolutionRetry(observer: c.AXObserverRef, element: c.AXUIElementRef, pid: i32) void {
-    const ctx = acquireWidRetryCtx() orelse {
-        log.warn("AX window-id retry pool exhausted pid={d} limit={d}", .{ pid, max_wid_retry_contexts });
-        return;
-    };
-
-    const retained_observer = c.CFRetain(@ptrCast(observer)) orelse {
-        releaseWidRetryCtx(ctx);
-        return;
-    };
-    ctx.observer = @ptrCast(@constCast(retained_observer));
-
-    const retained_element = c.CFRetain(@ptrCast(element)) orelse {
-        releaseWidRetryCtx(ctx);
-        return;
-    };
-    ctx.element = @ptrCast(@constCast(retained_element));
+    const ctx = acquireWidRetryCtx(observer, element, pid) orelse return;
     _ = c.AXUIElementSetMessagingTimeout(ctx.element, setup_timeout_seconds);
-    ctx.pid = pid;
-    ctx.attempts_remaining = wid_retry_attempts_max;
 
     c.dispatch_after_f(
         c.dispatch_time(c.DISPATCH_TIME_NOW, @as(i64, @intCast(wid_retry_delay_ms)) * c.NSEC_PER_MSEC),
-        widRetryQueue(),
+        ctx.queue,
         ctx,
         retryResolveWid,
     );
