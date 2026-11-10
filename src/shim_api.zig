@@ -1,4 +1,4 @@
-//! Shared ABI types/constants plus the two extern symbols that bridge leaf
+//! Shared ABI types/constants plus the extern symbols that bridge leaf
 //! modules to main.zig-owned state without importing the root module.
 
 const event_mod = @import("event.zig");
@@ -30,6 +30,7 @@ pub const BW_EVENT_MENU_CLOSED: u8 = @backingInt(event_mod.EventKind.menu_closed
 pub const BW_EVENT_PROCESS_SWEEP_DUE: u8 = @backingInt(event_mod.EventKind.process_sweep_due);
 pub const BW_EVENT_FOCUS_RETRY_OBSERVED: u8 = @backingInt(event_mod.EventKind.focus_retry_observed);
 pub const BW_EVENT_FOCUS_RETRY_UNANSWERED: u8 = @backingInt(event_mod.EventKind.focus_retry_unanswered);
+pub const BW_EVENT_WINDOW_READINESS_OBSERVED: u8 = @backingInt(event_mod.EventKind.window_readiness_observed);
 
 pub const BW_HK_FOCUS_WORKSPACE: u8 = @backingInt(event_mod.EventKind.hk_focus_workspace);
 pub const BW_HK_FOCUS_PREVIOUS_WORKSPACE: u8 = @backingInt(event_mod.EventKind.hk_focus_previous_workspace);
@@ -71,4 +72,5 @@ pub const bw_frame = extern struct {
 
 // Thread-safe: may be called from per-app AX observer background threads.
 pub extern fn bw_emit_event(kind: u8, pid: i32, wid: u32) void;
+pub extern fn bw_emit_event_detail(kind: u8, pid: i32, wid: u32, detail: u8) void;
 pub extern fn bw_set_keybinds(binds: ?[*]const bw_keybind, count: u32) void;

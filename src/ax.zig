@@ -120,40 +120,40 @@ pub fn strings() ?*const AxStrings {
     return &g_strings.?;
 }
 
-pub fn deinitStrings() void {
-    if (g_strings) |s| {
-        const refs = [_]c.CFStringRef{
-            s.system_dialog_subrole,
-            s.tab_group_role,
-            s.tabs_attr,
-            s.children_attr,
-            s.focused_attr,
-            s.fullscreen_button_attr,
-            s.zoom_button_attr,
-            s.minimize_button_attr,
-            s.close_button_attr,
-            s.enhanced_ui_attr,
-            s.modal_attr,
-            s.unknown_subrole,
-            s.dialog_subrole,
-            s.floating_window_subrole,
-            s.standard_window_subrole,
-            s.subrole_attr,
-            s.unknown_role,
-            s.window_role,
-            s.role_attr,
-            s.main_attr,
-            s.raise_action,
-            s.position_attr,
-            s.size_attr,
-            s.windows_attr,
-            s.focused_window_attr,
-        };
-        for (refs) |value| {
-            releaseAxString(value);
-        }
-        g_strings = null;
+/// Returns a retained attribute value; the caller must release it.
+pub fn copyAttribute(element: c.AXUIElementRef, attr: c.CFStringRef) c.CFTypeRef {
+    var value: c.CFTypeRef = null;
+    trace.countAx();
+    const err = c.AXUIElementCopyAttributeValue(element, attr, &value);
+    return if (err == c.kAXErrorSuccess) value else null;
+}
+
+/// True when the AX attribute exists and is non-null on the element.
+pub fn hasAttribute(element: c.AXUIElementRef, attr: c.CFStringRef) bool {
+    const value = copyAttribute(element, attr) orelse return false;
+    c.CFRelease(value);
+    return true;
+}
+
+/// True when the AX attribute is a CFBoolean set to true.
+pub fn isAttributeTrue(element: c.AXUIElementRef, attr: c.CFStringRef) bool {
+    const value = copyAttribute(element, attr) orelse return false;
+    defer c.CFRelease(value);
+    return c.CFEqual(value, @ptrCast(c.kCFBooleanTrue)) != 0;
+}
+
+/// Returns true when a window exposes a real top-level-window signal: any
+/// title-bar button (close/minimize/zoom/fullscreen) or being the app's main or
+/// focused window. Transient popups (autocomplete lists, tooltips, context
+/// menus) report a dialog or floating subrole but have none of these, so this
+/// guard keeps them from being tiled.
+pub fn hasRealWindowSignal(win: c.AXUIElementRef, ax: *const AxStrings) bool {
+    std.debug.assert(win != null);
+
+    for ([_]c.CFStringRef{ ax.close_button_attr, ax.minimize_button_attr, ax.zoom_button_attr, ax.fullscreen_button_attr }) |attr| {
+        if (hasAttribute(win, attr)) return true;
     }
+    return isAttributeTrue(win, ax.main_attr) or isAttributeTrue(win, ax.focused_attr);
 }
 
 /// Accessibility trust check.
@@ -209,6 +209,69 @@ fn findWindowWithTimeout(pid: i32, target_wid: u32, timeout_seconds: ?f32) ?c.AX
         return win;
     }
 
+    return null;
+}
+
+/// Resolve several window ids from one copy of the app's window list, then
+/// the app's focused window for an id the list lacks: remote-hosted panels
+/// (open/save dialogs) can be focused without being listed. `out[i]` gets a
+/// retained element for `target_wids[i]`, or null; the caller releases each.
+pub fn findWindows(pid: i32, target_wids: []const u32, out: []?c.AXUIElementRef, timeout_seconds: f32) void {
+    std.debug.assert(pid > 0);
+    std.debug.assert(out.len >= target_wids.len);
+    @memset(out[0..target_wids.len], null);
+
+    const app = c.AXUIElementCreateApplication(pid) orelse return;
+    defer c.CFRelease(@ptrCast(app));
+    _ = c.AXUIElementSetMessagingTimeout(app, timeout_seconds);
+    const ax = strings() orelse return;
+
+    var missing_count = target_wids.len;
+    var windows: c.CFArrayRef = null;
+    trace.countAx();
+    if (c.AXUIElementCopyAttributeValue(app, ax.windows_attr, @ptrCast(&windows)) == c.kAXErrorSuccess) {
+        if (windows) |windows_ref| {
+            defer c.CFRelease(@ptrCast(windows_ref));
+            const count = c.CFArrayGetCount(windows_ref);
+            var index: c.CFIndex = 0;
+            while (index < count and missing_count > 0) : (index += 1) {
+                const win: c.AXUIElementRef = @ptrCast(c.CFArrayGetValueAtIndex(windows_ref, index) orelse continue);
+                // Elements copied out of the list do not inherit the app's timeout.
+                _ = c.AXUIElementSetMessagingTimeout(win, timeout_seconds);
+
+                var wid: u32 = 0;
+                trace.countAx();
+                if (_AXUIElementGetWindow(win, &wid) != c.kAXErrorSuccess) continue;
+                const slot = unresolvedIndex(target_wids, out, wid) orelse continue;
+                _ = c.CFRetain(@ptrCast(win));
+                out[slot] = win;
+                missing_count -= 1;
+            }
+        }
+    }
+    if (missing_count == 0) return;
+
+    var focused: c.AXUIElementRef = null;
+    trace.countAx();
+    if (c.AXUIElementCopyAttributeValue(app, ax.focused_window_attr, @ptrCast(&focused)) != c.kAXErrorSuccess) return;
+    const focused_ref = focused orelse return;
+    _ = c.AXUIElementSetMessagingTimeout(focused_ref, timeout_seconds);
+
+    var wid: u32 = 0;
+    trace.countAx();
+    if (_AXUIElementGetWindow(focused_ref, &wid) == c.kAXErrorSuccess) {
+        if (unresolvedIndex(target_wids, out, wid)) |slot| {
+            out[slot] = focused_ref;
+            return;
+        }
+    }
+    c.CFRelease(@ptrCast(focused_ref));
+}
+
+fn unresolvedIndex(target_wids: []const u32, out: []const ?c.AXUIElementRef, wid: u32) ?usize {
+    for (target_wids, 0..) |target_wid, index| {
+        if (target_wid == wid and out[index] == null) return index;
+    }
     return null;
 }
 
@@ -290,38 +353,6 @@ pub fn deinitElementCache() void {
         c.CFRelease(@ptrCast(entry.element));
         slot.* = null;
     }
-}
-
-/// Resolve a window id via the app's AXFocusedWindow attribute. Open/save
-/// panels are remote-hosted by openAndSavePanelService and can be the app's
-/// focused window without ever appearing in its AXWindows array, so the list
-/// scan in findWindow misses them. Returns the element only when its window id
-/// matches `target_wid`. The returned element is retained; the caller must
-/// CFRelease it.
-pub fn focusedWindowIfMatches(pid: i32, target_wid: u32, timeout_seconds: f32) ?c.AXUIElementRef {
-    std.debug.assert(pid > 0);
-    std.debug.assert(target_wid > 0);
-    std.debug.assert(timeout_seconds > 0);
-
-    const app = c.AXUIElementCreateApplication(pid) orelse return null;
-    defer c.CFRelease(@ptrCast(app));
-    _ = c.AXUIElementSetMessagingTimeout(app, timeout_seconds);
-
-    const ax = strings() orelse return null;
-    var focused: c.AXUIElementRef = null;
-    trace.countAx();
-    const err = c.AXUIElementCopyAttributeValue(app, ax.focused_window_attr, @ptrCast(&focused));
-    if (err != c.kAXErrorSuccess or focused == null) return null;
-    const focused_ref = focused orelse return null;
-    _ = c.AXUIElementSetMessagingTimeout(focused_ref, timeout_seconds);
-
-    var wid: u32 = 0;
-    trace.countAx();
-    if (_AXUIElementGetWindow(focused_ref, &wid) != c.kAXErrorSuccess or wid != target_wid) {
-        c.CFRelease(@ptrCast(focused_ref));
-        return null;
-    }
-    return focused_ref;
 }
 
 /// Number of tabs in a window's native tab bar, or 0 when it has none.

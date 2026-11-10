@@ -29,16 +29,24 @@ pub const Counters = struct {
 
 var global_counters: Counters = .{};
 
+extern "c" fn pthread_main_np() c_int;
+
+// Spans measure main-thread work, and the shared AX helpers also run on app
+// queues, whose calls would race the counters and land in unrelated spans.
+inline fn isCounting() bool {
+    return enabled and pthread_main_np() != 0;
+}
+
 pub inline fn countAx() void {
-    if (enabled) global_counters.ax +%= 1;
+    if (isCounting()) global_counters.ax +%= 1;
 }
 
 pub inline fn countSkylight() void {
-    if (enabled) global_counters.skylight +%= 1;
+    if (isCounting()) global_counters.skylight +%= 1;
 }
 
 pub inline fn countWindowList() void {
-    if (enabled) global_counters.window_list +%= 1;
+    if (isCounting()) global_counters.window_list +%= 1;
 }
 
 pub const Span = struct {

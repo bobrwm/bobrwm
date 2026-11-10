@@ -27,6 +27,8 @@ pub const Job = enum {
     observe,
     /// ax_observer: look for windows the app never announced.
     scan,
+    /// window_readiness: answer readiness requests.
+    readiness,
 };
 
 /// One app process as seen by a job. `index` names the app's slot until the
