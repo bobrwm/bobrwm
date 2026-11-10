@@ -40,10 +40,6 @@ pub const BW_MOD_SHIFT: u8 = 1 << 1;
 pub const BW_MOD_CMD: u8 = 1 << 2;
 pub const BW_MOD_CTRL: u8 = 1 << 3;
 
-pub const BW_MANAGE_REJECT: u8 = 0;
-pub const BW_MANAGE_READY: u8 = 1;
-pub const BW_MANAGE_PENDING: u8 = 2;
-
 pub const bw_keybind = extern struct {
     keycode: u16,
     mods: u8,
