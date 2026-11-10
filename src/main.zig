@@ -28,11 +28,16 @@ const objc_classes = @import("objc_classes.zig");
 const animation_mod = @import("animation.zig");
 const display_link = @import("display_link.zig");
 const ax_mod = @import("ax.zig");
+const app_queue = @import("app_queue.zig");
+const ax_backoff = @import("ax_backoff.zig");
 const ax_writer = @import("ax_writer.zig");
+const focus_query = @import("focus_query.zig");
 const geometry_mod = @import("geometry.zig");
 const spsc_queue = @import("spsc_queue.zig");
 const trace = @import("trace.zig");
+const watchdog = @import("watchdog.zig");
 const focus_follows_mouse = @import("focus_follows_mouse.zig");
+const window_readiness = @import("window_readiness.zig");
 const window_server = @import("window_server.zig");
 
 extern fn _AXUIElementGetWindow(element: c.AXUIElementRef, wid: *u32) c.AXError;
@@ -64,27 +69,15 @@ pub const std_options = std.Options{
 const log = std.log.scoped(.bobrwm);
 
 const EventQueue = spsc_queue.Queue(event_mod.Event, 1024);
-// Effects raised inside an effect handler wait until it returns, and one
-// cleanup pass can remove every managed window with a window_removed each.
-// Those wait in their own 8-byte slots so the 192-byte general queue stays
-// small: a removal burst costs ~9 KiB of slots instead of ~200 KiB.
+// One cleanup pass can queue a window_removed for every managed window while
+// an effect handler runs. Those wait in their own small slots so the queue of
+// full-size effects stays short.
 const StateEffectQueue = spsc_queue.Queue(state_mod.Effect, 64);
 const WindowRemoval = @FieldType(state_mod.Effect, "window_removed");
 const WindowRemovalQueue = spsc_queue.Queue(WindowRemoval, state_mod.max_managed_windows + 64);
 
 /// Poll cadence for windows that are waiting on role readiness or visibility.
 const role_poll_interval_ms: u64 = 100;
-/// Keep one slow app AX server from monopolizing the main event drain.
-const role_poll_ax_timeout_s: f32 = 0.025;
-const role_poll_work_budget_ms: i128 = 30;
-/// Bounds every other readiness query. Slow apps (Electron at startup)
-/// answer AX in 50-200ms; a hung one would hold AX's default 6s per message,
-/// and readiness sends up to six.
-const readiness_ax_timeout_s: f32 = 0.25;
-/// A hung app is skipped this long after a readiness query times out, so it
-/// costs one stall per backoff instead of one per poll tick.
-const ax_hang_backoff_ms: i128 = 2000;
-const max_ax_hangs = 16;
 /// Retry budget for deferred candidates before they are dropped or fall back.
 /// Electron-family apps can take multiple seconds before publishing stable AX roles.
 const role_poll_attempts_max: u8 = 50;
@@ -94,6 +87,11 @@ const app_launch_retry_attempts_max: u8 = 10;
 /// focused window for several hundred milliseconds after activation;
 /// 10 attempts at the 100ms role-poll cadence covers that window.
 const focus_retry_attempts_max: u8 = 10;
+/// An app can leave AX unanswered for many seconds while it launches. One
+/// that never reports a launch is never observed, so a resolved retry is
+/// what adopts its window. Unanswered queries run back to back at the 250ms
+/// query timeout, so 120 wait ~30s before giving up on a hung app.
+const focus_retry_unanswered_max: u8 = 120;
 const mouse_focus_handoff_ns: i64 = 40 * std.time.ns_per_ms;
 const mouse_focus_confirmation_ns: i64 = std.time.ns_per_s;
 /// Quiet period after the last display notification before the trailing
@@ -106,8 +104,7 @@ const native_space_capacity_settle_attempts: u8 = 20;
 const native_space_capacity_poll_delay_us: c_uint = 25_000;
 const native_space_topology_poll_interval_ms: u64 = 1000;
 /// Termination notifications can be lost; a missed one keeps a dead app's
-/// windows and observer until this sweep. Each check costs under a
-/// microsecond per process, but nothing needs a faster repair.
+/// windows and observer until this sweep.
 const process_sweep_interval_ms: u64 = 60_000;
 const DisplayInfo = struct {
     id: u32,
@@ -121,7 +118,7 @@ const DisplayInfo = struct {
     settings: config_mod.DisplaySettings,
 };
 
-const WindowRoleState = state_mod.WindowReadiness;
+const WindowReadiness = state_mod.WindowReadiness;
 
 const FocusEventSource = state_mod.FocusEventSource;
 
@@ -151,8 +148,6 @@ fn nsString(str: [*:0]const u8) objc.Object {
 // AX attribute strings and window-frame plumbing live in ax.zig; aliases
 // keep the many existing call sites unchanged.
 const AxStrings = ax_mod.AxStrings;
-const ensureAxStrings = ax_mod.strings;
-const deinitAxStrings = ax_mod.deinitStrings;
 const findAxWindow = ax_mod.findWindow;
 
 fn displayIndexById(display_id: u32) ?usize {
@@ -472,64 +467,27 @@ fn frontmostApplicationPid() ?i32 {
     return pid;
 }
 
-fn focusedWindowIdForPid(pid: i32) ?u32 {
-    std.debug.assert(pid > 0);
-
-    const focused_wid = bw_ax_get_focused_window(pid);
-    if (focused_wid == 0) return null;
-
-    return focused_wid;
+/// Log a focus event and unwrap the window `focus_query` observed for it; 0
+/// means the app had none or did not answer in time.
+fn focusEventWindowId(comptime event_name: []const u8, ev: *const event_mod.Event) ?u32 {
+    log.debug(event_name ++ " pid={} wid={}", .{ ev.pid, ev.wid });
+    if (ev.wid == 0) return null;
+    return ev.wid;
 }
 
-fn focusedWindowIdForLoggedEvent(comptime event_name: []const u8, pid: i32) ?u32 {
-    const focused_wid = focusedWindowIdForPid(pid);
-    log.debug(event_name ++ " pid={} wid={}", .{ pid, focused_wid orelse 0 });
-    return focused_wid;
-}
+/// The managed window hotkey actions apply to: the focused workspace's focus,
+/// while its app is frontmost. Read from the model, which focus events and
+/// bobrwm's own focus requests keep current, so a hung frontmost app cannot
+/// hold a hotkey on an AX query.
+fn actionTargetWindowId() ?u32 {
+    const wid = focusedWorkspaceWindow(activeWorkspace()) orelse return null;
+    const win = managedWindow(wid) orelse return null;
 
-fn managedLeaderForFocusedWindow(pid: i32, focused_wid: u32) ?window_mod.Window {
-    std.debug.assert(pid > 0);
-    std.debug.assert(focused_wid != 0);
-    const leader_wid = g_state.windowTabLeader(focused_wid);
-    const leader = managedWindow(leader_wid) orelse return null;
-    if (leader.pid != pid) return null;
-    return leader;
-}
+    // Focus moved to an app with no managed window focused.
+    const front_pid = frontmostApplicationPid() orelse return null;
+    if (win.pid != front_pid) return null;
 
-/// Resolve the frontmost app's AX-focused window to its visible layout owner.
-fn reconciledFocusedWindowId() ?u32 {
-    const pid = frontmostApplicationPid() orelse return null;
-    const focused_wid = focusedWindowIdForPid(pid) orelse return null;
-
-    if (managedLeaderForFocusedWindow(pid, focused_wid)) |win| {
-        if (managedWindowSpace(win.wid)) |space| {
-            if (spaceVisible(space)) {
-                // A known suppressed member can become AX-focused without a
-                // notification reaching the main loop first. The leader owns the
-                // fullscreen flag, but retile must address this active member.
-                if (!g_state.isWorkspaceTransitionActive()) {
-                    _ = syncFocusStateForWindowId(focused_wid, .keyboard);
-                }
-                return win.wid;
-            }
-        }
-    }
-
-    // Native tabs can replace the focused CG window ID without emitting a
-    // creation event. Do not send the first hotkey after a tab switch to the
-    // stale workspace cache: reconcile the AX-reported ID synchronously, then
-    // resolve it back to the group's slot. Transition focus remains isolated
-    // until its settle window closes, as with asynchronous AX focus events.
-    if (!g_state.isWorkspaceTransitionActive()) {
-        log.debug("hotkey target reconciling unknown focused window pid={d} wid={d}", .{ pid, focused_wid });
-        reconcileFocusedWindow(pid, focused_wid);
-        if (managedLeaderForFocusedWindow(pid, focused_wid)) |win| {
-            const space = managedWindowSpace(win.wid) orelse return null;
-            if (spaceVisible(space)) return win.wid;
-        }
-    }
-
-    return null;
+    return wid;
 }
 
 const ActionContext = struct {
@@ -539,7 +497,7 @@ const ActionContext = struct {
 };
 
 fn actionContext() ?ActionContext {
-    const focused_wid = reconciledFocusedWindowId() orelse return null;
+    const focused_wid = actionTargetWindowId() orelse return null;
     const focused_win = managedWindow(focused_wid) orelse return null;
     const workspace = managedWindowSpace(focused_win.wid) orelse return null;
     if (!spaceVisible(workspace)) return null;
@@ -830,15 +788,15 @@ fn observeArcOverlay(pid: i32, wid: u32) ?focus_follows_mouse.ArcOverlayObservat
 
     const win = ax_mod.findWindowWithMessagingTimeout(pid, wid, 0.04) orelse return null;
     defer c.CFRelease(@ptrCast(win));
-    const ax = ensureAxStrings() orelse return null;
-    const subrole = copyAxAttribute(win, ax.subrole_attr) orelse return null;
+    const ax = ax_mod.strings() orelse return null;
+    const subrole = ax_mod.copyAttribute(win, ax.subrole_attr) orelse return null;
     defer c.CFRelease(subrole);
     var observation: focus_follows_mouse.ArcOverlayObservation = .{
         .is_system_dialog = c.CFEqual(subrole, @ptrCast(ax.system_dialog_subrole)) != 0,
     };
     if (observation.is_system_dialog) {
-        observation.is_modal = axBooleanAttributeTrue(win, ax.modal_attr);
-        if (!observation.is_modal) observation.has_real_window_signal = windowHasRealWindowSignal(win, ax);
+        observation.is_modal = ax_mod.isAttributeTrue(win, ax.modal_attr);
+        if (!observation.is_modal) observation.has_real_window_signal = ax_mod.hasRealWindowSignal(win, ax);
     }
     return observation;
 }
@@ -853,7 +811,7 @@ fn mouseFocusedWindowId(pid: i32) u32 {
         if (window.value == null) return 0;
         return @intCast(window.msgSend(i64, "windowNumber", .{}));
     }
-    return axFocusedWindow(pid, 0.04);
+    return focusedWindowId(pid, 0.04) orelse 0;
 }
 
 fn beginMouseFocus(pid: i32, wid: u32) void {
@@ -1162,7 +1120,7 @@ fn displayUuidBytes(display_id: u32) ?[16]u8 {
 
 /// Single synthetic display for when NSScreen reports none we can manage.
 fn useFallbackDisplay() void {
-    const frame = bw_get_display_frame();
+    const frame = mainDisplayFrame();
     g_display_count = 1;
     g_displays[0] = .{
         .id = 1,
@@ -1324,16 +1282,6 @@ fn inferDisplayIdForWindow(wid: u32) ?u32 {
     return displayIdForFrame(frame);
 }
 
-/// Whether WindowServer still knows `wid`. An unreadable answer counts as
-/// present so a transient CG failure never drops a live window.
-fn windowServerHasWindow(wid: u32) bool {
-    std.debug.assert(wid != 0);
-    trace.countWindowList();
-    var existing_buffer: [1]u32 = undefined;
-    const existing = window_server.existingWindowIds(&.{wid}, &existing_buffer) orelse return true;
-    return existing.len > 0;
-}
-
 /// Live WindowServer bounds for a window. `Window.frame` records bobrwm's last
 /// accepted target or adopted user/external geometry; callers that need what
 /// is physically visible now must still ask WindowServer.
@@ -1363,7 +1311,7 @@ fn isVisibleOnScreen(wid: u32) bool {
         const space = managedWindowSpace(win.wid) orelse return false;
         if (!spaceVisible(space)) return false;
     }
-    return bw_is_window_on_screen(wid);
+    return isInOnScreenWindowList(wid);
 }
 
 fn framesEqual(lhs: window_mod.Window.Frame, rhs: window_mod.Window.Frame) bool {
@@ -1396,9 +1344,6 @@ var g_workspace_application_inventory_count: usize = 0;
 var g_state_effect_queue: StateEffectQueue = .{};
 var g_window_removal_queue: WindowRemovalQueue = .{};
 var g_state_effect_drain_active = false;
-var g_ax_hangs: [max_ax_hangs]AxHang = @splat(.{});
-var g_role_poll_cursor: usize = 0;
-var g_deferred_poll_cursor: usize = 0;
 var g_displays: [workspace_mod.max_displays]DisplayInfo = undefined;
 var g_display_count: usize = 0;
 var g_workspace_observer: ?objc.Object = null;
@@ -1458,6 +1403,9 @@ fn nativeTabGroupMoveConfirmed(wid: u32, pending: state_mod.PendingNativeWindowM
 /// needed because same-process switches require an Electron-compatible delay.
 var g_last_focused_pid: i32 = 0;
 var g_last_focused_window_id: u32 = 0;
+/// Latest app activation, used to drop an earlier activation's focus answer
+/// that `focus_query` delivered late.
+var g_last_activated_pid: i32 = 0;
 /// Compiled keybind table referenced (not copied) by the hotkey event tap.
 /// The caller of bw_set_keybinds owns the storage and must keep it alive for
 /// as long as the event tap can fire; main's KeybindTable guarantees this.
@@ -1644,9 +1592,8 @@ fn deinitWorkspaceObservers() void {
     g_workspace_observer = null;
 }
 
-/// Get the usable display frame (menu bar / dock excluded), CG coordinates.
-/// Exported for C callers while implemented in Zig via zig-objc.
-fn bw_get_display_frame() shim.bw_frame {
+/// The usable display frame (menu bar / dock excluded), CG coordinates.
+fn mainDisplayFrame() shim.bw_frame {
     const NSScreen = objc.getClass("NSScreen") orelse return .{
         .x = 0,
         .y = 0,
@@ -1707,23 +1654,19 @@ fn axPrompt() void {
     _ = c.AXIsProcessTrustedWithOptions(@ptrCast(options_value));
 }
 
-/// Get the focused window ID for a given application PID.
-/// Returns 0 when no focused AX window is available.
-fn bw_ax_get_focused_window(pid: i32) u32 {
-    return axFocusedWindow(pid, null);
-}
-
-fn axFocusedWindow(pid: i32, messaging_timeout_seconds: ?f32) u32 {
+/// The app's AX-focused window ID, or null when it has none. Without a
+/// timeout the query waits AX's 6s default.
+fn focusedWindowId(pid: i32, messaging_timeout_seconds: ?f32) ?u32 {
     std.debug.assert(pid > 0);
 
-    const app = c.AXUIElementCreateApplication(pid) orelse return 0;
+    const app = c.AXUIElementCreateApplication(pid) orelse return null;
     defer c.CFRelease(@ptrCast(app));
     if (messaging_timeout_seconds) |seconds| {
         std.debug.assert(seconds > 0);
         _ = c.AXUIElementSetMessagingTimeout(app, seconds);
     }
 
-    const ax = ensureAxStrings() orelse return 0;
+    const ax = ax_mod.strings() orelse return null;
     const focused_attr = ax.focused_window_attr;
 
     var focused: c.AXUIElementRef = null;
@@ -1733,19 +1676,21 @@ fn axFocusedWindow(pid: i32, messaging_timeout_seconds: ?f32) u32 {
         focused_attr,
         @ptrCast(&focused),
     );
-    if (err != c.kAXErrorSuccess or focused == null) return 0;
-    const focused_ref = focused orelse return 0;
+    if (err != c.kAXErrorSuccess or focused == null) return null;
+    const focused_ref = focused orelse return null;
     defer c.CFRelease(@ptrCast(focused_ref));
 
     var wid: u32 = 0;
     trace.countAx();
     _ = _AXUIElementGetWindow(focused_ref, &wid);
+    if (wid == 0) return null;
+
     return wid;
 }
 
 /// Check if a window currently appears in the on-screen CG window list.
 /// This excludes desktop elements and naturally filters background tabs.
-fn bw_is_window_on_screen(target_wid: u32) bool {
+fn isInOnScreenWindowList(target_wid: u32) bool {
     std.debug.assert(target_wid > 0);
 
     const options: cg_extra.CGWindowListOption =
@@ -1834,7 +1779,7 @@ const BoundedSnapshotResult = struct {
     truncated: bool,
 };
 
-fn bw_get_app_window_ids(pid: i32, out: []u32) BoundedSnapshotResult {
+fn axAppWindowIds(pid: i32, out: []u32) BoundedSnapshotResult {
     if (out.len == 0) return .{ .count = 0, .truncated = true };
 
     std.debug.assert(pid > 0);
@@ -1843,7 +1788,7 @@ fn bw_get_app_window_ids(pid: i32, out: []u32) BoundedSnapshotResult {
     const app = c.AXUIElementCreateApplication(pid) orelse return .{ .count = 0, .truncated = false };
     defer c.CFRelease(@ptrCast(app));
 
-    const ax = ensureAxStrings() orelse return .{ .count = 0, .truncated = false };
+    const ax = ax_mod.strings() orelse return .{ .count = 0, .truncated = false };
     const windows_attr = ax.windows_attr;
 
     var windows: c.CFArrayRef = null;
@@ -1902,47 +1847,22 @@ fn axCanResize(win_ref: c.AXUIElementRef, ax: *const AxStrings) bool {
     return err == c.kAXErrorSuccess and result != 0;
 }
 
-/// Raise and focus a window, then activate its owning app.
-///
-/// When switching between windows within the same process, a 40ms delay is
-/// inserted between the raise and the activation. Some apps (notably Electron)
-/// get confused by instantaneous same-process focus switches and fail to render
-/// the focus ring or route keyboard events to the wrong window. Yabai uses the
-/// same 40ms delay for same-PSN switches.
-fn bw_ax_focus_window(pid: i32, wid: u32) bool {
-    const same_process_focus_delay_us: c_uint = 40_000; // 40ms, matches yabai
-
+/// Raise and focus a window, then activate its owning app, on the app's
+/// writer queue. The last-focused process updates now so the next request
+/// sees this switch.
+fn focusWindow(pid: i32, wid: u32) void {
     std.debug.assert(pid > 0);
     std.debug.assert(wid > 0);
 
     if (managedWindowSpace(wid)) |space| {
-        if (g_state.native_topology.observedWorkspace(space.display_id) == null) return false;
-    }
-    const win = ax_mod.retainWindow(pid, wid) orelse return false;
-    defer c.CFRelease(@ptrCast(win));
-
-    const ax = ensureAxStrings() orelse return false;
-    const raise_action = ax.raise_action;
-    const main_attr = ax.main_attr;
-
-    const is_same_process = (g_last_focused_pid == pid);
-
-    _ = c.AXUIElementPerformAction(win, raise_action);
-    _ = c.AXUIElementSetAttributeValue(win, main_attr, c.kCFBooleanTrue);
-
-    // Delay activation for same-process switches so the app has time to
-    // process the deactivation of the previous window before the new
-    // activation arrives.
-    if (is_same_process) {
-        _ = c.usleep(same_process_focus_delay_us);
+        if (g_state.native_topology.observedWorkspace(space.display_id) == null) return;
     }
 
-    const focused = setFrontProcessViaSkylight(pid, wid);
-    if (focused) {
-        g_last_focused_pid = pid;
-        g_last_focused_window_id = wid;
-    }
-    return focused;
+    const is_same_process = g_last_focused_pid == pid;
+    if (!ax_writer.focus(pid, wid, is_same_process)) return;
+
+    g_last_focused_pid = pid;
+    g_last_focused_window_id = wid;
 }
 
 /// Carbon PSN lookup. Deprecated since 10.9 but still exported and functional;
@@ -1993,183 +1913,75 @@ fn postSameProcessFocusEvent(
     return post_event(psn, &event) == 0;
 }
 
-const AxHang = struct {
-    process_id: i32 = 0,
-    until_ns: i128 = 0,
-};
-
-fn isAxBackedOff(pid: i32) bool {
-    const now_ns = nanoTimestamp();
-    for (g_ax_hangs) |hang| {
-        if (hang.process_id == pid and hang.until_ns > now_ns) return true;
-    }
-    return false;
-}
-
-/// Reuse the PID's slot, else the one expiring first: expired and unused
-/// slots sort before every live backoff.
-fn backOffAx(pid: i32) void {
+/// Readiness for discovery and addNewWindow, which decide on the spot.
+/// Pending while the app is backed off as hung: the window is queued, and the
+/// role poll asks again on the app's queue.
+fn windowReadiness(pid: i32, wid: u32) WindowReadiness {
     std.debug.assert(pid > 0);
-    var slot = &g_ax_hangs[0];
-    for (&g_ax_hangs) |*hang| {
-        if (hang.process_id == pid) {
-            slot = hang;
-            break;
-        }
-        if (hang.until_ns < slot.until_ns) slot = hang;
-    }
-    slot.* = .{
-        .process_id = pid,
-        .until_ns = nanoTimestamp() + ax_hang_backoff_ms * std.time.ns_per_ms,
-    };
-}
-
-/// Readiness for discovery, cleanup, and the deferred poll. Pending while the
-/// app is backed off as hung: discovery then queues the window, and cleanup
-/// keeps it, both of which a later poll revisits.
-fn manageStateForWindow(pid: i32, wid: u32) u8 {
-    std.debug.assert(pid > 0);
-    if (isAxBackedOff(pid)) return shim.BW_MANAGE_PENDING;
+    if (!isRegularActivationApp(pid)) return .reject;
+    if (ax_backoff.isBackedOff(pid)) return .pending;
 
     const started_ns = nanoTimestamp();
-    const state = manageStateForWindowWithMessagingTimeout(pid, wid, readiness_ax_timeout_s, true);
+    const readiness = window_readiness.query(pid, wid, window_readiness.timeout_seconds);
 
     // Pending after a full timeout means a message went unanswered. A slow
     // app that answered every message got a verdict, however long it took.
     const elapsed_ns = nanoTimestamp() - started_ns;
-    const timeout_ns: i128 = @intFromFloat(readiness_ax_timeout_s * std.time.ns_per_s);
-    if (state == shim.BW_MANAGE_PENDING and elapsed_ns >= timeout_ns) {
+    const timeout_ns: i128 = @intFromFloat(window_readiness.timeout_seconds * std.time.ns_per_s);
+    if (readiness == .pending and elapsed_ns >= timeout_ns) {
         log.debug("readiness: pid={d} wid={d} timed out after {d}ms; backing off", .{
             pid, wid, @divTrunc(elapsed_ns, std.time.ns_per_ms),
         });
-        backOffAx(pid);
+        ax_backoff.backOff(pid);
     }
-    return state;
+    return readiness;
 }
 
-fn manageStateForWindowWithMessagingTimeout(
-    pid: i32,
-    wid: u32,
-    timeout_seconds: f32,
-    should_try_focused: bool,
-) u8 {
-    std.debug.assert(pid > 0);
-    std.debug.assert(wid > 0);
-
-    if (!isRegularActivationApp(pid)) return shim.BW_MANAGE_REJECT;
-
-    // Remote-hosted panels (open/save dialogs) can be the app's focused window
-    // without appearing in AXWindows; without the focused-window fallback they
-    // stay PENDING and never reach the AXModal rejection below.
-    const listed = ax_mod.findWindowWithMessagingTimeout(pid, wid, timeout_seconds);
-    const win = listed orelse if (should_try_focused)
-        ax_mod.focusedWindowIfMatches(pid, wid, timeout_seconds)
-    else
-        null;
-    const win_ref = win orelse return shim.BW_MANAGE_PENDING;
-    defer c.CFRelease(@ptrCast(win_ref));
-
-    const ax = ensureAxStrings() orelse return shim.BW_MANAGE_PENDING;
-    // Native open/save panels are app-modal AX windows. They expose enough
-    // top-level-window signals to pass the dialog heuristic below, but tiling
-    // them resizes the parent app while the user is choosing a file.
-    if (axBooleanAttributeTrue(win_ref, ax.modal_attr)) return shim.BW_MANAGE_REJECT;
-
-    const role_attr = ax.role_attr;
-    var role_any: c.CFTypeRef = null;
-    trace.countAx();
-    const role_err = c.AXUIElementCopyAttributeValue(win_ref, role_attr, @ptrCast(&role_any));
-    if (role_err != c.kAXErrorSuccess or role_any == null) return shim.BW_MANAGE_PENDING;
-    const role_ref: c.CFStringRef = @ptrCast(role_any orelse return shim.BW_MANAGE_PENDING);
-    defer c.CFRelease(@ptrCast(role_ref));
-
-    const window_role = ax.window_role;
-    const unknown_role = ax.unknown_role;
-
-    const is_window = c.CFEqual(@ptrCast(role_ref), @ptrCast(window_role)) != 0;
-    const is_unknown_role = c.CFEqual(@ptrCast(role_ref), @ptrCast(unknown_role)) != 0;
-    if (!is_window) {
-        return if (is_unknown_role) shim.BW_MANAGE_PENDING else shim.BW_MANAGE_REJECT;
+/// Ask on the app's queue; the answer arrives as window_readiness_observed.
+fn requestReadiness(pid: i32, wid: u32, purpose: window_readiness.Purpose) void {
+    if (!isRegularActivationApp(pid)) {
+        applyReadiness(pid, wid, .{ .purpose = purpose, .answer = .reject });
+        return;
     }
+    window_readiness.request(pid, wid, purpose);
+}
 
-    const subrole_attr = ax.subrole_attr;
-    var subrole_any: c.CFTypeRef = null;
-    trace.countAx();
-    const subrole_err = c.AXUIElementCopyAttributeValue(win_ref, subrole_attr, @ptrCast(&subrole_any));
-    if (subrole_err != c.kAXErrorSuccess or subrole_any == null) return shim.BW_MANAGE_PENDING;
-    const subrole_ref: c.CFStringRef = @ptrCast(subrole_any orelse return shim.BW_MANAGE_PENDING);
-    defer c.CFRelease(@ptrCast(subrole_ref));
+fn applyReadiness(pid: i32, wid: u32, observation: window_readiness.Observation) void {
+    const readiness: WindowReadiness = switch (observation.answer) {
+        .reject => .reject,
+        .ready => .ready,
+        .pending => .pending,
+        .gone => {
+            if (observation.purpose == .cleanup) return removeUnmanageableWindow(pid, wid, "missing-windowserver");
+            log.debug("{s}: window gone pid={d} wid={d}", .{ @tagName(observation.purpose), pid, wid });
+            dispatchStateEvent(.{ .window_candidate_destroyed = wid });
+            return;
+        },
+    };
 
-    const unknown_subrole = ax.unknown_subrole;
-    const is_unknown_subrole = c.CFEqual(@ptrCast(subrole_ref), @ptrCast(unknown_subrole)) != 0;
-    if (is_unknown_subrole) return shim.BW_MANAGE_PENDING;
-
-    // AXStandardWindow is the canonical tileable subrole — accept unconditionally.
-    if (c.CFEqual(@ptrCast(subrole_ref), @ptrCast(ax.standard_window_subrole)) != 0) {
-        return shim.BW_MANAGE_READY;
+    switch (observation.purpose) {
+        .pending_role => dispatchStateEvent(.{ .pending_role_observed = .{
+            .window_id = wid,
+            .readiness = readiness,
+        } }),
+        .deferred => dispatchStateEvent(.{ .deferred_window_observed = .{
+            .window_id = wid,
+            .readiness = readiness,
+            .is_visible = isVisibleOnScreen(wid),
+        } }),
+        .cleanup => if (readiness == .reject) removeUnmanageableWindow(pid, wid, "should-manage=false"),
     }
-
-    // AXFloatingWindow and AXDialog are accepted only as a heuristic exception:
-    // some Electron apps and IDEs report these subroles for their real, top-level
-    // windows. But transient chrome-less popups also report AXDialog — Xcode's
-    // autocomplete list is role=AXWindow/subrole=AXDialog with an empty title and
-    // no title-bar buttons. Tiling one shrinks the editor on every keystroke as
-    // the popup is created and destroyed (a resize storm).
-    const is_dialog_like = c.CFEqual(@ptrCast(subrole_ref), @ptrCast(ax.floating_window_subrole)) != 0 or
-        c.CFEqual(@ptrCast(subrole_ref), @ptrCast(ax.dialog_subrole)) != 0;
-    if (is_dialog_like and windowHasRealWindowSignal(win_ref, ax)) {
-        return shim.BW_MANAGE_READY;
-    }
-
-    return shim.BW_MANAGE_REJECT;
 }
 
-/// Returns true when a window exposes a real top-level-window signal: any
-/// title-bar button (close/minimize/zoom/fullscreen) or being the app's main or
-/// focused window. Transient popups — Xcode's autocomplete list, tooltips,
-/// context menus — report a dialog/floating subrole but have none of these, so
-/// this guard keeps them from being tiled. Mirrors the button/subrole heuristics
-/// used by yabai, AeroSpace, and OmniWM.
-fn windowHasRealWindowSignal(win: c.AXUIElementRef, ax: *const AxStrings) bool {
-    std.debug.assert(win != null);
-    std.debug.assert(ax.modal_attr != null);
+/// Cleanup found the window no longer manageable. Its answer arrives after
+/// the pass, so skip a window that left or changed hands since.
+fn removeUnmanageableWindow(pid: i32, wid: u32, comptime reason: []const u8) void {
+    const win = managedWindow(wid) orelse return;
+    if (win.pid != pid) return;
 
-    for ([_]c.CFStringRef{ ax.close_button_attr, ax.minimize_button_attr, ax.zoom_button_attr, ax.fullscreen_button_attr }) |attr| {
-        if (axAttributePresent(win, attr)) return true;
-    }
-    return axBooleanAttributeTrue(win, ax.main_attr) or axBooleanAttributeTrue(win, ax.focused_attr);
-}
-
-/// Returns a retained attribute value; the caller must release it.
-fn copyAxAttribute(win: c.AXUIElementRef, attr: c.CFStringRef) c.CFTypeRef {
-    var value: c.CFTypeRef = null;
-    trace.countAx();
-    const err = c.AXUIElementCopyAttributeValue(win, attr, &value);
-    return if (err == c.kAXErrorSuccess) value else null;
-}
-
-/// True when the AX attribute exists and is non-null on the element.
-fn axAttributePresent(win: c.AXUIElementRef, attr: c.CFStringRef) bool {
-    const value = copyAxAttribute(win, attr) orelse return false;
-    c.CFRelease(value);
-    return true;
-}
-
-/// True when the AX attribute is a CFBoolean set to true.
-fn axBooleanAttributeTrue(win: c.AXUIElementRef, attr: c.CFStringRef) bool {
-    const value = copyAxAttribute(win, attr) orelse return false;
-    defer c.CFRelease(value);
-    return c.CFEqual(value, @ptrCast(c.kCFBooleanTrue)) != 0;
-}
-
-fn windowMayRemainManaged(pid: i32, wid: u32) bool {
-    const state = manageStateForWindow(pid, wid);
-    return state != shim.BW_MANAGE_REJECT;
-}
-
-/// Returns management state for a given window.
-fn bw_window_manage_state(pid: i32, wid: u32) u8 {
-    return manageStateForWindow(pid, wid);
+    log.debug("cleanup: removing wid={d} pid={d} reason=" ++ reason, .{ wid, pid });
+    removeWindow(wid);
+    retile();
 }
 
 /// Enumerate layer-0 windows for regular applications.
@@ -2181,7 +1993,7 @@ fn bw_window_manage_state(pid: i32, wid: u32) u8 {
 /// share the CGWindowList but have Prohibited activation policy. Caching the
 /// accept/reject decision per PID avoids an ObjC message send for every window
 /// belonging to the same rejected process.
-fn bw_discover_windows(
+fn enumerateWindows(
     out: []shim.bw_window_info,
     on_screen: ?*OnScreenWindows,
     on_screen_only: bool,
@@ -2288,7 +2100,7 @@ fn pidInCache(pid: i32, cache: []const i32, count: usize) bool {
 
 fn wakerPerform(info: ?*anyopaque) callconv(.c) void {
     _ = info;
-    bw_drain_events();
+    drainEvents();
 }
 
 fn initWakerSource() void {
@@ -2590,19 +2402,19 @@ fn hotkeyTapCallback(
     if (event_type == c.kCGEventLeftMouseDown) {
         g_mouse_down_location = cg_extra.CGEventGetLocation(event);
         g_mouse_drag_event_emitted = false;
-        bw_hotkey_mouse_down();
+        emitMouseDown();
         return event;
     }
     if (event_type == c.kCGEventLeftMouseDragged) {
         if (!g_mouse_drag_event_emitted) {
             g_mouse_drag_event_emitted = true;
-            bw_hotkey_mouse_dragged();
+            emitMouseDragged();
         }
         return event;
     }
     if (event_type == c.kCGEventLeftMouseUp) {
         g_mouse_drag_event_emitted = false;
-        bw_hotkey_mouse_up();
+        emitMouseUp();
         return event;
     }
     if (event_type == c.kCGEventMouseMoved) {
@@ -2619,7 +2431,7 @@ fn hotkeyTapCallback(
     const keycode: u16 = @intCast(keycode_raw);
     const mods = modsFromEventFlags(flags);
 
-    if (bw_hotkey_handle_keydown(keycode, mods)) {
+    if (handleHotkeyKeyDown(keycode, mods)) {
         return null;
     }
     return event;
@@ -2651,7 +2463,7 @@ fn eventWindowIdUnderPointer(event: c.CGEventRef) u32 {
 
 fn initializeMouseFocus() void {
     if (frontmostApplicationPid()) |pid| {
-        if (focusedWindowIdForPid(pid)) |window_id| {
+        if (focusedWindowId(pid, null)) |window_id| {
             g_last_focused_pid = pid;
             g_last_focused_window_id = window_id;
             log.debug("focus follows mouse initialized pid={d} wid={d}", .{ pid, window_id });
@@ -2945,8 +2757,13 @@ export fn bw_core_menu_tracking_changed(is_open: bool) void {
 // and push events here.  The os_unfair_lock serialises concurrent pushes
 // while the main-thread consumer (pop) is wait-free.
 export fn bw_emit_event(kind: u8, pid: i32, wid: u32) void {
+    bw_emit_event_detail(kind, pid, wid, 0);
+}
+
+export fn bw_emit_event_detail(kind: u8, pid: i32, wid: u32, detail: u8) void {
     var event: event_mod.Event = .{
         .kind = @fromBackingInt(@intCast(kind)),
+        .detail = detail,
         .pid = pid,
         .wid = wid,
     };
@@ -2976,10 +2793,12 @@ fn workspaceAppLaunched(pid: i32) void {
     bw_emit_event(shim.BW_EVENT_APP_LAUNCHED, pid, 0);
 }
 
-/// Callback target for BWObserver.activeAppChanged:.
+/// Callback target for BWObserver.activeAppChanged:. The focused-window
+/// answer arrives later as `window_focused`.
 fn workspaceActiveAppChanged(pid: i32) void {
     std.debug.assert(pid > 0);
-    bw_emit_event(shim.BW_EVENT_WINDOW_FOCUSED, pid, 0);
+    g_last_activated_pid = pid;
+    focus_query.request(pid, .activated);
 }
 
 /// Callback target for BWObserver.appVisibilityChanged:.
@@ -2997,19 +2816,17 @@ fn workspaceDisplayChanged() void {
     bw_emit_event(shim.BW_EVENT_DISPLAY_CHANGED, 0, 0);
 }
 
-/// Callback target for shim hotkey mouse down events.
-fn bw_hotkey_mouse_down() void {
+fn emitMouseDown() void {
     bw_emit_event(shim.BW_EVENT_MOUSE_DOWN, 0, 0);
 }
 
-/// Callback target for shim hotkey mouse up events.
-fn bw_hotkey_mouse_up() void {
+fn emitMouseUp() void {
     bw_emit_event(shim.BW_EVENT_MOUSE_UP, 0, 0);
 }
 
 /// Mark the first actual pointer-drag event separately from mouse-down. A
 /// click held while bobrwm retiles is not a user geometry change.
-fn bw_hotkey_mouse_dragged() void {
+fn emitMouseDragged() void {
     bw_emit_event(shim.BW_EVENT_MOUSE_DRAGGED, 0, 0);
 }
 
@@ -3026,7 +2843,7 @@ export fn bw_set_keybinds(binds: ?[*]const shim.bw_keybind, count: u32) void {
 }
 
 /// Resolve a key press against current keybinds and emit matching action.
-fn bw_hotkey_handle_keydown(keycode: u16, mods: u8) bool {
+fn handleHotkeyKeyDown(keycode: u16, mods: u8) bool {
     for (g_hotkey_bindings) |binding| {
         if (binding.keycode != keycode) continue;
         if (binding.mods != mods) continue;
@@ -3105,7 +2922,9 @@ fn startCore(config_path_arg: ?[]const u8) !void {
     dim.configure(g_config.dimmed_inactive);
     loginitem.reconcile(g_config.start_at_login);
 
-    ax_writer.init(geometryWriteFailed);
+    ax_writer.init(geometryWriteFailed, setFrontProcessViaSkylight);
+    focus_query.init();
+    window_readiness.init();
 
     // -- Accessibility check --
     if (!ax_mod.isTrusted()) {
@@ -3156,7 +2975,7 @@ fn startCore(config_path_arg: ?[]const u8) !void {
     // Topology starts focused on the primary display, which may not hold the
     // frontmost window. Adopt it so focus and dimming start where the user is.
     if (frontmostApplicationPid()) |pid| {
-        if (focusedWindowIdForPid(pid)) |wid| _ = syncFocusStateForWindowId(wid, .ax);
+        if (focusedWindowId(pid, null)) |wid| _ = syncFocusStateForWindowId(wid, .ax);
     }
     retileAllDisplays();
 
@@ -3182,6 +3001,7 @@ fn startCore(config_path_arg: ?[]const u8) !void {
     setMouseEventTapEnabled(g_config.focus_follows_mouse);
     setNativeSpaceTopologyPolling(true);
     setProcessSweep(true);
+    watchdog.start();
     try g_ipc_transport.start(g_ipc.fd, signalWaker);
     g_core_stage = .ipc_transport;
     refreshRolePolling();
@@ -3227,6 +3047,7 @@ fn stopCore() void {
     setRolePolling(false);
     setNativeSpaceTopologyPolling(false);
     setProcessSweep(false);
+    watchdog.stop();
     if (coreReached(.ax_observer)) {
         setMouseEventTapEnabled(false);
     }
@@ -3259,7 +3080,6 @@ fn stopCore() void {
         g_ipc.deinit(g_allocator);
         ipc.g_dispatch = null;
     }
-    deinitAxStrings();
     ax_mod.deinitElementCache();
 
     g_core_stage = .none;
@@ -3274,15 +3094,19 @@ fn coreReached(stage: CoreStage) bool {
 // Exported callbacks (called from ObjC shim on main thread)
 
 /// Drain the event ring buffer — called by the CFRunLoopSource waker.
-fn bw_drain_events() void {
+fn drainEvents() void {
     std.debug.assert(!g_event_drain_active);
     g_event_drain_active = true;
     defer g_event_drain_active = false;
 
     const drain_span = trace.begin("drain");
+    const drain_scope = watchdog.begin("drain", 0, 0);
+    defer watchdog.end(drain_scope);
 
     if (!nativeSwitchPending()) {
+        const tabs_scope = watchdog.begin("refresh tab groups", 0, 0);
         refreshTabGroupActiveTabs();
+        watchdog.end(tabs_scope);
     }
 
     var handled: u32 = 0;
@@ -3331,7 +3155,9 @@ fn bw_drain_events() void {
 /// Separate time queued behind earlier work from the event's own cost.
 fn handleTracedEvent(ev: *const event_mod.Event) void {
     const span = trace.beginWindow(@tagName(ev.kind), ev.pid, ev.wid);
+    const scope = watchdog.begin(@tagName(ev.kind), ev.pid, ev.wid);
     handleEvent(ev);
+    watchdog.end(scope);
 
     const elapsed_us = span.elapsedUs();
     const spent = span.cost();
@@ -3383,7 +3209,7 @@ fn recoverFromEventOverflow() void {
     reconcileVisibleFramesFromWindowServer();
 
     if (frontmostApplicationPid()) |pid| {
-        if (focusedWindowIdForPid(pid)) |wid| {
+        if (focusedWindowId(pid, null)) |wid| {
             reconcileFocusedWindow(pid, wid);
         }
         requestCleanupForPid(pid);
@@ -3451,9 +3277,9 @@ fn reconcileDivergedGeometryIntent(wid: u32, intent: geometry_mod.Intent) bool {
     const win = managedWindow(wid) orelse return false;
     const space = managedWindowSpace(win.wid) orelse return false;
     if (!spaceVisible(space)) return false;
-    if (bw_is_window_on_screen(wid)) return false;
+    if (isInOnScreenWindowList(wid)) return false;
 
-    const focused_wid = focusedWindowIdForPid(win.pid) orelse return false;
+    const focused_wid = focusedWindowId(win.pid, null) orelse return false;
     if (focused_wid == wid) return false;
 
     log.debug("geometry: divergent intent reconciling stale wid={d} focused_wid={d} pid={d} source={s}", .{
@@ -3503,6 +3329,8 @@ fn drainIpcRequests() void {
 // state mutations are safe here. Keeping them in the application root makes
 // the UI adapter depend only on the callbacks it is given.
 fn statusBarRetile() callconv(.c) void {
+    const scope = watchdog.begin("menu retile", 0, 0);
+    defer watchdog.end(scope);
     retile();
 }
 
@@ -3621,6 +3449,8 @@ fn invalidAppSettings() bool {
 
 fn statusBarSwitchToWorkspace(workspace_id: u8) callconv(.c) void {
     if (workspace_id == 0 or workspace_id > workspaceCount()) return;
+    const scope = watchdog.begin("menu switch workspace", 0, 0);
+    defer watchdog.end(scope);
     switchWorkspace(workspace_id);
 }
 
@@ -3969,9 +3799,15 @@ fn handleEvent(ev: *const event_mod.Event) void {
             retile();
         },
         .window_focused => {
+            // Each app answers on its own queue, so an earlier activation's
+            // answer can arrive after a later one's.
+            if (ev.pid != g_last_activated_pid) {
+                log.debug("window focused: stale activation pid={d} active_pid={d}", .{ ev.pid, g_last_activated_pid });
+                return;
+            }
             // Activation raises windows even when no managed focus changes.
             g_dim_dirty = true;
-            const focused_wid_opt = focusedWindowIdForLoggedEvent("window focused", ev.pid);
+            const focused_wid_opt = focusEventWindowId("window focused", ev);
             if (!g_state.isWorkspaceTransitionActive()) {
                 requestCleanupForPid(ev.pid);
                 requestOffscreenCleanup();
@@ -3988,7 +3824,7 @@ fn handleEvent(ev: *const event_mod.Event) void {
         },
         .focused_window_changed => {
             g_dim_dirty = true;
-            const focused_wid_opt = focusedWindowIdForLoggedEvent("focused window changed", ev.pid);
+            const focused_wid_opt = focusEventWindowId("focused window changed", ev);
             if (!g_state.isWorkspaceTransitionActive()) {
                 requestCleanupForPid(ev.pid);
                 requestOffscreenCleanup();
@@ -4038,7 +3874,8 @@ fn handleEvent(ev: *const event_mod.Event) void {
             // removeWindow only covers managed windows; a window still
             // waiting on readiness must leave the poll queues too. AX element
             // lifetime can diverge from the CG window, so confirm first.
-            if (!windowServerHasWindow(ev.wid)) {
+            trace.countWindowList();
+            if (!window_server.hasWindow(ev.wid)) {
                 dispatchStateEvent(.{ .window_candidate_destroyed = ev.wid });
             }
             removeWindow(ev.wid);
@@ -4087,6 +3924,16 @@ fn handleEvent(ev: *const event_mod.Event) void {
         },
         .native_topology_poll_tick => reconcileNativeSpaceTopologyIfNeeded(),
         .process_sweep_due => if (sweepProcesses()) retile(),
+        .focus_retry_observed => dispatchStateEvent(.{ .focus_retry_observed = .{
+            .process_id = ev.pid,
+            .focused_window_id = ev.wid,
+        } }),
+        .window_readiness_observed => applyReadiness(ev.pid, ev.wid, .decode(ev.detail)),
+        .focus_retry_unanswered => dispatchStateEvent(.{ .focus_retry_observed = .{
+            .process_id = ev.pid,
+            .focused_window_id = 0,
+            .has_answered = false,
+        } }),
         .native_observation_due => {
             if (processDueNativeStateObservation()) return;
             // A replaced timer's fire must not re-arm: the current timer already
@@ -4290,28 +4137,6 @@ fn centerFloatingWindow(wid: u32) void {
 }
 
 // Window management helpers
-
-fn windowRoleState(pid: i32, wid: u32) WindowRoleState {
-    return windowRoleStateFromRaw(pid, wid, bw_window_manage_state(pid, wid));
-}
-
-fn windowRoleStateWithMessagingTimeout(pid: i32, wid: u32) WindowRoleState {
-    const raw_state = manageStateForWindowWithMessagingTimeout(pid, wid, role_poll_ax_timeout_s, false);
-    return windowRoleStateFromRaw(pid, wid, raw_state);
-}
-
-fn windowRoleStateFromRaw(pid: i32, wid: u32, raw_state: u8) WindowRoleState {
-    std.debug.assert(wid != 0);
-    return switch (raw_state) {
-        shim.BW_MANAGE_REJECT => .reject,
-        shim.BW_MANAGE_READY => .ready,
-        shim.BW_MANAGE_PENDING => .pending,
-        else => {
-            log.warn("pending-role: unknown manage state pid={d} wid={d} state={d}", .{ pid, wid, raw_state });
-            return .pending;
-        },
-    };
-}
 
 fn refreshRolePolling() void {
     const has_pending = g_state.hasPendingDiscovery() or
@@ -5066,7 +4891,7 @@ fn executeStateEffect(effect: state_mod.Effect) void {
         },
         .focus_window => |focus| {
             cancelPendingMouseFocus(false, false);
-            _ = bw_ax_focus_window(focus.process_id, focus.window_id);
+            focusWindow(focus.process_id, focus.window_id);
             const window = managedWindow(focus.window_id) orelse return;
             observeWindowFocus(window, .keyboard, null);
         },
@@ -5481,7 +5306,7 @@ fn executeWorkspaceTransitionSettled(settlement: state_mod.WorkspaceTransitionSe
         });
     } else if (settlement.reason == .deadline_expired) {
         const front_pid = frontmostApplicationPid() orelse 0;
-        const front_wid = if (front_pid > 0) focusedWindowIdForPid(front_pid) orelse 0 else 0;
+        const front_wid = if (front_pid > 0) focusedWindowId(front_pid, null) orelse 0 else 0;
         const active_workspace_id = activeWorkspaceIdForDisplay(transition.target.display_id);
         log.warn(
             "workspace transition watchdog expired epoch={d} kind={s} workspace={d} display={d} active_workspace={d} focused_display={d} front_pid={d} front_wid={d}",
@@ -5806,6 +5631,7 @@ fn trackFocusRetry(pid: i32) void {
     dispatchStateEvent(.{ .track_focus_retry = .{
         .process_id = pid,
         .attempts_remaining = focus_retry_attempts_max,
+        .unanswered_remaining = focus_retry_unanswered_max,
     } });
 }
 
@@ -5815,16 +5641,11 @@ fn untrackFocusRetry(pid: i32) void {
 }
 
 /// Re-query the AX focused window for tracked pids on the role-poll cadence.
-/// Resolved pids run the normal focus reconciliation path; exhausted pids are
-/// dropped (the next real focus event will try again).
+/// Answers arrive as `focus_retry_observed`; ticks while a query is queued
+/// collapse into it, so a hung app spends one attempt per answer, not per tick.
 fn processFocusRetries() void {
     const retries = g_state.focus_retries;
-    for (retries.items()) |retry| {
-        dispatchStateEvent(.{ .focus_retry_observed = .{
-            .process_id = retry.process_id,
-            .focused_window_id = bw_ax_get_focused_window(retry.process_id),
-        } });
-    }
+    for (retries.items()) |retry| focus_query.request(retry.process_id, .retry);
 }
 
 fn trackAppLaunchRetry(pid: i32) void {
@@ -5885,80 +5706,16 @@ fn untrackWindowCandidatesForPid(pid: i32) void {
     dispatchStateEvent(.{ .untrack_window_candidates_for_process = pid });
 }
 
+/// Ask each candidate's app again; answers feed the reducer as they arrive.
+/// Iterates copies: an immediate answer mutates the queues.
 fn processPendingRoleWindows() void {
     const candidates = g_state.pending_role_windows;
-    const items = candidates.items();
-    if (items.len == 0) return;
-
-    const started_ns = nanoTimestamp();
-    var window_ids: [candidates.entries.len]u32 = undefined;
-    for (items, 0..) |candidate, index| window_ids[index] = candidate.window_id;
-    var existing_buffer: [candidates.entries.len]u32 = undefined;
-    // One allocating WindowServer query per snapshot, not per candidate.
-    // An unreadable answer keeps every candidate until the next pass.
-    trace.countWindowList();
-    const existing = window_server.existingWindowIds(window_ids[0..items.len], &existing_buffer) orelse window_ids[0..items.len];
-
-    // The budget can end a pass early. Resume where it stopped so windows late
-    // in the queue are polled too, not only the slow ones at its head.
-    const first = g_role_poll_cursor % items.len;
-    for (0..items.len) |offset| {
-        if (nanoTimestamp() - started_ns >= role_poll_work_budget_ms * std.time.ns_per_ms) {
-            g_role_poll_cursor = first + offset;
-            return;
-        }
-        const candidate = items[(first + offset) % items.len];
-
-        // A destroyed window is not in AXWindows either, so the role query
-        // would report it pending until the budget runs out.
-        if (std.mem.findScalar(u32, existing, candidate.window_id) == null) {
-            log.debug("pending-role: window gone pid={d} wid={d}", .{ candidate.process_id, candidate.window_id });
-            dispatchStateEvent(.{ .window_candidate_destroyed = candidate.window_id });
-            continue;
-        }
-        // Polling a hung app would spend an attempt without an answer.
-        if (isAxBackedOff(candidate.process_id)) continue;
-        dispatchStateEvent(.{ .pending_role_observed = .{
-            .window_id = candidate.window_id,
-            .readiness = windowRoleStateWithMessagingTimeout(candidate.process_id, candidate.window_id),
-        } });
-    }
+    for (candidates.items()) |candidate| requestReadiness(candidate.process_id, candidate.window_id, .pending_role);
 }
 
 fn processDeferredWindowCandidates() void {
     const candidates = g_state.deferred_window_candidates;
-    const items = candidates.items();
-    if (items.len == 0) return;
-
-    const started_ns = nanoTimestamp();
-    var window_ids: [candidates.entries.len]u32 = undefined;
-    for (items, 0..) |candidate, index| window_ids[index] = candidate.window_id;
-    var existing_buffer: [candidates.entries.len]u32 = undefined;
-    trace.countWindowList();
-    const existing = window_server.existingWindowIds(window_ids[0..items.len], &existing_buffer) orelse window_ids[0..items.len];
-
-    // Same budget and resume point as the role poll: a query can take up to
-    // the readiness timeout before its app is backed off.
-    const first = g_deferred_poll_cursor % items.len;
-    for (0..items.len) |offset| {
-        if (nanoTimestamp() - started_ns >= role_poll_work_budget_ms * std.time.ns_per_ms) {
-            g_deferred_poll_cursor = first + offset;
-            return;
-        }
-        const candidate = items[(first + offset) % items.len];
-
-        if (std.mem.findScalar(u32, existing, candidate.window_id) == null) {
-            log.debug("deferred-window: window gone pid={d} wid={d}", .{ candidate.process_id, candidate.window_id });
-            dispatchStateEvent(.{ .window_candidate_destroyed = candidate.window_id });
-            continue;
-        }
-        if (isAxBackedOff(candidate.process_id)) continue;
-        dispatchStateEvent(.{ .deferred_window_observed = .{
-            .window_id = candidate.window_id,
-            .readiness = windowRoleState(candidate.process_id, candidate.window_id),
-            .is_visible = isVisibleOnScreen(candidate.window_id),
-        } });
-    }
+    for (candidates.items()) |candidate| requestReadiness(candidate.process_id, candidate.window_id, .deferred);
 }
 
 /// Capture one trustworthy app-to-workspace association per process before
@@ -5970,7 +5727,7 @@ fn captureWorkspaceApplicationInventory() void {
     g_workspace_application_inventory_count = 0;
 
     var candidates: [256]shim.bw_window_info = undefined;
-    const discovery = bw_discover_windows(&candidates, null, false);
+    const discovery = enumerateWindows(&candidates, null, false);
     if (discovery.truncated) {
         log.debug("startup application inventory truncated limit={d}", .{candidates.len});
     }
@@ -5987,8 +5744,7 @@ fn captureWorkspaceApplicationInventory() void {
         queried_pids[queried_pid_count] = candidate.pid;
         queried_pid_count += 1;
 
-        const focused_window_id = axFocusedWindow(candidate.pid, 0.025);
-        if (focused_window_id == 0) continue;
+        const focused_window_id = focusedWindowId(candidate.pid, 0.025) orelse continue;
         const focused = findDiscoveredWindow(candidates[0..discovery.count], candidate.pid, focused_window_id) orelse continue;
         const display_id = displayIdForFrame(.{
             .x = focused.x,
@@ -6060,7 +5816,7 @@ fn discoverWindowsImpl(should_refresh_tabs: bool) usize {
     const span = trace.begin("discover");
     var buf: [256]shim.bw_window_info = undefined;
     var on_screen: OnScreenWindows = .{};
-    const discovery = bw_discover_windows(&buf, if (should_refresh_tabs) &on_screen else null, true);
+    const discovery = enumerateWindows(&buf, if (should_refresh_tabs) &on_screen else null, true);
     const enumerated_ns = nanoTimestamp();
     if (discovery.truncated) {
         log.warn("window discovery truncated limit={d}; excess windows remain unmanaged", .{buf.len});
@@ -6122,7 +5878,7 @@ fn discoverWindowsImpl(should_refresh_tabs: bool) usize {
             continue;
         }
 
-        switch (windowRoleState(info.pid, info.wid)) {
+        switch (windowReadiness(info.pid, info.wid)) {
             .reject => {
                 untrackPendingRoleWindow(info.wid);
                 continue;
@@ -6294,7 +6050,7 @@ fn appWindowSnapshot(
     std.debug.assert(pid > 0);
 
     var ax_wids: [128]u32 = undefined;
-    const ax_snapshot = bw_get_app_window_ids(pid, &ax_wids);
+    const ax_snapshot = axAppWindowIds(pid, &ax_wids);
 
     var count: usize = 0;
     var truncated = ax_snapshot.truncated;
@@ -6346,7 +6102,7 @@ fn shouldFloatWindow(pid: i32, wid: u32, frame: window_mod.Window.Frame) bool {
     if (frame.width > 500 and frame.height > 500) return false;
     const ax_win = findAxWindow(pid, wid) orelse return false;
     defer c.CFRelease(@ptrCast(ax_win));
-    const ax = ensureAxStrings() orelse return false;
+    const ax = ax_mod.strings() orelse return false;
     return !axCanResize(ax_win, ax);
 }
 
@@ -6464,7 +6220,7 @@ fn addNewWindow(pid: i32, wid: u32, detect: TabDetectPass) void {
     std.debug.assert(wid != 0);
     if (managedWindow(wid) != null) return;
 
-    switch (windowRoleState(pid, wid)) {
+    switch (windowReadiness(pid, wid)) {
         .reject => {
             untrackPendingRoleWindow(wid);
             untrackDeferredWindowCandidate(wid);
@@ -6740,8 +6496,7 @@ fn reconcileGroupActiveAfterRemoval(member_window_id: u32, pid: i32) void {
 
     const group = g_state.windowTabGroup(member_window_id) orelse return;
 
-    const focused_wid = bw_ax_get_focused_window(pid);
-    const app_focused: ?u32 = if (focused_wid == 0) null else focused_wid;
+    const app_focused = focusedWindowId(pid, null);
     const active = tab_detect.activeAfterRemoval(app_focused, group.members()) orelse return;
 
     setTabGroupActive(active);
@@ -6767,13 +6522,15 @@ fn releaseProcess(pid: i32) void {
     }
     removeWorkspaceApplication(pid);
     ax_writer.forgetApp(pid);
+    window_readiness.forgetApp(pid);
+    app_queue.forget(pid);
     ax_observer.unobserveApp(pid);
     removeAppWindows(pid);
 }
 
-/// The old process's windows and observer died with it. Inside another
-/// effect handler, discovery may already have adopted the new process's
-/// windows; they leave with the old ones, so the launch retry rediscovers them.
+/// Release the ended process and bring the PID up as a new launch. Windows
+/// the new process already had adopted are released too; the launch retry
+/// rediscovers them.
 fn executeProcessReplaced(pid: i32) void {
     log.info("process replaced pid={d}; the previous process ended unreported", .{pid});
     releaseProcess(pid);
@@ -6854,6 +6611,7 @@ fn sweepProcesses() bool {
 fn cleanupWorkspaceWindowsForPid(pid: i32) bool {
     const sky = g_sky orelse return false;
     const conn = sky.mainConnectionID();
+    const is_regular_app = isRegularActivationApp(pid);
 
     var stale_wids: [128]u32 = undefined;
     var stale_count: usize = 0;
@@ -6869,18 +6627,18 @@ fn cleanupWorkspaceWindowsForPid(pid: i32) bool {
             const win = managedWindow(wid) orelse continue;
             if (win.pid != pid) continue;
 
-            var should_remove = false;
             var rect: skylight.CGRect = undefined;
             trace.countSkylight();
             if (sky.getWindowBounds(conn, wid, &rect) != 0) {
-                should_remove = true;
                 log.debug("cleanup: removing wid={d} pid={d} reason=missing-windowserver", .{ wid, pid });
-            } else if (!windowMayRemainManaged(pid, wid)) {
-                should_remove = true;
+            } else if (!is_regular_app) {
                 log.debug("cleanup: removing wid={d} pid={d} reason=should-manage=false", .{ wid, pid });
+            } else {
+                // The app answers on its queue, and a rejected window is
+                // removed then.
+                window_readiness.request(pid, wid, .cleanup);
+                continue;
             }
-
-            if (!should_remove) continue;
 
             if (stale_count < stale_wids.len) {
                 stale_wids[stale_count] = wid;
@@ -6935,7 +6693,7 @@ fn cleanupOffscreenManagedWindows() bool {
             // is never placed again: every geometry write for it is addressed to
             // a window that no longer exists, so the slot silently stops
             // responding to tiling, fullscreen and parking.
-            const is_on_screen = bw_is_window_on_screen(wid);
+            const is_on_screen = isInOnScreenWindowList(wid);
             if (is_on_screen and appListsWindow(win.pid, wid)) continue;
 
             if (suspect_count < suspects.len) {
@@ -6989,7 +6747,7 @@ fn appListsWindow(pid: i32, wid: u32) bool {
     std.debug.assert(wid != 0);
 
     var ax_wids: [128]u32 = undefined;
-    const snapshot = bw_get_app_window_ids(pid, &ax_wids);
+    const snapshot = axAppWindowIds(pid, &ax_wids);
     if (snapshot.count == 0) return true;
 
     if (std.mem.findScalar(u32, ax_wids[0..snapshot.count], wid) != null) return true;
@@ -7727,7 +7485,7 @@ fn focusWorkspaceWindow(ws: state_mod.SpaceRef) void {
                     actual_wid,
                 });
             }
-            _ = bw_ax_focus_window(win.pid, actual_wid);
+            focusWindow(win.pid, actual_wid);
             recordWorkspaceFocus(ws, fwid);
             observeWindowFocus(win, .keyboard, null);
         }

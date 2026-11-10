@@ -180,8 +180,8 @@ pub fn makePath(allocator: std.mem.Allocator, path: []const u8) bool {
 pub fn processStartTimeUs(pid: i32) error{QueryFailed}!?u64 {
     std.debug.assert(pid > 0);
 
-    // proc_pidinfo costs ~0.6us against sysctl's ~10us, but refuses other
-    // users' processes and exited ones awaiting reap.
+    // proc_pidinfo is the cheap path but refuses other users' processes and
+    // exited ones awaiting reap.
     var info: ProcBsdInfo = undefined;
     const info_size: c_int = @sizeOf(ProcBsdInfo);
     if (proc_pidinfo(pid, proc_pidtbsdinfo, 0, &info, info_size) == info_size) {

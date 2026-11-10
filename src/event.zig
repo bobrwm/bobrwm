@@ -26,6 +26,9 @@ pub const EventKind = enum(u8) {
     menu_opened = 44,
     menu_closed = 45,
     process_sweep_due = 46,
+    focus_retry_observed = 47,
+    focus_retry_unanswered = 48,
+    window_readiness_observed = 49,
 
     hk_focus_workspace = 20,
     hk_move_to_workspace = 21,
@@ -52,6 +55,8 @@ pub const EventKind = enum(u8) {
 
 pub const Event = extern struct {
     kind: EventKind,
+    /// Kind-specific payload; zero when the kind has none.
+    detail: u8 = 0,
     pid: i32,
     wid: u32,
     /// Monotonic publication time; zero when the producer does not set it.

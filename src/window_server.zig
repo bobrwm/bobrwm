@@ -44,6 +44,14 @@ pub fn existingWindowIds(window_ids: []const u32, out: []u32) ?[]u32 {
     return out[0..count];
 }
 
+/// Whether WindowServer still knows `wid`. A failed query counts as present,
+/// so a transient failure never drops a live window.
+pub fn hasWindow(wid: u32) bool {
+    var out: [1]u32 = undefined;
+    const existing = existingWindowIds(&.{wid}, &out) orelse return true;
+    return existing.len > 0;
+}
+
 /// An empty description list is either every window gone or a WindowServer
 /// that is not answering. The on-screen list always holds at least the menu
 /// bar, so an empty one means the query failed.
