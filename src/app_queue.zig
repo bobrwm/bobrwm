@@ -23,6 +23,10 @@ pub const Job = enum {
     query_focus_changed,
     /// focus_query: answer a focus retry.
     query_retry,
+    /// ax_observer: create, register, and prime the app's observer.
+    observe,
+    /// ax_observer: look for windows the app never announced.
+    scan,
 };
 
 /// One app process as seen by a job. `index` names the app's slot until the
