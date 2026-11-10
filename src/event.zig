@@ -29,6 +29,7 @@ pub const EventKind = enum(u8) {
     focus_retry_observed = 47,
     focus_retry_unanswered = 48,
     window_readiness_observed = 49,
+    app_windows_observed = 50,
 
     hk_focus_workspace = 20,
     hk_move_to_workspace = 21,
@@ -61,4 +62,8 @@ pub const Event = extern struct {
     wid: u32,
     /// Monotonic publication time; zero when the producer does not set it.
     enqueued_ns: i64 = 0,
+    /// Keep release coordinates with the event, even if another pointer
+    /// sample arrives before the main-thread drain processes it.
+    mouse_x: f64 = 0,
+    mouse_y: f64 = 0,
 };

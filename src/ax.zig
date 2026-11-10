@@ -5,6 +5,7 @@
 
 const std = @import("std");
 const c = @import("c");
+const osutil = @import("osutil.zig");
 const trace = @import("trace.zig");
 
 extern fn _AXUIElementGetWindow(element: c.AXUIElementRef, wid: *u32) c.AXError;
@@ -355,7 +356,7 @@ pub fn deinitElementCache() void {
     }
 }
 
-/// Number of tabs in a window's native tab bar, or 0 when it has none.
+/// Number of tabs in a window's native tab bar, or null when the read failed.
 ///
 /// AppKit puts an `AXTabGroup` titled "tab bar" among a window's AX children,
 /// with one tab element per tab, and only the *selected* tab's window carries
@@ -368,42 +369,44 @@ pub fn deinitElementCache() void {
 ///
 /// Costs an AXChildren copy plus a role read per child, so callers should ask
 /// once per detection pass rather than per decision.
-pub fn tabCount(pid: i32, wid: u32) usize {
-    std.debug.assert(pid > 0);
-    std.debug.assert(wid > 0);
-
-    const ax = strings() orelse return 0;
-    const win = retainWindow(pid, wid) orelse return 0;
-    defer c.CFRelease(@ptrCast(win));
-
+pub fn tabCountForElement(win: c.AXUIElementRef, ax: *const AxStrings, timeout_seconds: f32, deadline_ns: i128) ?usize {
     var children: c.CFArrayRef = null;
-    trace.countAx();
-    if (c.AXUIElementCopyAttributeValue(win, ax.children_attr, @ptrCast(&children)) != c.kAXErrorSuccess) return 0;
-    const children_ref = children orelse return 0;
+    if (c.AXUIElementCopyAttributeValue(win, ax.children_attr, @ptrCast(&children)) != c.kAXErrorSuccess) return null;
+    const children_ref = children orelse return null;
     defer c.CFRelease(@ptrCast(children_ref));
+    if (c.CFGetTypeID(@ptrCast(children_ref)) != c.CFArrayGetTypeID()) return null;
 
     const count = c.CFArrayGetCount(children_ref);
+    var incomplete = false;
     var i: c.CFIndex = 0;
     while (i < count) : (i += 1) {
-        const child_any = c.CFArrayGetValueAtIndex(children_ref, i) orelse continue;
+        // A broad or slow AX tree is unknown, not proof that tabs are absent.
+        if (i >= 128 or osutil.nanoTimestamp() >= deadline_ns) return null;
+        const child_any = c.CFArrayGetValueAtIndex(children_ref, i) orelse {
+            incomplete = true;
+            continue;
+        };
         const child: c.AXUIElementRef = @ptrCast(child_any);
+        _ = c.AXUIElementSetMessagingTimeout(child, timeout_seconds);
 
         var role: c.CFTypeRef = null;
-        trace.countAx();
-        if (c.AXUIElementCopyAttributeValue(child, ax.role_attr, &role) != c.kAXErrorSuccess) continue;
-        const role_ref = role orelse continue;
-        defer c.CFRelease(role_ref);
-        if (c.CFEqual(role_ref, @ptrCast(ax.tab_group_role)) == 0) continue;
+        const role_err = c.AXUIElementCopyAttributeValue(child, ax.role_attr, &role);
+        defer if (role) |ref| c.CFRelease(ref);
+        if (role_err != c.kAXErrorSuccess or role == null) {
+            incomplete = true;
+            continue;
+        }
+        if (c.CFEqual(role, @ptrCast(ax.tab_group_role)) == 0) continue;
 
+        if (osutil.nanoTimestamp() >= deadline_ns) return null;
         var tabs: c.CFArrayRef = null;
-        trace.countAx();
-        if (c.AXUIElementCopyAttributeValue(child, ax.tabs_attr, @ptrCast(&tabs)) != c.kAXErrorSuccess) return 0;
-        const tabs_ref = tabs orelse return 0;
-        defer c.CFRelease(@ptrCast(tabs_ref));
-
-        const tab_total = c.CFArrayGetCount(tabs_ref);
-        return if (tab_total > 0) @intCast(tab_total) else 0;
+        const tabs_err = c.AXUIElementCopyAttributeValue(child, ax.tabs_attr, @ptrCast(&tabs));
+        defer if (tabs) |ref| c.CFRelease(@ptrCast(ref));
+        if (tabs_err == c.kAXErrorAttributeUnsupported or tabs_err == c.kAXErrorNoValue) continue;
+        if (tabs_err != c.kAXErrorSuccess or tabs == null) return null;
+        if (c.CFGetTypeID(@ptrCast(tabs)) != c.CFArrayGetTypeID()) return null;
+        return if (incomplete) null else @intCast(c.CFArrayGetCount(tabs));
     }
 
-    return 0;
+    return if (incomplete) null else 0;
 }

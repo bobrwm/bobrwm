@@ -248,22 +248,6 @@ pub fn classifyMember(
     return .promote_to_standalone;
 }
 
-// ── Active tab after a member is removed ─────────────────────────────────────
-
-/// The member that should become active after one is removed.
-///
-/// Removal picks a surviving member arbitrarily, but macOS selects the adjacent
-/// tab, so prefer whatever the app itself reports as focused. Returns null when
-/// the app's focused window is not a member, leaving the caller's guess in
-/// place until the next focus notification corrects it.
-pub fn activeAfterRemoval(app_focused_wid: ?WindowId, members: []const WindowId) ?WindowId {
-    const focused = app_focused_wid orelse return null;
-    for (members) |member| {
-        if (member == focused) return focused;
-    }
-    return null;
-}
-
 // ── Tests ────────────────────────────────────────────────────────────────────
 
 const testing = std.testing;
@@ -423,11 +407,4 @@ test "classifyMember: diverged bounds while on screen is a drag-out" {
     try testing.expectEqual(MemberOutcome.keep, classifyMember(tiled_right, tiled_left, false));
     try testing.expectEqual(MemberOutcome.keep, classifyMember(tiled_left, tiled_left, true));
     try testing.expectEqual(MemberOutcome.keep, classifyMember(null, tiled_left, true));
-}
-
-test "activeAfterRemoval: prefers the app's focused window when it is a member" {
-    const members = [_]WindowId{ 1, 2, 3 };
-    try testing.expectEqual(@as(?WindowId, 2), activeAfterRemoval(2, &members));
-    try testing.expectEqual(@as(?WindowId, null), activeAfterRemoval(9, &members));
-    try testing.expectEqual(@as(?WindowId, null), activeAfterRemoval(null, &members));
 }

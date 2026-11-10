@@ -1,7 +1,7 @@
 //! Whether or not a window is ready to tile (based off of AX responses).
 //!
-//! `query` answers on the calling thread. `request` asks on the app's queue
-//! and publishes the answer as a `window_readiness_observed` event, so a slow
+//! `request` asks on the app's queue and publishes the answer as a
+//! `window_readiness_observed` event, so a slow
 //! app only stalls its own queue, not others.
 
 const std = @import("std");
@@ -75,7 +75,7 @@ pub fn init() void {
 
 /// Ask whether `wid` is ready on its app's queue. A request already waiting
 /// for the window absorbs this one. The caller has checked that the app is a
-/// regular one; `query` assumes it.
+/// regular one.
 pub fn request(pid: i32, wid: u32, purpose: Purpose) void {
     std.debug.assert(pid > 0);
     std.debug.assert(wid > 0);
@@ -191,18 +191,6 @@ fn answerRequests(app: app_queue.App) void {
             shim.bw_emit_event_detail(shim.BW_EVENT_WINDOW_READINESS_OBSERVED, queued.pid, queued.wid, observation.encode());
         }
     }
-}
-
-/// Readiness of one window, answered on the calling thread.
-pub fn query(pid: i32, wid: u32, timeout: f32) Readiness {
-    std.debug.assert(pid > 0);
-    std.debug.assert(wid > 0);
-
-    var element: [1]?c.AXUIElementRef = undefined;
-    ax.findWindows(pid, &.{wid}, &element, timeout);
-    const win = element[0] orelse return .pending;
-    defer c.CFRelease(@ptrCast(win));
-    return classify(win);
 }
 
 /// Classify a window from its AX role and subrole.
