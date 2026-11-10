@@ -2667,6 +2667,36 @@ test "process retry outcomes are reducer owned" {
     try testing.expectEqual(@as(WindowId, 100), transition.effects[0].focus_retry_resolved.window_id);
 }
 
+test "unanswered focus retries spend their own budget" {
+    const testing = std.testing;
+    const retry: ProcessRetry = .{ .process_id = 42, .attempts_remaining = 1, .unanswered_remaining = 1 };
+    const model = reduceCopy(.{}, .{ .track_focus_retry = retry }).model;
+    const unanswered: @FieldType(Event, "focus_retry_observed") = .{
+        .process_id = retry.process_id,
+        .focused_window_id = 0,
+        .has_answered = false,
+    };
+
+    // A launching app that has not answered yet keeps its answered attempts.
+    var transition = reduceCopy(model, .{ .focus_retry_observed = unanswered });
+    try testing.expectEqual(@as(u8, 0), transition.effect_count);
+    try testing.expectEqual(@as(u8, 1), transition.model.focus_retries.get(retry.process_id).?.attempts_remaining);
+
+    transition = reduceCopy(transition.model, .{ .focus_retry_observed = unanswered });
+    try testing.expectEqual(retry.process_id, transition.effects[0].focus_retry_expired);
+    try testing.expectEqual(@as(?ProcessRetry, null), transition.model.focus_retries.get(retry.process_id));
+
+    // An answer without a focused window spends the regular attempts.
+    const answered_empty: @FieldType(Event, "focus_retry_observed") = .{
+        .process_id = retry.process_id,
+        .focused_window_id = 0,
+    };
+    transition = reduceCopy(model, .{ .focus_retry_observed = answered_empty });
+    try testing.expectEqual(@as(u8, 1), transition.model.focus_retries.get(retry.process_id).?.unanswered_remaining);
+    transition = reduceCopy(transition.model, .{ .focus_retry_observed = answered_empty });
+    try testing.expectEqual(retry.process_id, transition.effects[0].focus_retry_expired);
+}
+
 test "process table tells a reused PID from a known process" {
     const testing = std.testing;
     const first: ProcessIdentity = .{ .process_id = 500, .started_at_us = 1_000 };

@@ -10,6 +10,7 @@ const log = std.log.scoped(.ax_observer);
 const objc = @import("objc");
 const c = @import("c");
 const cg_extra = @import("cg_extra");
+const focus_query = @import("focus_query.zig");
 const osutil = @import("osutil.zig");
 const shim = @import("shim_api.zig");
 const watchdog = @import("watchdog.zig");
@@ -894,8 +895,9 @@ fn axNotificationHandler(
     }
 
     if (isNotification(notification, strings.focused_window_changed_notification)) {
-        // App-level (wid=0 in refcon): emit so Zig can reconcile tab groups.
-        shim.bw_emit_event(shim.BW_EVENT_FOCUSED_WINDOW_CHANGED, pid, 0);
+        // App-level (wid=0 in refcon). Resolve the window on the app's own
+        // queue: a slow app must not hold this thread, which serves every app.
+        focus_query.request(pid, .focus_changed);
         return;
     }
 

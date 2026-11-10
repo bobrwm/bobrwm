@@ -137,6 +137,15 @@ pub fn reduceFocusRetryObserved(
     observation: @FieldType(Event, "focus_retry_observed"),
 ) void {
     const retry = transition.model.focus_retries.getPtr(observation.process_id) orelse return;
+    if (!observation.has_answered) {
+        if (retry.unanswered_remaining > 0) {
+            retry.unanswered_remaining -= 1;
+            return;
+        }
+        _ = transition.model.focus_retries.remove(observation.process_id);
+        transition.addEffect(.{ .focus_retry_expired = observation.process_id });
+        return;
+    }
     if (observation.focused_window_id != 0) {
         _ = transition.model.focus_retries.remove(observation.process_id);
         transition.addEffect(.{ .focus_retry_resolved = .{

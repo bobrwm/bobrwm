@@ -29,6 +29,7 @@ const animation_mod = @import("animation.zig");
 const display_link = @import("display_link.zig");
 const ax_mod = @import("ax.zig");
 const ax_writer = @import("ax_writer.zig");
+const focus_query = @import("focus_query.zig");
 const geometry_mod = @import("geometry.zig");
 const spsc_queue = @import("spsc_queue.zig");
 const trace = @import("trace.zig");
@@ -95,6 +96,11 @@ const app_launch_retry_attempts_max: u8 = 10;
 /// focused window for several hundred milliseconds after activation;
 /// 10 attempts at the 100ms role-poll cadence covers that window.
 const focus_retry_attempts_max: u8 = 10;
+/// An app can leave AX unanswered for many seconds while it launches. One
+/// that never reports a launch is never observed, so a resolved retry is
+/// what adopts its window. Unanswered queries run back to back at the 250ms
+/// query timeout, so 120 wait ~30s before giving up on a hung app.
+const focus_retry_unanswered_max: u8 = 120;
 const mouse_focus_handoff_ns: i64 = 40 * std.time.ns_per_ms;
 const mouse_focus_confirmation_ns: i64 = std.time.ns_per_s;
 /// Quiet period after the last display notification before the trailing
@@ -482,10 +488,12 @@ fn focusedWindowIdForPid(pid: i32) ?u32 {
     return focused_wid;
 }
 
-fn focusedWindowIdForLoggedEvent(comptime event_name: []const u8, pid: i32) ?u32 {
-    const focused_wid = focusedWindowIdForPid(pid);
-    log.debug(event_name ++ " pid={} wid={}", .{ pid, focused_wid orelse 0 });
-    return focused_wid;
+/// The focused window `focus_query` observed for a focus event; 0 means the
+/// app had none or did not answer in time.
+fn focusedWindowIdForLoggedEvent(comptime event_name: []const u8, ev: *const event_mod.Event) ?u32 {
+    log.debug(event_name ++ " pid={} wid={}", .{ ev.pid, ev.wid });
+    if (ev.wid == 0) return null;
+    return ev.wid;
 }
 
 fn managedLeaderForFocusedWindow(pid: i32, focused_wid: u32) ?window_mod.Window {
@@ -1459,6 +1467,9 @@ fn nativeTabGroupMoveConfirmed(wid: u32, pending: state_mod.PendingNativeWindowM
 /// needed because same-process switches require an Electron-compatible delay.
 var g_last_focused_pid: i32 = 0;
 var g_last_focused_window_id: u32 = 0;
+/// Latest app activation, used to drop an earlier activation's focus answer
+/// that `focus_query` delivered late.
+var g_last_activated_pid: i32 = 0;
 /// Compiled keybind table referenced (not copied) by the hotkey event tap.
 /// The caller of bw_set_keybinds owns the storage and must keep it alive for
 /// as long as the event tap can fire; main's KeybindTable guarantees this.
@@ -2977,10 +2988,12 @@ fn workspaceAppLaunched(pid: i32) void {
     bw_emit_event(shim.BW_EVENT_APP_LAUNCHED, pid, 0);
 }
 
-/// Callback target for BWObserver.activeAppChanged:.
+/// Callback target for BWObserver.activeAppChanged:. The focused-window
+/// answer arrives later as `window_focused`.
 fn workspaceActiveAppChanged(pid: i32) void {
     std.debug.assert(pid > 0);
-    bw_emit_event(shim.BW_EVENT_WINDOW_FOCUSED, pid, 0);
+    g_last_activated_pid = pid;
+    focus_query.request(pid, .activated);
 }
 
 /// Callback target for BWObserver.appVisibilityChanged:.
@@ -3107,6 +3120,7 @@ fn startCore(config_path_arg: ?[]const u8) !void {
     loginitem.reconcile(g_config.start_at_login);
 
     ax_writer.init(geometryWriteFailed);
+    focus_query.init();
 
     // -- Accessibility check --
     if (!ax_mod.isTrusted()) {
@@ -3982,9 +3996,15 @@ fn handleEvent(ev: *const event_mod.Event) void {
             retile();
         },
         .window_focused => {
+            // Each app answers on its own queue, so an earlier activation's
+            // answer can arrive after a later one's.
+            if (ev.pid != g_last_activated_pid) {
+                log.debug("window focused: stale activation pid={d} active_pid={d}", .{ ev.pid, g_last_activated_pid });
+                return;
+            }
             // Activation raises windows even when no managed focus changes.
             g_dim_dirty = true;
-            const focused_wid_opt = focusedWindowIdForLoggedEvent("window focused", ev.pid);
+            const focused_wid_opt = focusedWindowIdForLoggedEvent("window focused", ev);
             if (!g_state.isWorkspaceTransitionActive()) {
                 requestCleanupForPid(ev.pid);
                 requestOffscreenCleanup();
@@ -4001,7 +4021,7 @@ fn handleEvent(ev: *const event_mod.Event) void {
         },
         .focused_window_changed => {
             g_dim_dirty = true;
-            const focused_wid_opt = focusedWindowIdForLoggedEvent("focused window changed", ev.pid);
+            const focused_wid_opt = focusedWindowIdForLoggedEvent("focused window changed", ev);
             if (!g_state.isWorkspaceTransitionActive()) {
                 requestCleanupForPid(ev.pid);
                 requestOffscreenCleanup();
@@ -4100,6 +4120,15 @@ fn handleEvent(ev: *const event_mod.Event) void {
         },
         .native_topology_poll_tick => reconcileNativeSpaceTopologyIfNeeded(),
         .process_sweep_due => if (sweepProcesses()) retile(),
+        .focus_retry_observed => dispatchStateEvent(.{ .focus_retry_observed = .{
+            .process_id = ev.pid,
+            .focused_window_id = ev.wid,
+        } }),
+        .focus_retry_unanswered => dispatchStateEvent(.{ .focus_retry_observed = .{
+            .process_id = ev.pid,
+            .focused_window_id = 0,
+            .has_answered = false,
+        } }),
         .native_observation_due => {
             if (processDueNativeStateObservation()) return;
             // A replaced timer's fire must not re-arm: the current timer already
@@ -5819,6 +5848,7 @@ fn trackFocusRetry(pid: i32) void {
     dispatchStateEvent(.{ .track_focus_retry = .{
         .process_id = pid,
         .attempts_remaining = focus_retry_attempts_max,
+        .unanswered_remaining = focus_retry_unanswered_max,
     } });
 }
 
@@ -5828,16 +5858,11 @@ fn untrackFocusRetry(pid: i32) void {
 }
 
 /// Re-query the AX focused window for tracked pids on the role-poll cadence.
-/// Resolved pids run the normal focus reconciliation path; exhausted pids are
-/// dropped (the next real focus event will try again).
+/// Answers arrive as `focus_retry_observed`; ticks while a query is queued
+/// collapse into it, so a hung app spends one attempt per answer, not per tick.
 fn processFocusRetries() void {
     const retries = g_state.focus_retries;
-    for (retries.items()) |retry| {
-        dispatchStateEvent(.{ .focus_retry_observed = .{
-            .process_id = retry.process_id,
-            .focused_window_id = bw_ax_get_focused_window(retry.process_id),
-        } });
-    }
+    for (retries.items()) |retry| focus_query.request(retry.process_id, .retry);
 }
 
 fn trackAppLaunchRetry(pid: i32) void {
@@ -6780,6 +6805,7 @@ fn releaseProcess(pid: i32) void {
     }
     removeWorkspaceApplication(pid);
     ax_writer.forgetApp(pid);
+    focus_query.forgetApp(pid);
     ax_observer.unobserveApp(pid);
     removeAppWindows(pid);
 }

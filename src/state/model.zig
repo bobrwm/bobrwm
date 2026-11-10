@@ -485,6 +485,10 @@ pub const DiscoveryQueue = enum {
 pub const ProcessRetry = struct {
     process_id: i32,
     attempts_remaining: u8,
+    /// Focus retries only: queries the app may leave unanswered before the
+    /// retry expires, counted apart so an app still launching does not use
+    /// up the attempts meant for one that answers without a window.
+    unanswered_remaining: u8 = 0,
 };
 
 pub const ProcessRetries = struct {
@@ -1128,6 +1132,9 @@ pub const Event = union(enum) {
     focus_retry_observed: struct {
         process_id: i32,
         focused_window_id: WindowId,
+        /// False when the app did not answer in time, as opposed to
+        /// answering without a focused window.
+        has_answered: bool = true,
     },
     // The shell found the process alive. A known PID with a new start time
     // was reused, so its previous process ended without a termination event.

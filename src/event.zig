@@ -26,6 +26,8 @@ pub const EventKind = enum(u8) {
     menu_opened = 44,
     menu_closed = 45,
     process_sweep_due = 46,
+    focus_retry_observed = 47,
+    focus_retry_unanswered = 48,
 
     hk_focus_workspace = 20,
     hk_move_to_workspace = 21,
