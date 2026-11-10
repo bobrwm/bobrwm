@@ -246,7 +246,8 @@ fn appState(app: app_queue.App) *App {
     return state;
 }
 
-/// Apply every write queued for one app.
+/// Stop after eight writes or eight milliseconds so focus and query jobs
+/// get a turn too. One slow AX write can take longer than eight milliseconds.
 fn runWrites(app: app_queue.App) void {
     const state = appState(app);
     const strings = ax.strings().?;
@@ -261,16 +262,26 @@ fn runWrites(app: app_queue.App) void {
         _ = c.AXUIElementSetAttributeValue(ax_app, strings.enhanced_ui_attr, c.kCFBooleanTrue);
     };
 
-    while (true) {
+    const deadline_ns = osutil.nanoTimestamp() + 8 * std.time.ns_per_ms;
+    for (0..8) |_| {
         c.os_unfair_lock_lock(&g_lock);
         const pending = takePending(app.pid);
         c.os_unfair_lock_unlock(&g_lock);
         const write_request = pending orelse return;
 
         if (!restore_enhanced_ui) restore_enhanced_ui = suspendEnhancedUi(state, ax_app, strings);
-        if (applyPending(state, app.pid, strings, write_request)) continue;
-        if (write_request.write.quiet) continue;
-        reportFailure(write_request);
+        if (!applyPending(state, app.pid, strings, write_request) and !write_request.write.quiet) {
+            reportFailure(write_request);
+        }
+        if (osutil.nanoTimestamp() >= deadline_ns) break;
+    }
+
+    c.os_unfair_lock_lock(&g_lock);
+    defer c.os_unfair_lock_unlock(&g_lock);
+    for (g_pending[0..g_pending_count]) |pending| {
+        if (pending.pid != app.pid) continue;
+        _ = app_queue.submit(app.pid, .write);
+        break;
     }
 }
 
