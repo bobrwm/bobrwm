@@ -1,8 +1,7 @@
 //! Whether or not a window is ready to tile (based off of AX responses).
 //!
-//! `query` answers on the calling thread. `request` asks on the app's queue
-//! and publishes the answer as a `window_readiness_observed` event, so a slow
-//! app only stalls its own queue, not others.
+//! Requests are answered on the app's queue and published as
+//! `window_readiness_observed` events.
 
 const std = @import("std");
 const c = @import("c");
@@ -14,7 +13,7 @@ const window_server = @import("window_server.zig");
 
 const log = std.log.scoped(.window_readiness);
 
-pub const Readiness = state_mod.WindowReadiness;
+const Readiness = state_mod.WindowReadiness;
 
 /// What asked, which decides how the main thread applies the answer.
 pub const Purpose = enum(u2) {
@@ -49,7 +48,7 @@ pub const Observation = struct {
 
 /// A responsive app answers well within it; a hung one holds only its own
 /// queue this long per message.
-pub const timeout_seconds: f32 = 0.25;
+const timeout_seconds: f32 = 0.25;
 
 /// Covers every candidate queue plus a cleanup pass over the managed windows.
 const max_requests = 1024;
@@ -75,7 +74,7 @@ pub fn init() void {
 
 /// Ask whether `wid` is ready on its app's queue. A request already waiting
 /// for the window absorbs this one. The caller has checked that the app is a
-/// regular one; `query` assumes it.
+/// regular one.
 pub fn request(pid: i32, wid: u32, purpose: Purpose) void {
     std.debug.assert(pid > 0);
     std.debug.assert(wid > 0);
@@ -88,16 +87,13 @@ pub fn forgetApp(pid: i32) void {
     c.os_unfair_lock_lock(&g_lock);
     defer c.os_unfair_lock_unlock(&g_lock);
 
-    var index: usize = 0;
-    while (index < g_request_count) {
-        if (g_requests[index].pid != pid) {
-            index += 1;
-            continue;
-        }
-
-        g_request_count -= 1;
-        g_requests[index] = g_requests[g_request_count];
+    var kept: usize = 0;
+    for (g_requests[0..g_request_count]) |queued| {
+        if (queued.pid == pid) continue;
+        g_requests[kept] = queued;
+        kept += 1;
     }
+    g_request_count = kept;
 }
 
 fn queueRequest(pid: i32, wid: u32, purpose: Purpose) bool {
@@ -121,23 +117,25 @@ fn queueRequest(pid: i32, wid: u32, purpose: Purpose) bool {
     return true;
 }
 
+/// Take the app's oldest requests. Order is kept because adoption order sets
+/// layout placement.
 fn takeRequests(pid: i32, out: *[max_batch]Request) []Request {
     c.os_unfair_lock_lock(&g_lock);
     defer c.os_unfair_lock_unlock(&g_lock);
 
     var count: usize = 0;
-    var index: usize = 0;
-    while (index < g_request_count and count < out.len) {
-        if (g_requests[index].pid != pid) {
-            index += 1;
+    var kept: usize = 0;
+    for (g_requests[0..g_request_count]) |queued| {
+        if (queued.pid == pid and count < out.len) {
+            out[count] = queued;
+            count += 1;
             continue;
         }
 
-        out[count] = g_requests[index];
-        count += 1;
-        g_request_count -= 1;
-        g_requests[index] = g_requests[g_request_count];
+        g_requests[kept] = queued;
+        kept += 1;
     }
+    g_request_count = kept;
 
     return out[0..count];
 }
@@ -191,18 +189,6 @@ fn answerRequests(app: app_queue.App) void {
             shim.bw_emit_event_detail(shim.BW_EVENT_WINDOW_READINESS_OBSERVED, queued.pid, queued.wid, observation.encode());
         }
     }
-}
-
-/// Readiness of one window, answered on the calling thread.
-pub fn query(pid: i32, wid: u32, timeout: f32) Readiness {
-    std.debug.assert(pid > 0);
-    std.debug.assert(wid > 0);
-
-    var element: [1]?c.AXUIElementRef = undefined;
-    ax.findWindows(pid, &.{wid}, &element, timeout);
-    const win = element[0] orelse return .pending;
-    defer c.CFRelease(@ptrCast(win));
-    return classify(win);
 }
 
 /// Classify a window from its AX role and subrole.

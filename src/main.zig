@@ -29,7 +29,6 @@ const animation_mod = @import("animation.zig");
 const display_link = @import("display_link.zig");
 const ax_mod = @import("ax.zig");
 const app_queue = @import("app_queue.zig");
-const ax_backoff = @import("ax_backoff.zig");
 const ax_writer = @import("ax_writer.zig");
 const focus_query = @import("focus_query.zig");
 const geometry_mod = @import("geometry.zig");
@@ -1913,30 +1912,6 @@ fn postSameProcessFocusEvent(
     return post_event(psn, &event) == 0;
 }
 
-/// Readiness for discovery and addNewWindow, which decide on the spot.
-/// Pending while the app is backed off as hung: the window is queued, and the
-/// role poll asks again on the app's queue.
-fn windowReadiness(pid: i32, wid: u32) WindowReadiness {
-    std.debug.assert(pid > 0);
-    if (!isRegularActivationApp(pid)) return .reject;
-    if (ax_backoff.isBackedOff(pid)) return .pending;
-
-    const started_ns = nanoTimestamp();
-    const readiness = window_readiness.query(pid, wid, window_readiness.timeout_seconds);
-
-    // Pending after a full timeout means a message went unanswered. A slow
-    // app that answered every message got a verdict, however long it took.
-    const elapsed_ns = nanoTimestamp() - started_ns;
-    const timeout_ns: i128 = @intFromFloat(window_readiness.timeout_seconds * std.time.ns_per_s);
-    if (readiness == .pending and elapsed_ns >= timeout_ns) {
-        log.debug("readiness: pid={d} wid={d} timed out after {d}ms; backing off", .{
-            pid, wid, @divTrunc(elapsed_ns, std.time.ns_per_ms),
-        });
-        ax_backoff.backOff(pid);
-    }
-    return readiness;
-}
-
 /// Ask on the app's queue; the answer arrives as window_readiness_observed.
 fn requestReadiness(pid: i32, wid: u32, purpose: window_readiness.Purpose) void {
     if (!isRegularActivationApp(pid)) {
@@ -2112,6 +2087,8 @@ fn initWakerSource() void {
     g_waker_source = c.CFRunLoopSourceCreate(null, 0, &context);
     const source = g_waker_source orelse return;
     c.CFRunLoopAddSource(c.CFRunLoopGetMain(), source, c.kCFRunLoopCommonModes);
+    // Drain events queued before the source existed.
+    c.CFRunLoopSourceSignal(source);
 }
 
 fn signalWaker() void {
@@ -2969,14 +2946,9 @@ fn startCore(config_path_arg: ?[]const u8) !void {
 
     // -- Discover existing windows and tile --
     captureWorkspaceApplicationInventory();
+    // The app frontmost at launch never reports an activation.
+    if (frontmostApplicationPid()) |pid| g_last_activated_pid = pid;
     discoverWindows();
-    log.info("discovered {} windows", .{g_state.windows.count});
-
-    // Topology starts focused on the primary display, which may not hold the
-    // frontmost window. Adopt it so focus and dimming start where the user is.
-    if (frontmostApplicationPid()) |pid| {
-        if (focusedWindowId(pid, null)) |wid| _ = syncFocusStateForWindowId(wid, .ax);
-    }
     retileAllDisplays();
 
     // Register runtime ObjC classes (BWObserver / BWLaunchGate) before
@@ -3863,8 +3835,7 @@ fn handleEvent(ev: *const event_mod.Event) void {
                 return;
             }
 
-            addNewWindow(ev.pid, ev.wid, .needed);
-            retile();
+            addNewWindow(ev.pid, ev.wid);
         },
         .window_destroyed => {
             log.debug("window destroyed wid={}", .{ev.wid});
@@ -4991,7 +4962,7 @@ fn executeWindowMoved(move: state_mod.WindowMoveEffect) void {
 }
 
 fn executePendingRoleReady(candidate: state_mod.WindowCandidate) void {
-    if (!addNewWindowManaged(candidate.process_id, candidate.window_id, .needed) and
+    if (!addNewWindowManaged(candidate.process_id, candidate.window_id) and
         managedWindow(candidate.window_id) == null) return;
 
     retile();
@@ -4999,7 +4970,7 @@ fn executePendingRoleReady(candidate: state_mod.WindowCandidate) void {
 }
 
 fn executeDeferredWindowReady(candidate: state_mod.WindowCandidate) void {
-    if (addNewWindowManaged(candidate.process_id, candidate.window_id, .needed) or
+    if (addNewWindowManaged(candidate.process_id, candidate.window_id) or
         managedWindow(candidate.window_id) != null)
     {
         untrackDeferredWindowCandidate(candidate.window_id);
@@ -5442,7 +5413,7 @@ fn completeNativeSwitch(space: state_mod.SpaceRef, epoch: state_mod.Epoch) void 
     const started_ns = nanoTimestamp();
     if (g_state.space(space.key) == null) return;
 
-    _ = discoverWindowsAfterNativeSpaceSwitch();
+    discoverWindowsAfterNativeSpaceSwitch();
     clearDragPreview();
     requestRetileDisplay(space.display_id);
     if (!g_event_drain_active) flushRetileRequests();
@@ -5800,17 +5771,19 @@ fn removeWorkspaceApplication(process_id: i32) void {
 }
 
 fn discoverWindows() void {
-    _ = discoverWindowsImpl(false);
+    discoverWindowsImpl(false);
 }
 
-fn discoverWindowsAfterNativeSpaceSwitch() usize {
-    return discoverWindowsImpl(true);
+fn discoverWindowsAfterNativeSpaceSwitch() void {
+    discoverWindowsImpl(true);
 }
 
-fn discoverWindowsImpl(should_refresh_tabs: bool) usize {
+/// Queue every unmanaged on-screen window for adoption once its app reports
+/// it ready.
+fn discoverWindowsImpl(should_refresh_tabs: bool) void {
     // A multi-step native switch exposes intermediate Spaces long enough for
     // CG and AX discovery. Adopt only after SkyLight confirms the destination.
-    if (nativeSwitchPending()) return 0;
+    if (nativeSwitchPending()) return;
     const started_ns = nanoTimestamp();
 
     const span = trace.begin("discover");
@@ -5827,11 +5800,9 @@ fn discoverWindowsImpl(should_refresh_tabs: bool) usize {
 
     var observed_pids: [128]i32 = undefined;
     var observed_pid_count: usize = 0;
-    var adopted_count: usize = 0;
 
-    // Sort windows by current x-position so the BSP tree order matches
-    // their on-screen placement. Without this, windows discovered in
-    // arbitrary order get swapped to the opposite side on the first retile.
+    // Requests are answered in order, so sorting by x keeps each app's
+    // windows in their on-screen order.
     const slice = buf[0..discovery.count];
     std.mem.sortUnstable(shim.bw_window_info, slice, {}, struct {
         fn lessThan(_: void, a: shim.bw_window_info, b: shim.bw_window_info) bool {
@@ -5871,72 +5842,14 @@ fn discoverWindowsImpl(should_refresh_tabs: bool) usize {
             log.debug("discover: ignored pid={d} wid={d} on unmanaged native Space", .{ info.pid, info.wid });
             continue;
         };
-        // A landing must not wait on an app's AX server. The role poll applies
-        // the same gate after the switch path is free to accept more input.
-        if (should_refresh_tabs) {
-            trackPendingRoleWindow(info.pid, info.wid, target_ws);
-            continue;
-        }
-
-        switch (windowReadiness(info.pid, info.wid)) {
-            .reject => {
-                untrackPendingRoleWindow(info.wid);
-                continue;
-            },
-            .pending => {
-                trackPendingRoleWindow(info.pid, info.wid, target_ws);
-                continue;
-            },
-            .ready => {
-                untrackPendingRoleWindow(info.wid);
-                // Degenerate discovery bounds mean the window is still
-                // mid-construction. Defer for bounded re-evaluation instead
-                // of storing a garbage frame that would be tiled at zero size.
-                // Deliberately not untracked first: tracking an
-                // existing candidate preserves its remaining retry budget.
-                if (frame.width <= 1 or frame.height <= 1) {
-                    trackDeferredWindowCandidate(info.pid, info.wid, target_ws);
-                    log.debug("discover: deferred pid={d} wid={d} unsettled bounds", .{ info.pid, info.wid });
-                    continue;
-                }
-                untrackDeferredWindowCandidate(info.wid);
-            },
-        }
-
-        const source_ws = nativeWorkspaceForWindow(info.wid, discovered_display) orelse {
-            trackDeferredWindowCandidate(info.pid, info.wid, target_ws);
-            log.debug("discover: deferred pid={d} wid={d} unsettled native Space", .{ info.pid, info.wid });
-            continue;
-        };
-
-        const win: window_mod.Window = .{
-            .wid = info.wid,
-            .pid = info.pid,
-            .frame = frame,
-            .mode = if (shouldFloatWindow(info.pid, info.wid, frame)) .floating else .tiled,
-        };
-
-        adoptWindow(target_ws, win) catch |err| {
-            log.err("discover: failed to adopt pid={d} wid={d}: {}", .{ info.pid, info.wid, err });
-            continue;
-        };
-        adopted_count += 1;
-
-        if (!source_ws.key.eql(target_ws.key)) requestNativeWindowMove(info.wid, source_ws, target_ws);
-    }
-
-    // Ensure a focused window is set on the active workspace
-    const active_ws = activeWorkspace();
-    const active_windows = workspaceWindows(active_ws);
-    if (focusedWorkspaceWindow(active_ws) == null and active_windows.items().len > 0) {
-        recordWorkspaceFocus(active_ws, active_windows.items()[0]);
+        trackPendingRoleWindow(info.pid, info.wid, target_ws);
+        requestReadiness(info.pid, info.wid, .pending_role);
     }
 
     const completed_ns = nanoTimestamp();
     const spent = span.cost();
-    log.debug("discover: candidates={d} adopted={d} enumerate_us={d} tabs_us={d} adopt_us={d} ax={d} sky={d} cg={d}", .{
+    log.debug("discover: candidates={d} enumerate_us={d} tabs_us={d} request_us={d} ax={d} sky={d} cg={d}", .{
         discovery.count,
-        adopted_count,
         @divTrunc(enumerated_ns - started_ns, std.time.ns_per_us),
         @divTrunc(tabs_refreshed_ns - enumerated_ns, std.time.ns_per_us),
         @divTrunc(completed_ns - tabs_refreshed_ns, std.time.ns_per_us),
@@ -5944,7 +5857,6 @@ fn discoverWindowsImpl(should_refresh_tabs: bool) usize {
         spent.skylight,
         spent.window_list,
     });
-    return adopted_count;
 }
 
 /// Snapshot of the window ids CG reports on screen, excluding desktop elements
@@ -6110,7 +6022,6 @@ fn addNewWindowManagedWithAssignment(
     pid: i32,
     wid: u32,
     assigned_space: state_mod.SpaceRef,
-    detect: TabDetectPass,
 ) bool {
     const span = trace.beginWindow("addNewWindow", pid, wid);
     defer _ = span.end();
@@ -6171,7 +6082,7 @@ fn addNewWindowManagedWithAssignment(
     // Check if this new on-screen window replaces an existing same-PID window
     // that just went off-screen (i.e. a new tab was created and became active,
     // pushing the old tab to background). If so, form a tab group.
-    if (detect == .needed and tryFormTabGroupOnCreate(pid, wid, .adopt) == .joined) return false;
+    if (tryFormTabGroupOnCreate(pid, wid, .adopt) == .joined) return false;
 
     const ws = g_state.space(assigned_space.key) orelse return false;
     const win: window_mod.Window = .{
@@ -6185,7 +6096,10 @@ fn addNewWindowManagedWithAssignment(
         log.err("addNewWindow: failed to adopt pid={d} wid={d}: {}", .{ pid, wid, err });
         return false;
     };
-    recordWorkspaceFocus(ws, wid);
+    // A window adopted in the background must not take focus.
+    if (focusedWorkspaceWindow(ws) == null) recordWorkspaceFocus(ws, wid);
+    // Its focus event may have arrived before it was managed.
+    if (frontmostApplicationPid() == pid) focus_query.request(pid, .activated);
 
     if (!source_ws.key.eql(ws.key)) requestNativeWindowMove(wid, source_ws, ws);
 
@@ -6199,7 +6113,7 @@ fn addNewWindowManagedWithAssignment(
     return true;
 }
 
-fn addNewWindowManaged(pid: i32, wid: u32, detect: TabDetectPass) bool {
+fn addNewWindowManaged(pid: i32, wid: u32) bool {
     // Prefer the window's actual on-screen position over the currently
     // focused display: a torn-off tab dropped on another monitor must land
     // on the workspace that owns the destination monitor, not on whichever
@@ -6213,37 +6127,22 @@ fn addNewWindowManaged(pid: i32, wid: u32, detect: TabDetectPass) bool {
     // A rule-pinned app's transient launch position is meaningless: place it
     // on the display that currently owns its assigned workspace, not wherever
     // it happened to launch.
-    return addNewWindowManagedWithAssignment(pid, wid, ws, detect);
+    return addNewWindowManagedWithAssignment(pid, wid, ws);
 }
 
-fn addNewWindow(pid: i32, wid: u32, detect: TabDetectPass) void {
+/// Queue `wid` for adoption once its app reports it ready.
+fn addNewWindow(pid: i32, wid: u32) void {
     std.debug.assert(wid != 0);
     if (managedWindow(wid) != null) return;
 
-    switch (windowReadiness(pid, wid)) {
-        .reject => {
-            untrackPendingRoleWindow(wid);
-            untrackDeferredWindowCandidate(wid);
-            log.debug("addNewWindow: role gate rejected pid={d} wid={d}", .{ pid, wid });
-        },
-        .ready => {
-            untrackPendingRoleWindow(wid);
-            _ = addNewWindowManaged(pid, wid, detect);
-        },
-        .pending => {
-            // Same rationale as addNewWindowManaged: derive the display from
-            // the actual window position so a deferred candidate is later
-            // promoted onto the correct workspace+display.
-            const display_id = inferDisplayIdForWindow(wid) orelse focusedDisplayId();
-            const ws = resolveWorkspaceForWindow(pid, wid, display_id) orelse {
-                log.debug("addNewWindow: ignored pending pid={d} wid={d} on unmanaged native Space", .{ pid, wid });
-                return;
-            };
-            trackPendingRoleWindow(pid, wid, ws);
-            trackDeferredWindowCandidate(pid, wid, ws);
-            log.debug("addNewWindow: role gate pending pid={d} wid={d}", .{ pid, wid });
-        },
-    }
+    // Use the window's own display, not the focused one.
+    const display_id = inferDisplayIdForWindow(wid) orelse focusedDisplayId();
+    const ws = resolveWorkspaceForWindow(pid, wid, display_id) orelse {
+        log.debug("addNewWindow: ignored pid={d} wid={d} on unmanaged native Space", .{ pid, wid });
+        return;
+    };
+    trackPendingRoleWindow(pid, wid, ws);
+    requestReadiness(pid, wid, .pending_role);
 }
 
 fn hasWindowTabGroups() bool {
@@ -6344,9 +6243,6 @@ fn refreshTabGroupActiveTabsFromSnapshot(on_screen: *const OnScreenWindows) void
 /// Identifies callers when one window triggers duplicate detection passes.
 const TabDetectReason = enum { focus_unknown, adopt };
 
-/// Whether adoption still needs the expensive AX tab-detection pass.
-const TabDetectPass = enum { needed, standalone };
-
 const TabDetectResult = enum {
     joined,
     standalone,
@@ -6356,8 +6252,7 @@ const TabDetectResult = enum {
 
 /// Check whether a window that just appeared — created, or focused while
 /// unknown — is a native tab of an already-managed window, and if so hand it
-/// the group's slot. Distinguishing a standalone verdict from an inconclusive
-/// observation lets callers skip only genuinely redundant detection passes.
+/// the group's slot.
 ///
 /// Gathers the OS facts, classifies them, and applies the outcome.
 fn tryFormTabGroupOnCreate(pid: i32, new_wid: u32, reason: TabDetectReason) TabDetectResult {
@@ -7358,16 +7253,12 @@ fn reconcileFocusedWindow(pid: i32, focused_wid: u32) void {
     // window. Same decision as the creation path, so it runs the same code.
     log.debug("reconcile case 3: unknown wid={d}", .{focused_wid});
 
-    // Retry inconclusive observations; skip only a conclusive standalone pass.
-    const adoption_pass: TabDetectPass = switch (tryFormTabGroupOnCreate(pid, focused_wid, .focus_unknown)) {
-        .joined => {
-            _ = syncFocusStateForWindowId(focused_wid, .ax);
-            return;
-        },
-        .standalone => .standalone,
-        .inconclusive => .needed,
-    };
-    addNewWindow(pid, focused_wid, adoption_pass);
+    if (tryFormTabGroupOnCreate(pid, focused_wid, .focus_unknown) == .joined) {
+        _ = syncFocusStateForWindowId(focused_wid, .ax);
+        return;
+    }
+    addNewWindow(pid, focused_wid);
+    // Tab detection may have removed stale windows.
     retile();
 }
 
