@@ -7,6 +7,7 @@
 
 const std = @import("std");
 const c = @import("c");
+const app_queue = @import("app_queue.zig");
 const ax = @import("ax.zig");
 const osutil = @import("osutil.zig");
 const window_mod = @import("window.zig");
@@ -57,7 +58,6 @@ const messaging_timeout_seconds: f32 = 1.0;
 /// writes while bounding how long an external change goes unnoticed.
 const enhanced_ui_false_ttl_ns: i128 = 500 * std.time.ns_per_ms;
 
-const max_apps = 64;
 const max_pending = 256;
 const element_slots = 32;
 
@@ -73,14 +73,9 @@ const CachedElement = struct {
     element: c.AXUIElementRef,
 };
 
+/// Per-app state, indexed by the app's queue slot and confined to its queue.
 const App = struct {
-    // Guarded by g_lock.
-    pid: i32 = 0,
-    scheduled: bool = false,
-    reset: bool = false,
-    queue: c.dispatch_queue_t = null,
-
-    // Confined to the app's queue.
+    generation: u32 = 0,
     elements: [element_slots]?CachedElement = @splat(null),
     enhanced_ui_false_at_ns: ?i128 = null,
 
@@ -95,7 +90,7 @@ const App = struct {
 };
 
 var g_lock: c.os_unfair_lock = .{};
-var g_apps: [max_apps]App = @splat(.{});
+var g_apps: [app_queue.max_apps]App = @splat(.{});
 var g_pending: [max_pending]Pending = undefined;
 var g_pending_count: usize = 0;
 var g_on_failure: ?FailureFn = null;
@@ -119,6 +114,8 @@ pub fn init(on_failure: FailureFn, activate: ActivateFn) void {
     _ = ax.strings();
     g_on_failure = on_failure;
     g_activate = activate;
+    app_queue.setHandler(.write, runWrites);
+    app_queue.setHandler(.focus, runFocus);
 }
 
 /// Queue `frame` for `wid`. Returns false only when the tables are full, in
@@ -129,13 +126,17 @@ pub fn write(pid: i32, wid: u32, frame: Frame, kind: Write) bool {
     std.debug.assert(kind.position or kind.size);
     if (kind.size and (frame.width <= 0 or frame.height <= 0)) return false;
 
+    if (!queuePending(pid, wid, frame, kind)) return false;
+    if (app_queue.submit(pid, .write)) return true;
+
+    forgetWindow(wid);
+    return false;
+}
+
+fn queuePending(pid: i32, wid: u32, frame: Frame, kind: Write) bool {
     c.os_unfair_lock_lock(&g_lock);
     defer c.os_unfair_lock_unlock(&g_lock);
 
-    const app = appForPid(pid) orelse {
-        log.warn("writer app table full; dropping write wid={d} pid={d}", .{ wid, pid });
-        return false;
-    };
     if (pendingIndex(wid)) |index| {
         const pending = &g_pending[index];
         pending.frame = frame;
@@ -149,11 +150,6 @@ pub fn write(pid: i32, wid: u32, frame: Frame, kind: Write) bool {
         g_pending[g_pending_count] = .{ .pid = pid, .wid = wid, .frame = frame, .write = kind };
         g_pending_count += 1;
     }
-
-    if (!app.scheduled) {
-        app.scheduled = true;
-        c.dispatch_async_f(app.queue, app, drainApp);
-    }
     return true;
 }
 
@@ -166,12 +162,6 @@ pub fn focus(pid: i32, wid: u32, is_same_process: bool) bool {
     std.debug.assert(wid > 0);
 
     c.os_unfair_lock_lock(&g_lock);
-    defer c.os_unfair_lock_unlock(&g_lock);
-
-    const app = appForPid(pid) orelse {
-        log.warn("writer app table full; dropping focus wid={d} pid={d}", .{ wid, pid });
-        return false;
-    };
     g_focus_sequence += 1;
     g_focus = .{
         .pid = pid,
@@ -179,12 +169,14 @@ pub fn focus(pid: i32, wid: u32, is_same_process: bool) bool {
         .is_same_process = is_same_process,
         .sequence = g_focus_sequence,
     };
+    c.os_unfair_lock_unlock(&g_lock);
 
-    if (!app.scheduled) {
-        app.scheduled = true;
-        c.dispatch_async_f(app.queue, app, drainApp);
-    }
-    return true;
+    if (app_queue.submit(pid, .focus)) return true;
+
+    c.os_unfair_lock_lock(&g_lock);
+    if (hasFocusFor(pid)) g_focus = null;
+    c.os_unfair_lock_unlock(&g_lock);
+    return false;
 }
 
 /// Drop writes still queued for a destroyed window. One already executing
@@ -195,8 +187,8 @@ pub fn forgetWindow(wid: u32) void {
     if (pendingIndex(wid)) |index| removePending(index);
 }
 
-/// Drop queued writes and cached elements for a terminated app. PIDs are
-/// recycled, so a later process must never inherit the old elements.
+/// Drop queued writes and focus for a terminated app. Its cached elements are
+/// dropped when its queue slot passes to another process.
 pub fn forgetApp(pid: i32) void {
     std.debug.assert(pid > 0);
     c.os_unfair_lock_lock(&g_lock);
@@ -207,37 +199,6 @@ pub fn forgetApp(pid: i32) void {
         if (g_pending[index].pid == pid) removePending(index) else index += 1;
     }
     if (hasFocusFor(pid)) g_focus = null;
-    for (&g_apps) |*app| {
-        if (app.pid != pid) continue;
-        app.reset = true;
-        app.pid = 0;
-    }
-}
-
-/// Caller holds g_lock. Reuses an idle slot for a new pid; its queue drops
-/// the previous app's elements before the first write.
-fn appForPid(pid: i32) ?*App {
-    var idle: ?*App = null;
-    for (&g_apps) |*app| {
-        if (app.pid == pid) return app;
-        if (idle == null and !app.scheduled and !hasPendingFor(app.pid) and !hasFocusFor(app.pid)) idle = app;
-    }
-    const app = idle orelse return null;
-    if (app.queue == null) {
-        const attr = c.dispatch_queue_attr_make_with_qos_class(null, c.QOS_CLASS_USER_INTERACTIVE, 0);
-        app.queue = c.dispatch_queue_create("com.bobrwm.ax-writer", attr);
-    }
-    app.reset = app.reset or app.pid != 0;
-    app.pid = pid;
-    return app;
-}
-
-fn hasPendingFor(pid: i32) bool {
-    if (pid == 0) return false;
-    for (g_pending[0..g_pending_count]) |pending| {
-        if (pending.pid == pid) return true;
-    }
-    return false;
 }
 
 fn hasFocusFor(pid: i32) bool {
@@ -274,28 +235,22 @@ fn takePending(pid: i32) ?Pending {
     return null;
 }
 
-/// Apply every write queued for one app. Runs on that app's serial queue, so
-/// `app`'s queue-confined fields need no lock.
-fn drainApp(context: ?*anyopaque) callconv(.c) void {
-    const app: *App = @ptrCast(@alignCast(context.?));
-
-    c.os_unfair_lock_lock(&g_lock);
-    const pid = app.pid;
-    const reset = app.reset;
-    app.reset = false;
-    c.os_unfair_lock_unlock(&g_lock);
-
-    if (reset) app.dropElements();
-    if (pid == 0) {
-        markIdle(app);
-        return;
+/// The app's queue-confined state, reset when its slot passed to a new
+/// process: PIDs are recycled, and a new process must not inherit elements.
+fn appState(app: app_queue.App) *App {
+    const state = &g_apps[app.index];
+    if (state.generation != app.generation) {
+        state.dropElements();
+        state.generation = app.generation;
     }
+    return state;
+}
 
+/// Apply every write queued for one app.
+fn runWrites(app: app_queue.App) void {
+    const state = appState(app);
     const strings = ax.strings().?;
-    const ax_app = c.AXUIElementCreateApplication(pid) orelse {
-        markIdle(app);
-        return;
-    };
+    const ax_app = c.AXUIElementCreateApplication(app.pid) orelse return;
     defer c.CFRelease(@ptrCast(ax_app));
     _ = c.AXUIElementSetMessagingTimeout(ax_app, messaging_timeout_seconds);
 
@@ -308,34 +263,23 @@ fn drainApp(context: ?*anyopaque) callconv(.c) void {
 
     while (true) {
         c.os_unfair_lock_lock(&g_lock);
-        const pending = takePending(pid) orelse {
-            const request = takeFocus(pid) orelse {
-                app.scheduled = false;
-                c.os_unfair_lock_unlock(&g_lock);
-                return;
-            };
-            c.os_unfair_lock_unlock(&g_lock);
-            applyFocus(app, pid, strings, request);
-            continue;
-        };
+        const pending = takePending(app.pid);
         c.os_unfair_lock_unlock(&g_lock);
+        const write_request = pending orelse return;
 
-        if (!restore_enhanced_ui) restore_enhanced_ui = suspendEnhancedUi(app, ax_app, strings);
-        if (applyPending(app, pid, strings, pending)) continue;
-        if (pending.write.quiet) continue;
-        reportFailure(pending);
+        if (!restore_enhanced_ui) restore_enhanced_ui = suspendEnhancedUi(state, ax_app, strings);
+        if (applyPending(state, app.pid, strings, write_request)) continue;
+        if (write_request.write.quiet) continue;
+        reportFailure(write_request);
     }
 }
 
-fn markIdle(app: *App) void {
+fn runFocus(app: app_queue.App) void {
     c.os_unfair_lock_lock(&g_lock);
-    defer c.os_unfair_lock_unlock(&g_lock);
-    app.scheduled = false;
-    // A write can arrive between reading pid and here; keep it moving.
-    if (app.pid != 0 and (hasPendingFor(app.pid) or hasFocusFor(app.pid))) {
-        app.scheduled = true;
-        c.dispatch_async_f(app.queue, app, drainApp);
-    }
+    const request = takeFocus(app.pid);
+    c.os_unfair_lock_unlock(&g_lock);
+
+    applyFocus(appState(app), app.pid, ax.strings().?, request orelse return);
 }
 
 /// Report a rejected write unless a newer one for the same window is already

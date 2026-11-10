@@ -28,6 +28,7 @@ const objc_classes = @import("objc_classes.zig");
 const animation_mod = @import("animation.zig");
 const display_link = @import("display_link.zig");
 const ax_mod = @import("ax.zig");
+const app_queue = @import("app_queue.zig");
 const ax_backoff = @import("ax_backoff.zig");
 const ax_writer = @import("ax_writer.zig");
 const focus_query = @import("focus_query.zig");
@@ -6658,7 +6659,7 @@ fn releaseProcess(pid: i32) void {
     }
     removeWorkspaceApplication(pid);
     ax_writer.forgetApp(pid);
-    focus_query.forgetApp(pid);
+    app_queue.forget(pid);
     ax_observer.unobserveApp(pid);
     removeAppWindows(pid);
 }

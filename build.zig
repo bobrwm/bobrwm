@@ -591,6 +591,24 @@ pub fn build(b: *std.Build) !void {
 
     const run_watchdog_tests = b.addRunArtifact(watchdog_tests);
 
+    // app_queue.zig runs jobs on libdispatch queues; libSystem provides it.
+    const app_queue_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/app_queue.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    app_queue_test_mod.addImport("c", c_mod);
+    app_queue_test_mod.addSystemFrameworkPath(.{ .cwd_relative = sdk_frameworks });
+    app_queue_test_mod.addLibraryPath(.{ .cwd_relative = sdk_lib });
+
+    const app_queue_tests = b.addTest(.{
+        .name = "app-queue-tests",
+        .root_module = app_queue_test_mod,
+    });
+
+    const run_app_queue_tests = b.addRunArtifact(app_queue_tests);
+
     // window_server.zig queries the live WindowServer through CoreGraphics;
     // its test skips when no session is available.
     const window_server_test_mod = b.createModule(.{
@@ -708,6 +726,7 @@ pub fn build(b: *std.Build) !void {
     test_step.dependOn(&run_logging_tests.step);
     test_step.dependOn(&run_trace_tests.step);
     test_step.dependOn(&run_watchdog_tests.step);
+    test_step.dependOn(&run_app_queue_tests.step);
     test_step.dependOn(&run_window_server_tests.step);
     test_step.dependOn(&run_swipe_tests.step);
     test_step.dependOn(&run_osutil_tests.step);
