@@ -91,6 +91,8 @@ var g_window_scan_idle_ticks: u32 = 0;
 var g_window_scan_found_new: std.atomic.Value(bool) = .init(false);
 var g_is_running: bool = false;
 var g_wid_retry_contexts: [max_wid_retry_contexts]WidRetryContext = @splat(.{});
+// Count each retry until it finishes, including time spent waiting to run.
+var g_wid_retry_group: c.dispatch_group_t = null;
 var g_ax_observer_strings: ?AxObserverStrings = null;
 
 fn createAxObserverString(raw: [*:0]const u8) ?c.CFStringRef {
@@ -218,6 +220,7 @@ fn stopAxThread() void {
 
 pub fn init() void {
     deinit();
+    if (g_wid_retry_group == null) g_wid_retry_group = c.dispatch_group_create();
     // Created here, on the main thread, and kept for the process: app queue
     // jobs can still be reading them after a deinit.
     _ = ensureAxObserverStrings();
@@ -261,8 +264,10 @@ pub fn deinit() void {
     g_observe_retry_count = 0;
     g_window_scan_idle_ticks = 0;
 
-    for (&g_wid_retry_contexts) |*ctx| {
-        releaseWidRetryCtx(ctx);
+    // Retries can still be running after the observer thread stops. Wait for
+    // them to finish so we don't free an AX object while a retry is using it.
+    if (g_wid_retry_group) |group| {
+        _ = c.dispatch_group_wait(group, c.DISPATCH_TIME_FOREVER);
     }
 }
 
@@ -769,15 +774,20 @@ fn acquireWidRetryCtx() ?*WidRetryContext {
     c.os_unfair_lock_lock(&g_ax_lock);
     defer c.os_unfair_lock_unlock(&g_ax_lock);
 
+    if (!g_is_running) return null;
     for (&g_wid_retry_contexts) |*ctx| {
         if (ctx.in_use) continue;
         ctx.* = .{ .in_use = true };
+        c.dispatch_group_enter(g_wid_retry_group);
         return ctx;
     }
     return null;
 }
 
 fn releaseWidRetryCtx(ctx: *WidRetryContext) void {
+    c.os_unfair_lock_lock(&g_ax_lock);
+    defer c.os_unfair_lock_unlock(&g_ax_lock);
+
     if (!ctx.in_use) return;
     if (ctx.observer != null) {
         c.CFRelease(@ptrCast(ctx.observer));
@@ -786,6 +796,7 @@ fn releaseWidRetryCtx(ctx: *WidRetryContext) void {
         c.CFRelease(@ptrCast(ctx.element));
     }
     ctx.* = .{};
+    c.dispatch_group_leave(g_wid_retry_group);
 }
 
 fn retryResolveWid(context: ?*anyopaque) callconv(.c) void {
