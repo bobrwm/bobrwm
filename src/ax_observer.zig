@@ -51,7 +51,6 @@ const ObserveRetryEntry = struct {
 };
 
 const WidRetryContext = struct {
-    in_use: bool = false,
     observer: c.AXObserverRef = null,
     element: c.AXUIElementRef = null,
     queue: c.dispatch_queue_t = null,
@@ -777,18 +776,17 @@ fn acquireWidRetryCtx(observer: c.AXObserverRef, element: c.AXUIElementRef, pid:
 
     if (!g_is_running) return null;
     for (&g_wid_retry_contexts) |*ctx| {
-        if (!ctx.in_use or ctx.observer != observer or ctx.pid != pid) continue;
+        if (ctx.queue == null or ctx.observer != observer or ctx.pid != pid) continue;
         // AX can report the same new window more than once before it has an ID.
         // Checking whether these are the same window does not contact the app.
         if (c.CFEqual(@ptrCast(ctx.element), @ptrCast(element)) != 0) return null;
     }
     for (&g_wid_retry_contexts) |*ctx| {
-        if (ctx.in_use) continue;
+        if (ctx.queue != null) continue;
         const queue = app_queue.retainQueue(pid) orelse return null;
         _ = c.CFRetain(@ptrCast(observer));
         _ = c.CFRetain(@ptrCast(element));
         ctx.* = .{
-            .in_use = true,
             .observer = observer,
             .element = element,
             .queue = queue,
@@ -806,7 +804,7 @@ fn releaseWidRetryCtx(ctx: *WidRetryContext) void {
     c.os_unfair_lock_lock(&g_ax_lock);
     defer c.os_unfair_lock_unlock(&g_ax_lock);
 
-    if (!ctx.in_use) return;
+    if (ctx.queue == null) return;
     if (ctx.observer != null) {
         c.CFRelease(@ptrCast(ctx.observer));
     }
@@ -820,7 +818,7 @@ fn releaseWidRetryCtx(ctx: *WidRetryContext) void {
 
 fn retryResolveWid(context: ?*anyopaque) callconv(.c) void {
     const ctx = @as(*WidRetryContext, @ptrCast(@alignCast(context orelse return)));
-    if (!ctx.in_use) return;
+    if (ctx.queue == null) return;
 
     // Bail out if the app was unobserved, or its observer replaced, while
     // this retry was in flight: it must not emit WINDOW_CREATED for a pid the
