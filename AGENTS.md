@@ -101,6 +101,8 @@ _ = app.msgSend(bool, "setActivationPolicy:", .{@as(i64, 1)});
 
 **Architecture:** Swift runs NSApplication and starts/stops the embedded Zig core through `bobrwm_ui.h`. The AppKit main thread owns BobrWM state mutation, layout, workspace state, IPC, status bar, and event draining. AX observer callbacks run on a dedicated background observer thread so slow or hung app AX servers cannot stall the main CFRunLoop. Background AX callbacks must only enqueue events or update observer bookkeeping protected by the AX lock; BobrWM state mutations happen on the main thread during event drain.
 
+**AX off the main thread:** Every AX message blocks until the target app answers, so new AX work must not run on the main thread. Submit it as a job on `app_queue.zig` (one serial queue per app) and publish the answer as an event for the reducer to decide on, as `focus_query.zig` and `window_readiness.zig` do; writes go through `ax_writer.zig`. Set a messaging timeout on the app element and on every element copied out of it. Some calls are still synchronous (discovery, `addNewWindow`, tab detection); do not add more.
+
 ## Menu Bar UI (Swift)
 
 The native app, status item, and menu live in `macos/`. `build.zig` builds Zig as a static core, then uses `swiftc` and Apple's linker to produce the app executable. No Xcode project or bundled dylib is needed; the Swift runtime is OS-provided (`/usr/lib/swift`). Swift owns AppKit lifecycle while Zig keeps the main-thread event drain and window-manager state.
@@ -159,6 +161,8 @@ zig build -Doptimize=ReleaseFast
 ```
 
 When behavior depends on macOS event ordering, also perform a manual repro with the relevant app class, for example Ghostty native tabs or Discord/Electron close-to-background behavior.
+
+Debug builds run a main-thread stall watchdog (`src/watchdog.zig`). After changes on the event path, run a debug build against a slow or busy app and check the log for `main thread stalled` lines.
 
 For menu bar UI changes, also run `zig build ui-preview` and look at the rendered PNGs before reporting the change as done.
 
