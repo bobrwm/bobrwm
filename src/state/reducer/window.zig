@@ -145,6 +145,10 @@ pub fn reduceWindowRemoved(transition: *Transition, window_id: WindowId) void {
     _ = transition.model.pending_native_window_moves.remove(window_id);
     std.debug.assert(transition.model.windows.remove(window_id));
     transition.model.geometry.forget(window_id);
+    transition.addEffect(.{ .window_removed = .{
+        .window_id = window_id,
+        .process_id = window.process_id,
+    } });
     if (!owned_layout) return;
 
     const successor_window_id: ?WindowId = if (group) |snapshot| blk: {

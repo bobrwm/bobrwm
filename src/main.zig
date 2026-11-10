@@ -33,6 +33,7 @@ const geometry_mod = @import("geometry.zig");
 const spsc_queue = @import("spsc_queue.zig");
 const trace = @import("trace.zig");
 const focus_follows_mouse = @import("focus_follows_mouse.zig");
+const window_server = @import("window_server.zig");
 
 extern fn _AXUIElementGetWindow(element: c.AXUIElementRef, wid: *u32) c.AXError;
 
@@ -63,14 +64,27 @@ pub const std_options = std.Options{
 const log = std.log.scoped(.bobrwm);
 
 const EventQueue = spsc_queue.Queue(event_mod.Event, 1024);
-const state_effect_queue_capacity = 64;
-const StateEffectQueue = spsc_queue.Queue(state_mod.Effect, state_effect_queue_capacity);
+// Effects raised inside an effect handler wait until it returns, and one
+// cleanup pass can remove every managed window with a window_removed each.
+// Those wait in their own 8-byte slots so the 192-byte general queue stays
+// small: a removal burst costs ~9 KiB of slots instead of ~200 KiB.
+const StateEffectQueue = spsc_queue.Queue(state_mod.Effect, 64);
+const WindowRemoval = @FieldType(state_mod.Effect, "window_removed");
+const WindowRemovalQueue = spsc_queue.Queue(WindowRemoval, state_mod.max_managed_windows + 64);
 
 /// Poll cadence for windows that are waiting on role readiness or visibility.
 const role_poll_interval_ms: u64 = 100;
 /// Keep one slow app AX server from monopolizing the main event drain.
 const role_poll_ax_timeout_s: f32 = 0.025;
 const role_poll_work_budget_ms: i128 = 30;
+/// Bounds every other readiness query. Slow apps (Electron at startup)
+/// answer AX in 50-200ms; a hung one would hold AX's default 6s per message,
+/// and readiness sends up to six.
+const readiness_ax_timeout_s: f32 = 0.25;
+/// A hung app is skipped this long after a readiness query times out, so it
+/// costs one stall per backoff instead of one per poll tick.
+const ax_hang_backoff_ms: i128 = 2000;
+const max_ax_hangs = 16;
 /// Retry budget for deferred candidates before they are dropped or fall back.
 /// Electron-family apps can take multiple seconds before publishing stable AX roles.
 const role_poll_attempts_max: u8 = 50;
@@ -91,6 +105,10 @@ const display_settle_delay_ms: u64 = 250;
 const native_space_capacity_settle_attempts: u8 = 20;
 const native_space_capacity_poll_delay_us: c_uint = 25_000;
 const native_space_topology_poll_interval_ms: u64 = 1000;
+/// Termination notifications can be lost; a missed one keeps a dead app's
+/// windows and observer until this sweep. Each check costs under a
+/// microsecond per process, but nothing needs a faster repair.
+const process_sweep_interval_ms: u64 = 60_000;
 const DisplayInfo = struct {
     id: u32,
     /// Stable per-display identity (CGDisplayCreateUUIDFromDisplayID) used to
@@ -1306,6 +1324,16 @@ fn inferDisplayIdForWindow(wid: u32) ?u32 {
     return displayIdForFrame(frame);
 }
 
+/// Whether WindowServer still knows `wid`. An unreadable answer counts as
+/// present so a transient CG failure never drops a live window.
+fn windowServerHasWindow(wid: u32) bool {
+    std.debug.assert(wid != 0);
+    trace.countWindowList();
+    var existing_buffer: [1]u32 = undefined;
+    const existing = window_server.existingWindowIds(&.{wid}, &existing_buffer) orelse return true;
+    return existing.len > 0;
+}
+
 /// Live WindowServer bounds for a window. `Window.frame` records bobrwm's last
 /// accepted target or adopted user/external geometry; callers that need what
 /// is physically visible now must still ask WindowServer.
@@ -1366,7 +1394,11 @@ const WorkspaceApplication = struct {
 var g_workspace_application_inventory: [max_workspace_application_inventory]WorkspaceApplication = undefined;
 var g_workspace_application_inventory_count: usize = 0;
 var g_state_effect_queue: StateEffectQueue = .{};
+var g_window_removal_queue: WindowRemovalQueue = .{};
 var g_state_effect_drain_active = false;
+var g_ax_hangs: [max_ax_hangs]AxHang = @splat(.{});
+var g_role_poll_cursor: usize = 0;
+var g_deferred_poll_cursor: usize = 0;
 var g_displays: [workspace_mod.max_displays]DisplayInfo = undefined;
 var g_display_count: usize = 0;
 var g_workspace_observer: ?objc.Object = null;
@@ -1439,6 +1471,7 @@ var g_observation_generation: u32 = 0;
 /// when it is set, so mouse moves and animation echoes skip the window-list copy.
 var g_dim_dirty: bool = false;
 var g_native_space_topology_poll_source: c.dispatch_source_t = null;
+var g_process_sweep_source: c.dispatch_source_t = null;
 var g_tap_port: c.CFMachPortRef = null;
 var g_swipe_tap_port: c.CFMachPortRef = null;
 var g_mouse_tap_port: c.CFMachPortRef = null;
@@ -1448,6 +1481,8 @@ var g_config_watcher: config_watch.Watcher = .{};
 var g_layout_entries: std.ArrayList(tiling.LayoutEntry) = .empty;
 var g_event_drain_active = false;
 var g_event_overflow_recovery_pending = false;
+var g_has_warned_process_table_full = false;
+var g_warned_full_discovery_queues: std.EnumSet(state_mod.DiscoveryQueue) = .empty;
 var g_on_screen_truncation_logged = false;
 
 var g_animator: animation_mod.Animator = undefined;
@@ -1958,11 +1993,66 @@ fn postSameProcessFocusEvent(
     return post_event(psn, &event) == 0;
 }
 
-fn manageStateForWindow(pid: i32, wid: u32) u8 {
-    return manageStateForWindowWithMessagingTimeout(pid, wid, null);
+const AxHang = struct {
+    process_id: i32 = 0,
+    until_ns: i128 = 0,
+};
+
+fn isAxBackedOff(pid: i32) bool {
+    const now_ns = nanoTimestamp();
+    for (g_ax_hangs) |hang| {
+        if (hang.process_id == pid and hang.until_ns > now_ns) return true;
+    }
+    return false;
 }
 
-fn manageStateForWindowWithMessagingTimeout(pid: i32, wid: u32, timeout_seconds: ?f32) u8 {
+/// Reuse the PID's slot, else the one expiring first: expired and unused
+/// slots sort before every live backoff.
+fn backOffAx(pid: i32) void {
+    std.debug.assert(pid > 0);
+    var slot = &g_ax_hangs[0];
+    for (&g_ax_hangs) |*hang| {
+        if (hang.process_id == pid) {
+            slot = hang;
+            break;
+        }
+        if (hang.until_ns < slot.until_ns) slot = hang;
+    }
+    slot.* = .{
+        .process_id = pid,
+        .until_ns = nanoTimestamp() + ax_hang_backoff_ms * std.time.ns_per_ms,
+    };
+}
+
+/// Readiness for discovery, cleanup, and the deferred poll. Pending while the
+/// app is backed off as hung: discovery then queues the window, and cleanup
+/// keeps it, both of which a later poll revisits.
+fn manageStateForWindow(pid: i32, wid: u32) u8 {
+    std.debug.assert(pid > 0);
+    if (isAxBackedOff(pid)) return shim.BW_MANAGE_PENDING;
+
+    const started_ns = nanoTimestamp();
+    const state = manageStateForWindowWithMessagingTimeout(pid, wid, readiness_ax_timeout_s, true);
+
+    // Pending after a full timeout means a message went unanswered. A slow
+    // app that answered every message got a verdict, however long it took.
+    const elapsed_ns = nanoTimestamp() - started_ns;
+    const timeout_ns: i128 = @intFromFloat(readiness_ax_timeout_s * std.time.ns_per_s);
+    if (state == shim.BW_MANAGE_PENDING and elapsed_ns >= timeout_ns) {
+        log.debug("readiness: pid={d} wid={d} timed out after {d}ms; backing off", .{
+            pid, wid, @divTrunc(elapsed_ns, std.time.ns_per_ms),
+        });
+        backOffAx(pid);
+    }
+    return state;
+}
+
+fn manageStateForWindowWithMessagingTimeout(
+    pid: i32,
+    wid: u32,
+    timeout_seconds: f32,
+    should_try_focused: bool,
+) u8 {
     std.debug.assert(pid > 0);
     std.debug.assert(wid > 0);
 
@@ -1971,10 +2061,11 @@ fn manageStateForWindowWithMessagingTimeout(pid: i32, wid: u32, timeout_seconds:
     // Remote-hosted panels (open/save dialogs) can be the app's focused window
     // without appearing in AXWindows; without the focused-window fallback they
     // stay PENDING and never reach the AXModal rejection below.
-    const win = if (timeout_seconds) |seconds|
-        ax_mod.findWindowWithMessagingTimeout(pid, wid, seconds)
+    const listed = ax_mod.findWindowWithMessagingTimeout(pid, wid, timeout_seconds);
+    const win = listed orelse if (should_try_focused)
+        ax_mod.focusedWindowIfMatches(pid, wid, timeout_seconds)
     else
-        findAxWindow(pid, wid) orelse ax_mod.focusedWindowIfMatches(pid, wid);
+        null;
     const win_ref = win orelse return shim.BW_MANAGE_PENDING;
     defer c.CFRelease(@ptrCast(win_ref));
 
@@ -2433,6 +2524,41 @@ fn setNativeSpaceTopologyPolling(enabled: bool) void {
     c.dispatch_source_set_event_handler_f(source, nativeSpaceTopologyPollTimerTick);
     c.dispatch_resume(.{ ._ds = source });
     g_native_space_topology_poll_source = source;
+}
+
+fn setProcessSweep(enabled: bool) void {
+    if (!enabled) {
+        if (g_process_sweep_source) |source| {
+            c.dispatch_source_cancel(source);
+            c.dispatch_release(.{ ._ds = source });
+            g_process_sweep_source = null;
+        }
+        return;
+    }
+
+    if (g_process_sweep_source != null) return;
+
+    const source = c.dispatch_source_create(
+        cg_extra.DISPATCH_SOURCE_TYPE_TIMER(),
+        0,
+        0,
+        cg_extra.dispatch_get_main_queue(),
+    ) orelse return;
+    const interval_ns = process_sweep_interval_ms * c.NSEC_PER_MSEC;
+    c.dispatch_source_set_timer(
+        source,
+        c.dispatch_time(c.DISPATCH_TIME_NOW, @intCast(interval_ns)),
+        interval_ns,
+        5 * c.NSEC_PER_SEC,
+    );
+    c.dispatch_source_set_event_handler_f(source, processSweepTimerTick);
+    c.dispatch_resume(.{ ._ds = source });
+    g_process_sweep_source = source;
+}
+
+fn processSweepTimerTick(context: ?*anyopaque) callconv(.c) void {
+    _ = context;
+    bw_emit_event(shim.BW_EVENT_PROCESS_SWEEP_DUE, 0, 0);
 }
 
 fn modsFromEventFlags(flags: c.CGEventFlags) u8 {
@@ -3055,6 +3181,7 @@ fn startCore(config_path_arg: ?[]const u8) !void {
     setupHotkeyEventTap();
     setMouseEventTapEnabled(g_config.focus_follows_mouse);
     setNativeSpaceTopologyPolling(true);
+    setProcessSweep(true);
     try g_ipc_transport.start(g_ipc.fd, signalWaker);
     g_core_stage = .ipc_transport;
     refreshRolePolling();
@@ -3099,6 +3226,7 @@ fn stopCore() void {
     }
     setRolePolling(false);
     setNativeSpaceTopologyPolling(false);
+    setProcessSweep(false);
     if (coreReached(.ax_observer)) {
         setMouseEventTapEnabled(false);
     }
@@ -3249,7 +3377,7 @@ fn recoverFromEventOverflow() void {
     g_focus_follows_mouse.reset();
     dispatchStateEvent(.{ .geometry = .clear_intents });
 
-    _ = removeStoppedAppWindows();
+    _ = sweepProcesses();
     discoverWindows();
     refreshTabGroupActiveTabs();
     reconcileVisibleFramesFromWindowServer();
@@ -3829,6 +3957,7 @@ fn handleEvent(ev: *const event_mod.Event) void {
         // -- Window / app events --
         .app_launched => {
             log.debug("app launched pid={}", .{ev.pid});
+            observeProcess(ev.pid);
             discoverWindows();
             ax_observer.observeApp(ev.pid);
             trackAppLaunchRetry(ev.pid);
@@ -3837,15 +3966,6 @@ fn handleEvent(ev: *const event_mod.Event) void {
         .app_terminated => {
             log.debug("app terminated pid={}", .{ev.pid});
             dispatchStateEvent(.{ .process_terminated = ev.pid });
-            if (g_focus_follows_mouse.intent) |intent| {
-                if (intent.process_id == ev.pid) cancelPendingMouseFocus(false, false);
-            }
-            removeWorkspaceApplication(ev.pid);
-            untrackAppLaunchRetry(ev.pid);
-            untrackFocusRetry(ev.pid);
-            ax_writer.forgetApp(ev.pid);
-            ax_observer.unobserveApp(ev.pid);
-            removeAppWindows(ev.pid);
             retile();
         },
         .window_focused => {
@@ -3915,6 +4035,12 @@ fn handleEvent(ev: *const event_mod.Event) void {
             if (g_focus_follows_mouse.intent) |intent| {
                 if (intent.window_id == ev.wid) cancelPendingMouseFocus(true, false);
             }
+            // removeWindow only covers managed windows; a window still
+            // waiting on readiness must leave the poll queues too. AX element
+            // lifetime can diverge from the CG window, so confirm first.
+            if (!windowServerHasWindow(ev.wid)) {
+                dispatchStateEvent(.{ .window_candidate_destroyed = ev.wid });
+            }
             removeWindow(ev.wid);
             retile();
         },
@@ -3960,6 +4086,7 @@ fn handleEvent(ev: *const event_mod.Event) void {
             processPendingFocusQueue();
         },
         .native_topology_poll_tick => reconcileNativeSpaceTopologyIfNeeded(),
+        .process_sweep_due => if (sweepProcesses()) retile(),
         .native_observation_due => {
             if (processDueNativeStateObservation()) return;
             // A replaced timer's fire must not re-arm: the current timer already
@@ -4169,7 +4296,7 @@ fn windowRoleState(pid: i32, wid: u32) WindowRoleState {
 }
 
 fn windowRoleStateWithMessagingTimeout(pid: i32, wid: u32) WindowRoleState {
-    const raw_state = manageStateForWindowWithMessagingTimeout(pid, wid, role_poll_ax_timeout_s);
+    const raw_state = manageStateForWindowWithMessagingTimeout(pid, wid, role_poll_ax_timeout_s, false);
     return windowRoleStateFromRaw(pid, wid, raw_state);
 }
 
@@ -4714,7 +4841,11 @@ fn dispatchStateEvent(event: state_mod.Event) void {
     g_dim_dirty = true;
 
     for (transition.effects[0..transition.effect_count]) |effect| {
-        if (!g_state_effect_queue.push(effect)) @panic("state effect queue overflow");
+        const is_queued = switch (effect) {
+            .window_removed => |removal| g_window_removal_queue.push(removal),
+            else => g_state_effect_queue.push(effect),
+        };
+        if (!is_queued) @panic("state effect queue overflow");
     }
 
     drainStateEffects();
@@ -4726,8 +4857,16 @@ fn drainStateEffects() void {
     g_state_effect_drain_active = true;
     defer g_state_effect_drain_active = false;
 
-    while (g_state_effect_queue.pop()) |effect| {
-        executeStateEffect(effect);
+    // Removals release per-window shell state, which nothing else reads once
+    // the window left the catalog, so running them after the other effects
+    // is safe.
+    while (true) {
+        if (g_state_effect_queue.pop()) |effect| {
+            executeStateEffect(effect);
+            continue;
+        }
+        const removal = g_window_removal_queue.pop() orelse break;
+        executeWindowRemoved(removal);
     }
     refreshRolePolling();
     scheduleNativeObservation();
@@ -4819,6 +4958,7 @@ fn executeStateEffect(effect: state_mod.Effect) void {
             rejection.window_id,
             @tagName(rejection.reason),
         }),
+        .window_removed => unreachable, // Queued and run apart, see drainStateEffects.
         .workspace_transition_started => |transition| executeWorkspaceTransitionStarted(transition),
         .workspace_transition_settled => |settlement| executeWorkspaceTransitionSettled(settlement),
         .move_native_window => |pending| executeNativeWindowMove(pending),
@@ -4903,6 +5043,19 @@ fn executeStateEffect(effect: state_mod.Effect) void {
             reconcileFocusedWindow(resolved.process_id, resolved.window_id);
         },
         .focus_retry_expired => |process_id| log.debug("focus-retry: gave up pid={d}", .{process_id}),
+        .discovery_queue_full => |queue| if (!g_warned_full_discovery_queues.contains(queue)) {
+            g_warned_full_discovery_queues.insert(queue);
+            log.warn("discovery queue {s} full; dropping new entries until it drains", .{@tagName(queue)});
+        },
+        .process_ended => |process_id| releaseProcess(process_id),
+        .process_replaced => |process_id| executeProcessReplaced(process_id),
+        .process_table_full => |identity| if (!g_has_warned_process_table_full) {
+            g_has_warned_process_table_full = true;
+            log.warn("process table full limit={d} pid={d}; reused PIDs of untracked processes go undetected", .{
+                state_mod.max_tracked_processes,
+                identity.process_id,
+            });
+        },
         .display_resettle_due => {
             log.debug("display resettle", .{});
             reconcileDisplays(g_state.display_resettle_cause);
@@ -5682,11 +5835,6 @@ fn trackAppLaunchRetry(pid: i32) void {
     } });
 }
 
-fn untrackAppLaunchRetry(pid: i32) void {
-    std.debug.assert(pid > 0);
-    dispatchStateEvent(.{ .untrack_app_launch_retry = pid });
-}
-
 fn processAppLaunchRetries() void {
     const retries = g_state.app_launch_retries;
     for (retries.items()) |retry| {
@@ -5739,9 +5887,37 @@ fn untrackWindowCandidatesForPid(pid: i32) void {
 
 fn processPendingRoleWindows() void {
     const candidates = g_state.pending_role_windows;
+    const items = candidates.items();
+    if (items.len == 0) return;
+
     const started_ns = nanoTimestamp();
-    for (candidates.items()) |candidate| {
-        if (nanoTimestamp() - started_ns >= role_poll_work_budget_ms * std.time.ns_per_ms) return;
+    var window_ids: [candidates.entries.len]u32 = undefined;
+    for (items, 0..) |candidate, index| window_ids[index] = candidate.window_id;
+    var existing_buffer: [candidates.entries.len]u32 = undefined;
+    // One allocating WindowServer query per snapshot, not per candidate.
+    // An unreadable answer keeps every candidate until the next pass.
+    trace.countWindowList();
+    const existing = window_server.existingWindowIds(window_ids[0..items.len], &existing_buffer) orelse window_ids[0..items.len];
+
+    // The budget can end a pass early. Resume where it stopped so windows late
+    // in the queue are polled too, not only the slow ones at its head.
+    const first = g_role_poll_cursor % items.len;
+    for (0..items.len) |offset| {
+        if (nanoTimestamp() - started_ns >= role_poll_work_budget_ms * std.time.ns_per_ms) {
+            g_role_poll_cursor = first + offset;
+            return;
+        }
+        const candidate = items[(first + offset) % items.len];
+
+        // A destroyed window is not in AXWindows either, so the role query
+        // would report it pending until the budget runs out.
+        if (std.mem.findScalar(u32, existing, candidate.window_id) == null) {
+            log.debug("pending-role: window gone pid={d} wid={d}", .{ candidate.process_id, candidate.window_id });
+            dispatchStateEvent(.{ .window_candidate_destroyed = candidate.window_id });
+            continue;
+        }
+        // Polling a hung app would spend an attempt without an answer.
+        if (isAxBackedOff(candidate.process_id)) continue;
         dispatchStateEvent(.{ .pending_role_observed = .{
             .window_id = candidate.window_id,
             .readiness = windowRoleStateWithMessagingTimeout(candidate.process_id, candidate.window_id),
@@ -5751,7 +5927,32 @@ fn processPendingRoleWindows() void {
 
 fn processDeferredWindowCandidates() void {
     const candidates = g_state.deferred_window_candidates;
-    for (candidates.items()) |candidate| {
+    const items = candidates.items();
+    if (items.len == 0) return;
+
+    const started_ns = nanoTimestamp();
+    var window_ids: [candidates.entries.len]u32 = undefined;
+    for (items, 0..) |candidate, index| window_ids[index] = candidate.window_id;
+    var existing_buffer: [candidates.entries.len]u32 = undefined;
+    trace.countWindowList();
+    const existing = window_server.existingWindowIds(window_ids[0..items.len], &existing_buffer) orelse window_ids[0..items.len];
+
+    // Same budget and resume point as the role poll: a query can take up to
+    // the readiness timeout before its app is backed off.
+    const first = g_deferred_poll_cursor % items.len;
+    for (0..items.len) |offset| {
+        if (nanoTimestamp() - started_ns >= role_poll_work_budget_ms * std.time.ns_per_ms) {
+            g_deferred_poll_cursor = first + offset;
+            return;
+        }
+        const candidate = items[(first + offset) % items.len];
+
+        if (std.mem.findScalar(u32, existing, candidate.window_id) == null) {
+            log.debug("deferred-window: window gone pid={d} wid={d}", .{ candidate.process_id, candidate.window_id });
+            dispatchStateEvent(.{ .window_candidate_destroyed = candidate.window_id });
+            continue;
+        }
+        if (isAxBackedOff(candidate.process_id)) continue;
         dispatchStateEvent(.{ .deferred_window_observed = .{
             .window_id = candidate.window_id,
             .readiness = windowRoleState(candidate.process_id, candidate.window_id),
@@ -5894,6 +6095,7 @@ fn discoverWindowsImpl(should_refresh_tabs: bool) usize {
         // Observe the owning app even if this specific window is not yet
         // manageable (for example AX role/subrole is still pending).
         if (!already_observed) {
+            observeProcess(info.pid);
             if (should_refresh_tabs) {
                 ax_observer.observeAppDeferred(info.pid);
             } else {
@@ -6493,16 +6695,25 @@ fn joinTabGroup(pid: i32, sibling_wid: u32, new_wid: u32, new_frame: window_mod.
 
 fn removeWindow(wid: u32) void {
     const win = managedWindow(wid) orelse return;
-    const space = managedWindowSpace(win.wid) orelse return;
+    if (managedWindowSpace(win.wid) == null) return;
     const tab_group = g_state.windowTabGroup(wid);
-    g_animator.cancel(wid);
-    ax_mod.invalidateWindow(wid);
-    ax_writer.forgetWindow(wid);
     removeWindowIdentity(wid);
 
+    // Inline rather than in window_removed: the surviving tabs' active state
+    // must be settled before the caller's next decision, and an effect raised
+    // inside another effect would run only after that handler returns.
     if (tab_group) |group| reconcileTabGroupAfterRemoval(&group, wid);
+}
 
-    _ = focusedWorkspaceWindow(space);
+/// Release platform state keyed by a removed window's ID. Runs late when the
+/// removal happened inside another effect handler, so skip a window that was
+/// adopted again under the same ID in between: the state is its own again.
+fn executeWindowRemoved(removal: WindowRemoval) void {
+    if (managedWindow(removal.window_id) != null) return;
+    g_animator.cancel(removal.window_id);
+    ax_mod.invalidateWindow(removal.window_id);
+    ax_writer.forgetWindow(removal.window_id);
+    ax_observer.forgetWindowIfGone(removal.process_id, removal.window_id);
 }
 
 fn reconcileTabGroupAfterRemoval(
@@ -6536,6 +6747,41 @@ fn reconcileGroupActiveAfterRemoval(member_window_id: u32, pid: i32) void {
     setTabGroupActive(active);
 }
 
+/// Report a live process so the reducer can tell a reused PID from a known
+/// process. A process that already exited is skipped; its termination
+/// notification is on the way.
+fn observeProcess(pid: i32) void {
+    std.debug.assert(pid > 0);
+    const started_at_us = (osutil.processStartTimeUs(pid) catch return) orelse return;
+    dispatchStateEvent(.{ .process_observed = .{
+        .process_id = pid,
+        .started_at_us = started_at_us,
+    } });
+}
+
+/// Release shell state keyed by an ended process's PID.
+fn releaseProcess(pid: i32) void {
+    std.debug.assert(pid > 0);
+    if (g_focus_follows_mouse.intent) |intent| {
+        if (intent.process_id == pid) cancelPendingMouseFocus(false, false);
+    }
+    removeWorkspaceApplication(pid);
+    ax_writer.forgetApp(pid);
+    ax_observer.unobserveApp(pid);
+    removeAppWindows(pid);
+}
+
+/// The old process's windows and observer died with it. Inside another
+/// effect handler, discovery may already have adopted the new process's
+/// windows; they leave with the old ones, so the launch retry rediscovers them.
+fn executeProcessReplaced(pid: i32) void {
+    log.info("process replaced pid={d}; the previous process ended unreported", .{pid});
+    releaseProcess(pid);
+    ax_observer.observeApp(pid);
+    trackAppLaunchRetry(pid);
+    retile();
+}
+
 fn removeAppWindows(pid: i32) void {
     untrackWindowCandidatesForPid(pid);
     clearDragPreview();
@@ -6565,36 +6811,40 @@ fn removeAppWindows(pid: i32) void {
     }
 }
 
-fn isAppRunning(pid: i32) ?bool {
-    std.debug.assert(pid > 0);
-    const NSRunningApplication = objc.getClass("NSRunningApplication") orelse return null;
-    const app = NSRunningApplication.msgSend(objc.Object, "runningApplicationWithProcessIdentifier:", .{pid});
-    return app.value != null;
-}
-
-/// Recover app-termination notifications lost to event-ring overflow. Find one
-/// stopped process at a time so catalog mutation never overlaps iteration.
-fn removeStoppedAppWindows() bool {
-    var removed_any = false;
-    while (true) {
-        const stopped_pid: ?i32 = blk: {
-            for (g_state.windows.items()) |managed_window| {
-                const win = managed_window.snapshot();
-                const running = isAppRunning(win.pid) orelse {
-                    log.warn("event overflow: cannot query running applications; skipping termination recovery", .{});
-                    return removed_any;
-                };
-                if (!running) break :blk win.pid;
-            }
-            break :blk null;
-        };
-        const pid = stopped_pid orelse return removed_any;
-
-        ax_writer.forgetApp(pid);
-        ax_observer.unobserveApp(pid);
-        removeAppWindows(pid);
-        removed_any = true;
+/// Report every process the manager holds state for as alive or gone, so a
+/// termination lost to event overflow or a missed notification still releases
+/// the app. Windows of processes the table could not hold count through their
+/// owning PID. True when a process ended.
+fn sweepProcesses() bool {
+    // Snapshot first: each report can shrink the table and window catalog.
+    var process_ids: [state_mod.max_tracked_processes + state_mod.max_managed_windows]i32 = undefined;
+    var process_count: usize = 0;
+    for (g_state.processes.items()) |identity| {
+        process_ids[process_count] = identity.process_id;
+        process_count += 1;
     }
+    for (g_state.windows.items()) |managed_window| {
+        if (std.mem.findScalar(i32, process_ids[0..process_count], managed_window.process_id) != null) continue;
+        process_ids[process_count] = managed_window.process_id;
+        process_count += 1;
+    }
+
+    var has_ended = false;
+    for (process_ids[0..process_count]) |pid| {
+        // A failed query proves nothing; the next sweep asks again.
+        const lookup = osutil.processStartTimeUs(pid) catch continue;
+        const started_at_us = lookup orelse {
+            log.debug("process sweep: pid={d} is gone", .{pid});
+            dispatchStateEvent(.{ .process_terminated = pid });
+            has_ended = true;
+            continue;
+        };
+        dispatchStateEvent(.{ .process_observed = .{
+            .process_id = pid,
+            .started_at_us = started_at_us,
+        } });
+    }
+    return has_ended;
 }
 
 /// Remove stale or ineligible managed windows for a single app process.

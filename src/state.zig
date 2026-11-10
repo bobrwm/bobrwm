@@ -8,6 +8,7 @@ const command_reducer = @import("state/reducer/command.zig");
 const discovery_reducer = @import("state/reducer/discovery.zig");
 const layout_reducer = @import("state/reducer/layout.zig");
 const pointer_reducer = @import("state/reducer/pointer.zig");
+const process_reducer = @import("state/reducer/process.zig");
 const swipe_reducer = @import("state/reducer/swipe.zig");
 const window_reducer = @import("state/reducer/window.zig");
 const workspace_reducer = @import("state/reducer/workspace.zig");
@@ -15,6 +16,7 @@ const tiling_mod = @import("tiling.zig");
 const window_mod = @import("window.zig");
 
 pub const max_managed_windows = model_mod.max_managed_windows;
+pub const max_tracked_processes = model_mod.max_tracked_processes;
 pub const max_spaces_per_display = model_mod.max_spaces_per_display;
 pub const native_switch_timeout_ms = model_mod.native_switch_timeout_ms;
 pub const native_window_move_attempts_max = model_mod.native_window_move_attempts_max;
@@ -62,6 +64,8 @@ pub const PendingFocus = model_mod.PendingFocus;
 pub const WindowReadiness = model_mod.WindowReadiness;
 pub const WindowCandidate = model_mod.WindowCandidate;
 pub const ProcessRetry = model_mod.ProcessRetry;
+pub const ProcessIdentity = model_mod.ProcessIdentity;
+pub const DiscoveryQueue = model_mod.DiscoveryQueue;
 pub const RetileRequest = model_mod.RetileRequest;
 pub const CleanupRequest = model_mod.CleanupRequest;
 pub const LayoutRebuild = model_mod.LayoutRebuild;
@@ -206,20 +210,30 @@ pub fn reduce(model: *Model, event: Event) Transition {
         },
         .deferred_window_observed => |observation| discovery_reducer.reduceDeferredWindowObserved(&transition, observation),
         .deferred_window_promotion_failed => |window_id| discovery_reducer.reduceDeferredWindowPromotionFailed(&transition, window_id),
+        .window_candidate_destroyed => |window_id| discovery_reducer.reduceWindowCandidateDestroyed(&transition, window_id),
         .untrack_window_candidates_for_process => |process_id| {
             transition.model.pending_role_windows.removeProcess(process_id);
             transition.model.deferred_window_candidates.removeProcess(process_id);
         },
-        .track_app_launch_retry => |retry| discovery_reducer.reduceProcessRetryTracked(&transition.model.app_launch_retries, retry),
-        .untrack_app_launch_retry => |process_id| {
-            _ = transition.model.app_launch_retries.remove(process_id);
-        },
+        .track_app_launch_retry => |retry| discovery_reducer.reduceProcessRetryTracked(
+            &transition,
+            &transition.model.app_launch_retries,
+            .app_launch_retries,
+            retry,
+        ),
         .app_launch_retry_timer_fired => |process_id| discovery_reducer.reduceAppLaunchRetryTimer(&transition, process_id),
-        .track_focus_retry => |retry| discovery_reducer.reduceProcessRetryTracked(&transition.model.focus_retries, retry),
+        .track_focus_retry => |retry| discovery_reducer.reduceProcessRetryTracked(
+            &transition,
+            &transition.model.focus_retries,
+            .focus_retries,
+            retry,
+        ),
         .untrack_focus_retry => |process_id| {
             _ = transition.model.focus_retries.remove(process_id);
         },
         .focus_retry_observed => |observation| discovery_reducer.reduceFocusRetryObserved(&transition, observation),
+        .process_observed => |identity| process_reducer.reduceProcessObserved(&transition, identity),
+        .process_terminated => |process_id| process_reducer.reduceProcessTerminated(&transition, process_id),
         .display_changed => |change| {
             transition.model.display_resettle_due_at_ms = change.resettle_at_ms;
             transition.model.display_resettle_cause = .display_change;
@@ -265,7 +279,6 @@ pub fn reduce(model: *Model, event: Event) Transition {
         .clear_drag_preview => pointer_reducer.clearDragPreview(&transition),
         .pointer_up => pointer_reducer.reducePointerUp(&transition),
         .menu_tracking_observed => |observation| pointer_reducer.reduceMenuTrackingObserved(&transition, observation),
-        .process_terminated => |process_id| pointer_reducer.reduceProcessTerminated(&transition, process_id),
         .request_retile_all_displays => {
             transition.model.retile_request.all_displays = true;
             transition.model.retile_request.display_count = 0;
@@ -566,6 +579,12 @@ test "window catalog owns identity and Space membership" {
     try testing.expect(removed.model.window(102) == null);
     try testing.expect(removed.model.geometry.get(102) == null);
     try testing.expectEqual(@as(u16, 1), removed.model.windows.count);
+    try testing.expectEqual(@as(u8, 1), removed.effect_count);
+    try testing.expectEqual(@as(WindowId, 102), removed.effects[0].window_removed.window_id);
+    try testing.expectEqual(@as(i32, 1002), removed.effects[0].window_removed.process_id);
+
+    const unknown = reduceCopy(removed.model, .{ .remove_window = 102 });
+    try testing.expectEqual(@as(u8, 0), unknown.effect_count);
 }
 
 test "window lifecycle transitions update catalog geometry focus and layout atomically" {
@@ -2555,6 +2574,79 @@ test "window discovery retries are reducer owned" {
     try testing.expectEqual(DeferredWindowExpiryReason.unsettled_bounds, transition.effects[0].deferred_window_expired.reason);
 }
 
+test "destroyed window candidates leave both queues without expiring" {
+    const testing = std.testing;
+    var catalog: SpaceCatalog = .{};
+    catalog.add(.{ .key = .{ .id = 1 }, .workspace_id = 1, .display_id = 11 });
+    var model = reduceCopy(.{}, .{ .replace_space_catalog = &catalog }).model;
+    const candidate: WindowCandidate = .{
+        .process_id = 42,
+        .window_id = 100,
+        .space_key = .{ .id = 1 },
+        .attempts_remaining = 5,
+    };
+    const survivor: WindowCandidate = .{
+        .process_id = 42,
+        .window_id = 101,
+        .space_key = .{ .id = 1 },
+        .attempts_remaining = 5,
+    };
+
+    model = reduceCopy(model, .{ .track_pending_role_window = candidate }).model;
+    model = reduceCopy(model, .{ .track_deferred_window_candidate = candidate }).model;
+    model = reduceCopy(model, .{ .track_pending_role_window = survivor }).model;
+
+    const transition = reduceCopy(model, .{ .window_candidate_destroyed = candidate.window_id });
+    try testing.expectEqual(@as(u8, 0), transition.effect_count);
+    try testing.expect(!transition.model.hasPendingRoleWindow(candidate.window_id));
+    try testing.expect(!transition.model.hasDeferredWindowCandidate(candidate.window_id));
+    try testing.expect(transition.model.hasPendingRoleWindow(survivor.window_id));
+}
+
+test "full discovery queues drop new entries instead of panicking" {
+    const testing = std.testing;
+    var catalog: SpaceCatalog = .{};
+    catalog.add(.{ .key = .{ .id = 1 }, .workspace_id = 1, .display_id = 11 });
+    var model = reduceCopy(.{}, .{ .replace_space_catalog = &catalog }).model;
+
+    for (0..model_mod.max_pending_window_candidates) |index| {
+        const candidate: WindowCandidate = .{
+            .process_id = 42,
+            .window_id = @intCast(index + 1),
+            .space_key = .{ .id = 1 },
+            .attempts_remaining = 5,
+        };
+        _ = reduce(&model, .{ .track_pending_role_window = candidate });
+        _ = reduce(&model, .{ .track_deferred_window_candidate = candidate });
+    }
+    for (0..model_mod.max_process_retries) |index| {
+        _ = reduce(&model, .{ .track_focus_retry = .{
+            .process_id = @intCast(index + 1),
+            .attempts_remaining = 3,
+        } });
+    }
+
+    const extra: WindowCandidate = .{
+        .process_id = 42,
+        .window_id = 9_000,
+        .space_key = .{ .id = 1 },
+        .attempts_remaining = 5,
+    };
+    var transition = reduceCopy(model, .{ .track_pending_role_window = extra });
+    try testing.expectEqual(DiscoveryQueue.pending_role_windows, transition.effects[0].discovery_queue_full);
+    try testing.expect(!transition.model.hasPendingRoleWindow(extra.window_id));
+
+    transition = reduceCopy(model, .{ .track_deferred_window_candidate = extra });
+    try testing.expectEqual(DiscoveryQueue.deferred_window_candidates, transition.effects[0].discovery_queue_full);
+
+    transition = reduceCopy(model, .{ .track_focus_retry = .{ .process_id = 9_000, .attempts_remaining = 3 } });
+    try testing.expectEqual(DiscoveryQueue.focus_retries, transition.effects[0].discovery_queue_full);
+
+    // A tracked entry still updates in place when the queue is full.
+    transition = reduceCopy(model, .{ .track_focus_retry = .{ .process_id = 1, .attempts_remaining = 7 } });
+    try testing.expectEqual(@as(u8, 0), transition.effect_count);
+}
+
 test "process retry outcomes are reducer owned" {
     const testing = std.testing;
     const retry: ProcessRetry = .{ .process_id = 42, .attempts_remaining = 1 };
@@ -2573,6 +2665,52 @@ test "process retry outcomes are reducer owned" {
     } });
     try testing.expectEqual(@as(?ProcessRetry, null), transition.model.focus_retries.get(retry.process_id));
     try testing.expectEqual(@as(WindowId, 100), transition.effects[0].focus_retry_resolved.window_id);
+}
+
+test "process table tells a reused PID from a known process" {
+    const testing = std.testing;
+    const first: ProcessIdentity = .{ .process_id = 500, .started_at_us = 1_000 };
+    var transition = reduceCopy(.{}, .{ .process_observed = first });
+    try testing.expectEqual(@as(u8, 0), transition.effect_count);
+    transition = reduceCopy(transition.model, .{ .process_observed = first });
+    try testing.expectEqual(@as(u8, 0), transition.effect_count);
+
+    const retry: ProcessRetry = .{ .process_id = first.process_id, .attempts_remaining = 3 };
+    var model = reduceCopy(transition.model, .{ .track_app_launch_retry = retry }).model;
+    model = reduceCopy(model, .{ .track_focus_retry = retry }).model;
+
+    // Same PID, later start: the first process ended without a termination.
+    const reused: ProcessIdentity = .{ .process_id = first.process_id, .started_at_us = 2_000 };
+    transition = reduceCopy(model, .{ .process_observed = reused });
+    try testing.expectEqual(@as(u8, 1), transition.effect_count);
+    try testing.expectEqual(first.process_id, transition.effects[0].process_replaced);
+    try testing.expectEqual(@as(?ProcessIdentity, reused), transition.model.processes.get(first.process_id));
+    try testing.expectEqual(@as(?ProcessRetry, null), transition.model.app_launch_retries.get(first.process_id));
+    try testing.expectEqual(@as(?ProcessRetry, null), transition.model.focus_retries.get(first.process_id));
+
+    transition = reduceCopy(transition.model, .{ .process_terminated = first.process_id });
+    try testing.expectEqual(first.process_id, transition.effects[0].process_ended);
+    try testing.expectEqual(@as(u16, 0), transition.model.processes.count);
+
+    // The shell may hold state for a PID it never identified.
+    transition = reduceCopy(transition.model, .{ .process_terminated = 600 });
+    try testing.expectEqual(@as(i32, 600), transition.effects[0].process_ended);
+}
+
+test "full process table reports the identity it could not track" {
+    const testing = std.testing;
+    var model: Model = .{};
+    for (0..max_tracked_processes) |index| {
+        _ = reduce(&model, .{ .process_observed = .{
+            .process_id = @intCast(index + 1),
+            .started_at_us = 1,
+        } });
+    }
+
+    const extra: ProcessIdentity = .{ .process_id = 9_000, .started_at_us = 1 };
+    const transition = reduceCopy(model, .{ .process_observed = extra });
+    try testing.expectEqual(extra, transition.effects[0].process_table_full);
+    try testing.expectEqual(@as(?ProcessIdentity, null), transition.model.processes.get(extra.process_id));
 }
 
 test "display settle timer is reducer owned" {

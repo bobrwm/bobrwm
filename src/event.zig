@@ -25,6 +25,7 @@ pub const EventKind = enum(u8) {
     geometry_write_failed = 43,
     menu_opened = 44,
     menu_closed = 45,
+    process_sweep_due = 46,
 
     hk_focus_workspace = 20,
     hk_move_to_workspace = 21,
