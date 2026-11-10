@@ -481,49 +481,19 @@ fn focusEventWindowId(comptime event_name: []const u8, ev: *const event_mod.Even
     return ev.wid;
 }
 
-fn managedLeaderForFocusedWindow(pid: i32, focused_wid: u32) ?window_mod.Window {
-    std.debug.assert(pid > 0);
-    std.debug.assert(focused_wid != 0);
-    const leader_wid = g_state.windowTabLeader(focused_wid);
-    const leader = managedWindow(leader_wid) orelse return null;
-    if (leader.pid != pid) return null;
-    return leader;
-}
+/// The managed window hotkey actions apply to: the focused workspace's focus,
+/// while its app is frontmost. Read from the model, which focus events and
+/// bobrwm's own focus requests keep current, so a hung frontmost app cannot
+/// hold a hotkey on an AX query.
+fn actionTargetWindowId() ?u32 {
+    const wid = focusedWorkspaceWindow(activeWorkspace()) orelse return null;
+    const win = managedWindow(wid) orelse return null;
 
-/// Resolve the frontmost app's AX-focused window to its visible layout owner.
-fn reconciledFocusedWindowId() ?u32 {
-    const pid = frontmostApplicationPid() orelse return null;
-    const focused_wid = focusedWindowId(pid, null) orelse return null;
+    // Focus moved to an app with no managed window focused.
+    const front_pid = frontmostApplicationPid() orelse return null;
+    if (win.pid != front_pid) return null;
 
-    if (managedLeaderForFocusedWindow(pid, focused_wid)) |win| {
-        if (managedWindowSpace(win.wid)) |space| {
-            if (spaceVisible(space)) {
-                // A known suppressed member can become AX-focused without a
-                // notification reaching the main loop first. The leader owns the
-                // fullscreen flag, but retile must address this active member.
-                if (!g_state.isWorkspaceTransitionActive()) {
-                    _ = syncFocusStateForWindowId(focused_wid, .keyboard);
-                }
-                return win.wid;
-            }
-        }
-    }
-
-    // Native tabs can replace the focused CG window ID without emitting a
-    // creation event. Do not send the first hotkey after a tab switch to the
-    // stale workspace cache: reconcile the AX-reported ID synchronously, then
-    // resolve it back to the group's slot. Transition focus remains isolated
-    // until its settle window closes, as with asynchronous AX focus events.
-    if (!g_state.isWorkspaceTransitionActive()) {
-        log.debug("hotkey target reconciling unknown focused window pid={d} wid={d}", .{ pid, focused_wid });
-        reconcileFocusedWindow(pid, focused_wid);
-        if (managedLeaderForFocusedWindow(pid, focused_wid)) |win| {
-            const space = managedWindowSpace(win.wid) orelse return null;
-            if (spaceVisible(space)) return win.wid;
-        }
-    }
-
-    return null;
+    return wid;
 }
 
 const ActionContext = struct {
@@ -533,7 +503,7 @@ const ActionContext = struct {
 };
 
 fn actionContext() ?ActionContext {
-    const focused_wid = reconciledFocusedWindowId() orelse return null;
+    const focused_wid = actionTargetWindowId() orelse return null;
     const focused_win = managedWindow(focused_wid) orelse return null;
     const workspace = managedWindowSpace(focused_win.wid) orelse return null;
     if (!spaceVisible(workspace)) return null;
@@ -1885,47 +1855,22 @@ fn axCanResize(win_ref: c.AXUIElementRef, ax: *const AxStrings) bool {
     return err == c.kAXErrorSuccess and result != 0;
 }
 
-/// Raise and focus a window, then activate its owning app.
-///
-/// When switching between windows within the same process, a 40ms delay is
-/// inserted between the raise and the activation. Some apps (notably Electron)
-/// get confused by instantaneous same-process focus switches and fail to render
-/// the focus ring or route keyboard events to the wrong window. Yabai uses the
-/// same 40ms delay for same-PSN switches.
-fn axFocusWindow(pid: i32, wid: u32) bool {
-    const same_process_focus_delay_us: c_uint = 40_000; // 40ms, matches yabai
-
+/// Raise and focus a window, then activate its owning app, on the app's
+/// writer queue. The last-focused process updates now so the next request
+/// sees this switch.
+fn focusWindow(pid: i32, wid: u32) void {
     std.debug.assert(pid > 0);
     std.debug.assert(wid > 0);
 
     if (managedWindowSpace(wid)) |space| {
-        if (g_state.native_topology.observedWorkspace(space.display_id) == null) return false;
-    }
-    const win = ax_mod.retainWindow(pid, wid) orelse return false;
-    defer c.CFRelease(@ptrCast(win));
-
-    const ax = ax_mod.strings() orelse return false;
-    const raise_action = ax.raise_action;
-    const main_attr = ax.main_attr;
-
-    const is_same_process = (g_last_focused_pid == pid);
-
-    _ = c.AXUIElementPerformAction(win, raise_action);
-    _ = c.AXUIElementSetAttributeValue(win, main_attr, c.kCFBooleanTrue);
-
-    // Delay activation for same-process switches so the app has time to
-    // process the deactivation of the previous window before the new
-    // activation arrives.
-    if (is_same_process) {
-        _ = c.usleep(same_process_focus_delay_us);
+        if (g_state.native_topology.observedWorkspace(space.display_id) == null) return;
     }
 
-    const focused = setFrontProcessViaSkylight(pid, wid);
-    if (focused) {
-        g_last_focused_pid = pid;
-        g_last_focused_window_id = wid;
-    }
-    return focused;
+    const is_same_process = g_last_focused_pid == pid;
+    if (!ax_writer.focus(pid, wid, is_same_process)) return;
+
+    g_last_focused_pid = pid;
+    g_last_focused_window_id = wid;
 }
 
 /// Carbon PSN lookup. Deprecated since 10.9 but still exported and functional;
@@ -3059,7 +3004,7 @@ fn startCore(config_path_arg: ?[]const u8) !void {
     dim.configure(g_config.dimmed_inactive);
     loginitem.reconcile(g_config.start_at_login);
 
-    ax_writer.init(geometryWriteFailed);
+    ax_writer.init(geometryWriteFailed, setFrontProcessViaSkylight);
     focus_query.init();
 
     // -- Accessibility check --
@@ -5027,7 +4972,7 @@ fn executeStateEffect(effect: state_mod.Effect) void {
         },
         .focus_window => |focus| {
             cancelPendingMouseFocus(false, false);
-            _ = axFocusWindow(focus.process_id, focus.window_id);
+            focusWindow(focus.process_id, focus.window_id);
             const window = managedWindow(focus.window_id) orelse return;
             observeWindowFocus(window, .keyboard, null);
         },
@@ -7674,7 +7619,7 @@ fn focusWorkspaceWindow(ws: state_mod.SpaceRef) void {
                     actual_wid,
                 });
             }
-            _ = axFocusWindow(win.pid, actual_wid);
+            focusWindow(win.pid, actual_wid);
             recordWorkspaceFocus(ws, fwid);
             observeWindowFocus(win, .keyboard, null);
         }
