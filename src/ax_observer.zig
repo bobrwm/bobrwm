@@ -366,14 +366,13 @@ fn hasCurrentObserver(pid: i32) bool {
 }
 
 /// Forget a window the manager removed, once WindowServer confirms it is gone.
-/// A minimized or hidden window is unmanaged too but keeps its slot: its
-/// deminiaturize notification is what brings it back.
+/// A minimized or hidden window keeps its slot: its deminiaturize
+/// notification is what brings it back.
 pub fn forgetWindowIfGone(pid: i32, wid: u32) void {
     std.debug.assert(pid > 0);
     std.debug.assert(wid != 0);
 
-    // Most removals follow app termination or a destroy notification, which
-    // already dropped the entry; skip the WindowServer round trip for those.
+    // Termination and destroy notifications usually dropped it already.
     const is_known = blk: {
         c.os_unfair_lock_lock(&g_ax_lock);
         defer c.os_unfair_lock_unlock(&g_ax_lock);
@@ -382,10 +381,7 @@ pub fn forgetWindowIfGone(pid: i32, wid: u32) void {
         break :blk std.mem.findScalar(u32, entry.known_windows[0..entry.known_window_count], wid) != null;
     };
     if (!is_known) return;
-
-    var existing_buffer: [1]u32 = undefined;
-    const existing = window_server.existingWindowIds(&.{wid}, &existing_buffer) orelse return;
-    if (existing.len > 0) return;
+    if (window_server.hasWindow(wid)) return;
     appUntrackWindow(pid, wid);
 }
 
@@ -399,20 +395,13 @@ const TrackResult = enum { added, known, full, unobserved };
 fn appTrackWindow(pid: i32, wid: u32) bool {
     if (wid == 0) return false;
 
-    switch (appTrackWindowOnce(pid, wid)) {
-        .added => return true,
-        .known, .unobserved => return false,
-        .full => {},
+    var result = appTrackWindowOnce(pid, wid);
+    if (result == .full) {
+        pruneGoneWindows(pid);
+        result = appTrackWindowOnce(pid, wid);
     }
-    pruneGoneWindows(pid);
-    switch (appTrackWindowOnce(pid, wid)) {
-        .added => return true,
-        .known, .unobserved => return false,
-        .full => {
-            warnKnownWindowsFull(pid, wid);
-            return false;
-        },
-    }
+    if (result == .full) warnKnownWindowsFull(pid, wid);
+    return result == .added;
 }
 
 fn appTrackWindowOnce(pid: i32, wid: u32) TrackResult {

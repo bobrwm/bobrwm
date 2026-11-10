@@ -485,9 +485,8 @@ pub const DiscoveryQueue = enum {
 pub const ProcessRetry = struct {
     process_id: i32,
     attempts_remaining: u8,
-    /// Focus retries only: queries the app may leave unanswered before the
-    /// retry expires, counted apart so an app still launching does not use
-    /// up the attempts meant for one that answers without a window.
+    /// Focus retries only: queries the app may leave unanswered, counted
+    /// apart from answers without a focused window.
     unanswered_remaining: u8 = 0,
 };
 
@@ -1121,8 +1120,7 @@ pub const Event = union(enum) {
         is_visible: bool,
     },
     deferred_window_promotion_failed: WindowId,
-    // WindowServer or AX reported the window gone, so neither queue can ever
-    // promote it and polling it would only spend AX calls until expiry.
+    // The window is gone, so neither candidate queue can promote it.
     window_candidate_destroyed: WindowId,
     untrack_window_candidates_for_process: i32,
     track_app_launch_retry: ProcessRetry,
@@ -1254,9 +1252,8 @@ pub const Effect = union(enum) {
         window_id: WindowId,
         reason: WindowCatalogRejectionReason,
     },
-    // The window left the catalog. Platform state keyed by its ID (animation,
-    // AX element caches, queued writes) belongs to the shell, so the reducer
-    // hands release over here instead of each removal path doing it.
+    // The window left the catalog. Release the shell's state keyed by its ID:
+    // animation, AX element caches, queued writes.
     window_removed: struct {
         window_id: WindowId,
         process_id: i32,
