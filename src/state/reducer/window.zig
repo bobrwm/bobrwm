@@ -89,6 +89,15 @@ pub fn reduceWindowAdopted(transition: *Transition, adoption: WindowAdoption) vo
 
     _ = transition.model.pending_role_windows.remove(adopted.window_id);
     _ = transition.model.deferred_window_candidates.remove(adopted.window_id);
+
+    // Only fill empty focus memory: an adopted window may be in the background.
+    const space = transition.model.space(window.space_key).?;
+    if (transition.model.focusedWorkspaceWindow(space.workspace_id) == null) {
+        reduceWorkspaceFocusRecorded(transition, .{
+            .workspace_id = space.workspace_id,
+            .window_id = adopted.window_id,
+        });
+    }
 }
 
 pub fn reduceWindowUpdated(transition: *Transition, update: WindowUpdate) void {

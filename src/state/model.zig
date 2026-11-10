@@ -414,6 +414,12 @@ pub const WindowCandidate = struct {
     attempts_remaining: u8,
 };
 
+/// A candidate its app reported ready to tile.
+pub const ReadyWindowCandidate = struct {
+    candidate: WindowCandidate,
+    is_resizable: bool,
+};
+
 pub const WindowCandidates = struct {
     entries: [max_pending_window_candidates]WindowCandidate = undefined,
     count: u16 = 0,
@@ -1107,10 +1113,11 @@ pub const Event = union(enum) {
     request_pending_focus,
     follow_focus_observed: FollowFocusObservation,
     track_pending_role_window: WindowCandidate,
-    untrack_pending_role_window: WindowId,
     pending_role_observed: struct {
         window_id: WindowId,
         readiness: WindowReadiness,
+        /// Meaningful only when ready.
+        is_resizable: bool,
     },
     track_deferred_window_candidate: WindowCandidate,
     untrack_deferred_window_candidate: WindowId,
@@ -1118,6 +1125,8 @@ pub const Event = union(enum) {
         window_id: WindowId,
         readiness: WindowReadiness,
         is_visible: bool,
+        /// Meaningful only when ready.
+        is_resizable: bool,
     },
     deferred_window_promotion_failed: WindowId,
     // The window is gone, so neither candidate queue can promote it.
@@ -1297,9 +1306,11 @@ pub const Effect = union(enum) {
         observation: FollowFocusObservation,
         transition: WorkspaceTransition,
     },
-    pending_role_ready: WindowCandidate,
+    /// Ask the candidate's app whether the window is ready.
+    request_pending_role_readiness: WindowCandidate,
+    pending_role_ready: ReadyWindowCandidate,
     pending_role_expired: WindowCandidate,
-    deferred_window_ready: WindowCandidate,
+    deferred_window_ready: ReadyWindowCandidate,
     deferred_window_expired: struct {
         candidate: WindowCandidate,
         reason: DeferredWindowExpiryReason,

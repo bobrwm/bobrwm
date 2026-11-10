@@ -63,6 +63,7 @@ pub const WindowMoveEffect = model_mod.WindowMoveEffect;
 pub const PendingFocus = model_mod.PendingFocus;
 pub const WindowReadiness = model_mod.WindowReadiness;
 pub const WindowCandidate = model_mod.WindowCandidate;
+pub const ReadyWindowCandidate = model_mod.ReadyWindowCandidate;
 pub const ProcessRetry = model_mod.ProcessRetry;
 pub const ProcessIdentity = model_mod.ProcessIdentity;
 pub const DiscoveryQueue = model_mod.DiscoveryQueue;
@@ -200,9 +201,6 @@ pub fn reduce(model: *Model, event: Event) Transition {
         .request_pending_focus => workspace_reducer.reducePendingFocusRequest(&transition),
         .follow_focus_observed => |observation| workspace_reducer.reduceFollowFocusObserved(&transition, observation),
         .track_pending_role_window => |candidate| discovery_reducer.reducePendingRoleTracked(&transition, candidate),
-        .untrack_pending_role_window => |window_id| {
-            _ = transition.model.pending_role_windows.remove(window_id);
-        },
         .pending_role_observed => |observation| discovery_reducer.reducePendingRoleObserved(&transition, observation),
         .track_deferred_window_candidate => |candidate| discovery_reducer.reduceDeferredWindowTracked(&transition, candidate),
         .untrack_deferred_window_candidate => |window_id| {
@@ -489,6 +487,27 @@ test "workspace summaries preserve globally unique active workspaces" {
     try testing.expectEqual(@as(u32, 1), summaries[1].window_count);
     try testing.expect(summaries[1].is_active);
     try testing.expect(summaries[1].is_focused);
+}
+
+test "adoption fills empty workspace focus without replacing it" {
+    const testing = std.testing;
+    var catalog: SpaceCatalog = .{};
+    catalog.add(.{ .key = .{ .id = 101 }, .workspace_id = 1, .display_id = 11 });
+    var model = reduceCopy(.{}, .{ .replace_space_catalog = &catalog }).model;
+
+    model = reduceCopy(model, .{ .adopt_window = .{
+        .window_id = 101,
+        .process_id = 1001,
+        .space_key = .{ .id = 101 },
+    } }).model;
+    try testing.expectEqual(@as(?WindowId, 101), model.focusedWorkspaceWindow(1));
+
+    model = reduceCopy(model, .{ .adopt_window = .{
+        .window_id = 102,
+        .process_id = 1002,
+        .space_key = .{ .id = 101 },
+    } }).model;
+    try testing.expectEqual(@as(?WindowId, 101), model.focusedWorkspaceWindow(1));
 }
 
 test "workspace process ids are deduplicated and exclude suppressed windows" {
@@ -2543,10 +2562,13 @@ test "window discovery retries are reducer owned" {
         .attempts_remaining = 1,
     };
 
-    model = reduceCopy(model, .{ .track_pending_role_window = candidate }).model;
-    var transition = reduceCopy(model, .{ .pending_role_observed = .{
+    var transition = reduceCopy(model, .{ .track_pending_role_window = candidate });
+    try testing.expectEqual(candidate, transition.effects[0].request_pending_role_readiness);
+    model = transition.model;
+    transition = reduceCopy(model, .{ .pending_role_observed = .{
         .window_id = candidate.window_id,
         .readiness = .pending,
+        .is_resizable = true,
     } });
     try testing.expectEqual(@as(u8, 0), transition.effect_count);
     try testing.expectEqual(@as(u8, 0), transition.model.pending_role_windows.get(candidate.window_id).?.attempts_remaining);
@@ -2554,6 +2576,7 @@ test "window discovery retries are reducer owned" {
     transition = reduceCopy(transition.model, .{ .pending_role_observed = .{
         .window_id = candidate.window_id,
         .readiness = .pending,
+        .is_resizable = true,
     } });
     try testing.expectEqual(@as(?WindowCandidate, null), transition.model.pending_role_windows.get(candidate.window_id));
     try testing.expectEqual(std.meta.Tag(Effect).pending_role_expired, std.meta.activeTag(transition.effects[0]));
@@ -2563,9 +2586,10 @@ test "window discovery retries are reducer owned" {
         .window_id = candidate.window_id,
         .readiness = .ready,
         .is_visible = true,
+        .is_resizable = false,
     } });
     try testing.expect(transition.model.hasDeferredWindowCandidate(candidate.window_id));
-    try testing.expectEqual(std.meta.Tag(Effect).deferred_window_ready, std.meta.activeTag(transition.effects[0]));
+    try testing.expect(!transition.effects[0].deferred_window_ready.is_resizable);
 
     transition = reduceCopy(transition.model, .{ .deferred_window_promotion_failed = candidate.window_id });
     try testing.expectEqual(@as(u8, 0), transition.model.deferred_window_candidates.get(candidate.window_id).?.attempts_remaining);

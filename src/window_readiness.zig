@@ -8,12 +8,9 @@ const c = @import("c");
 const app_queue = @import("app_queue.zig");
 const ax = @import("ax.zig");
 const shim = @import("shim_api.zig");
-const state_mod = @import("state.zig");
 const window_server = @import("window_server.zig");
 
 const log = std.log.scoped(.window_readiness);
-
-const Readiness = state_mod.WindowReadiness;
 
 /// What asked, which decides how the main thread applies the answer.
 pub const Purpose = enum(u2) {
@@ -33,15 +30,20 @@ pub const Answer = enum(u2) {
 pub const Observation = struct {
     purpose: Purpose,
     answer: Answer,
+    /// Whether the app lets the window be resized. Meaningful only when ready.
+    is_resizable: bool = true,
 
     pub fn encode(self: Observation) u8 {
-        return @as(u8, @backingInt(self.purpose)) | (@as(u8, @backingInt(self.answer)) << 2);
+        return @as(u8, @backingInt(self.purpose)) |
+            (@as(u8, @backingInt(self.answer)) << 2) |
+            (@as(u8, @intFromBool(self.is_resizable)) << 4);
     }
 
     pub fn decode(detail: u8) Observation {
         return .{
             .purpose = @fromBackingInt(@intCast(@as(u2, @truncate(detail)))),
             .answer = @fromBackingInt(@intCast(@as(u2, @truncate(detail >> 2)))),
+            .is_resizable = detail & (1 << 4) != 0,
         };
     }
 };
@@ -153,6 +155,7 @@ fn hasRequestFor(pid: i32) bool {
 /// Answer a batch of the app's requests, then requeue for the rest. Runs on
 /// that app's queue.
 fn answerRequests(app: app_queue.App) void {
+    const strings = ax.strings() orelse return;
     var batch_buffer: [max_batch]Request = undefined;
     const batch = takeRequests(app.pid, &batch_buffer);
     if (batch.len == 0) return;
@@ -177,22 +180,20 @@ fn answerRequests(app: app_queue.App) void {
 
     for (batch, 0..) |queued, index| {
         const is_gone = if (live) |ids| std.mem.findScalar(u32, ids, queued.wid) == null else false;
-        const answer: Answer = if (is_gone) .gone else if (elements[index]) |win| switch (classify(win)) {
-            .reject => .reject,
-            .ready => .ready,
-            .pending => .pending,
-        } else .pending;
+        const answer: Answer = if (is_gone) .gone else if (elements[index]) |win| classify(win) else .pending;
+        // Asked here so adoption on the main thread does not message the app.
+        const is_resizable = answer != .ready or ax.isAttributeSettable(elements[index].?, strings.size_attr);
 
         var purposes = queued.purposes.iterator();
         while (purposes.next()) |purpose| {
-            const observation: Observation = .{ .purpose = purpose, .answer = answer };
+            const observation: Observation = .{ .purpose = purpose, .answer = answer, .is_resizable = is_resizable };
             shim.bw_emit_event_detail(shim.BW_EVENT_WINDOW_READINESS_OBSERVED, queued.pid, queued.wid, observation.encode());
         }
     }
 }
 
 /// Classify a window from its AX role and subrole.
-fn classify(win: c.AXUIElementRef) Readiness {
+fn classify(win: c.AXUIElementRef) Answer {
     const strings = ax.strings() orelse return .pending;
     // Native open/save panels are app-modal AX windows. They pass the dialog
     // heuristic below, but tiling them resizes the parent app while the user

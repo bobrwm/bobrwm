@@ -147,7 +147,6 @@ fn nsString(str: [*:0]const u8) objc.Object {
 // AX attribute strings and window-frame plumbing live in ax.zig; aliases
 // keep the many existing call sites unchanged.
 const AxStrings = ax_mod.AxStrings;
-const findAxWindow = ax_mod.findWindow;
 
 fn displayIndexById(display_id: u32) ?usize {
     for (g_displays[0..g_display_count], 0..) |display, i| {
@@ -1839,13 +1838,6 @@ fn isRegularActivationApp(pid: i32) bool {
     return activation_policy == 0;
 }
 
-/// Query whether the AXSize attribute is settable (i.e. the window can be resized).
-fn axCanResize(win_ref: c.AXUIElementRef, ax: *const AxStrings) bool {
-    var result: c.Boolean = 0;
-    const err = c.AXUIElementIsAttributeSettable(win_ref, ax.size_attr, &result);
-    return err == c.kAXErrorSuccess and result != 0;
-}
-
 /// Raise and focus a window, then activate its owning app, on the app's
 /// writer queue. The last-focused process updates now so the next request
 /// sees this switch.
@@ -1938,11 +1930,13 @@ fn applyReadiness(pid: i32, wid: u32, observation: window_readiness.Observation)
         .pending_role => dispatchStateEvent(.{ .pending_role_observed = .{
             .window_id = wid,
             .readiness = readiness,
+            .is_resizable = observation.is_resizable,
         } }),
         .deferred => dispatchStateEvent(.{ .deferred_window_observed = .{
             .window_id = wid,
             .readiness = readiness,
             .is_visible = isVisibleOnScreen(wid),
+            .is_resizable = observation.is_resizable,
         } }),
         .cleanup => if (readiness == .reject) removeUnmanageableWindow(pid, wid, "should-manage=false"),
     }
@@ -2948,7 +2942,7 @@ fn startCore(config_path_arg: ?[]const u8) !void {
     captureWorkspaceApplicationInventory();
     // The app frontmost at launch never reports an activation.
     if (frontmostApplicationPid()) |pid| g_last_activated_pid = pid;
-    discoverWindows();
+    discoverWindows(.runtime);
     retileAllDisplays();
 
     // Register runtime ObjC classes (BWObserver / BWLaunchGate) before
@@ -3176,7 +3170,7 @@ fn recoverFromEventOverflow() void {
     dispatchStateEvent(.{ .geometry = .clear_intents });
 
     _ = sweepProcesses();
-    discoverWindows();
+    discoverWindows(.runtime);
     refreshTabGroupActiveTabs();
     reconcileVisibleFramesFromWindowServer();
 
@@ -3760,7 +3754,7 @@ fn handleEvent(ev: *const event_mod.Event) void {
         .app_launched => {
             log.debug("app launched pid={}", .{ev.pid});
             observeProcess(ev.pid);
-            discoverWindows();
+            discoverWindows(.runtime);
             ax_observer.observeApp(ev.pid);
             trackAppLaunchRetry(ev.pid);
             retile();
@@ -3859,7 +3853,7 @@ fn handleEvent(ev: *const event_mod.Event) void {
         },
         .window_deminimized => {
             log.debug("window deminimized wid={}", .{ev.wid});
-            discoverWindows();
+            discoverWindows(.runtime);
             retile();
         },
         .display_changed => {
@@ -4252,7 +4246,7 @@ fn reconcileDisplays(cause: state_mod.DisplayReconcileCause) void {
         .display_change => returnDisplacedWindows(),
         .topology_repair => reconcileNativeWindowAssignmentsFromWindowServer(false),
     }
-    discoverWindows();
+    discoverWindows(.runtime);
     retile();
     updateStatusBar();
 }
@@ -4639,6 +4633,12 @@ fn dispatchStateEvent(event: state_mod.Event) void {
     for (transition.effects[0..transition.effect_count]) |effect| {
         const is_queued = switch (effect) {
             .window_removed => |removal| g_window_removal_queue.push(removal),
+            // Run now: a discovery pass can track more windows than the
+            // effect queue holds.
+            .request_pending_role_readiness => |candidate| {
+                requestReadiness(candidate.process_id, candidate.window_id, .pending_role);
+                continue;
+            },
             else => g_state_effect_queue.push(effect),
         };
         if (!is_queued) @panic("state effect queue overflow");
@@ -4755,6 +4755,7 @@ fn executeStateEffect(effect: state_mod.Effect) void {
             @tagName(rejection.reason),
         }),
         .window_removed => unreachable, // Queued and run apart, see drainStateEffects.
+        .request_pending_role_readiness => unreachable, // Run at dispatch, see dispatchStateEvent.
         .workspace_transition_started => |transition| executeWorkspaceTransitionStarted(transition),
         .workspace_transition_settled => |settlement| executeWorkspaceTransitionSettled(settlement),
         .move_native_window => |pending| executeNativeWindowMove(pending),
@@ -4813,12 +4814,12 @@ fn executeStateEffect(effect: state_mod.Effect) void {
             deferred.transition.target.workspace_id,
             if (deferred.transition.completion_reason) |reason| @tagName(reason) else "none",
         }),
-        .pending_role_ready => |candidate| executePendingRoleReady(candidate),
+        .pending_role_ready => |ready| executePendingRoleReady(ready),
         .pending_role_expired => |candidate| log.warn("pending-role: retry budget exhausted pid={d} wid={d}", .{
             candidate.process_id,
             candidate.window_id,
         }),
-        .deferred_window_ready => |candidate| executeDeferredWindowReady(candidate),
+        .deferred_window_ready => |ready| executeDeferredWindowReady(ready),
         .deferred_window_expired => |expired| {
             const message = "deferred-window: retry budget exhausted pid={d} wid={d} reason={s}";
             const args = .{
@@ -4961,16 +4962,18 @@ fn executeWindowMoved(move: state_mod.WindowMoveEffect) void {
     });
 }
 
-fn executePendingRoleReady(candidate: state_mod.WindowCandidate) void {
-    if (!addNewWindowManaged(candidate.process_id, candidate.window_id) and
+fn executePendingRoleReady(ready: state_mod.ReadyWindowCandidate) void {
+    const candidate = ready.candidate;
+    if (!addNewWindowManaged(candidate.process_id, candidate.window_id, ready.is_resizable) and
         managedWindow(candidate.window_id) == null) return;
 
     retile();
     updateStatusBar();
 }
 
-fn executeDeferredWindowReady(candidate: state_mod.WindowCandidate) void {
-    if (addNewWindowManaged(candidate.process_id, candidate.window_id) or
+fn executeDeferredWindowReady(ready: state_mod.ReadyWindowCandidate) void {
+    const candidate = ready.candidate;
+    if (addNewWindowManaged(candidate.process_id, candidate.window_id, ready.is_resizable) or
         managedWindow(candidate.window_id) != null)
     {
         untrackDeferredWindowCandidate(candidate.window_id);
@@ -4985,7 +4988,7 @@ fn executeDeferredWindowReady(candidate: state_mod.WindowCandidate) void {
 fn executeAppLaunchRetry(process_id: i32) void {
     log.debug("app-launch-retry: retrying discovery for pid={d}", .{process_id});
     ax_observer.observeApp(process_id);
-    discoverWindows();
+    discoverWindows(.runtime);
     retile();
     updateStatusBar();
 }
@@ -5413,7 +5416,7 @@ fn completeNativeSwitch(space: state_mod.SpaceRef, epoch: state_mod.Epoch) void 
     const started_ns = nanoTimestamp();
     if (g_state.space(space.key) == null) return;
 
-    discoverWindowsAfterNativeSpaceSwitch();
+    discoverWindows(.native_switch);
     clearDragPreview();
     requestRetileDisplay(space.display_id);
     if (!g_event_drain_active) flushRetileRequests();
@@ -5444,7 +5447,7 @@ fn failNativeSwitch(failure: @FieldType(state_mod.Effect, "native_switch_failed"
 fn reconcileObservedNativeTopology() void {
     const started_ns = nanoTimestamp();
     reconcileNativeWindowAssignmentsFromWindowServer(true);
-    discoverWindows();
+    discoverWindows(.runtime);
     retile();
     updateStatusBar();
 
@@ -5645,11 +5648,6 @@ fn trackPendingRoleWindow(pid: i32, wid: u32, space: state_mod.SpaceRef) void {
     } });
 }
 
-fn untrackPendingRoleWindow(wid: u32) void {
-    std.debug.assert(wid != 0);
-    dispatchStateEvent(.{ .untrack_pending_role_window = wid });
-}
-
 fn forgetGeometryIfUnmanaged(wid: u32) void {
     if (managedWindow(wid) != null) return;
     if (g_state.hasPendingRoleWindow(wid)) return;
@@ -5770,32 +5768,31 @@ fn removeWorkspaceApplication(process_id: i32) void {
     g_workspace_application_inventory_count = write_index;
 }
 
-fn discoverWindows() void {
-    discoverWindowsImpl(false);
-}
-
-fn discoverWindowsAfterNativeSpaceSwitch() void {
-    discoverWindowsImpl(true);
-}
+const DiscoveryContext = enum {
+    runtime,
+    /// Landing on a native Space: refresh tab groups and defer observer setup.
+    native_switch,
+};
 
 /// Queue every unmanaged on-screen window for adoption once its app reports
 /// it ready.
-fn discoverWindowsImpl(should_refresh_tabs: bool) void {
+fn discoverWindows(context: DiscoveryContext) void {
     // A multi-step native switch exposes intermediate Spaces long enough for
     // CG and AX discovery. Adopt only after SkyLight confirms the destination.
     if (nativeSwitchPending()) return;
     const started_ns = nanoTimestamp();
 
+    const is_native_switch = context == .native_switch;
     const span = trace.begin("discover");
     var buf: [256]shim.bw_window_info = undefined;
     var on_screen: OnScreenWindows = .{};
-    const discovery = enumerateWindows(&buf, if (should_refresh_tabs) &on_screen else null, true);
+    const discovery = enumerateWindows(&buf, if (is_native_switch) &on_screen else null, true);
     const enumerated_ns = nanoTimestamp();
     if (discovery.truncated) {
         log.warn("window discovery truncated limit={d}; excess windows remain unmanaged", .{buf.len});
     }
 
-    if (should_refresh_tabs) refreshTabGroupActiveTabsFromSnapshot(&on_screen);
+    if (is_native_switch) refreshTabGroupActiveTabsFromSnapshot(&on_screen);
     const tabs_refreshed_ns = nanoTimestamp();
 
     var observed_pids: [128]i32 = undefined;
@@ -5823,7 +5820,7 @@ fn discoverWindowsImpl(should_refresh_tabs: bool) void {
         // manageable (for example AX role/subrole is still pending).
         if (!already_observed) {
             observeProcess(info.pid);
-            if (should_refresh_tabs) {
+            if (is_native_switch) {
                 ax_observer.observeAppDeferred(info.pid);
             } else {
                 ax_observer.observeApp(info.pid);
@@ -5843,7 +5840,6 @@ fn discoverWindowsImpl(should_refresh_tabs: bool) void {
             continue;
         };
         trackPendingRoleWindow(info.pid, info.wid, target_ws);
-        requestReadiness(info.pid, info.wid, .pending_role);
     }
 
     const completed_ns = nanoTimestamp();
@@ -5998,7 +5994,7 @@ fn appWindowSnapshot(
 /// Whether a window should start floating when bobrwm begins managing it.
 /// Startup discovery and window creation both use this, so a window gets the
 /// same mode whether it existed before bobrwm started or appeared afterwards.
-fn shouldFloatWindow(pid: i32, wid: u32, frame: window_mod.Window.Frame) bool {
+fn shouldFloatWindow(pid: i32, frame: window_mod.Window.Frame, is_resizable: bool) bool {
     // An app_rules entry with .float = true floats every window of that app.
     if (g_config.app_rules.len > 0) {
         var id_buf: [256]u8 = undefined;
@@ -6011,17 +6007,14 @@ fn shouldFloatWindow(pid: i32, wid: u32, frame: window_mod.Window.Frame) bool {
     // are floated instead of tiled. This catches transient splash screens and
     // updater dialogs (e.g. Discord Updater at 300x300) that have standard
     // AX roles but are not real application windows.
-    if (frame.width > 500 and frame.height > 500) return false;
-    const ax_win = findAxWindow(pid, wid) orelse return false;
-    defer c.CFRelease(@ptrCast(ax_win));
-    const ax = ax_mod.strings() orelse return false;
-    return !axCanResize(ax_win, ax);
+    return !is_resizable and (frame.width <= 500 or frame.height <= 500);
 }
 
 fn addNewWindowManagedWithAssignment(
     pid: i32,
     wid: u32,
     assigned_space: state_mod.SpaceRef,
+    is_resizable: bool,
 ) bool {
     const span = trace.beginWindow("addNewWindow", pid, wid);
     defer _ = span.end();
@@ -6089,15 +6082,13 @@ fn addNewWindowManagedWithAssignment(
         .wid = wid,
         .pid = pid,
         .frame = window_frame,
-        .mode = if (shouldFloatWindow(pid, wid, window_frame)) .floating else .tiled,
+        .mode = if (shouldFloatWindow(pid, window_frame, is_resizable)) .floating else .tiled,
     };
 
     adoptWindow(ws, win) catch |err| {
         log.err("addNewWindow: failed to adopt pid={d} wid={d}: {}", .{ pid, wid, err });
         return false;
     };
-    // A window adopted in the background must not take focus.
-    if (focusedWorkspaceWindow(ws) == null) recordWorkspaceFocus(ws, wid);
     // Its focus event may have arrived before it was managed.
     if (frontmostApplicationPid() == pid) focus_query.request(pid, .activated);
 
@@ -6113,7 +6104,7 @@ fn addNewWindowManagedWithAssignment(
     return true;
 }
 
-fn addNewWindowManaged(pid: i32, wid: u32) bool {
+fn addNewWindowManaged(pid: i32, wid: u32, is_resizable: bool) bool {
     // Prefer the window's actual on-screen position over the currently
     // focused display: a torn-off tab dropped on another monitor must land
     // on the workspace that owns the destination monitor, not on whichever
@@ -6127,7 +6118,7 @@ fn addNewWindowManaged(pid: i32, wid: u32) bool {
     // A rule-pinned app's transient launch position is meaningless: place it
     // on the display that currently owns its assigned workspace, not wherever
     // it happened to launch.
-    return addNewWindowManagedWithAssignment(pid, wid, ws);
+    return addNewWindowManagedWithAssignment(pid, wid, ws, is_resizable);
 }
 
 /// Queue `wid` for adoption once its app reports it ready.
@@ -6142,7 +6133,6 @@ fn addNewWindow(pid: i32, wid: u32) void {
         return;
     };
     trackPendingRoleWindow(pid, wid, ws);
-    requestReadiness(pid, wid, .pending_role);
 }
 
 fn hasWindowTabGroups() bool {

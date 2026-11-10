@@ -156,15 +156,17 @@ pub fn hasRealWindowSignal(win: c.AXUIElementRef, ax: *const AxStrings) bool {
     return isAttributeTrue(win, ax.main_attr) or isAttributeTrue(win, ax.focused_attr);
 }
 
+/// True when the AX attribute can be set on the element.
+pub fn isAttributeSettable(element: c.AXUIElementRef, attr: c.CFStringRef) bool {
+    var is_settable: c.Boolean = 0;
+    trace.countAx();
+    const err = c.AXUIElementIsAttributeSettable(element, attr, &is_settable);
+    return err == c.kAXErrorSuccess and is_settable != 0;
+}
+
 /// Accessibility trust check.
 pub fn isTrusted() bool {
     return c.AXIsProcessTrusted() != 0;
-}
-
-/// Resolve a window id to its AX element by scanning the app's window list.
-/// The returned element is retained; the caller must CFRelease it.
-pub fn findWindow(pid: i32, target_wid: u32) ?c.AXUIElementRef {
-    return findWindowWithTimeout(pid, target_wid, null);
 }
 
 /// Resolve a window id while bounding messages sent through temporary AX elements.
@@ -309,10 +311,10 @@ fn cachedElement(pid: i32, wid: u32) ?c.AXUIElementRef {
     return entry.element;
 }
 
-/// Resolve (pid, wid) through findWindow and cache it, evicting whatever
-/// shared its slot. Borrowed — the cache owns the reference.
+/// Resolve (pid, wid) and cache it, evicting whatever shared its slot.
+/// Borrowed — the cache owns the reference.
 fn resolveElement(pid: i32, wid: u32) ?c.AXUIElementRef {
-    const element = findWindow(pid, wid) orelse return null;
+    const element = findWindowWithTimeout(pid, wid, null) orelse return null;
 
     const slot = elementCacheSlot(wid);
     if (g_element_cache[slot]) |evicted| c.CFRelease(@ptrCast(evicted.element));
