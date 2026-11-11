@@ -5957,6 +5957,9 @@ fn addNewWindowManagedWithAssignment(
         return false;
     }
     if (nativeSwitchPending()) {
+        // A readiness answer left its queue before it got here, so a switch
+        // that began after the request would otherwise lose the window.
+        trackDeferredWindowCandidate(pid, wid, assigned_space);
         log.debug("addNewWindow: deferred pid={d} wid={d} during native switch", .{ pid, wid });
         return false;
     }
