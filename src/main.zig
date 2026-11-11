@@ -101,7 +101,13 @@ const mouse_focus_confirmation_ns: i64 = std.time.ns_per_s;
 /// an intermediate topology, so a reconcile this long after the final event
 /// converges on the settled arrangement.
 const display_settle_delay_ms: u64 = 250;
-const native_space_capacity_settle_attempts: u8 = 20;
+/// WindowServer lists a created or destroyed Space within ~5ms; past this
+/// the change is treated as failed.
+const native_space_capacity_settle_ms: u64 = 500;
+/// After a failed change, so a Space that WindowServer creates but never
+/// lists cannot pile up more on every retry.
+const native_space_capacity_retry_ms: u64 = 2000;
+/// Startup's wait between capacity steps.
 const native_space_capacity_poll_delay_us: c_uint = 25_000;
 const native_space_topology_poll_interval_ms: u64 = 1000;
 /// Termination notifications can be lost; a missed one keeps a dead app's
@@ -2863,7 +2869,7 @@ fn startCore(config_path_arg: ?[]const u8) !void {
     // -- Core state --
     g_core_stage = .layout;
     refreshDisplays();
-    if (!reconcileNativeSpaceCapacity()) {
+    if (!waitForNativeSpaceCapacity()) {
         log.err("could not reconcile Mission Control Space count", .{});
         return error.NativeSpaceCapacityUnavailable;
     }
@@ -4212,9 +4218,12 @@ const NativeSpaceCapacity = struct {
     excess_space_id: ?u64,
 
     /// Whether the Space count needs creating or removing a Space.
-    fn needsRepair(self: NativeSpaceCapacity, required_count: u16) bool {
-        return self.total_count < required_count or
-            (self.total_count > required_count and self.excess_space_id != null);
+    fn needsRepair(self: NativeSpaceCapacity, required_count: u16, now_ms: state_mod.TimestampMs) bool {
+        if (self.total_count < required_count) return true;
+        // A Space that failed to go waits out the cooldown, so it does not
+        // rerun reconciliation on every topology poll.
+        const is_cooling_down = now_ms < g_native_space_capacity_retry_at_ms;
+        return self.total_count > required_count and self.excess_space_id != null and !is_cooling_down;
     }
 };
 
@@ -4335,112 +4344,113 @@ const OccupiedNativeSpaces = struct {
     }
 };
 
-fn reconcileNativeSpaceCapacity() bool {
+const NativeSpaceCapacityStep = enum { ready, pending, failed };
+
+/// A Space create or destroy that WindowServer has not listed yet.
+const NativeSpaceCapacityChange = struct {
+    space_id: u64,
+    is_create: bool,
+    /// Ordinary Space count before the change.
+    before_count: u16,
+    deadline_ms: state_mod.TimestampMs,
+};
+
+var g_native_space_capacity_change: ?NativeSpaceCapacityChange = null;
+var g_native_space_capacity_retry_at_ms: state_mod.TimestampMs = 0;
+
+/// Take one step toward the configured Space count without waiting on
+/// WindowServer: confirm the change in flight, or start the next one.
+/// Callers retry on `.pending`; display reconciliation does so through its
+/// resettle timer. Only missing Spaces hold reconciliation back: an extra
+/// Space is not bound to a workspace, so failing to remove it is not fatal.
+fn stepNativeSpaceCapacity() NativeSpaceCapacityStep {
+    const now_ms = nativeStateNowMs();
+    const capacity = nativeSpaceCapacity() orelse {
+        // A snapshot can fail while WindowServer applies the change.
+        const change = g_native_space_capacity_change orelse return .failed;
+        return if (now_ms < change.deadline_ms) .pending else .failed;
+    };
+
+    if (g_native_space_capacity_change) |change| {
+        const has_landed = if (change.is_create)
+            capacity.total_count > change.before_count
+        else
+            capacity.total_count < change.before_count;
+        if (!has_landed) {
+            if (now_ms < change.deadline_ms) return .pending;
+
+            log.warn("native Space {s} did not reach WindowServer space={d} before={d} available={d} required={d}", .{
+                if (change.is_create) "creation" else "removal",
+                change.space_id,
+                change.before_count,
+                capacity.total_count,
+                workspaceCount(),
+            });
+            g_native_space_capacity_change = null;
+            g_native_space_capacity_retry_at_ms = now_ms +| native_space_capacity_retry_ms;
+            return if (change.is_create) .failed else .ready;
+        }
+
+        log.info("{s} Mission Control Space space={d} available={d}", .{
+            if (change.is_create) "created" else "removed",
+            change.space_id,
+            capacity.total_count,
+        });
+        g_native_space_capacity_change = null;
+    }
+
     const required_count: u16 = workspaceCount();
-    var capacity = nativeSpaceCapacity() orelse return false;
-
-    const sky = &g_sky.?;
-    const display_id = primaryDisplayId();
+    const is_cooling_down = now_ms < g_native_space_capacity_retry_at_ms;
     if (capacity.total_count < required_count) {
-        log.info("creating missing Mission Control Spaces required={d} available={d} display={d}", .{
-            required_count,
-            capacity.total_count,
-            display_id,
-        });
-    }
+        if (is_cooling_down) return .pending;
 
-    while (capacity.total_count < required_count) {
-        const space_id = sky.createNativeSpace(display_id) orelse {
+        const display_id = primaryDisplayId();
+        const space_id = g_sky.?.createNativeSpace(display_id) orelse {
             log.warn("native Space creation failed display={d} required={d} available={d}", .{ display_id, required_count, capacity.total_count });
-            return false;
+            g_native_space_capacity_retry_at_ms = now_ms +| native_space_capacity_retry_ms;
+            return .failed;
         };
-
-        var observed_capacity = capacity;
-        const started_ns = nanoTimestamp();
-        var unavailable_samples: u8 = 0;
-        var attempt: u8 = 0;
-        while (attempt < native_space_capacity_settle_attempts) : (attempt += 1) {
-            _ = c.usleep(native_space_capacity_poll_delay_us);
-            observed_capacity = nativeSpaceCapacity() orelse {
-                unavailable_samples += 1;
-                continue;
-            };
-            if (observed_capacity.total_count > capacity.total_count) break;
-        }
-        if (observed_capacity.total_count <= capacity.total_count) {
-            log.warn("created native Space did not enter managed topology display={d} space={d} required={d} before={d} last_available={d} polls={d} unavailable_samples={d} elapsed_ms={d}", .{
-                display_id,
-                space_id,
-                required_count,
-                capacity.total_count,
-                observed_capacity.total_count,
-                attempt,
-                unavailable_samples,
-                @divTrunc(nanoTimestamp() - started_ns, std.time.ns_per_ms),
-            });
-            return false;
-        }
-
-        capacity = observed_capacity;
-        log.info("created Mission Control Space display={d} space={d} available={d}", .{
-            display_id,
-            space_id,
-            capacity.total_count,
-        });
+        startNativeSpaceCapacityChange(space_id, true, capacity.total_count, now_ms);
+        return .pending;
     }
 
-    if (capacity.total_count > required_count) {
-        log.info("removing excess Mission Control Spaces required={d} available={d}", .{
-            required_count,
-            capacity.total_count,
-        });
-    }
-
-    while (capacity.total_count > required_count) {
+    if (capacity.total_count > required_count and !is_cooling_down) {
         const space_id = capacity.excess_space_id orelse {
-            log.debug("keeping excess Mission Control Spaces required={d} available={d}", .{
-                required_count,
-                capacity.total_count,
-            });
-            break;
+            log.debug("keeping excess Mission Control Spaces required={d} available={d}", .{ required_count, capacity.total_count });
+            return .ready;
         };
-        if (!sky.destroyNativeSpace(space_id)) {
+        if (!g_sky.?.destroyNativeSpace(space_id)) {
             log.warn("native Space removal failed space={d}", .{space_id});
-            return false;
+            g_native_space_capacity_retry_at_ms = now_ms +| native_space_capacity_retry_ms;
+            return .ready;
         }
-
-        var observed_capacity = capacity;
-        const started_ns = nanoTimestamp();
-        var unavailable_samples: u8 = 0;
-        var attempt: u8 = 0;
-        while (attempt < native_space_capacity_settle_attempts) : (attempt += 1) {
-            _ = c.usleep(native_space_capacity_poll_delay_us);
-            observed_capacity = nativeSpaceCapacity() orelse {
-                unavailable_samples += 1;
-                continue;
-            };
-            if (observed_capacity.total_count < capacity.total_count) break;
-        }
-        if (observed_capacity.total_count >= capacity.total_count) {
-            log.warn("destroyed native Space did not leave managed topology space={d} required={d} before={d} last_available={d} polls={d} unavailable_samples={d} elapsed_ms={d}", .{
-                space_id,
-                required_count,
-                capacity.total_count,
-                observed_capacity.total_count,
-                attempt,
-                unavailable_samples,
-                @divTrunc(nanoTimestamp() - started_ns, std.time.ns_per_ms),
-            });
-            return false;
-        }
-
-        capacity = observed_capacity;
-        log.info("removed Mission Control Space space={d} available={d}", .{
-            space_id,
-            capacity.total_count,
-        });
+        startNativeSpaceCapacityChange(space_id, false, capacity.total_count, now_ms);
+        return .pending;
     }
-    return true;
+
+    return .ready;
+}
+
+fn startNativeSpaceCapacityChange(space_id: u64, is_create: bool, before_count: u16, now_ms: state_mod.TimestampMs) void {
+    std.debug.assert(g_native_space_capacity_change == null);
+    g_native_space_capacity_change = .{
+        .space_id = space_id,
+        .is_create = is_create,
+        .before_count = before_count,
+        .deadline_ms = now_ms +| native_space_capacity_settle_ms,
+    };
+}
+
+/// Startup only: nothing else runs on the main thread yet, and workspaces
+/// cannot be mapped until the Spaces exist.
+fn waitForNativeSpaceCapacity() bool {
+    while (true) {
+        switch (stepNativeSpaceCapacity()) {
+            .ready => return true,
+            .failed => return false,
+            .pending => _ = c.usleep(native_space_capacity_poll_delay_us),
+        }
+    }
 }
 
 /// Read only; reconciliation rechecks before mutating state.
@@ -4456,7 +4466,7 @@ fn nativeSpaceTopologyDiverged() bool {
     defer snapshot.deinit();
 
     const capacity = nativeSpaceCapacityFromSnapshot(&snapshot) orelse return false;
-    if (capacity.needsRepair(workspaceCount())) return true;
+    if (capacity.needsRepair(workspaceCount(), nativeStateNowMs())) return true;
 
     const topology = nativeTopologyFromSnapshot(&snapshot, .preserve_space_ids) orelse return false;
     return !g_state.native_topology.eql(&topology);
@@ -4473,19 +4483,13 @@ fn reconcileNativeSpaceTopologyIfNeeded() void {
     var snapshot = g_sky.?.nativeSpaceTopology() orelse return;
     defer snapshot.deinit();
     const capacity = nativeSpaceCapacityFromSnapshot(&snapshot) orelse return;
-    if (capacity.needsRepair(workspaceCount())) {
+    if (capacity.needsRepair(workspaceCount(), nativeStateNowMs())) {
         log.debug("native Space count changed required={d} available={d}", .{
             workspaceCount(),
             capacity.total_count,
         });
-        if (!reconcileNativeSpaceCapacity()) {
-            log.warn("live native Space capacity reconciliation failed required={d} initial_available={d} displays={d}", .{
-                workspaceCount(),
-                capacity.total_count,
-                g_display_count,
-            });
-            return;
-        }
+        // Display reconciliation repairs the count a step at a time and
+        // retries through its resettle timer until it lands.
         reconcileDisplays(.topology_repair);
         return;
     }
@@ -6822,7 +6826,7 @@ fn reconcileDisplayChange(cause: state_mod.DisplayReconcileCause) bool {
     refreshDisplays();
 
     const restored_focused_display_id = displayIdForUuid(focused_uuid) orelse primaryDisplayId();
-    const native_topology = (if (reconcileNativeSpaceCapacity()) captureNativeTopology(.preserve_space_ids) else null) orelse {
+    const native_topology = (if (stepNativeSpaceCapacity() == .ready) captureNativeTopology(.preserve_space_ids) else null) orelse {
         g_displays = previous_displays;
         g_display_count = previous_display_count;
         dispatchStateEvent(.{ .display_reconcile_unavailable = .{
