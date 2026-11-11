@@ -1653,17 +1653,15 @@ fn axPrompt() void {
     _ = c.AXIsProcessTrustedWithOptions(@ptrCast(options_value));
 }
 
-/// The app's AX-focused window ID, or null when it has none. Without a
-/// timeout the query waits AX's 6s default.
-fn focusedWindowId(pid: i32, messaging_timeout_seconds: ?f32) ?u32 {
+/// The app's AX-focused window ID, or null when it has none or did not answer
+/// within `timeout_seconds`.
+fn focusedWindowId(pid: i32, timeout_seconds: f32) ?u32 {
     std.debug.assert(pid > 0);
+    std.debug.assert(timeout_seconds > 0);
 
     const app = c.AXUIElementCreateApplication(pid) orelse return null;
     defer c.CFRelease(@ptrCast(app));
-    if (messaging_timeout_seconds) |seconds| {
-        std.debug.assert(seconds > 0);
-        _ = c.AXUIElementSetMessagingTimeout(app, seconds);
-    }
+    _ = c.AXUIElementSetMessagingTimeout(app, timeout_seconds);
 
     const ax = ax_mod.strings() orelse return null;
     const focused_attr = ax.focused_window_attr;
@@ -2380,12 +2378,10 @@ fn eventWindowIdUnderPointer(event: c.CGEventRef) u32 {
 }
 
 fn initializeMouseFocus() void {
+    // The answer arrives as window_focused, which records the last focus.
     if (frontmostApplicationPid()) |pid| {
-        if (focusedWindowId(pid, null)) |window_id| {
-            g_last_focused_pid = pid;
-            g_last_focused_window_id = window_id;
-            log.debug("focus follows mouse initialized pid={d} wid={d}", .{ pid, window_id });
-        }
+        g_last_activated_pid = pid;
+        focus_query.request(pid, .activated);
     }
 
     const event = cg_extra.CGEventCreate(null) orelse return;
@@ -3121,10 +3117,10 @@ fn recoverFromEventOverflow() void {
     refreshTabGroupActiveTabs();
     reconcileVisibleFramesFromWindowServer();
 
+    // The lost events may include activations.
     if (frontmostApplicationPid()) |pid| {
-        if (focusedWindowId(pid, null)) |wid| {
-            reconcileFocusedWindow(pid, wid);
-        }
+        g_last_activated_pid = pid;
+        focus_query.request(pid, .activated);
         requestCleanupForPid(pid);
     }
     requestOffscreenCleanup();
@@ -3179,8 +3175,9 @@ fn reconcileDueGeometryObservations() void {
 
 /// An accepted AX write can target a native-tab ID that disappeared from the
 /// visible AX window set while the application simultaneously surfaced a new
-/// focused ID. Reconcile through the existing tab-aware focus path before
-/// retrying geometry; blindly reissuing the stale ID would loop forever.
+/// focused ID. Ask the app for its focused window instead of retrying geometry:
+/// the answer takes the tab-aware focus path, and reissuing the stale ID would
+/// loop forever.
 fn reconcileDivergedGeometryIntent(wid: u32, intent: geometry_mod.Intent) bool {
     switch (intent.source) {
         .tab_sync => return false,
@@ -3192,17 +3189,12 @@ fn reconcileDivergedGeometryIntent(wid: u32, intent: geometry_mod.Intent) bool {
     if (!spaceVisible(space)) return false;
     if (isInOnScreenWindowList(wid)) return false;
 
-    const focused_wid = focusedWindowId(win.pid, null) orelse return false;
-    if (focused_wid == wid) return false;
-
-    log.debug("geometry: divergent intent reconciling stale wid={d} focused_wid={d} pid={d} source={s}", .{
+    log.debug("geometry: divergent intent wid={d} pid={d} source={s}", .{
         wid,
-        focused_wid,
         win.pid,
         @tagName(intent.source),
     });
-    reconcileFocusedWindow(win.pid, focused_wid);
-    requestRetileDisplay(space.display_id);
+    focus_query.request(win.pid, .focus_changed);
     return true;
 }
 
@@ -3452,10 +3444,6 @@ fn adoptWindowIdentity(
     } });
     const adopted = g_state.window(win.wid) orelse return false;
     return adopted.process_id == win.pid and adopted.space_key.eql(space_key);
-}
-
-fn removeWindowIdentity(wid: u32) void {
-    dispatchStateEvent(.{ .remove_window = wid });
 }
 
 fn observeWindowTabGroup(observation: *const state_mod.WindowTabGroupObservation) bool {
@@ -5235,10 +5223,9 @@ fn executeWorkspaceTransitionSettled(settlement: state_mod.WorkspaceTransitionSe
         });
     } else if (settlement.reason == .deadline_expired) {
         const front_pid = frontmostApplicationPid() orelse 0;
-        const front_wid = if (front_pid > 0) focusedWindowId(front_pid, null) orelse 0 else 0;
         const active_workspace_id = activeWorkspaceIdForDisplay(transition.target.display_id);
         log.warn(
-            "workspace transition watchdog expired epoch={d} kind={s} workspace={d} display={d} active_workspace={d} focused_display={d} front_pid={d} front_wid={d}",
+            "workspace transition watchdog expired epoch={d} kind={s} workspace={d} display={d} active_workspace={d} focused_display={d} front_pid={d}",
             .{
                 transition.epoch,
                 @tagName(transition.kind),
@@ -5247,7 +5234,6 @@ fn executeWorkspaceTransitionSettled(settlement: state_mod.WorkspaceTransitionSe
                 active_workspace_id,
                 focusedDisplayId(),
                 front_pid,
-                front_wid,
             },
         );
     } else {
@@ -6313,13 +6299,7 @@ fn joinTabGroup(pid: i32, sibling_wid: u32, new_wid: u32, new_frame: window_mod.
 fn removeWindow(wid: u32) void {
     const win = managedWindow(wid) orelse return;
     if (managedWindowSpace(win.wid) == null) return;
-    const tab_group = g_state.windowTabGroup(wid);
-    removeWindowIdentity(wid);
-
-    // Inline rather than in window_removed: the surviving tabs' active state
-    // must be settled before the caller's next decision, and an effect raised
-    // inside another effect would run only after that handler returns.
-    if (tab_group) |group| reconcileTabGroupAfterRemoval(&group, wid);
+    dispatchStateEvent(.{ .remove_window = wid });
 }
 
 /// Release platform state keyed by a removed window's ID. Runs late when the
@@ -6330,36 +6310,6 @@ fn executeWindowRemoved(removal: WindowRemoval) void {
     g_animator.cancel(removal.window_id);
     ax_writer.forgetWindow(removal.window_id);
     ax_observer.forgetWindowIfGone(removal.process_id, removal.window_id);
-}
-
-fn reconcileTabGroupAfterRemoval(
-    previous_group: *const state_mod.WindowTabGroupSnapshot,
-    removed_window_id: u32,
-) void {
-    if (previous_group.member_count <= 2) return;
-
-    for (previous_group.members()) |member_window_id| {
-        if (member_window_id == removed_window_id) continue;
-
-        reconcileGroupActiveAfterRemoval(member_window_id, previous_group.process_id);
-        return;
-    }
-}
-
-/// Align a surviving tab group's active tab with the window the app actually
-/// focused after a member was removed. Best-effort: when the app has not yet
-/// focused the adjacent tab (or AX reports nothing), the members[0] guess
-/// stands until the next AXFocusedWindowChanged notification corrects it.
-fn reconcileGroupActiveAfterRemoval(member_window_id: u32, pid: i32) void {
-    std.debug.assert(member_window_id != 0);
-    std.debug.assert(pid > 0);
-
-    const group = g_state.windowTabGroup(member_window_id) orelse return;
-
-    const app_focused = focusedWindowId(pid, null);
-    const active = tab_detect.activeAfterRemoval(app_focused, group.members()) orelse return;
-
-    setTabGroupActive(active);
 }
 
 /// Report a live process so the reducer can tell a reused PID from a known
@@ -7248,7 +7198,6 @@ fn checkTabDragOut(_: i32, wid: u32) bool {
 
     log.debug("tab drag-out detected: wid={d} promoted to standalone", .{wid});
     if (!detachWindowTab(wid)) return false;
-    reconcileTabGroupAfterRemoval(&group, wid);
 
     if (managedWindow(wid)) |win| {
         var updated = win;
