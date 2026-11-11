@@ -4292,7 +4292,10 @@ fn removableExcessSpace(
 /// inactive Spaces and minimized ones, which would spill if their Space went.
 /// One batched Space query covers every window: this runs on each topology
 /// poll while an extra Space is kept. A window on every Space marks them all
-/// occupied, which only keeps an extra Space around.
+/// occupied, which only keeps an extra Space around. BobrWM's own windows do
+/// not count: dim overlays join every Space, so counting them would keep
+/// every extra Space forever. Neither do macOS's WindowManager windows, which
+/// sit on every empty Space while Mission Control is open.
 const OccupiedNativeSpaces = struct {
     space_ids: [256]u64 = undefined,
     count: usize = 0,
@@ -4307,12 +4310,24 @@ const OccupiedNativeSpaces = struct {
 
         var wids: [skylight.space_query_window_capacity]u32 = undefined;
         var wid_count: usize = 0;
+        const own_pid = std.c.getpid();
+        const window_manager_name = c.CFStringCreateWithCString(null, "WindowManager", c.kCFStringEncodingUTF8) orelse return null;
+        defer c.CFRelease(@ptrCast(window_manager_name));
         const total = c.CFArrayGetCount(list);
         std.debug.assert(total >= 0);
         var i: c.CFIndex = 0;
         while (i < total) : (i += 1) {
             const info: c.CFDictionaryRef = @ptrCast(c.CFArrayGetValueAtIndex(list, i) orelse continue);
             if (!cgWindowInfoVisible(info)) continue;
+
+            var owner_pid: i32 = 0;
+            if (c.CFDictionaryGetValue(info, cg_extra.kCGWindowOwnerPID)) |owner_ref| {
+                _ = c.CFNumberGetValue(@ptrCast(owner_ref), c.kCFNumberSInt32Type, &owner_pid);
+            }
+            if (owner_pid == own_pid) continue;
+            if (c.CFDictionaryGetValue(info, cg_extra.kCGWindowOwnerName)) |owner_name| {
+                if (c.CFEqual(owner_name, @ptrCast(window_manager_name)) != 0) continue;
+            }
 
             var layer: i32 = 0;
             if (c.CFDictionaryGetValue(info, cg_extra.kCGWindowLayer)) |layer_ref| {
