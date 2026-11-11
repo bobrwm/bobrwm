@@ -94,5 +94,8 @@ void bw_menubar_set_settings(BWSettings settings);
 void bw_menubar_set_app_rules(const BWAppRule *rules, size_t count);
 void bw_menubar_set_message(const char *message);
 void bw_menubar_set_config_status(bool success, const char *message);
+// Mission Control settings that break workspace numbering: Spaces rearranged
+// by recent use, and "Displays have separate Spaces" turned off.
+void bw_menubar_set_spaces_warnings(bool rearranges_automatically, bool displays_share_spaces);
 
 #endif // BOBRWM_UI_H

@@ -117,6 +117,16 @@ final class MenuBarController: NSObject, StatusMenuActions {
         settingsModel.setConfigStatus(succeeded: succeeded, message: message)
     }
 
+    func setSpacesWarnings(_ warnings: [SpacesWarning]) {
+        settingsModel.setSpacesWarnings(warnings)
+        statusMenu.setSpacesWarnings(warnings, target: self)
+        statusModel.isSpacesWarningShown = !warnings.isEmpty
+        statusItem.button?.toolTip = warnings.isEmpty
+            ? nil
+            : warnings.map(\.summary).joined(separator: "\n")
+        scheduleResize()
+    }
+
     func showSettingsIfPermissionRequired() {
         settingsModel.refreshAccessibility()
         if !settingsModel.accessibilityGranted {
@@ -176,6 +186,7 @@ final class MenuBarController: NSObject, StatusMenuActions {
     func reloadConfig(_ sender: NSMenuItem) { _ = callbacks.reload_config() }
     func openConfig(_ sender: NSMenuItem) { callbacks.open_config() }
     func showSettings(_ sender: NSMenuItem) { settingsWindow.show() }
+    func openSpacesSettings(_ sender: NSMenuItem) { SpacesWarning.openSettings() }
 
     // An accessory app is never frontmost, so the panel would open behind
     // the current app without activating first.
@@ -279,6 +290,14 @@ public func menuBarSetAppRules(_ rules: UnsafePointer<BWAppRule>?, _ count: Int)
 public func menuBarSetMessage(_ message: UnsafePointer<CChar>?) {
     guard let controller, let message = borrowedString(message) else { return }
     controller.setMessage(message)
+}
+
+@_cdecl("bw_menubar_set_spaces_warnings")
+public func menuBarSetSpacesWarnings(_ rearrangesAutomatically: Bool, _ displaysShareSpaces: Bool) {
+    var warnings: [SpacesWarning] = []
+    if rearrangesAutomatically { warnings.append(.rearrangesAutomatically) }
+    if displaysShareSpaces { warnings.append(.displaysShareSpaces) }
+    controller?.setSpacesWarnings(warnings)
 }
 
 @_cdecl("bw_menubar_set_config_status")

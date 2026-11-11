@@ -89,6 +89,15 @@ pub const DeferredFollowFocus = struct {
     transition_epoch: Epoch,
 };
 
+/// Mission Control settings that break workspace numbering when they differ
+/// from what BobrWM expects.
+pub const SpacesSettings = struct {
+    /// "Automatically rearrange Spaces based on most recent use".
+    rearranges_automatically: bool,
+    /// "Displays have separate Spaces" turned off.
+    displays_share_spaces: bool,
+};
+
 pub const FollowFocusObservation = struct {
     process_id: i32,
     window_id: WindowId,
@@ -745,6 +754,8 @@ pub const Model = struct {
     pointer_drag: PointerDragState = .{},
     drag_preview: DragPreviewState = .{},
     menu_tracking: ?MenuTracking = null,
+    /// Null until first read.
+    spaces_settings: ?SpacesSettings = null,
     swipe: swipe.State = .{},
     retile_request: RetileRequest = .{},
     cleanup_request: CleanupRequest = .{},
@@ -1204,6 +1215,7 @@ pub const Event = union(enum) {
         is_open: bool,
     },
     process_terminated: i32,
+    spaces_settings_observed: SpacesSettings,
     request_retile_all_displays,
     request_retile_display: DisplayId,
     flush_retile_requests,
@@ -1240,6 +1252,8 @@ pub const WindowCatalogRejectionReason = enum {
 };
 
 pub const Effect = union(enum) {
+    /// A Mission Control setting changed or was read for the first time.
+    spaces_settings_changed: SpacesSettings,
     cancel_native_gesture: native_gesture.Direction,
     post_native_gesture: struct { epoch: Epoch, phase: native_gesture.Phase, direction: native_gesture.Direction, velocity: f64 },
     schedule_native_gesture: Epoch,

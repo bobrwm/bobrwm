@@ -39,6 +39,7 @@ const watchdog = @import("watchdog.zig");
 const focus_follows_mouse = @import("focus_follows_mouse.zig");
 const window_readiness = @import("window_readiness.zig");
 const window_server = @import("window_server.zig");
+const spaces_settings = @import("spaces_settings.zig");
 
 extern fn _AXUIElementGetWindow(element: c.AXUIElementRef, wid: *u32) c.AXError;
 
@@ -2936,6 +2937,7 @@ fn startCore(config_path_arg: ?[]const u8) !void {
     );
     g_core_stage = .statusbar;
     updateStatusBar();
+    spaces_settings.start(if (g_sky) |*sky| sky else null);
 
     // Watch after the status bar exists: reloads update its menu. Startup can
     // no longer fail past this point, so a failed start never leaves sources
@@ -2958,6 +2960,7 @@ fn stopCore() void {
     setRolePolling(false);
     setNativeSpaceTopologyPolling(false);
     setProcessSweep(false);
+    spaces_settings.stop();
     watchdog.stop();
     if (coreReached(.ax_observer)) {
         setMouseEventTapEnabled(false);
@@ -3114,6 +3117,7 @@ fn recoverFromEventOverflow() void {
     dispatchStateEvent(.{ .geometry = .clear_intents });
 
     _ = sweepProcesses();
+    spaces_settings.forgetLastReading();
     discoverWindows(.runtime);
     refreshTabGroupActiveTabs();
     reconcileVisibleFramesFromWindowServer();
@@ -3825,6 +3829,13 @@ fn handleEvent(ev: *const event_mod.Event) void {
         },
         .native_topology_poll_tick => reconcileNativeSpaceTopologyIfNeeded(),
         .process_sweep_due => if (sweepProcesses()) retile(),
+        .spaces_settings_observed => {
+            const reading = spaces_settings.Reading.decode(ev.detail);
+            dispatchStateEvent(.{ .spaces_settings_observed = .{
+                .rearranges_automatically = reading.rearranges_automatically,
+                .displays_share_spaces = reading.displays_share_spaces,
+            } });
+        },
         .focus_retry_observed => dispatchStateEvent(.{ .focus_retry_observed = .{
             .process_id = ev.pid,
             .focused_window_id = ev.wid,
@@ -4841,6 +4852,15 @@ fn executeStateEffect(effect: state_mod.Effect) void {
         .retile_requested => |request| executeRetileRequest(request),
         .cleanup_requested => |request| executeCleanupRequest(request),
         .clean_offscreen_windows => |pid| if (cleanupOffscreenWindows(pid)) requestRetileAllDisplays(),
+        .spaces_settings_changed => |settings| {
+            if (settings.rearranges_automatically) {
+                log.warn("macOS rearranges Spaces by recent use; workspace numbers can change when BobrWM restarts", .{});
+            }
+            if (settings.displays_share_spaces) {
+                log.warn("\"Displays have separate Spaces\" is off; workspaces cannot be mapped per display", .{});
+            }
+            statusbar.setSpacesWarnings(settings.rearranges_automatically, settings.displays_share_spaces);
+        },
         .cleanup_request_overflow => |process_id| {
             log.warn("cleanup: pid queue saturated, scheduling broad reconciliation pid={d}", .{process_id});
             g_event_overflow_recovery_pending = true;

@@ -9,6 +9,7 @@ import SwiftUI
     func openConfig(_ sender: NSMenuItem)
     func showAbout(_ sender: NSMenuItem)
     func showSettings(_ sender: NSMenuItem)
+    func openSpacesSettings(_ sender: NSMenuItem)
     func quit(_ sender: NSMenuItem)
 }
 
@@ -29,6 +30,8 @@ final class StatusMenu {
     private var workspaceItems: [UInt8: NSMenuItem] = [:]
     private var rowStates: [UInt8: RowState] = [:]
     private var countTab = NSTextTab(textAlignment: .right, location: 0)
+    private var spacesWarnings: [SpacesWarning] = []
+    private var spacesWarningItems: [NSMenuItem] = []
 
     init() {
         menu.autoenablesItems = false
@@ -36,7 +39,10 @@ final class StatusMenu {
     }
 
     func rebuild(workspaces: [WorkspaceInfo], target: StatusMenuActions) {
+        let warnings = spacesWarnings
         menu.removeAllItems()
+        spacesWarnings.removeAll()
+        spacesWarningItems.removeAll()
         workspaceItems.removeAll(keepingCapacity: true)
         rowStates.removeAll(keepingCapacity: true)
         countTab = Self.countTab(for: workspaces)
@@ -81,6 +87,39 @@ final class StatusMenu {
             .init(key: "q", modifiers: .command),
             target
         )
+        setSpacesWarnings(warnings, target: target)
+    }
+
+    /// Explains the status item's warning symbol. Rows are inserted and
+    /// removed rather than hidden so item indices stay those of the plain menu.
+    func setSpacesWarnings(_ warnings: [SpacesWarning], target: StatusMenuActions) {
+        guard warnings != spacesWarnings else { return }
+        spacesWarningItems.forEach(menu.removeItem)
+        spacesWarningItems.removeAll()
+        spacesWarnings = warnings
+        guard !warnings.isEmpty else { return }
+
+        for warning in warnings {
+            let action = NSMenuItem(
+                title: "Open Desktop & Dock Settings…",
+                action: #selector(StatusMenuActions.openSpacesSettings(_:)),
+                keyEquivalent: ""
+            )
+            action.target = target
+            action.subtitle = warning.reason
+            action.image = NSImage(
+                systemSymbolName: "exclamationmark.triangle",
+                accessibilityDescription: "Warning"
+            )
+            if #available(macOS 27, *) {
+                action.preferredImageVisibility = .visible
+            }
+            spacesWarningItems += [.sectionHeader(title: warning.title), action]
+        }
+        spacesWarningItems.append(.separator())
+        for (index, item) in spacesWarningItems.enumerated() {
+            menu.insertItem(item, at: index)
+        }
     }
 
     func update(_ workspaces: [WorkspaceInfo]) {
@@ -345,6 +384,7 @@ final class StatusModel: ObservableObject {
 
     @Published var chips: [Chip] = []
     @Published var message: String?
+    @Published var isSpacesWarningShown = false
 }
 
 struct StatusBarView: View {
@@ -356,6 +396,11 @@ struct StatusBarView: View {
                 Text(message).font(.system(size: 13))
             } else {
                 HStack(spacing: 3) {
+                    if model.isSpacesWarningShown {
+                        Image(systemName: "exclamationmark.triangle")
+                            .font(.system(size: 12))
+                            .padding(.trailing, 2)
+                    }
                     ForEach(model.chips) { chip in
                         StatusChip(chip: chip)
                     }

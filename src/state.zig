@@ -42,6 +42,7 @@ pub const Epoch = model_mod.Epoch;
 pub const TimestampMs = model_mod.TimestampMs;
 pub const WindowId = model_mod.WindowId;
 pub const FocusEventSource = model_mod.FocusEventSource;
+pub const SpacesSettings = model_mod.SpacesSettings;
 pub const FocusDirection = model_mod.FocusDirection;
 pub const swipe = model_mod.swipe;
 pub const SwipeInput = model_mod.SwipeInput;
@@ -232,6 +233,7 @@ pub fn reduce(model: *Model, event: Event) Transition {
         .focus_retry_observed => |observation| discovery_reducer.reduceFocusRetryObserved(&transition, observation),
         .process_observed => |identity| process_reducer.reduceProcessObserved(&transition, identity),
         .process_terminated => |process_id| process_reducer.reduceProcessTerminated(&transition, process_id),
+        .spaces_settings_observed => |settings| reduceSpacesSettingsObserved(&transition, settings),
         .display_changed => |change| {
             transition.model.display_resettle_due_at_ms = change.resettle_at_ms;
             transition.model.display_resettle_cause = .display_change;
@@ -324,6 +326,14 @@ pub fn reduce(model: *Model, event: Event) Transition {
     if (should_refresh_workspace_focus) workspace_reducer.refreshWorkspaceFocus(transition.model);
     invariants.assertModel(transition.model);
     return transition;
+}
+
+fn reduceSpacesSettingsObserved(transition: *Transition, settings: SpacesSettings) void {
+    if (transition.model.spaces_settings) |current| {
+        if (std.meta.eql(current, settings)) return;
+    }
+    transition.model.spaces_settings = settings;
+    transition.addEffect(.{ .spaces_settings_changed = settings });
 }
 
 fn reduceCleanupProcessRequested(transition: *Transition, process_id: i32) void {
@@ -1955,6 +1965,23 @@ test "hidden focus without a transition requests a workspace switch" {
     try testing.expectEqual(std.meta.Tag(Effect).workspace_transition_started, std.meta.activeTag(transition.effects[0]));
     try testing.expectEqual(std.meta.Tag(Effect).observe_native_topology, std.meta.activeTag(transition.effects[1]));
     try testing.expect(!transition.model.hasDeferredFollowFocus());
+}
+
+test "Spaces settings report their first reading and each change" {
+    const testing = std.testing;
+    const defaults: SpacesSettings = .{ .rearranges_automatically = true, .displays_share_spaces = false };
+    var transition = reduceCopy(.{}, .{ .spaces_settings_observed = defaults });
+    try testing.expectEqual(@as(?SpacesSettings, defaults), transition.model.spaces_settings);
+    try testing.expectEqual(@as(u8, 1), transition.effect_count);
+    try testing.expectEqual(defaults, transition.effects[0].spaces_settings_changed);
+
+    transition = reduceCopy(transition.model, .{ .spaces_settings_observed = defaults });
+    try testing.expectEqual(@as(u8, 0), transition.effect_count);
+
+    const shared: SpacesSettings = .{ .rearranges_automatically = true, .displays_share_spaces = true };
+    transition = reduceCopy(transition.model, .{ .spaces_settings_observed = shared });
+    try testing.expectEqual(@as(u8, 1), transition.effect_count);
+    try testing.expectEqual(shared, transition.effects[0].spaces_settings_changed);
 }
 
 test "hidden AX focus from an inactive app does not switch workspace" {
