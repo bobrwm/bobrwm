@@ -291,6 +291,10 @@ pub fn reduce(model: *Model, event: Event) Transition {
         },
         .request_cleanup_process => |process_id| reduceCleanupProcessRequested(&transition, process_id),
         .request_offscreen_cleanup => transition.model.cleanup_request.should_clean_offscreen = true,
+        // The answer can arrive after a workspace transition began.
+        .offscreen_window_list_observed => |process_id| if (!transition.model.isWorkspaceTransitionActive()) {
+            transition.addEffect(.{ .clean_offscreen_windows = process_id });
+        },
         .clear_cleanup_requests => transition.model.cleanup_request = .{},
         .flush_cleanup_requests => {
             const request = transition.model.cleanup_request;
@@ -1696,6 +1700,25 @@ test "workspace and focused display are reducer owned" {
     try testing.expectEqual(@as(?WorkspaceId, 3), transition.model.activeWorkspace(11));
     try testing.expectEqual(@as(?WorkspaceId, 2), transition.model.activeWorkspace(22));
     try testing.expectEqual(@as(?DisplayId, 22), transition.model.focusedDisplay());
+    try testing.expectEqual(@as(u8, 0), transition.effect_count);
+}
+
+test "off-screen cleanup waits out a workspace transition" {
+    const testing = std.testing;
+    var catalog: SpaceCatalog = .{};
+    catalog.add(.{ .key = .{ .id = 1 }, .workspace_id = 1, .display_id = 11 });
+    catalog.add(.{ .key = .{ .id = 2 }, .workspace_id = 2, .display_id = 11 });
+    const model = reduceCopy(.{}, .{ .replace_space_catalog = &catalog }).model;
+
+    var transition = reduceCopy(model, .{ .offscreen_window_list_observed = 42 });
+    try testing.expectEqual(@as(i32, 42), transition.effects[0].clean_offscreen_windows);
+
+    const switching = reduceCopy(model, .{ .start_workspace_transition = .{
+        .kind = .switch_workspace,
+        .target = model.space(.{ .id = 2 }).?,
+        .at_ms = 100,
+    } }).model;
+    transition = reduceCopy(switching, .{ .offscreen_window_list_observed = 42 });
     try testing.expectEqual(@as(u8, 0), transition.effect_count);
 }
 

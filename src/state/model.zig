@@ -1207,6 +1207,8 @@ pub const Event = union(enum) {
     flush_retile_requests,
     request_cleanup_process: i32,
     request_offscreen_cleanup,
+    /// An app's window list arrived for an off-screen cleanup.
+    offscreen_window_list_observed: i32,
     clear_cleanup_requests,
     flush_cleanup_requests,
     rebuild_layout: *const LayoutRebuild,
@@ -1342,6 +1344,7 @@ pub const Effect = union(enum) {
     cancel_mouse_focus,
     retile_requested: RetileRequest,
     cleanup_requested: CleanupRequest,
+    clean_offscreen_windows: i32,
     cleanup_request_overflow: i32,
     geometry: geometry_mod.Effect,
     layout: tiling_mod.Effect,

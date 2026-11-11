@@ -31,6 +31,7 @@ pub const BW_EVENT_PROCESS_SWEEP_DUE: u8 = @backingInt(event_mod.EventKind.proce
 pub const BW_EVENT_FOCUS_RETRY_OBSERVED: u8 = @backingInt(event_mod.EventKind.focus_retry_observed);
 pub const BW_EVENT_FOCUS_RETRY_UNANSWERED: u8 = @backingInt(event_mod.EventKind.focus_retry_unanswered);
 pub const BW_EVENT_WINDOW_READINESS_OBSERVED: u8 = @backingInt(event_mod.EventKind.window_readiness_observed);
+pub const BW_EVENT_APP_WINDOWS_OBSERVED: u8 = @backingInt(event_mod.EventKind.app_windows_observed);
 
 pub const BW_HK_FOCUS_WORKSPACE: u8 = @backingInt(event_mod.EventKind.hk_focus_workspace);
 pub const BW_HK_FOCUS_PREVIOUS_WORKSPACE: u8 = @backingInt(event_mod.EventKind.hk_focus_previous_workspace);

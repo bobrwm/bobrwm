@@ -171,17 +171,13 @@ pub fn isTrusted() bool {
 
 /// Resolve a window id while bounding messages sent through temporary AX elements.
 pub fn findWindowWithMessagingTimeout(pid: i32, target_wid: u32, timeout_seconds: f32) ?c.AXUIElementRef {
-    std.debug.assert(timeout_seconds > 0);
-    return findWindowWithTimeout(pid, target_wid, timeout_seconds);
-}
-
-fn findWindowWithTimeout(pid: i32, target_wid: u32, timeout_seconds: ?f32) ?c.AXUIElementRef {
     std.debug.assert(pid > 0);
     std.debug.assert(target_wid > 0);
+    std.debug.assert(timeout_seconds > 0);
 
     const app = c.AXUIElementCreateApplication(pid) orelse return null;
     defer c.CFRelease(@ptrCast(app));
-    if (timeout_seconds) |seconds| _ = c.AXUIElementSetMessagingTimeout(app, seconds);
+    _ = c.AXUIElementSetMessagingTimeout(app, timeout_seconds);
 
     const ax = strings() orelse return null;
     const windows_attr = ax.windows_attr;
@@ -201,7 +197,7 @@ fn findWindowWithTimeout(pid: i32, target_wid: u32, timeout_seconds: ?f32) ?c.AX
         const win: c.AXUIElementRef = @ptrCast(win_any);
 
         // Elements copied out of the list do not inherit the app's timeout.
-        if (timeout_seconds) |seconds| _ = c.AXUIElementSetMessagingTimeout(win, seconds);
+        _ = c.AXUIElementSetMessagingTimeout(win, timeout_seconds);
         var wid: u32 = 0;
         trace.countAx();
         if (_AXUIElementGetWindow(win, &wid) != c.kAXErrorSuccess) continue;
@@ -277,84 +273,57 @@ fn unresolvedIndex(target_wids: []const u32, out: []const ?c.AXUIElementRef, wid
     return null;
 }
 
-/// Direct-mapped cache of resolved AX window elements, keyed by window id.
-/// findWindow costs one AXWindows copy plus an _AXUIElementGetWindow per
-/// element in the app's list — for a workspace switch, which moves every
-/// window of both workspaces, that dominates the whole operation and is
-/// visible as the desktop showing between hide and show. Elements stay valid
-/// for a window's lifetime, so resolve each one once.
-///
-/// Main thread only: every caller runs on the main queue, either during event
-/// drain or from the animator's dispatch timer.
-///
-/// A slot collision costs one re-resolve, never the wrong window: entries are
-/// matched on both pid and wid, and destroyed windows are invalidated.
-const element_cache_slots = 128;
-
-const CachedElement = struct {
-    pid: i32,
+/// One window from an app's AX window list.
+pub const AppWindow = struct {
     wid: u32,
-    element: c.AXUIElementRef,
+    /// Tabs in the window's own tab bar, 0 when it has none.
+    tab_count: u32,
 };
 
-var g_element_cache: [element_cache_slots]?CachedElement = @splat(null);
+pub const AppWindowsResult = struct {
+    count: usize,
+    /// The app listed more windows than fit in `out`.
+    is_truncated: bool,
+};
 
-fn elementCacheSlot(wid: u32) usize {
-    return wid % element_cache_slots;
-}
-
-/// Cached element for (pid, wid), or null on a miss. Borrowed — the cache owns
-/// the reference, callers must not release it.
-fn cachedElement(pid: i32, wid: u32) ?c.AXUIElementRef {
-    const entry = g_element_cache[elementCacheSlot(wid)] orelse return null;
-    if (entry.pid != pid or entry.wid != wid) return null;
-    return entry.element;
-}
-
-/// Resolve (pid, wid) and cache it, evicting whatever shared its slot.
-/// Borrowed — the cache owns the reference.
-fn resolveElement(pid: i32, wid: u32) ?c.AXUIElementRef {
-    const element = findWindowWithTimeout(pid, wid, null) orelse return null;
-
-    const slot = elementCacheSlot(wid);
-    if (g_element_cache[slot]) |evicted| c.CFRelease(@ptrCast(evicted.element));
-    g_element_cache[slot] = .{ .pid = pid, .wid = wid, .element = element };
-    return element;
-}
-
-/// Acquire a retained AX element for a known window, reusing the geometry
-/// cache when possible. Workspace switches retile the incoming window before
-/// focusing it, so a second AXWindows enumeration here would repeat the most
-/// expensive part of resolving the focus target.
-///
-/// The caller owns the returned reference and must CFRelease it.
-pub fn retainWindow(pid: i32, wid: u32) ?c.AXUIElementRef {
+/// Read the app's AX window list and each window's tab count. Every message
+/// is bounded by `timeout_seconds`; an app that does not answer reads as
+/// listing no windows.
+pub fn appWindows(pid: i32, out: []AppWindow, timeout_seconds: f32) AppWindowsResult {
     std.debug.assert(pid > 0);
-    std.debug.assert(wid > 0);
+    std.debug.assert(timeout_seconds > 0);
 
-    const element = cachedElement(pid, wid) orelse resolveElement(pid, wid) orelse return null;
-    _ = c.CFRetain(@ptrCast(element));
-    return element;
-}
+    var result: AppWindowsResult = .{ .count = 0, .is_truncated = false };
+    const ax = strings() orelse return result;
+    const app = c.AXUIElementCreateApplication(pid) orelse return result;
+    defer c.CFRelease(@ptrCast(app));
+    _ = c.AXUIElementSetMessagingTimeout(app, timeout_seconds);
 
-/// Drop a window's cached element. WindowServer recycles window ids, so
-/// callers must invalidate when a window is destroyed or its id replaced
-/// rather than leave the retry path to discover it.
-pub fn invalidateWindow(wid: u32) void {
-    const slot = elementCacheSlot(wid);
-    const entry = g_element_cache[slot] orelse return;
-    if (entry.wid != wid) return;
+    var windows: c.CFArrayRef = null;
+    trace.countAx();
+    if (c.AXUIElementCopyAttributeValue(app, ax.windows_attr, @ptrCast(&windows)) != c.kAXErrorSuccess) return result;
+    const windows_ref = windows orelse return result;
+    defer c.CFRelease(@ptrCast(windows_ref));
 
-    c.CFRelease(@ptrCast(entry.element));
-    g_element_cache[slot] = null;
-}
+    const count = c.CFArrayGetCount(windows_ref);
+    var index: c.CFIndex = 0;
+    while (index < count) : (index += 1) {
+        const win: c.AXUIElementRef = @ptrCast(c.CFArrayGetValueAtIndex(windows_ref, index) orelse continue);
+        _ = c.AXUIElementSetMessagingTimeout(win, timeout_seconds);
 
-pub fn deinitElementCache() void {
-    for (&g_element_cache) |*slot| {
-        const entry = slot.* orelse continue;
-        c.CFRelease(@ptrCast(entry.element));
-        slot.* = null;
+        var wid: u32 = 0;
+        trace.countAx();
+        if (_AXUIElementGetWindow(win, &wid) != c.kAXErrorSuccess or wid == 0) continue;
+        if (result.count == out.len) {
+            result.is_truncated = true;
+            break;
+        }
+
+        out[result.count] = .{ .wid = wid, .tab_count = tabCount(win, ax, timeout_seconds) };
+        result.count += 1;
     }
+
+    return result;
 }
 
 /// Number of tabs in a window's native tab bar, or 0 when it has none.
@@ -367,17 +336,7 @@ pub fn deinitElementCache() void {
 /// `SLSCopyAssociatedWindows` returns only the window itself), CG's window
 /// dictionary has no tab key, and `AXWindows` omits background tabs entirely,
 /// so their ids are not reachable at all.
-///
-/// Costs an AXChildren copy plus a role read per child, so callers should ask
-/// once per detection pass rather than per decision.
-pub fn tabCount(pid: i32, wid: u32) usize {
-    std.debug.assert(pid > 0);
-    std.debug.assert(wid > 0);
-
-    const ax = strings() orelse return 0;
-    const win = retainWindow(pid, wid) orelse return 0;
-    defer c.CFRelease(@ptrCast(win));
-
+fn tabCount(win: c.AXUIElementRef, ax: *const AxStrings, timeout_seconds: f32) u32 {
     var children: c.CFArrayRef = null;
     trace.countAx();
     if (c.AXUIElementCopyAttributeValue(win, ax.children_attr, @ptrCast(&children)) != c.kAXErrorSuccess) return 0;
@@ -385,26 +344,18 @@ pub fn tabCount(pid: i32, wid: u32) usize {
     defer c.CFRelease(@ptrCast(children_ref));
 
     const count = c.CFArrayGetCount(children_ref);
-    var i: c.CFIndex = 0;
-    while (i < count) : (i += 1) {
-        const child_any = c.CFArrayGetValueAtIndex(children_ref, i) orelse continue;
-        const child: c.AXUIElementRef = @ptrCast(child_any);
+    var index: c.CFIndex = 0;
+    while (index < count) : (index += 1) {
+        const child: c.AXUIElementRef = @ptrCast(c.CFArrayGetValueAtIndex(children_ref, index) orelse continue);
+        _ = c.AXUIElementSetMessagingTimeout(child, timeout_seconds);
 
-        var role: c.CFTypeRef = null;
-        trace.countAx();
-        if (c.AXUIElementCopyAttributeValue(child, ax.role_attr, &role) != c.kAXErrorSuccess) continue;
-        const role_ref = role orelse continue;
-        defer c.CFRelease(role_ref);
-        if (c.CFEqual(role_ref, @ptrCast(ax.tab_group_role)) == 0) continue;
+        const role = copyAttribute(child, ax.role_attr) orelse continue;
+        defer c.CFRelease(role);
+        if (c.CFEqual(role, @ptrCast(ax.tab_group_role)) == 0) continue;
 
-        var tabs: c.CFArrayRef = null;
-        trace.countAx();
-        if (c.AXUIElementCopyAttributeValue(child, ax.tabs_attr, @ptrCast(&tabs)) != c.kAXErrorSuccess) return 0;
-        const tabs_ref = tabs orelse return 0;
-        defer c.CFRelease(@ptrCast(tabs_ref));
-
-        const tab_total = c.CFArrayGetCount(tabs_ref);
-        return if (tab_total > 0) @intCast(tab_total) else 0;
+        const tabs: c.CFArrayRef = @ptrCast(copyAttribute(child, ax.tabs_attr) orelse return 0);
+        defer c.CFRelease(@ptrCast(tabs));
+        return @intCast(c.CFArrayGetCount(tabs));
     }
 
     return 0;

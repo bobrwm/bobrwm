@@ -29,6 +29,7 @@ const animation_mod = @import("animation.zig");
 const display_link = @import("display_link.zig");
 const ax_mod = @import("ax.zig");
 const app_queue = @import("app_queue.zig");
+const app_windows = @import("app_windows.zig");
 const ax_writer = @import("ax_writer.zig");
 const focus_query = @import("focus_query.zig");
 const geometry_mod = @import("geometry.zig");
@@ -1770,61 +1771,10 @@ fn managedWindowAtPoint(point: c.CGPoint) ?u32 {
     return null;
 }
 
-/// Get all AX-backed window IDs for an application PID.
-/// Includes windows that may not currently be visible on screen.
 const BoundedSnapshotResult = struct {
     count: usize,
     truncated: bool,
 };
-
-fn axAppWindowIds(pid: i32, out: []u32) BoundedSnapshotResult {
-    if (out.len == 0) return .{ .count = 0, .truncated = true };
-
-    std.debug.assert(pid > 0);
-
-    const out_buf = out;
-    const app = c.AXUIElementCreateApplication(pid) orelse return .{ .count = 0, .truncated = false };
-    defer c.CFRelease(@ptrCast(app));
-
-    const ax = ax_mod.strings() orelse return .{ .count = 0, .truncated = false };
-    const windows_attr = ax.windows_attr;
-
-    var windows: c.CFArrayRef = null;
-    trace.countAx();
-    const err = c.AXUIElementCopyAttributeValue(
-        app,
-        windows_attr,
-        @ptrCast(&windows),
-    );
-    if (err != c.kAXErrorSuccess or windows == null) return .{ .count = 0, .truncated = false };
-    const windows_ref = windows orelse return .{ .count = 0, .truncated = false };
-    defer c.CFRelease(@ptrCast(windows_ref));
-
-    var written: usize = 0;
-    const total = c.CFArrayGetCount(windows_ref);
-    std.debug.assert(total >= 0);
-
-    var i: c.CFIndex = 0;
-    var truncated = false;
-    while (i < total) : (i += 1) {
-        const win_any = c.CFArrayGetValueAtIndex(windows_ref, i) orelse continue;
-        const win: c.AXUIElementRef = @ptrCast(win_any);
-
-        var wid: u32 = 0;
-        trace.countAx();
-        if (_AXUIElementGetWindow(win, &wid) == c.kAXErrorSuccess and wid != 0) {
-            if (written == out_buf.len) {
-                truncated = true;
-                break;
-            }
-            out_buf[written] = wid;
-            written += 1;
-        }
-    }
-
-    std.debug.assert(written <= out_buf.len);
-    return .{ .count = written, .truncated = truncated };
-}
 
 fn isRegularActivationApp(pid: i32) bool {
     std.debug.assert(pid > 0);
@@ -1964,7 +1914,6 @@ fn removeUnmanageableWindow(pid: i32, wid: u32, comptime reason: []const u8) voi
 /// belonging to the same rejected process.
 fn enumerateWindows(
     out: []shim.bw_window_info,
-    on_screen: ?*OnScreenWindows,
     on_screen_only: bool,
 ) BoundedSnapshotResult {
     if (out.len == 0) return .{ .count = 0, .truncated = true };
@@ -2003,7 +1952,6 @@ fn enumerateWindows(
         const wid_ref: c.CFNumberRef = @ptrCast(wid_ref_any);
         var wid: u32 = 0;
         _ = c.CFNumberGetValue(wid_ref, c.kCFNumberSInt32Type, &wid);
-        if (on_screen) |snapshot| snapshot.append(wid);
 
         var layer: i32 = 0;
         if (c.CFDictionaryGetValue(info, cg_extra.kCGWindowLayer)) |layer_ref_any| {
@@ -2044,7 +1992,6 @@ fn enumerateWindows(
 
         if (count == out_buf.len) {
             truncated = true;
-            if (on_screen) |snapshot| snapshot.truncated = true;
             break;
         }
 
@@ -2896,6 +2843,7 @@ fn startCore(config_path_arg: ?[]const u8) !void {
     ax_writer.init(geometryWriteFailed, setFrontProcessViaSkylight);
     focus_query.init();
     window_readiness.init();
+    app_windows.init();
 
     // -- Accessibility check --
     if (!ax_mod.isTrusted()) {
@@ -3046,7 +2994,6 @@ fn stopCore() void {
         g_ipc.deinit(g_allocator);
         ipc.g_dispatch = null;
     }
-    ax_mod.deinitElementCache();
 
     g_core_stage = .none;
     g_core_lifecycle = .stopped;
@@ -3894,6 +3841,13 @@ fn handleEvent(ev: *const event_mod.Event) void {
             .focused_window_id = ev.wid,
         } }),
         .window_readiness_observed => applyReadiness(ev.pid, ev.wid, .decode(ev.detail)),
+        .app_windows_observed => {
+            const reasons = app_windows.decodeReasons(ev.detail);
+            if (reasons.contains(.tab_bar)) applyTabBarObservation(ev.pid);
+            if (reasons.contains(.offscreen_cleanup)) {
+                dispatchStateEvent(.{ .offscreen_window_list_observed = ev.pid });
+            }
+        },
         .focus_retry_unanswered => dispatchStateEvent(.{ .focus_retry_observed = .{
             .process_id = ev.pid,
             .focused_window_id = 0,
@@ -4891,6 +4845,7 @@ fn executeStateEffect(effect: state_mod.Effect) void {
         },
         .retile_requested => |request| executeRetileRequest(request),
         .cleanup_requested => |request| executeCleanupRequest(request),
+        .clean_offscreen_windows => |pid| if (cleanupOffscreenWindows(pid)) requestRetileAllDisplays(),
         .cleanup_request_overflow => |process_id| {
             log.warn("cleanup: pid queue saturated, scheduling broad reconciliation pid={d}", .{process_id});
             g_event_overflow_recovery_pending = true;
@@ -5008,7 +4963,7 @@ fn executeCleanupRequest(request: state_mod.CleanupRequest) void {
     for (request.process_ids[0..request.process_count]) |process_id| {
         if (cleanupWorkspaceWindowsForPid(process_id)) removed_any = true;
     }
-    if (request.should_clean_offscreen and cleanupOffscreenManagedWindows()) removed_any = true;
+    if (request.should_clean_offscreen) requestOffscreenCleanupLists();
     if (removed_any) requestRetileAllDisplays();
 }
 
@@ -5696,7 +5651,7 @@ fn captureWorkspaceApplicationInventory() void {
     g_workspace_application_inventory_count = 0;
 
     var candidates: [256]shim.bw_window_info = undefined;
-    const discovery = enumerateWindows(&candidates, null, false);
+    const discovery = enumerateWindows(&candidates, false);
     if (discovery.truncated) {
         log.debug("startup application inventory truncated limit={d}", .{candidates.len});
     }
@@ -5785,15 +5740,11 @@ fn discoverWindows(context: DiscoveryContext) void {
     const is_native_switch = context == .native_switch;
     const span = trace.begin("discover");
     var buf: [256]shim.bw_window_info = undefined;
-    var on_screen: OnScreenWindows = .{};
-    const discovery = enumerateWindows(&buf, if (is_native_switch) &on_screen else null, true);
+    const discovery = enumerateWindows(&buf, true);
     const enumerated_ns = nanoTimestamp();
     if (discovery.truncated) {
         log.warn("window discovery truncated limit={d}; excess windows remain unmanaged", .{buf.len});
     }
-
-    if (is_native_switch) refreshTabGroupActiveTabsFromSnapshot(&on_screen);
-    const tabs_refreshed_ns = nanoTimestamp();
 
     var observed_pids: [128]i32 = undefined;
     var observed_pid_count: usize = 0;
@@ -5844,11 +5795,10 @@ fn discoverWindows(context: DiscoveryContext) void {
 
     const completed_ns = nanoTimestamp();
     const spent = span.cost();
-    log.debug("discover: candidates={d} enumerate_us={d} tabs_us={d} request_us={d} ax={d} sky={d} cg={d}", .{
+    log.debug("discover: candidates={d} enumerate_us={d} request_us={d} ax={d} sky={d} cg={d}", .{
         discovery.count,
         @divTrunc(enumerated_ns - started_ns, std.time.ns_per_us),
-        @divTrunc(tabs_refreshed_ns - enumerated_ns, std.time.ns_per_us),
-        @divTrunc(completed_ns - tabs_refreshed_ns, std.time.ns_per_us),
+        @divTrunc(completed_ns - enumerated_ns, std.time.ns_per_us),
         spent.ax,
         spent.skylight,
         spent.window_list,
@@ -5949,35 +5899,31 @@ fn tabCandidates(
     return .{ .count = count, .truncated = truncated };
 }
 
-/// Snapshot the windows an application exposes in its AX window list.
+/// Combine an app's captured AX window list with WindowServer and BobrWM facts.
 fn appWindowSnapshot(
-    pid: i32,
+    listed: *const app_windows.Snapshot,
     on_screen: *const OnScreenWindows,
     out: []tab_detect.AppWindow,
 ) BoundedSnapshotResult {
-    std.debug.assert(pid > 0);
-
-    var ax_wids: [128]u32 = undefined;
-    const ax_snapshot = axAppWindowIds(pid, &ax_wids);
-
     var count: usize = 0;
-    var truncated = ax_snapshot.truncated;
-    for (ax_wids[0..ax_snapshot.count]) |ax_wid| {
+    var truncated = listed.is_truncated;
+    for (listed.items()) |listed_window| {
         if (count == out.len) {
             truncated = true;
             break;
         }
+        const wid = listed_window.wid;
         out[count] = .{
-            .wid = ax_wid,
-            .live_frame = liveWindowFrame(ax_wid),
-            .is_on_screen = on_screen.contains(ax_wid),
-            .is_managed = managedWindow(ax_wid) != null,
-            .tab_count = ax_mod.tabCount(pid, ax_wid),
+            .wid = wid,
+            .live_frame = liveWindowFrame(wid),
+            .is_on_screen = on_screen.contains(wid),
+            .is_managed = managedWindow(wid) != null,
+            .tab_count = listed_window.tab_count,
         };
         const frame = out[count].live_frame orelse window_mod.Window.Frame{ .x = 0, .y = 0, .width = 0, .height = 0 };
         log.debug("tab facts: pid={d} wid={d} tabs={d} on_screen={} managed={} bounds=({d:.0},{d:.0},{d:.0},{d:.0})", .{
-            pid,
-            ax_wid,
+            listed.pid,
+            wid,
             out[count].tab_count,
             out[count].is_on_screen,
             out[count].is_managed,
@@ -6072,10 +6018,13 @@ fn addNewWindowManagedWithAssignment(
 
     defer untrackDeferredWindowCandidate(wid);
 
+    // Its focus event may have arrived before it was managed.
+    if (frontmostApplicationPid() == pid) focus_query.request(pid, .activated);
+
     // Check if this new on-screen window replaces an existing same-PID window
     // that just went off-screen (i.e. a new tab was created and became active,
     // pushing the old tab to background). If so, form a tab group.
-    if (tryFormTabGroupOnCreate(pid, wid, .adopt) == .joined) return false;
+    if (tryFormTabGroupOnCreate(pid, wid)) return false;
 
     const ws = g_state.space(assigned_space.key) orelse return false;
     const win: window_mod.Window = .{
@@ -6089,9 +6038,6 @@ fn addNewWindowManagedWithAssignment(
         log.err("addNewWindow: failed to adopt pid={d} wid={d}: {}", .{ pid, wid, err });
         return false;
     };
-    // Its focus event may have arrived before it was managed.
-    if (frontmostApplicationPid() == pid) focus_query.request(pid, .activated);
-
     if (!source_ws.key.eql(ws.key)) requestNativeWindowMove(wid, source_ws, ws);
 
     log.debug("addNewWindow: {s} pid={d} wid={d} on workspace {d} display {d} frame=({d:.0},{d:.0},{d:.0},{d:.0})", .{
@@ -6140,8 +6086,14 @@ fn hasWindowTabGroups() bool {
     return g_state.windowTabGroupLeaderIds(&leader_window_ids).len != 0;
 }
 
-/// Correct each tab group's recorded active tab against the window carrying its
-/// app's tab bar.
+/// Apps asked for their tab bar whose answer has not been applied. The drain
+/// an answer starts checks the gate before applying it, so asking again then
+/// would loop.
+var g_tab_bar_pids: [app_queue.max_apps]i32 = undefined;
+var g_tab_bar_pid_count: usize = 0;
+
+/// Ask for the window list of each app whose tab group may have switched tabs;
+/// `applyTabBarObservation` corrects the active tab when it arrives.
 ///
 /// macOS emits no notification of any kind when the user switches native tabs,
 /// so the recorded active tab is stale from that moment, and everything keyed
@@ -6150,44 +6102,76 @@ fn hasWindowTabGroups() bool {
 /// track it.
 ///
 /// The cheap gate is the point: a group whose recorded active tab is still on
-/// screen cannot have changed selection, so the AX work only happens on an actual
+/// screen cannot have changed selection, so the app is only asked on an actual
 /// switch. Only the active tab moves here; membership is decided elsewhere.
 fn refreshTabGroupActiveTabs() void {
-    const span = trace.begin("tab bar refresh");
-    defer _ = span.endIfSlow();
-
-    if (!hasWindowTabGroups()) return;
-
-    const on_screen = OnScreenWindows.snapshot();
-    refreshTabGroupActiveTabsFromSnapshot(&on_screen);
-}
-
-fn refreshTabGroupActiveTabsFromSnapshot(on_screen: *const OnScreenWindows) void {
-    if (on_screen.truncated) return;
-
     var leader_window_ids: [state_mod.max_managed_windows]u32 = undefined;
     const group_leaders = g_state.windowTabGroupLeaderIds(&leader_window_ids);
     if (group_leaders.len == 0) return;
+
+    const on_screen = OnScreenWindows.snapshot();
+    if (on_screen.truncated) return;
+
+    for (group_leaders) |leader_window_id| {
+        const group = g_state.windowTabGroup(leader_window_id) orelse continue;
+        if (!tabBarMayHaveMoved(&group, &on_screen)) continue;
+
+        const pid = group.process_id;
+        if (std.mem.findScalar(i32, g_tab_bar_pids[0..g_tab_bar_pid_count], pid) != null) continue;
+        if (g_tab_bar_pid_count == g_tab_bar_pids.len) return;
+        if (!app_windows.request(pid, .tab_bar)) continue;
+
+        g_tab_bar_pids[g_tab_bar_pid_count] = pid;
+        g_tab_bar_pid_count += 1;
+    }
+}
+
+fn forgetTabBarRequest(pid: i32) void {
+    const index = std.mem.findScalar(i32, g_tab_bar_pids[0..g_tab_bar_pid_count], pid) orelse return;
+    g_tab_bar_pid_count -= 1;
+    g_tab_bar_pids[index] = g_tab_bar_pids[g_tab_bar_pid_count];
+}
+
+fn tabBarMayHaveMoved(group: *const state_mod.WindowTabGroupSnapshot, on_screen: *const OnScreenWindows) bool {
+    const leader = managedWindow(group.leader_window_id) orelse return false;
+    const leader_space = managedWindowSpace(leader.wid) orelse return false;
+    // A group on another physical Space is off-screen on purpose.
+    if (!spaceVisible(leader_space)) return false;
+    return !on_screen.contains(group.active_window_id);
+}
+
+/// Correct the active tab of `pid`'s groups from the tab bar in its window list.
+fn applyTabBarObservation(pid: i32) void {
+    forgetTabBarRequest(pid);
+    // Intermediate Spaces show the wrong windows; the next drain asks again.
+    if (nativeSwitchPending()) return;
+
+    var listed: app_windows.Snapshot = undefined;
+    if (!app_windows.latest(pid, &listed)) return;
+
+    const on_screen = OnScreenWindows.snapshot();
+    if (on_screen.truncated) return;
+    var app_facts: [app_windows.max_windows]tab_detect.AppWindow = undefined;
+    const app_snapshot = appWindowSnapshot(&listed, &on_screen, &app_facts);
+    if (app_snapshot.truncated) {
+        log.warn("tab refresh skipped: AX window snapshot truncated pid={d} limit={d}", .{ pid, app_facts.len });
+        return;
+    }
+
+    var leader_window_ids: [state_mod.max_managed_windows]u32 = undefined;
+    const group_leaders = g_state.windowTabGroupLeaderIds(&leader_window_ids);
 
     const Move = struct { leader_window_id: u32, active_window_id: u32, selected_window_id: u32 };
     var moves: [state_mod.max_managed_windows]Move = undefined;
     var move_count: usize = 0;
     for (group_leaders) |leader_window_id| {
         const group = g_state.windowTabGroup(leader_window_id) orelse continue;
-        const leader = managedWindow(group.leader_window_id) orelse continue;
-        const leader_space = managedWindowSpace(leader.wid) orelse continue;
-        // A group on another physical Space is off-screen on purpose.
-        if (!spaceVisible(leader_space)) continue;
-        if (on_screen.contains(group.active_window_id)) continue;
+        if (group.process_id != pid) continue;
+        if (!tabBarMayHaveMoved(&group, &on_screen)) continue;
 
-        var app_windows: [128]tab_detect.AppWindow = undefined;
-        const app_snapshot = appWindowSnapshot(group.process_id, on_screen, &app_windows);
-        if (app_snapshot.truncated) {
-            log.warn("tab refresh skipped: AX window snapshot truncated pid={d} limit={d}", .{ group.process_id, app_windows.len });
-            continue;
-        }
+        const leader = managedWindow(group.leader_window_id) orelse continue;
         const selected = tab_detect.selectedTabWindow(
-            app_windows[0..app_snapshot.count],
+            app_facts[0..app_snapshot.count],
             leader.frame,
         ) orelse continue;
         if (selected == group.active_window_id) continue;
@@ -6230,49 +6214,44 @@ fn refreshTabGroupActiveTabsFromSnapshot(on_screen: *const OnScreenWindows) void
     }
 }
 
-/// Identifies callers when one window triggers duplicate detection passes.
-const TabDetectReason = enum { focus_unknown, adopt };
-
-const TabDetectResult = enum {
-    joined,
-    standalone,
-    /// A transient or truncated snapshot prevented a reliable verdict.
-    inconclusive,
-};
-
-/// Check whether a window that just appeared — created, or focused while
-/// unknown — is a native tab of an already-managed window, and if so hand it
-/// the group's slot.
+/// Check whether a window about to be adopted is a native tab of an
+/// already-managed window, and if so hand it the group's slot. True when it
+/// joined a group.
 ///
-/// Gathers the OS facts, classifies them, and applies the outcome.
-fn tryFormTabGroupOnCreate(pid: i32, new_wid: u32, reason: TabDetectReason) TabDetectResult {
+/// Reads the app's window list as captured with the window's readiness answer.
+fn tryFormTabGroupOnCreate(pid: i32, new_wid: u32) bool {
     const span = trace.beginWindow("tab detect", pid, new_wid);
     defer _ = span.end();
 
     const new_frame = liveWindowFrame(new_wid) orelse {
-        log.debug("tab detect: {s} wid={d} has no live bounds", .{ @tagName(reason), new_wid });
-        return .inconclusive;
+        log.debug("tab detect: wid={d} has no live bounds", .{new_wid});
+        return false;
     };
-    log.debug("tab detect: {s} wid={d} bounds=({d:.0},{d:.0},{d:.0},{d:.0})", .{
-        @tagName(reason), new_wid, new_frame.x, new_frame.y, new_frame.width, new_frame.height,
+    var listed: app_windows.Snapshot = undefined;
+    if (!app_windows.latest(pid, &listed)) {
+        log.debug("tab detect: no window list pid={d} wid={d}", .{ pid, new_wid });
+        return false;
+    }
+    log.debug("tab detect: wid={d} bounds=({d:.0},{d:.0},{d:.0},{d:.0})", .{
+        new_wid, new_frame.x, new_frame.y, new_frame.width, new_frame.height,
     });
 
     const on_screen = OnScreenWindows.snapshot();
-    if (on_screen.truncated) return .inconclusive;
+    if (on_screen.truncated) return false;
     var candidates: [128]tab_detect.Candidate = undefined;
     const candidate_snapshot = tabCandidates(pid, &on_screen, &candidates);
     if (candidate_snapshot.truncated) {
         log.warn("tab detect skipped: managed candidate snapshot truncated pid={d} limit={d}", .{ pid, candidates.len });
-        return .inconclusive;
+        return false;
     }
 
-    var app_windows: [128]tab_detect.AppWindow = undefined;
-    const app_snapshot = appWindowSnapshot(pid, &on_screen, &app_windows);
+    var app_facts: [app_windows.max_windows]tab_detect.AppWindow = undefined;
+    const app_snapshot = appWindowSnapshot(&listed, &on_screen, &app_facts);
     if (app_snapshot.truncated) {
-        log.warn("tab detect skipped: AX window snapshot truncated pid={d} limit={d}", .{ pid, app_windows.len });
-        return .inconclusive;
+        log.warn("tab detect skipped: AX window snapshot truncated pid={d} limit={d}", .{ pid, app_facts.len });
+        return false;
     }
-    const has_tab_group = tab_detect.appHasTabGroup(app_windows[0..app_snapshot.count]);
+    const has_tab_group = tab_detect.appHasTabGroup(app_facts[0..app_snapshot.count]);
 
     // Collect before removal so the candidate snapshot stays valid.
     var stale_wids: [128]u32 = undefined;
@@ -6283,15 +6262,12 @@ fn tryFormTabGroupOnCreate(pid: i32, new_wid: u32, reason: TabDetectReason) TabD
         app_snapshot.count, has_tab_group, stale_count,
     });
 
-    const result: TabDetectResult = switch (tab_detect.classifyNewWindow(pid, new_wid, new_frame, candidates[0..candidate_snapshot.count], has_tab_group)) {
+    const is_joined = switch (tab_detect.classifyNewWindow(pid, new_wid, new_frame, candidates[0..candidate_snapshot.count], has_tab_group)) {
         .standalone => blk: {
             log.debug("tab detect: wid={d} is standalone", .{new_wid});
-            break :blk .standalone;
+            break :blk false;
         },
-        .tab_of => |sibling_wid| if (joinTabGroup(pid, sibling_wid, new_wid, new_frame))
-            .joined
-        else
-            .inconclusive,
+        .tab_of => |sibling_wid| joinTabGroup(pid, sibling_wid, new_wid, new_frame),
     };
 
     for (stale_wids[0..stale_count]) |stale_wid| {
@@ -6299,7 +6275,7 @@ fn tryFormTabGroupOnCreate(pid: i32, new_wid: u32, reason: TabDetectReason) TabD
         removeWindow(stale_wid);
     }
 
-    return result;
+    return is_joined;
 }
 
 /// Add `new_wid` to `sibling_wid`'s tab group as the active tab.
@@ -6352,7 +6328,6 @@ fn removeWindow(wid: u32) void {
 fn executeWindowRemoved(removal: WindowRemoval) void {
     if (managedWindow(removal.window_id) != null) return;
     g_animator.cancel(removal.window_id);
-    ax_mod.invalidateWindow(removal.window_id);
     ax_writer.forgetWindow(removal.window_id);
     ax_observer.forgetWindowIfGone(removal.process_id, removal.window_id);
 }
@@ -6407,6 +6382,8 @@ fn releaseProcess(pid: i32) void {
     }
     removeWorkspaceApplication(pid);
     ax_writer.forgetApp(pid);
+    app_windows.forgetApp(pid);
+    forgetTabBarRequest(pid);
     window_readiness.forgetApp(pid);
     app_queue.forget(pid);
     ax_observer.unobserveApp(pid);
@@ -6545,8 +6522,25 @@ fn cleanupWorkspaceWindowsForPid(pid: i32) bool {
     return stale_count > 0;
 }
 
-/// Remove managed windows that are no longer physically on-screen, and hand a
-/// slot held by a background tab back to the tab group it belongs to.
+/// Ask each app with a standalone window on a visible Space for its window
+/// list. Cleanup for the app runs when it arrives.
+fn requestOffscreenCleanupLists() void {
+    for (g_state.spaces.spaces[0..g_state.spaces.space_count]) |ws| {
+        // macOS keeps windows on inactive Spaces off-screen.
+        if (!spaceVisible(ws)) continue;
+
+        for (workspaceWindows(ws).items()) |wid| {
+            const win = managedWindow(wid) orelse continue;
+            // Tab-group members can be intentionally off-screen when a sibling
+            // tab is active; treating them as ghosts causes layout churn.
+            if (g_state.windowTabGroup(wid) != null) continue;
+            _ = app_windows.request(win.pid, .offscreen_cleanup);
+        }
+    }
+}
+
+/// Remove `pid`'s managed windows that are no longer physically on-screen, and
+/// hand a slot held by a background tab back to the tab group it belongs to.
 ///
 /// Some Electron apps (Discord) close-to-background without emitting AX
 /// destroy/minimize notifications. This catches those ghost entries.
@@ -6554,22 +6548,21 @@ fn cleanupWorkspaceWindowsForPid(pid: i32) bool {
 /// A background tab looks the same to WindowServer, so every suspect goes
 /// through adoptWindowAsBackgroundTab, which keeps a window the app still lists,
 /// adopts a genuine background tab into its group, and reaps the rest.
-fn cleanupOffscreenManagedWindows() bool {
+fn cleanupOffscreenWindows(pid: i32) bool {
+    var listed: app_windows.Snapshot = undefined;
+    if (!app_windows.latest(pid, &listed)) return false;
+
     const Suspect = struct { wid: u32, is_on_screen: bool };
     var suspects: [128]Suspect = undefined;
     var suspect_count: usize = 0;
     var truncated = false;
 
     for (g_state.spaces.spaces[0..g_state.spaces.space_count]) |ws| {
-        // macOS keeps windows on inactive Spaces off-screen.
         if (!spaceVisible(ws)) continue;
 
-        const windows = workspaceWindows(ws);
-        for (windows.items()) |wid| {
+        for (workspaceWindows(ws).items()) |wid| {
             const win = managedWindow(wid) orelse continue;
-
-            // Tab-group members can be intentionally off-screen when a sibling
-            // tab is active; treating them as ghosts causes layout churn.
+            if (win.pid != pid) continue;
             if (g_state.windowTabGroup(wid) != null) continue;
 
             // An on-screen window is healthy unless its app has stopped listing
@@ -6579,7 +6572,7 @@ fn cleanupOffscreenManagedWindows() bool {
             // a window that no longer exists, so the slot silently stops
             // responding to tiling, fullscreen and parking.
             const is_on_screen = isInOnScreenWindowList(wid);
-            if (is_on_screen and appListsWindow(win.pid, wid)) continue;
+            if (is_on_screen and appListsWindow(&listed, wid)) continue;
 
             if (suspect_count < suspects.len) {
                 suspects[suspect_count] = .{ .wid = wid, .is_on_screen = is_on_screen };
@@ -6599,7 +6592,7 @@ fn cleanupOffscreenManagedWindows() bool {
     for (suspects[0..suspect_count]) |suspect| {
         const win = managedWindow(suspect.wid) orelse continue;
 
-        switch (adoptWindowAsBackgroundTab(win)) {
+        switch (adoptWindowAsBackgroundTab(win, &listed)) {
             .adopt => mutated = true,
             .keep => {},
             .reap => {
@@ -6622,24 +6615,17 @@ fn cleanupOffscreenManagedWindows() bool {
     return mutated;
 }
 
-/// Whether an app still exposes `wid` in its AX window list. A window it has
-/// dropped is either destroyed or a native background tab, which macOS omits
-/// from that list entirely. An unreadable list counts as listing the window, so
+/// Whether an app still lists `wid`. A window it has dropped is either
+/// destroyed or a native background tab, which macOS omits from that list
+/// entirely. An unreadable or truncated list counts as listing the window, so
 /// an AX timeout on a busy app cannot make every one of its windows look
 /// dropped at once.
-fn appListsWindow(pid: i32, wid: u32) bool {
-    std.debug.assert(pid > 0);
-    std.debug.assert(wid != 0);
-
-    var ax_wids: [128]u32 = undefined;
-    const snapshot = axAppWindowIds(pid, &ax_wids);
-    if (snapshot.count == 0) return true;
-
-    if (std.mem.findScalar(u32, ax_wids[0..snapshot.count], wid) != null) return true;
-    if (snapshot.truncated) {
-        log.warn("AX window membership inconclusive: snapshot truncated pid={d} wid={d} limit={d}", .{ pid, wid, ax_wids.len });
-        return true;
+fn appListsWindow(listed: *const app_windows.Snapshot, wid: u32) bool {
+    if (listed.count == 0 or listed.is_truncated) return true;
+    for (listed.items()) |listed_window| {
+        if (listed_window.wid == wid) return true;
     }
+
     return false;
 }
 
@@ -6656,19 +6642,19 @@ fn appListsWindow(pid: i32, wid: u32) bool {
 /// A window qualifies when its app's AXWindows list has dropped it (which is
 /// what a background tab looks like, and also what a destroyed ghost looks like)
 /// and an on-screen managed sibling occupies the same frame — the active tab.
-fn adoptWindowAsBackgroundTab(win: window_mod.Window) tab_detect.OffscreenOutcomeKind {
+fn adoptWindowAsBackgroundTab(win: window_mod.Window, listed: *const app_windows.Snapshot) tab_detect.OffscreenOutcomeKind {
     const frame = liveWindowFrame(win.wid);
 
     const on_screen = OnScreenWindows.snapshot();
     if (on_screen.truncated) return .keep;
-    var app_windows: [128]tab_detect.AppWindow = undefined;
-    const app_snapshot = appWindowSnapshot(win.pid, &on_screen, &app_windows);
+    var app_facts: [app_windows.max_windows]tab_detect.AppWindow = undefined;
+    const app_snapshot = appWindowSnapshot(listed, &on_screen, &app_facts);
     if (app_snapshot.truncated) {
-        log.warn("background-tab adoption skipped: AX window snapshot truncated pid={d} limit={d}", .{ win.pid, app_windows.len });
+        log.warn("background-tab adoption skipped: AX window snapshot truncated pid={d} limit={d}", .{ win.pid, app_facts.len });
         return .keep;
     }
     const listed_in_app = blk: {
-        for (app_windows[0..app_snapshot.count]) |app_window| {
+        for (app_facts[0..app_snapshot.count]) |app_window| {
             if (app_window.wid == win.wid) break :blk true;
         }
         break :blk false;
@@ -6681,7 +6667,7 @@ fn adoptWindowAsBackgroundTab(win: window_mod.Window) tab_detect.OffscreenOutcom
         return .keep;
     }
 
-    const has_tab_group = tab_detect.appHasTabGroup(app_windows[0..app_snapshot.count]);
+    const has_tab_group = tab_detect.appHasTabGroup(app_facts[0..app_snapshot.count]);
     const sibling_wid = switch (tab_detect.classifyOffscreenManaged(
         win.wid,
         win.pid,
@@ -7243,13 +7229,7 @@ fn reconcileFocusedWindow(pid: i32, focused_wid: u32) void {
     // window. Same decision as the creation path, so it runs the same code.
     log.debug("reconcile case 3: unknown wid={d}", .{focused_wid});
 
-    if (tryFormTabGroupOnCreate(pid, focused_wid, .focus_unknown) == .joined) {
-        _ = syncFocusStateForWindowId(focused_wid, .ax);
-        return;
-    }
     addNewWindow(pid, focused_wid);
-    // Tab detection may have removed stale windows.
-    retile();
 }
 
 /// Called on window_moved / window_resized — detects tab drag-out.

@@ -6,6 +6,7 @@
 const std = @import("std");
 const c = @import("c");
 const app_queue = @import("app_queue.zig");
+const app_windows = @import("app_windows.zig");
 const ax = @import("ax.zig");
 const shim = @import("shim_api.zig");
 const window_server = @import("window_server.zig");
@@ -178,15 +179,32 @@ fn answerRequests(app: app_queue.App) void {
         if (element) |ref| c.CFRelease(@ptrCast(ref));
     };
 
+    var answers: [max_batch]Answer = undefined;
+    var is_resizable: [max_batch]bool = undefined;
+    var is_adopting = false;
     for (batch, 0..) |queued, index| {
         const is_gone = if (live) |ids| std.mem.findScalar(u32, ids, queued.wid) == null else false;
         const answer: Answer = if (is_gone) .gone else if (elements[index]) |win| classify(win) else .pending;
+        answers[index] = answer;
         // Asked here so adoption on the main thread does not message the app.
-        const is_resizable = answer != .ready or ax.isAttributeSettable(elements[index].?, strings.size_attr);
+        is_resizable[index] = answer != .ready or ax.isAttributeSettable(elements[index].?, strings.size_attr);
 
+        const is_candidate = queued.purposes.contains(.pending_role) or queued.purposes.contains(.deferred);
+        if (answer == .ready and is_candidate) is_adopting = true;
+    }
+
+    // Adoption decides native tabs from this, so it must be stored before
+    // the answers are published.
+    if (is_adopting) app_windows.capture(app.pid);
+
+    for (batch, 0..) |queued, index| {
         var purposes = queued.purposes.iterator();
         while (purposes.next()) |purpose| {
-            const observation: Observation = .{ .purpose = purpose, .answer = answer, .is_resizable = is_resizable };
+            const observation: Observation = .{
+                .purpose = purpose,
+                .answer = answers[index],
+                .is_resizable = is_resizable[index],
+            };
             shim.bw_emit_event_detail(shim.BW_EVENT_WINDOW_READINESS_OBSERVED, queued.pid, queued.wid, observation.encode());
         }
     }
