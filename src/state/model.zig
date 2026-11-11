@@ -96,6 +96,8 @@ pub const FollowFocusObservation = struct {
     source: FocusEventSource,
     target: SpaceRef,
     is_target_visible: bool,
+    /// Whether the window's app is the last one macOS reported activated.
+    is_from_active_app: bool,
     at_ms: TimestampMs,
 };
 
@@ -1308,6 +1310,7 @@ pub const Effect = union(enum) {
         observation: FollowFocusObservation,
         transition: WorkspaceTransition,
     },
+    follow_focus_ignored_inactive_app: FollowFocusObservation,
     /// Ask the candidate's app whether the window is ready.
     request_pending_role_readiness: WindowCandidate,
     pending_role_ready: ReadyWindowCandidate,

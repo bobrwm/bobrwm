@@ -415,6 +415,7 @@ fn followFocusObservation(model: *const Model, target_key: SpaceKey, is_target_v
         .source = .ax,
         .target = model.space(target_key).?,
         .is_target_visible = is_target_visible,
+        .is_from_active_app = true,
         .at_ms = 100,
     } };
 }
@@ -1954,6 +1955,31 @@ test "hidden focus without a transition requests a workspace switch" {
     try testing.expectEqual(std.meta.Tag(Effect).workspace_transition_started, std.meta.activeTag(transition.effects[0]));
     try testing.expectEqual(std.meta.Tag(Effect).observe_native_topology, std.meta.activeTag(transition.effects[1]));
     try testing.expect(!transition.model.hasDeferredFollowFocus());
+}
+
+test "hidden AX focus from an inactive app does not switch workspace" {
+    const testing = std.testing;
+    const model = initializedModel(testTopology(101, null));
+    var event = followFocusObservation(&model, .{ .id = 102 }, false);
+    event.follow_focus_observed.is_from_active_app = false;
+    const transition = reduceCopy(model, event);
+
+    try testing.expect(transition.model.pending_switch == null);
+    try testing.expect(!transition.model.hasDeferredFollowFocus());
+    try testing.expectEqual(@as(usize, 1), transition.effect_count);
+    try testing.expectEqual(std.meta.Tag(Effect).follow_focus_ignored_inactive_app, std.meta.activeTag(transition.effects[0]));
+}
+
+test "hidden focus from user input switches workspace for an inactive app" {
+    const testing = std.testing;
+    const model = initializedModel(testTopology(101, null));
+    var event = followFocusObservation(&model, .{ .id = 102 }, false);
+    event.follow_focus_observed.is_from_active_app = false;
+    event.follow_focus_observed.source = .keyboard;
+    const transition = reduceCopy(model, event);
+
+    try testing.expect(transition.model.pending_switch.?.request.target.key.eql(.{ .id = 102 }));
+    try testing.expectEqual(std.meta.Tag(Effect).workspace_transition_started, std.meta.activeTag(transition.effects[0]));
 }
 
 test "native window move retries then requests rollback" {

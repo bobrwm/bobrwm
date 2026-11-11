@@ -617,6 +617,7 @@ fn switchToWindowWorkspaceIfHidden(win: window_mod.Window, focused_wid: u32, sou
         .source = source,
         .target = space,
         .is_target_visible = spaceVisible(space),
+        .is_from_active_app = win.pid == g_last_activated_pid,
         .at_ms = nativeStateNowMs(),
     } });
 }
@@ -4745,6 +4746,12 @@ fn executeStateEffect(effect: state_mod.Effect) void {
             ignored.observation.process_id,
             ignored.observation.target.workspace_id,
             ignored.pending_target.workspace_id,
+        }),
+        .follow_focus_ignored_inactive_app => |ignored| log.debug("follow focus ignored from inactive app wid={d} pid={d} workspace={d} active_pid={d}", .{
+            ignored.window_id,
+            ignored.process_id,
+            ignored.target.workspace_id,
+            g_last_activated_pid,
         }),
         .follow_focus_deferred => |deferred| log.debug("follow focus deferred wid={d} leader={d} pid={d} workspace={d} display={d} epoch={d} target_workspace={d} completion={s}", .{
             deferred.observation.window_id,
