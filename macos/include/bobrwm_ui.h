@@ -30,6 +30,7 @@ typedef struct {
   uint8_t animation_easing;
   bool start_at_login;
   bool focus_follows_mouse;
+  bool mouse_follows_display;
   bool swipe_enabled;
   bool swipe_reverse;
   bool follow_app_resizes;

@@ -307,7 +307,8 @@ pub const SkyLight = struct {
         var topology = self.nativeSpaceTopology() orelse return null;
         defer topology.deinit();
         const plan = topology.switchPlanToId(display_id, target_space_id) orelse return null;
-        if (plan.steps > 0 and !routeDockSwipeToDisplay(display_id)) return null;
+        // Dock swipes land on the display under the pointer.
+        if (plan.steps > 0 and !warpCursorToDisplay(display_id)) return null;
         return .{
             .direction = plan.direction,
             .steps = plan.steps,
@@ -970,7 +971,8 @@ fn readU16Big(input: []const u8) u16 {
     return (@as(u16, input[0]) << 8) | input[1];
 }
 
-fn routeDockSwipeToDisplay(display_id: u32) bool {
+/// Center the pointer on `display_id` unless it is already there.
+pub fn warpCursorToDisplay(display_id: u32) bool {
     const cursor_event = cg_extra.CGEventCreate(null) orelse return false;
     const cursor_location = cg_extra.CGEventGetLocation(cursor_event);
     c.CFRelease(cursor_event);

@@ -3373,6 +3373,7 @@ fn statusBarSetSettings(settings: *const statusbar.Settings) callconv(.c) bool {
     };
     next.start_at_login = settings.start_at_login;
     next.focus_follows_mouse = settings.focus_follows_mouse;
+    next.mouse_follows_display = settings.mouse_follows_display;
     next.swipe = .{ .enabled = settings.swipe_enabled, .reverse = settings.swipe_reverse };
     next.follow_app_resizes = settings.follow_app_resizes;
     next.auto_reload_config = settings.auto_reload_config;
@@ -7444,11 +7445,21 @@ fn nativeWorkspaceForWindow(wid: u32, display_id: u32) ?state_mod.SpaceRef {
 // Workspace switching
 
 fn switchWorkspace(target_id: u8) void {
-    const target_ws = spaceForCommand(focusedDisplayId(), target_id) orelse return;
+    const previous_display_id = focusedDisplayId();
+    const target_ws = spaceForCommand(previous_display_id, target_id) orelse return;
     dispatchStateEvent(.{ .request_workspace_switch = .{
         .target = target_ws,
         .at_ms = nativeStateNowMs(),
     } });
+
+    // The reducer moves display focus synchronously on both switch paths, so
+    // the new display is known here even while a native switch is pending.
+    const display_id = focusedDisplayId();
+    if (g_config.mouse_follows_display and display_id != previous_display_id) {
+        if (!skylight.warpCursorToDisplay(display_id)) {
+            log.debug("cursor warp failed display={d}", .{display_id});
+        }
+    }
 }
 
 /// Focus the remembered (or first available) window on a workspace.
