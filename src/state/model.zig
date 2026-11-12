@@ -105,8 +105,6 @@ pub const FollowFocusObservation = struct {
     source: FocusEventSource,
     target: SpaceRef,
     is_target_visible: bool,
-    /// Whether the window's app is the last one macOS reported activated.
-    is_from_active_app: bool,
     at_ms: TimestampMs,
 };
 
@@ -756,6 +754,8 @@ pub const Model = struct {
     menu_tracking: ?MenuTracking = null,
     /// Null until first read.
     spaces_settings: ?SpacesSettings = null,
+    /// The app macOS last reported activated; null until the first report.
+    active_process_id: ?i32 = null,
     swipe: swipe.State = .{},
     retile_request: RetileRequest = .{},
     cleanup_request: CleanupRequest = .{},
@@ -1216,6 +1216,12 @@ pub const Event = union(enum) {
     },
     process_terminated: i32,
     spaces_settings_observed: SpacesSettings,
+    app_activated: i32,
+    /// An activated app's focused window; 0 when it reported none.
+    activation_focus_observed: struct {
+        process_id: i32,
+        window_id: WindowId,
+    },
     request_retile_all_displays,
     request_retile_display: DisplayId,
     flush_retile_requests,
@@ -1254,6 +1260,16 @@ pub const WindowCatalogRejectionReason = enum {
 pub const Effect = union(enum) {
     /// A Mission Control setting changed or was read for the first time.
     spaces_settings_changed: SpacesSettings,
+    /// The answer belongs to the active app; window 0 means it reported none.
+    activation_focus_accepted: struct {
+        process_id: i32,
+        window_id: WindowId,
+    },
+    /// An earlier activation's answer arrived after a later activation.
+    activation_focus_stale: struct {
+        process_id: i32,
+        active_process_id: ?i32,
+    },
     cancel_native_gesture: native_gesture.Direction,
     post_native_gesture: struct { epoch: Epoch, phase: native_gesture.Phase, direction: native_gesture.Direction, velocity: f64 },
     schedule_native_gesture: Epoch,

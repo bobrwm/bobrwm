@@ -419,7 +419,7 @@ fn pushDimSnapshot() void {
         fn_count += 1;
     }
 
-    dim.apply(focused[0..fn_count], frontmostApplicationPid() orelse 0, entries[0..n]);
+    dim.apply(focused[0..fn_count], g_state.active_process_id orelse 0, entries[0..n]);
 }
 
 /// A display whose visible Space is being replaced still reports the outgoing
@@ -473,6 +473,33 @@ fn frontmostApplicationPid() ?i32 {
     return pid;
 }
 
+/// Apply the focused window an activated app reported, once the reducer has
+/// confirmed the app is still the active one.
+fn applyActivationFocus(pid: i32, wid: u32) void {
+    log.debug("window focused pid={} wid={}", .{ pid, wid });
+    // Activation raises windows even when no managed focus changes.
+    g_dim_dirty = true;
+    if (!g_state.isWorkspaceTransitionActive()) {
+        requestCleanupForPid(pid);
+        requestOffscreenCleanup();
+    }
+    if (wid == 0) {
+        trackFocusRetry(pid);
+        return;
+    }
+
+    untrackFocusRetry(pid);
+    const source: FocusEventSource = if (confirmMouseFocus(pid, wid)) .mouse else .ax;
+    if (!syncFocusStateForWindowId(wid, source)) {
+        reconcileFocusedWindow(pid, wid);
+    }
+}
+
+fn isActiveProcess(pid: i32) bool {
+    const active = g_state.active_process_id orelse return false;
+    return active == pid;
+}
+
 /// Log a focus event and unwrap the window `focus_query` observed for it; 0
 /// means the app had none or did not answer in time.
 fn focusEventWindowId(comptime event_name: []const u8, ev: *const event_mod.Event) ?u32 {
@@ -490,8 +517,7 @@ fn actionTargetWindowId() ?u32 {
     const win = managedWindow(wid) orelse return null;
 
     // Focus moved to an app with no managed window focused.
-    const front_pid = frontmostApplicationPid() orelse return null;
-    if (win.pid != front_pid) return null;
+    if (!isActiveProcess(win.pid)) return null;
 
     return wid;
 }
@@ -624,7 +650,6 @@ fn switchToWindowWorkspaceIfHidden(win: window_mod.Window, focused_wid: u32, sou
         .source = source,
         .target = space,
         .is_target_visible = spaceVisible(space),
-        .is_from_active_app = win.pid == g_last_activated_pid,
         .at_ms = nativeStateNowMs(),
     } });
 }
@@ -642,12 +667,11 @@ fn applyDeferredFollowFocus(deferred: ?state_mod.DeferredFollowFocus) void {
     const space = managedWindowSpace(leader.wid) orelse return;
     if (spaceVisible(space)) return;
 
-    const front_pid = frontmostApplicationPid() orelse return;
-    if (front_pid != focus.process_id) {
+    if (!isActiveProcess(focus.process_id)) {
         log.debug("follow focus replay dropped wid={d} pid={d} reason=focus-moved front_pid={d}", .{
             focus.window_id,
             focus.process_id,
-            front_pid,
+            g_state.active_process_id orelse 0,
         });
         return;
     }
@@ -1410,9 +1434,6 @@ fn nativeTabGroupMoveConfirmed(wid: u32, pending: state_mod.PendingNativeWindowM
 /// needed because same-process switches require an Electron-compatible delay.
 var g_last_focused_pid: i32 = 0;
 var g_last_focused_window_id: u32 = 0;
-/// Latest app activation, used to drop an earlier activation's focus answer
-/// that `focus_query` delivered late.
-var g_last_activated_pid: i32 = 0;
 /// Compiled keybind table referenced (not copied) by the hotkey event tap.
 /// The caller of bw_set_keybinds owns the storage and must keep it alive for
 /// as long as the event tap can fire; main's KeybindTable guarantees this.
@@ -2388,7 +2409,7 @@ fn eventWindowIdUnderPointer(event: c.CGEventRef) u32 {
 fn initializeMouseFocus() void {
     // The answer arrives as window_focused, which records the last focus.
     if (frontmostApplicationPid()) |pid| {
-        g_last_activated_pid = pid;
+        dispatchStateEvent(.{ .app_activated = pid });
         focus_query.request(pid, .activated);
     }
 
@@ -2719,7 +2740,7 @@ fn workspaceAppLaunched(pid: i32) void {
 /// answer arrives later as `window_focused`.
 fn workspaceActiveAppChanged(pid: i32) void {
     std.debug.assert(pid > 0);
-    g_last_activated_pid = pid;
+    dispatchStateEvent(.{ .app_activated = pid });
     focus_query.request(pid, .activated);
 }
 
@@ -2893,7 +2914,7 @@ fn startCore(config_path_arg: ?[]const u8) !void {
     // -- Discover existing windows and tile --
     captureWorkspaceApplicationInventory();
     // The app frontmost at launch never reports an activation.
-    if (frontmostApplicationPid()) |pid| g_last_activated_pid = pid;
+    if (frontmostApplicationPid()) |pid| dispatchStateEvent(.{ .app_activated = pid });
     discoverWindows(.runtime);
     retileAllDisplays();
 
@@ -2909,6 +2930,11 @@ fn startCore(config_path_arg: ?[]const u8) !void {
     });
     initWorkspaceObservers();
     g_core_stage = .workspace_observer;
+    // Discovery can block for seconds before the activation observer
+    // exists, so an app switch in that window was never reported.
+    if (frontmostApplicationPid()) |pid| {
+        if (!isActiveProcess(pid)) workspaceActiveAppChanged(pid);
+    }
 
     // -- Sources (observers, CGEventTap, waker, IPC) --
     ax_observer.init();
@@ -3130,7 +3156,7 @@ fn recoverFromEventOverflow() void {
 
     // The lost events may include activations.
     if (frontmostApplicationPid()) |pid| {
-        g_last_activated_pid = pid;
+        dispatchStateEvent(.{ .app_activated = pid });
         focus_query.request(pid, .activated);
         requestCleanupForPid(pid);
     }
@@ -3710,30 +3736,10 @@ fn handleEvent(ev: *const event_mod.Event) void {
             dispatchStateEvent(.{ .process_terminated = ev.pid });
             retile();
         },
-        .window_focused => {
-            // Each app answers on its own queue, so an earlier activation's
-            // answer can arrive after a later one's.
-            if (ev.pid != g_last_activated_pid) {
-                log.debug("window focused: stale activation pid={d} active_pid={d}", .{ ev.pid, g_last_activated_pid });
-                return;
-            }
-            // Activation raises windows even when no managed focus changes.
-            g_dim_dirty = true;
-            const focused_wid_opt = focusEventWindowId("window focused", ev);
-            if (!g_state.isWorkspaceTransitionActive()) {
-                requestCleanupForPid(ev.pid);
-                requestOffscreenCleanup();
-            }
-            const focused_wid = focused_wid_opt orelse {
-                trackFocusRetry(ev.pid);
-                return;
-            };
-            untrackFocusRetry(ev.pid);
-            const source: FocusEventSource = if (confirmMouseFocus(ev.pid, focused_wid)) .mouse else .ax;
-            if (!syncFocusStateForWindowId(focused_wid, source)) {
-                reconcileFocusedWindow(ev.pid, focused_wid);
-            }
-        },
+        .window_focused => dispatchStateEvent(.{ .activation_focus_observed = .{
+            .process_id = ev.pid,
+            .window_id = ev.wid,
+        } }),
         .focused_window_changed => {
             g_dim_dirty = true;
             const focused_wid_opt = focusEventWindowId("focused window changed", ev);
@@ -4781,7 +4787,12 @@ fn executeStateEffect(effect: state_mod.Effect) void {
             ignored.window_id,
             ignored.process_id,
             ignored.target.workspace_id,
-            g_last_activated_pid,
+            g_state.active_process_id orelse 0,
+        }),
+        .activation_focus_accepted => |focus| applyActivationFocus(focus.process_id, focus.window_id),
+        .activation_focus_stale => |stale| log.debug("window focused: stale activation pid={d} active_pid={d}", .{
+            stale.process_id,
+            stale.active_process_id orelse 0,
         }),
         .follow_focus_deferred => |deferred| log.debug("follow focus deferred wid={d} leader={d} pid={d} workspace={d} display={d} epoch={d} target_workspace={d} completion={s}", .{
             deferred.observation.window_id,
@@ -5268,7 +5279,7 @@ fn executeWorkspaceTransitionSettled(settlement: state_mod.WorkspaceTransitionSe
             @tagName(reason),
         });
     } else if (settlement.reason == .deadline_expired) {
-        const front_pid = frontmostApplicationPid() orelse 0;
+        const front_pid = g_state.active_process_id orelse 0;
         const active_workspace_id = activeWorkspaceIdForDisplay(transition.target.display_id);
         log.warn(
             "workspace transition watchdog expired epoch={d} kind={s} workspace={d} display={d} active_workspace={d} focused_display={d} front_pid={d}",
@@ -6054,7 +6065,7 @@ fn addNewWindowManagedWithAssignment(
     defer untrackDeferredWindowCandidate(wid);
 
     // Its focus event may have arrived before it was managed.
-    if (frontmostApplicationPid() == pid) focus_query.request(pid, .activated);
+    if (isActiveProcess(pid)) focus_query.request(pid, .activated);
 
     // Check if this new on-screen window replaces an existing same-PID window
     // that just went off-screen (i.e. a new tab was created and became active,

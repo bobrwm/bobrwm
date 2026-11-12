@@ -234,6 +234,10 @@ pub fn reduce(model: *Model, event: Event) Transition {
         .process_observed => |identity| process_reducer.reduceProcessObserved(&transition, identity),
         .process_terminated => |process_id| process_reducer.reduceProcessTerminated(&transition, process_id),
         .spaces_settings_observed => |settings| reduceSpacesSettingsObserved(&transition, settings),
+        .app_activated => |process_id| {
+            if (process_id > 0) transition.model.active_process_id = process_id;
+        },
+        .activation_focus_observed => |focus| reduceActivationFocusObserved(&transition, focus),
         .display_changed => |change| {
             transition.model.display_resettle_due_at_ms = change.resettle_at_ms;
             transition.model.display_resettle_cause = .display_change;
@@ -326,6 +330,23 @@ pub fn reduce(model: *Model, event: Event) Transition {
     if (should_refresh_workspace_focus) workspace_reducer.refreshWorkspaceFocus(transition.model);
     invariants.assertModel(transition.model);
     return transition;
+}
+
+/// Each app answers on its own queue, so an earlier activation's answer can
+/// arrive after a later activation.
+fn reduceActivationFocusObserved(transition: *Transition, focus: @FieldType(Event, "activation_focus_observed")) void {
+    const active_process_id = transition.model.active_process_id;
+    if (active_process_id == null or active_process_id.? != focus.process_id) {
+        transition.addEffect(.{ .activation_focus_stale = .{
+            .process_id = focus.process_id,
+            .active_process_id = active_process_id,
+        } });
+        return;
+    }
+    transition.addEffect(.{ .activation_focus_accepted = .{
+        .process_id = focus.process_id,
+        .window_id = focus.window_id,
+    } });
 }
 
 fn reduceSpacesSettingsObserved(transition: *Transition, settings: SpacesSettings) void {
@@ -425,7 +446,6 @@ fn followFocusObservation(model: *const Model, target_key: SpaceKey, is_target_v
         .source = .ax,
         .target = model.space(target_key).?,
         .is_target_visible = is_target_visible,
-        .is_from_active_app = true,
         .at_ms = 100,
     } };
 }
@@ -1923,6 +1943,7 @@ test "deferred follow focus leaves the model with transition settlement" {
         .target = model.space(.{ .id = 2 }).?,
         .at_ms = 100,
     } }).model;
+    model = reduceCopy(model, .{ .app_activated = 10 }).model;
     const epoch = model.workspace_transition.?.epoch;
 
     var transition = reduceCopy(model, followFocusObservation(&model, .{ .id = 1 }, false));
@@ -1950,6 +1971,7 @@ test "native switch ignores follow focus until Space observation" {
     const testing = std.testing;
     var model = initializedModel(testTopology(101, null));
     model = reduceCopy(model, switchRequest(&model, 1, 2, 100)).model;
+    model = reduceCopy(model, .{ .app_activated = 10 }).model;
     const transition = reduceCopy(model, followFocusObservation(&model, .{ .id = 101 }, false));
 
     try testing.expect(!transition.model.hasDeferredFollowFocus());
@@ -1958,13 +1980,32 @@ test "native switch ignores follow focus until Space observation" {
 
 test "hidden focus without a transition requests a workspace switch" {
     const testing = std.testing;
-    const model = initializedModel(testTopology(101, null));
+    const model = reduceCopy(initializedModel(testTopology(101, null)), .{ .app_activated = 10 }).model;
     const transition = reduceCopy(model, followFocusObservation(&model, .{ .id = 102 }, false));
 
     try testing.expect(transition.model.pending_switch.?.request.target.key.eql(.{ .id = 102 }));
     try testing.expectEqual(std.meta.Tag(Effect).workspace_transition_started, std.meta.activeTag(transition.effects[0]));
     try testing.expectEqual(std.meta.Tag(Effect).observe_native_topology, std.meta.activeTag(transition.effects[1]));
     try testing.expect(!transition.model.hasDeferredFollowFocus());
+}
+
+test "activation focus is accepted only from the active app" {
+    const testing = std.testing;
+    var transition = reduceCopy(.{}, .{ .activation_focus_observed = .{ .process_id = 10, .window_id = 40 } });
+    try testing.expectEqual(@as(?i32, null), transition.effects[0].activation_focus_stale.active_process_id);
+
+    var model = reduceCopy(.{}, .{ .app_activated = 10 }).model;
+    model = reduceCopy(model, .{ .app_activated = 11 }).model;
+    model = reduceCopy(model, .{ .app_activated = 0 }).model;
+    try testing.expectEqual(@as(?i32, 11), model.active_process_id);
+
+    transition = reduceCopy(model, .{ .activation_focus_observed = .{ .process_id = 10, .window_id = 40 } });
+    try testing.expectEqual(@as(u8, 1), transition.effect_count);
+    try testing.expectEqual(@as(?i32, 11), transition.effects[0].activation_focus_stale.active_process_id);
+
+    transition = reduceCopy(model, .{ .activation_focus_observed = .{ .process_id = 11, .window_id = 0 } });
+    try testing.expectEqual(@as(u8, 1), transition.effect_count);
+    try testing.expectEqual(@as(WindowId, 0), transition.effects[0].activation_focus_accepted.window_id);
 }
 
 test "Spaces settings report their first reading and each change" {
@@ -1986,10 +2027,8 @@ test "Spaces settings report their first reading and each change" {
 
 test "hidden AX focus from an inactive app does not switch workspace" {
     const testing = std.testing;
-    const model = initializedModel(testTopology(101, null));
-    var event = followFocusObservation(&model, .{ .id = 102 }, false);
-    event.follow_focus_observed.is_from_active_app = false;
-    const transition = reduceCopy(model, event);
+    const model = reduceCopy(initializedModel(testTopology(101, null)), .{ .app_activated = 11 }).model;
+    const transition = reduceCopy(model, followFocusObservation(&model, .{ .id = 102 }, false));
 
     try testing.expect(transition.model.pending_switch == null);
     try testing.expect(!transition.model.hasDeferredFollowFocus());
@@ -1999,9 +2038,8 @@ test "hidden AX focus from an inactive app does not switch workspace" {
 
 test "hidden focus from user input switches workspace for an inactive app" {
     const testing = std.testing;
-    const model = initializedModel(testTopology(101, null));
+    const model = reduceCopy(initializedModel(testTopology(101, null)), .{ .app_activated = 11 }).model;
     var event = followFocusObservation(&model, .{ .id = 102 }, false);
-    event.follow_focus_observed.is_from_active_app = false;
     event.follow_focus_observed.source = .keyboard;
     const transition = reduceCopy(model, event);
 

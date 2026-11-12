@@ -761,7 +761,8 @@ pub fn reduceFollowFocusObserved(
     // Only the active app's focus says where the user is. A background app's
     // focused window changes on its own, and its AX answer can arrive after
     // the user has moved on; following it would pull the display to its Space.
-    if (observation.source == .ax and !observation.is_from_active_app) {
+    const is_from_active_app = if (transition.model.active_process_id) |active| active == observation.process_id else false;
+    if (observation.source == .ax and !is_from_active_app) {
         transition.addEffect(.{ .follow_focus_ignored_inactive_app = observation });
         return;
     }
