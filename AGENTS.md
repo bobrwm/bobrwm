@@ -101,7 +101,7 @@ _ = app.msgSend(bool, "setActivationPolicy:", .{@as(i64, 1)});
 
 **Architecture:** Swift runs NSApplication and starts/stops the embedded Zig core through `bobrwm_ui.h`. The AppKit main thread owns BobrWM state mutation, layout, workspace state, IPC, status bar, and event draining. AX observer callbacks run on a dedicated background observer thread so slow or hung app AX servers cannot stall the main CFRunLoop. Background AX callbacks must only enqueue events or update observer bookkeeping protected by the AX lock; BobrWM state mutations happen on the main thread during event drain.
 
-**AX off the main thread:** Every AX message blocks until the target app answers, so new AX work must not run on the main thread. Submit it as a job on `app_queue.zig` (one serial queue per app) and publish the answer as an event for the reducer to decide on, as `focus_query.zig` and `window_readiness.zig` do; writes go through `ax_writer.zig`. Set a messaging timeout on the app element and on every element copied out of it. Some calls are still synchronous (discovery, `addNewWindow`, tab detection); do not add more.
+**AX off the main thread:** Every AX message blocks until the target app answers, so new AX work must not run on the main thread. Submit it as a job on `app_queue.zig` (one serial queue per app) and publish the answer as an event for the reducer to decide on, as `focus_query.zig` and `window_readiness.zig` do; writes go through `ax_writer.zig`. Set a messaging timeout on the app element and on every element copied out of it. One call is still synchronous: the hover-focus overlay check, bounded by a 40ms timeout. Do not add more.
 
 ## Menu Bar UI (Swift)
 
