@@ -1712,12 +1712,6 @@ test "parseSource accepts unknown fields like a reload does" {
     try t.expectEqual(tiling.LayoutKind.monocle, parsed.layout);
 }
 
-// Bundle ID helper
-
-pub fn getAppBundleId(pid: i32, buf: *[256]u8) ?[]const u8 {
-    return osutil.appBundleId(pid, buf);
-}
-
 // macOS virtual key code mapping
 
 fn keyNameToCode(name: []const u8) ?u16 {

@@ -814,7 +814,7 @@ fn mouseFocusTargetPid(wid: u32) ?i32 {
 /// do not need a remote query. Unknown details leave hover focus available.
 fn observeArcOverlay(pid: i32, wid: u32) ?focus_follows_mouse.ArcOverlayObservation {
     var bundle_buf: [256]u8 = undefined;
-    const bundle_id = config_mod.getAppBundleId(pid, &bundle_buf) orelse return null;
+    const bundle_id = appBundleId(pid, &bundle_buf) orelse return null;
     if (!std.mem.eql(u8, bundle_id, "company.thebrowser.Browser")) return null;
 
     const win = ax_mod.findWindowWithMessagingTimeout(pid, wid, 0.04) orelse return null;
@@ -1458,6 +1458,7 @@ var g_layout_entries: std.ArrayList(tiling.LayoutEntry) = .empty;
 var g_event_drain_active = false;
 var g_event_overflow_recovery_pending = false;
 var g_has_warned_process_table_full = false;
+var g_bundle_ids: osutil.BundleIdCache = .{};
 var g_warned_full_discovery_queues: std.EnumSet(state_mod.DiscoveryQueue) = .empty;
 var g_on_screen_truncation_logged = false;
 
@@ -3007,6 +3008,8 @@ fn stopCore() void {
         objc_classes.deinit();
     }
     resetDimming();
+    g_bundle_ids.deinit(g_allocator);
+    g_bundle_ids = .{};
     if (coreReached(.signal_transport)) {
         signal_transport.deinit();
     }
@@ -5137,7 +5140,7 @@ fn logUnsettledGeometry(observation: @FieldType(geometry_mod.Effect, "settled"),
     const win = managedWindow(observation.window_id) orelse return;
     const space = managedWindowSpace(observation.window_id) orelse return;
     var app_buf: [256]u8 = undefined;
-    const app = osutil.appBundleId(win.pid, &app_buf) orelse "unknown";
+    const app = appBundleId(win.pid, &app_buf) orelse "unknown";
     switch (intent.target) {
         .frame => |target| log.warn("geometry: frame intent did not converge wid={d} pid={d} app={s} workspace={d} display={d} source={s} generation={d} target=({d:.0},{d:.0},{d:.0},{d:.0}) observed=({d:.0},{d:.0},{d:.0},{d:.0}) delta=({d:.0},{d:.0},{d:.0},{d:.0})", .{
             observation.window_id,          win.pid,                        app,                                    space.workspace_id,                       space.display_id,
@@ -5987,7 +5990,7 @@ fn shouldFloatWindow(pid: i32, frame: window_mod.Window.Frame, is_resizable: boo
     // An app_rules entry with .float = true floats every window of that app.
     if (g_config.app_rules.len > 0) {
         var id_buf: [256]u8 = undefined;
-        if (config_mod.getAppBundleId(pid, &id_buf)) |bundle_id| {
+        if (appBundleId(pid, &id_buf)) |bundle_id| {
             if (g_config.shouldFloatApp(bundle_id)) return true;
         }
     }
@@ -6384,9 +6387,21 @@ fn observeProcess(pid: i32) void {
     } });
 }
 
+/// Bundle identifier of a process. Cached for processes in the table, whose
+/// start time tells a reused PID apart; others are queried each time.
+fn appBundleId(pid: i32, buf: *[osutil.BundleIdCache.max_len]u8) ?[]const u8 {
+    const identity = g_state.processes.get(pid) orelse return osutil.appBundleId(pid, buf);
+    if (g_bundle_ids.get(pid, identity.started_at_us, buf)) |bundle_id| return bundle_id;
+
+    const bundle_id = osutil.appBundleId(pid, buf) orelse return null;
+    g_bundle_ids.put(g_allocator, pid, identity.started_at_us, bundle_id);
+    return bundle_id;
+}
+
 /// Release shell state keyed by an ended process's PID.
 fn releaseProcess(pid: i32) void {
     std.debug.assert(pid > 0);
+    g_bundle_ids.forget(pid);
     if (g_focus_follows_mouse.intent) |intent| {
         if (intent.process_id == pid) cancelPendingMouseFocus(false, false);
     }
@@ -7280,7 +7295,7 @@ fn checkTabDragOut(_: i32, wid: u32) bool {
 fn configuredWorkspace(pid: i32, display_id: u32) ?state_mod.SpaceRef {
     if (g_config.hasAppWorkspaceRules()) {
         var id_buf: [256]u8 = undefined;
-        if (config_mod.getAppBundleId(pid, &id_buf)) |bundle_id| {
+        if (appBundleId(pid, &id_buf)) |bundle_id| {
             if (g_config.workspaceForApp(bundle_id)) |ws_id| {
                 return spaceForCommand(display_id, ws_id);
             }
@@ -7700,7 +7715,7 @@ fn ipcQueryWindows(fd: posix.socket_t, format: ipc.IpcCommand.QueryFormat) void 
         .text => for (snapshot.items()) |wid| {
             if (managedWindow(wid)) |win| {
                 var id_buf: [256]u8 = undefined;
-                const id_len = if (osutil.appBundleId(win.pid, &id_buf)) |id| id.len else 0;
+                const id_len = if (appBundleId(win.pid, &id_buf)) |id| id.len else 0;
                 const bundle_id: []const u8 = if (id_len > 0) id_buf[0..id_len] else "(unknown)";
 
                 w.print("{d} {d} {s} {d} {d} {d:.0} {d:.0} {d:.0} {d:.0}\n", .{
@@ -7716,7 +7731,7 @@ fn ipcQueryWindows(fd: posix.socket_t, format: ipc.IpcCommand.QueryFormat) void 
             for (snapshot.items()) |wid| {
                 if (managedWindow(wid)) |win| {
                     var id_buf: [256]u8 = undefined;
-                    const id_len = if (osutil.appBundleId(win.pid, &id_buf)) |id| id.len else 0;
+                    const id_len = if (appBundleId(win.pid, &id_buf)) |id| id.len else 0;
                     const bundle_id: []const u8 = if (id_len > 0) id_buf[0..id_len] else "(unknown)";
 
                     writeWindowJson(&json, win, ws, bundle_id) catch break;
@@ -7758,7 +7773,7 @@ fn ipcQueryApps(fd: posix.socket_t, format: ipc.IpcCommand.QueryFormat) void {
                 seen_count += 1;
 
                 var id_buf: [256]u8 = undefined;
-                const id_len = if (osutil.appBundleId(win.pid, &id_buf)) |id| id.len else 0;
+                const id_len = if (appBundleId(win.pid, &id_buf)) |id| id.len else 0;
                 const bundle_id: []const u8 = if (id_len > 0) id_buf[0..id_len] else "(unknown)";
 
                 switch (format) {
@@ -7848,7 +7863,7 @@ fn writeWorkspaceJsonEntry(json: *std.json.Stringify, space: state_mod.SpaceRef)
     for (g_state.workspaceWindowIds(space.key, &window_ids)) |wid| {
         const win = managedWindow(wid) orelse continue;
         var id_buf: [256]u8 = undefined;
-        const id_len = if (osutil.appBundleId(win.pid, &id_buf)) |id| id.len else 0;
+        const id_len = if (appBundleId(win.pid, &id_buf)) |id| id.len else 0;
         const bundle_id: []const u8 = if (id_len > 0) id_buf[0..id_len] else "(unknown)";
         try writeWindowJson(json, win, space, bundle_id);
     }
