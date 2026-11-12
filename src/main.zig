@@ -1403,6 +1403,7 @@ fn moveTabGroupToNativeSpace(wid: u32, target: state_mod.SpaceRef) bool {
 }
 
 fn requestNativeWindowMove(wid: u32, source: state_mod.SpaceRef, target: state_mod.SpaceRef) void {
+    g_adoption_on_screen = null;
     source.assertValid();
     target.assertValid();
     const leader_wid = g_state.windowTabLeader(wid);
@@ -1456,6 +1457,9 @@ var g_mouse_tap_port: c.CFMachPortRef = null;
 var g_config_watcher: config_watch.Watcher = .{};
 var g_layout_entries: std.ArrayList(tiling.LayoutEntry) = .empty;
 var g_event_drain_active = false;
+// Consecutive adoption answers share CG membership until another event or a
+// native move can change it. Bounds are read only for off-screen slot candidates.
+var g_adoption_on_screen: ?OnScreenWindows = null;
 var g_event_overflow_recovery_pending = false;
 var g_has_warned_process_table_full = false;
 var g_bundle_ids: osutil.BundleIdCache = .{};
@@ -3025,6 +3029,8 @@ fn drainEvents() void {
     std.debug.assert(!g_event_drain_active);
     g_event_drain_active = true;
     defer g_event_drain_active = false;
+    g_adoption_on_screen = null;
+    defer g_adoption_on_screen = null;
 
     const drain_span = trace.begin("drain");
     const drain_scope = watchdog.begin("drain", 0, 0);
@@ -3041,6 +3047,7 @@ fn drainEvents() void {
     var first_kind: []const u8 = "none";
     while (g_event_queue.pop()) |ev| {
         if (handled == 0) first_kind = @tagName(ev.kind);
+        if (ev.kind != .window_readiness_observed) g_adoption_on_screen = null;
         handleTracedEvent(&ev);
         handled += 1;
     }
@@ -5894,6 +5901,7 @@ fn tabCandidates(
     pid: i32,
     on_screen: *const OnScreenWindows,
     out: []tab_detect.Candidate,
+    include_on_screen: bool,
 ) BoundedSnapshotResult {
     std.debug.assert(pid > 0);
 
@@ -5902,18 +5910,20 @@ fn tabCandidates(
     for (g_state.windows.items()) |managed_window| {
         const win = managed_window.snapshot();
         if (win.pid != pid) continue;
+        const space = managedWindowSpace(win.wid) orelse continue;
+        const on_visible_workspace = spaceVisible(space);
+        const is_on_screen = on_visible_workspace and on_screen.contains(win.wid);
+        // A visible window cannot be the slot replaced by a new tab.
+        if (!include_on_screen and (is_on_screen or g_state.isWindowTabSuppressed(win.wid))) continue;
         if (count == out.len) {
             truncated = true;
             break;
         }
-
-        const space = managedWindowSpace(win.wid) orelse continue;
-        const on_visible_workspace = spaceVisible(space);
         out[count] = .{
             .wid = win.wid,
             .pid = win.pid,
             .live_frame = liveWindowFrame(win.wid),
-            .is_visible_on_screen = on_visible_workspace and on_screen.contains(win.wid),
+            .is_visible_on_screen = is_on_screen,
             .owns_workspace_slot = !g_state.isWindowTabSuppressed(win.wid),
         };
         count += 1;
@@ -6003,9 +6013,11 @@ fn addNewWindowManagedWithAssignment(
     // New windows from Electron-family apps can be created before WindowServer
     // reports them as on-screen. Queue them for bounded re-evaluation rather
     // than dropping them on a one-shot check.
-    if (!isVisibleOnScreen(wid)) {
+    const on_screen = g_adoption_on_screen orelse OnScreenWindows.snapshot();
+    if (g_event_drain_active) g_adoption_on_screen = on_screen;
+    if (on_screen.truncated or !on_screen.contains(wid)) {
         trackDeferredWindowCandidate(pid, wid, assigned_space);
-        log.debug("addNewWindow: deferred pid={d} wid={d} while off-screen", .{ pid, wid });
+        log.debug("addNewWindow: deferred pid={d} wid={d} while off-screen or visibility unknown", .{ pid, wid });
         return false;
     }
     var window_frame: window_mod.Window.Frame = .{ .x = 0, .y = 0, .width = 0, .height = 0 };
@@ -6047,7 +6059,7 @@ fn addNewWindowManagedWithAssignment(
     // Check if this new on-screen window replaces an existing same-PID window
     // that just went off-screen (i.e. a new tab was created and became active,
     // pushing the old tab to background). If so, form a tab group.
-    const joined = tryFormTabGroupOnCreate(pid, wid) orelse {
+    const joined = tryFormTabGroupOnCreate(pid, wid, window_frame, &on_screen) orelse {
         trackDeferredWindowCandidate(pid, wid, assigned_space);
         return false;
     };
@@ -6247,47 +6259,41 @@ fn applyTabBarObservation(pid: i32) void {
 /// joined a group; null when incomplete facts require another observation.
 ///
 /// Reads the app's window list as captured with the window's readiness answer.
-fn tryFormTabGroupOnCreate(pid: i32, new_wid: u32) ?bool {
+fn tryFormTabGroupOnCreate(
+    pid: i32,
+    new_wid: u32,
+    new_frame: window_mod.Window.Frame,
+    on_screen: *const OnScreenWindows,
+) ?bool {
     const span = trace.beginWindow("tab detect", pid, new_wid);
     defer _ = span.end();
 
-    const new_frame = liveWindowFrame(new_wid) orelse {
-        log.debug("tab detect: wid={d} has no live bounds", .{new_wid});
-        return null;
-    };
     var listed: app_windows.Snapshot = undefined;
     if (!app_windows.latest(pid, &listed)) {
         log.debug("tab detect: no window list pid={d} wid={d}", .{ pid, new_wid });
         return null;
     }
+    const has_tab_group = listed.hasTabGroup() orelse return null;
+    // Standalone discovery needs no further platform queries.
+    if (!has_tab_group) return false;
     log.debug("tab detect: wid={d} bounds=({d:.0},{d:.0},{d:.0},{d:.0})", .{
         new_wid, new_frame.x, new_frame.y, new_frame.width, new_frame.height,
     });
 
-    const on_screen = OnScreenWindows.snapshot();
-    if (on_screen.truncated) return null;
     var candidates: [128]tab_detect.Candidate = undefined;
-    const candidate_snapshot = tabCandidates(pid, &on_screen, &candidates);
+    const candidate_snapshot = tabCandidates(pid, on_screen, &candidates, false);
     if (candidate_snapshot.truncated) {
         log.warn("tab detect skipped: managed candidate snapshot truncated pid={d} limit={d}", .{ pid, candidates.len });
         return null;
     }
-
-    var app_facts: [app_windows.max_windows]tab_detect.AppWindow = undefined;
-    const app_snapshot = appWindowSnapshot(&listed, &on_screen, &app_facts);
-    if (app_snapshot.truncated) {
-        log.debug("tab detect skipped: incomplete AX window snapshot pid={d} limit={d}", .{ pid, app_facts.len });
-        return null;
-    }
-    const has_tab_group = tab_detect.appHasTabGroup(app_facts[0..app_snapshot.count]);
 
     // Collect before removal so the candidate snapshot stays valid.
     var stale_wids: [128]u32 = undefined;
     const stale_count = tab_detect.staleCandidates(pid, candidates[0..candidate_snapshot.count], &stale_wids);
 
     log.debug("tab detect: pid={d} wid={d} candidates={d} ax_windows={d} has_tab_group={} stale={d}", .{
-        pid,                new_wid,       candidate_snapshot.count,
-        app_snapshot.count, has_tab_group, stale_count,
+        pid,          new_wid,       candidate_snapshot.count,
+        listed.count, has_tab_group, stale_count,
     });
 
     const is_joined = switch (tab_detect.classifyNewWindow(pid, new_wid, new_frame, candidates[0..candidate_snapshot.count], has_tab_group)) {
@@ -6662,7 +6668,7 @@ fn adoptWindowAsBackgroundTab(win: window_mod.Window, listed: *const app_windows
     };
 
     var candidates: [128]tab_detect.Candidate = undefined;
-    const candidate_snapshot = tabCandidates(win.pid, &on_screen, &candidates);
+    const candidate_snapshot = tabCandidates(win.pid, &on_screen, &candidates, true);
     if (candidate_snapshot.truncated) {
         log.warn("background-tab adoption skipped: candidate snapshot truncated pid={d} limit={d}", .{ win.pid, candidates.len });
         return .keep;

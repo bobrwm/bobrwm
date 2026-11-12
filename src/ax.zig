@@ -471,3 +471,7 @@ test "app window snapshots stop on failure or deadline and distinguish complete 
     try testing.expect(result.is_truncated);
     try testing.expect(!result.is_incomplete);
 }
+
+test {
+    _ = @import("app_windows.zig");
+}

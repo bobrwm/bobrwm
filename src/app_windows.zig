@@ -34,6 +34,16 @@ pub const Snapshot = struct {
     pub fn items(self: *const Snapshot) []const ax.AppWindow {
         return self.windows[0..self.count];
     }
+
+    /// Tab inference needs only the captured bar counts, not fresh bounds for
+    /// every app window. Null leaves the decision for a complete observation.
+    pub fn hasTabGroup(self: *const Snapshot) ?bool {
+        if (self.is_incomplete or self.is_truncated) return null;
+        for (self.items()) |window| {
+            if (window.tab_count > 1) return true;
+        }
+        return false;
+    }
 };
 
 const PendingReasons = struct {
@@ -166,4 +176,20 @@ fn answerRequest(app: app_queue.App) void {
 
     _ = capture(app.pid);
     shim.bw_emit_event_detail(shim.BW_EVENT_APP_WINDOWS_OBSERVED, app.pid, 0, encodeReasons(reasons));
+}
+
+test "captured tab bars distinguish standalone apps from incomplete observations" {
+    const testing = std.testing;
+    var snapshot: Snapshot = .{ .count = 2, .is_incomplete = false };
+    snapshot.windows[0] = .{ .wid = 17, .tab_count = 0 };
+    snapshot.windows[1] = .{ .wid = 29, .tab_count = 1 };
+    try testing.expectEqual(@as(?bool, false), snapshot.hasTabGroup());
+
+    snapshot.windows[1].tab_count = 3;
+    try testing.expectEqual(@as(?bool, true), snapshot.hasTabGroup());
+    snapshot.is_incomplete = true;
+    try testing.expectEqual(@as(?bool, null), snapshot.hasTabGroup());
+    snapshot.is_incomplete = false;
+    snapshot.is_truncated = true;
+    try testing.expectEqual(@as(?bool, null), snapshot.hasTabGroup());
 }
