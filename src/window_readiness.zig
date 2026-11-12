@@ -8,6 +8,7 @@ const c = @import("c");
 const app_queue = @import("app_queue.zig");
 const app_windows = @import("app_windows.zig");
 const ax = @import("ax.zig");
+const osutil = @import("osutil.zig");
 const shim = @import("shim_api.zig");
 const window_server = @import("window_server.zig");
 
@@ -76,8 +77,7 @@ pub fn init() void {
 }
 
 /// Ask whether `wid` is ready on its app's queue. A request already waiting
-/// for the window absorbs this one. The caller has checked that the app is a
-/// regular one.
+/// for the window absorbs this one.
 pub fn request(pid: i32, wid: u32, purpose: Purpose) void {
     std.debug.assert(pid > 0);
     std.debug.assert(wid > 0);
@@ -165,6 +165,14 @@ fn answerRequests(app: app_queue.App) void {
         _ = app_queue.submit(app.pid, .readiness);
     };
 
+    // Only regular apps' windows are tiled. Asked per batch because an app
+    // can change its policy at runtime, and before any AX message so a
+    // helper process is never queried.
+    if (!osutil.isRegularApp(app.pid)) {
+        for (batch) |queued| publish(queued, .reject, true);
+        return;
+    }
+
     var wids: [max_batch]u32 = undefined;
     for (batch, 0..) |queued, index| wids[index] = queued.wid;
 
@@ -197,16 +205,19 @@ fn answerRequests(app: app_queue.App) void {
     // the answers are published.
     if (is_adopting) app_windows.capture(app.pid);
 
-    for (batch, 0..) |queued, index| {
-        var purposes = queued.purposes.iterator();
-        while (purposes.next()) |purpose| {
-            const observation: Observation = .{
-                .purpose = purpose,
-                .answer = answers[index],
-                .is_resizable = is_resizable[index],
-            };
-            shim.bw_emit_event_detail(shim.BW_EVENT_WINDOW_READINESS_OBSERVED, queued.pid, queued.wid, observation.encode());
-        }
+    for (batch, 0..) |queued, index| publish(queued, answers[index], is_resizable[index]);
+}
+
+/// One event per purpose: each decides differently on the main thread.
+fn publish(queued: Request, answer: Answer, is_resizable: bool) void {
+    var purposes = queued.purposes.iterator();
+    while (purposes.next()) |purpose| {
+        const observation: Observation = .{
+            .purpose = purpose,
+            .answer = answer,
+            .is_resizable = is_resizable,
+        };
+        shim.bw_emit_event_detail(shim.BW_EVENT_WINDOW_READINESS_OBSERVED, queued.pid, queued.wid, observation.encode());
     }
 }
 

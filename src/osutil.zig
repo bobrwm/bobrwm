@@ -276,6 +276,25 @@ pub fn appBundleId(pid: i32, buf: []u8) ?[]const u8 {
     return buf[0..copy_len];
 }
 
+/// Whether the process is a regular app, one with a Dock icon. Helpers,
+/// agents, and background processes are not tiled. An app can change its
+/// policy at runtime, so callers ask again rather than keep the answer.
+/// Safe off the main thread.
+pub fn isRegularApp(pid: i32) bool {
+    std.debug.assert(pid > 0);
+
+    const objc = @import("objc");
+    const pool = objc.AutoreleasePool.init();
+    defer pool.deinit();
+
+    const NSRunningApplication = objc.getClass("NSRunningApplication") orelse return false;
+    const app = NSRunningApplication.msgSend(objc.Object, "runningApplicationWithProcessIdentifier:", .{pid});
+    if (app.value == null) return false;
+
+    // NSApplicationActivationPolicyRegular == 0.
+    return app.msgSend(i64, "activationPolicy", .{}) == 0;
+}
+
 /// Bundle identifiers of processes, keyed by PID and start time so a reused
 /// PID never reads the previous process's identifier. An identifier is
 /// fixed for a process's lifetime, so entries leave only when the process

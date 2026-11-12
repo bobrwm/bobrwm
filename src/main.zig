@@ -1804,18 +1804,6 @@ const BoundedSnapshotResult = struct {
     truncated: bool,
 };
 
-fn isRegularActivationApp(pid: i32) bool {
-    std.debug.assert(pid > 0);
-
-    const NSRunningApplication = objc.getClass("NSRunningApplication") orelse return false;
-    const app = NSRunningApplication.msgSend(objc.Object, "runningApplicationWithProcessIdentifier:", .{pid});
-    if (app.value == null) return false;
-
-    // NSApplicationActivationPolicyRegular == 0.
-    const activation_policy = app.msgSend(i64, "activationPolicy", .{});
-    return activation_policy == 0;
-}
-
 /// Raise and focus a window, then activate its owning app, on the app's
 /// writer queue. The last-focused process updates now so the next request
 /// sees this switch.
@@ -1882,15 +1870,6 @@ fn postSameProcessFocusEvent(
     return post_event(psn, &event) == 0;
 }
 
-/// Ask on the app's queue; the answer arrives as window_readiness_observed.
-fn requestReadiness(pid: i32, wid: u32, purpose: window_readiness.Purpose) void {
-    if (!isRegularActivationApp(pid)) {
-        applyReadiness(pid, wid, .{ .purpose = purpose, .answer = .reject });
-        return;
-    }
-    window_readiness.request(pid, wid, purpose);
-}
-
 fn applyReadiness(pid: i32, wid: u32, observation: window_readiness.Observation) void {
     const readiness: WindowReadiness = switch (observation.answer) {
         .reject => .reject,
@@ -1935,7 +1914,7 @@ fn removeUnmanageableWindow(pid: i32, wid: u32, comptime reason: []const u8) voi
 ///
 /// Runtime discovery stays on-screen-only; startup can request all Spaces and
 /// then validate inactive candidates through AX and SkyLight before adoption.
-/// Uses a per-call PID cache to avoid redundant isRegularActivationApp calls.
+/// Uses a per-call PID cache to avoid redundant osutil.isRegularApp calls.
 /// Electron apps spawn many XPC helper processes (renderers, GPU process) that
 /// share the CGWindowList but have Prohibited activation policy. Caching the
 /// accept/reject decision per PID avoids an ObjC message send for every window
@@ -1998,7 +1977,7 @@ fn enumerateWindows(
         // Fast-path: check per-call caches before the ObjC message send.
         if (pidInCache(pid, &rejected_pids, rejected_pid_count)) continue;
         if (!pidInCache(pid, &accepted_pids, accepted_pid_count)) {
-            if (!isRegularActivationApp(pid)) {
+            if (!osutil.isRegularApp(pid)) {
                 if (rejected_pid_count < pid_cache_capacity) {
                     rejected_pids[rejected_pid_count] = pid;
                     rejected_pid_count += 1;
@@ -4618,7 +4597,7 @@ fn dispatchStateEvent(event: state_mod.Event) void {
             // Run now: a discovery pass can track more windows than the
             // effect queue holds.
             .request_pending_role_readiness => |candidate| {
-                requestReadiness(candidate.process_id, candidate.window_id, .pending_role);
+                window_readiness.request(candidate.process_id, candidate.window_id, .pending_role);
                 continue;
             },
             else => g_state_effect_queue.push(effect),
@@ -5677,15 +5656,12 @@ fn untrackWindowCandidatesForPid(pid: i32) void {
 }
 
 /// Ask each candidate's app again; answers feed the reducer as they arrive.
-/// Iterates copies: an immediate answer mutates the queues.
 fn processPendingRoleWindows() void {
-    const candidates = g_state.pending_role_windows;
-    for (candidates.items()) |candidate| requestReadiness(candidate.process_id, candidate.window_id, .pending_role);
+    for (g_state.pending_role_windows.items()) |candidate| window_readiness.request(candidate.process_id, candidate.window_id, .pending_role);
 }
 
 fn processDeferredWindowCandidates() void {
-    const candidates = g_state.deferred_window_candidates;
-    for (candidates.items()) |candidate| requestReadiness(candidate.process_id, candidate.window_id, .deferred);
+    for (g_state.deferred_window_candidates.items()) |candidate| window_readiness.request(candidate.process_id, candidate.window_id, .deferred);
 }
 
 /// Capture one trustworthy app-to-workspace association per process before
@@ -6498,7 +6474,6 @@ fn sweepProcesses() bool {
 fn cleanupWorkspaceWindowsForPid(pid: i32) bool {
     const sky = g_sky orelse return false;
     const conn = sky.mainConnectionID();
-    const is_regular_app = isRegularActivationApp(pid);
 
     var stale_wids: [128]u32 = undefined;
     var stale_count: usize = 0;
@@ -6518,8 +6493,6 @@ fn cleanupWorkspaceWindowsForPid(pid: i32) bool {
             trace.countSkylight();
             if (sky.getWindowBounds(conn, wid, &rect) != 0) {
                 log.debug("cleanup: removing wid={d} pid={d} reason=missing-windowserver", .{ wid, pid });
-            } else if (!is_regular_app) {
-                log.debug("cleanup: removing wid={d} pid={d} reason=should-manage=false", .{ wid, pid });
             } else {
                 // The app answers on its queue, and a rejected window is
                 // removed then.
