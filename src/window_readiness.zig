@@ -203,7 +203,14 @@ fn answerRequests(app: app_queue.App) void {
 
     // Adoption decides native tabs from this, so it must be stored before
     // the answers are published.
-    if (is_adopting) app_windows.capture(app.pid);
+    if (is_adopting and !app_windows.capture(app.pid)) {
+        // Missing tab facts are not evidence that a ready window is standalone.
+        for (batch, 0..) |queued, index| {
+            if (queued.purposes.contains(.pending_role) or queued.purposes.contains(.deferred)) {
+                if (answers[index] == .ready) answers[index] = .pending;
+            }
+        }
+    }
 
     for (batch, 0..) |queued, index| publish(queued, answers[index], is_resizable[index]);
 }

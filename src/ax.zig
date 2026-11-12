@@ -6,6 +6,7 @@
 const std = @import("std");
 const c = @import("c");
 const trace = @import("trace.zig");
+const osutil = @import("osutil.zig");
 
 extern fn _AXUIElementGetWindow(element: c.AXUIElementRef, wid: *u32) c.AXError;
 
@@ -284,47 +285,74 @@ pub const AppWindowsResult = struct {
     count: usize,
     /// The app listed more windows than fit in `out`.
     is_truncated: bool,
+    /// Missing facts must never be interpreted as absent windows or tab bars.
+    is_incomplete: bool,
 };
 
-/// Read the app's AX window list and each window's tab count. Every message
-/// is bounded by `timeout_seconds`; an app that does not answer reads as
-/// listing no windows.
-pub fn appWindows(pid: i32, out: []AppWindow, timeout_seconds: f32) AppWindowsResult {
+/// Read the app's AX window list and tab counts within a whole-scan budget.
+/// A timeout stops the scan so geometry and focus can use the app's queue.
+pub fn appWindows(pid: i32, out: []AppWindow, timeout_seconds: f32, budget_seconds: f32) AppWindowsResult {
     std.debug.assert(pid > 0);
-    std.debug.assert(timeout_seconds > 0);
+    std.debug.assert(timeout_seconds > 0 and budget_seconds > 0);
 
-    var result: AppWindowsResult = .{ .count = 0, .is_truncated = false };
+    const budget: ScanBudget = .{
+        .deadline_ns = osutil.nanoTimestamp() + @as(i128, @intFromFloat(budget_seconds * std.time.ns_per_s)),
+        .timeout_seconds = timeout_seconds,
+    };
+    var result: AppWindowsResult = .{ .count = 0, .is_truncated = false, .is_incomplete = true };
     const ax = strings() orelse return result;
     const app = c.AXUIElementCreateApplication(pid) orelse return result;
     defer c.CFRelease(@ptrCast(app));
-    _ = c.AXUIElementSetMessagingTimeout(app, timeout_seconds);
 
-    var windows: c.CFArrayRef = null;
-    trace.countAx();
-    if (c.AXUIElementCopyAttributeValue(app, ax.windows_attr, @ptrCast(&windows)) != c.kAXErrorSuccess) return result;
-    const windows_ref = windows orelse return result;
-    defer c.CFRelease(@ptrCast(windows_ref));
+    const windows: c.CFArrayRef = @ptrCast((budget.copyAttribute(app, ax.windows_attr) catch return result) orelse return result);
+    defer c.CFRelease(@ptrCast(windows));
 
-    const count = c.CFArrayGetCount(windows_ref);
+    const count = c.CFArrayGetCount(windows);
     var index: c.CFIndex = 0;
     while (index < count) : (index += 1) {
-        const win: c.AXUIElementRef = @ptrCast(c.CFArrayGetValueAtIndex(windows_ref, index) orelse continue);
-        _ = c.AXUIElementSetMessagingTimeout(win, timeout_seconds);
-
-        var wid: u32 = 0;
-        trace.countAx();
-        if (_AXUIElementGetWindow(win, &wid) != c.kAXErrorSuccess or wid == 0) continue;
         if (result.count == out.len) {
             result.is_truncated = true;
             break;
         }
+        const win: c.AXUIElementRef = @ptrCast(c.CFArrayGetValueAtIndex(windows, index) orelse continue);
+        budget.prepare(win) catch return result;
 
-        out[result.count] = .{ .wid = wid, .tab_count = tabCount(win, ax, timeout_seconds) };
+        var wid: u32 = 0;
+        trace.countAx();
+        // A failed ID read leaves membership unknown, even if later windows answer.
+        if (_AXUIElementGetWindow(win, &wid) != c.kAXErrorSuccess or wid == 0) return result;
+        const tabs = tabCount(win, ax, &budget) catch return result;
+        out[result.count] = .{ .wid = wid, .tab_count = tabs };
         result.count += 1;
     }
 
+    result.is_incomplete = false;
     return result;
 }
+
+const ScanBudget = struct {
+    deadline_ns: i128,
+    timeout_seconds: f32,
+
+    fn prepare(self: *const ScanBudget, element: c.AXUIElementRef) error{Incomplete}!void {
+        const remaining_ns = self.deadline_ns - osutil.nanoTimestamp();
+        if (remaining_ns <= 0) return error.Incomplete;
+        // AX treats zero as the default timeout, not a nonblocking query.
+        const remaining_seconds = @as(f32, @floatFromInt(remaining_ns)) / std.time.ns_per_s;
+        if (c.AXUIElementSetMessagingTimeout(element, @min(self.timeout_seconds, remaining_seconds)) != c.kAXErrorSuccess)
+            return error.Incomplete;
+    }
+
+    fn copyAttribute(self: *const ScanBudget, element: c.AXUIElementRef, attr: c.CFStringRef) error{Incomplete}!c.CFTypeRef {
+        try self.prepare(element);
+        var value: c.CFTypeRef = null;
+        trace.countAx();
+        const err = c.AXUIElementCopyAttributeValue(element, attr, &value);
+        if (err == c.kAXErrorSuccess) return value;
+        if (err == c.kAXErrorAttributeUnsupported or err == c.kAXErrorNoValue) return null;
+        return error.Incomplete;
+    }
+};
 
 /// Number of tabs in a window's native tab bar, or 0 when it has none.
 ///
@@ -336,27 +364,110 @@ pub fn appWindows(pid: i32, out: []AppWindow, timeout_seconds: f32) AppWindowsRe
 /// `SLSCopyAssociatedWindows` returns only the window itself), CG's window
 /// dictionary has no tab key, and `AXWindows` omits background tabs entirely,
 /// so their ids are not reachable at all.
-fn tabCount(win: c.AXUIElementRef, ax: *const AxStrings, timeout_seconds: f32) u32 {
-    var children: c.CFArrayRef = null;
-    trace.countAx();
-    if (c.AXUIElementCopyAttributeValue(win, ax.children_attr, @ptrCast(&children)) != c.kAXErrorSuccess) return 0;
-    const children_ref = children orelse return 0;
-    defer c.CFRelease(@ptrCast(children_ref));
+fn tabCount(win: c.AXUIElementRef, ax: *const AxStrings, budget: *const ScanBudget) error{Incomplete}!u32 {
+    const children: c.CFArrayRef = @ptrCast((try budget.copyAttribute(win, ax.children_attr)) orelse return 0);
+    defer c.CFRelease(@ptrCast(children));
 
-    const count = c.CFArrayGetCount(children_ref);
+    const count = c.CFArrayGetCount(children);
     var index: c.CFIndex = 0;
     while (index < count) : (index += 1) {
-        const child: c.AXUIElementRef = @ptrCast(c.CFArrayGetValueAtIndex(children_ref, index) orelse continue);
-        _ = c.AXUIElementSetMessagingTimeout(child, timeout_seconds);
-
-        const role = copyAttribute(child, ax.role_attr) orelse continue;
+        const child: c.AXUIElementRef = @ptrCast(c.CFArrayGetValueAtIndex(children, index) orelse continue);
+        const role = (try budget.copyAttribute(child, ax.role_attr)) orelse continue;
         defer c.CFRelease(role);
         if (c.CFEqual(role, @ptrCast(ax.tab_group_role)) == 0) continue;
 
-        const tabs: c.CFArrayRef = @ptrCast(copyAttribute(child, ax.tabs_attr) orelse return 0);
+        const tabs: c.CFArrayRef = @ptrCast((try budget.copyAttribute(child, ax.tabs_attr)) orelse return 0);
         defer c.CFRelease(@ptrCast(tabs));
         return @intCast(c.CFArrayGetCount(tabs));
     }
 
     return 0;
+}
+
+test "app window snapshots stop on failure or deadline and distinguish complete results" {
+    // Real CF objects exercise retain/release without requiring a live AX server.
+    // The exported AX fixture exists only in this test, never in the app binary.
+    const Fixture = struct {
+        var windows: c.CFArrayRef = null;
+        var children: c.CFArrayRef = null;
+        var role: c.CFStringRef = null;
+        var role_reads: usize = 0;
+        var fail_roles = false;
+        var fail_ids = false;
+        var role_delay_us: c_uint = 0;
+        var last_timeout: f32 = 0;
+
+        export fn AXUIElementCreateApplication(_: i32) c.AXUIElementRef {
+            return @ptrCast(c.CFRetain(@ptrCast(windows)));
+        }
+
+        export fn AXUIElementSetMessagingTimeout(_: c.AXUIElementRef, seconds: f32) c.AXError {
+            last_timeout = seconds;
+            return c.kAXErrorSuccess;
+        }
+
+        export fn _AXUIElementGetWindow(_: c.AXUIElementRef, wid: *u32) c.AXError {
+            if (fail_ids) return c.kAXErrorCannotComplete;
+            wid.* = 17;
+            return c.kAXErrorSuccess;
+        }
+
+        export fn AXUIElementCopyAttributeValue(_: c.AXUIElementRef, attr: c.CFStringRef, out: *c.CFTypeRef) c.AXError {
+            const attributes = strings().?;
+            const value: c.CFTypeRef = if (c.CFEqual(@ptrCast(attr), @ptrCast(attributes.windows_attr)) != 0)
+                @ptrCast(windows)
+            else if (c.CFEqual(@ptrCast(attr), @ptrCast(attributes.children_attr)) != 0)
+                @ptrCast(children)
+            else if (c.CFEqual(@ptrCast(attr), @ptrCast(attributes.role_attr)) != 0) blk: {
+                role_reads += 1;
+                if (fail_roles) return c.kAXErrorCannotComplete;
+                if (role_delay_us > 0) _ = c.usleep(role_delay_us);
+                break :blk @ptrCast(role);
+            } else return c.kAXErrorAttributeUnsupported;
+            out.* = c.CFRetain(value);
+            return c.kAXErrorSuccess;
+        }
+    };
+    const testing = std.testing;
+    Fixture.role = c.CFStringCreateWithCString(null, "AXButton", c.kCFStringEncodingUTF8).?;
+    defer c.CFRelease(@ptrCast(Fixture.role));
+    var values: [40]?*const anyopaque = @splat(@ptrCast(Fixture.role));
+    Fixture.windows = c.CFArrayCreate(null, @ptrCast(&values), 2, &c.kCFTypeArrayCallBacks).?;
+    defer c.CFRelease(@ptrCast(Fixture.windows));
+    Fixture.children = c.CFArrayCreate(null, @ptrCast(&values), values.len, &c.kCFTypeArrayCallBacks).?;
+    defer c.CFRelease(@ptrCast(Fixture.children));
+    var out: [4]AppWindow = undefined;
+
+    Fixture.fail_roles = true;
+    var result = appWindows(42, &out, 0.25, 1.0);
+    try testing.expect(result.is_incomplete);
+    try testing.expectEqual(@as(usize, 0), result.count);
+    // A timeout is not permission to spend another timeout on every sibling.
+    try testing.expectEqual(@as(usize, 1), Fixture.role_reads);
+
+    Fixture.fail_roles = false;
+    Fixture.fail_ids = true;
+    result = appWindows(42, &out, 0.25, 1.0);
+    try testing.expect(result.is_incomplete);
+    try testing.expectEqual(@as(usize, 0), result.count);
+
+    Fixture.fail_ids = false;
+    Fixture.role_reads = 0;
+    Fixture.role_delay_us = 1000;
+    result = appWindows(42, &out, 0.25, 0.01);
+    try testing.expect(result.is_incomplete);
+    try testing.expect(Fixture.role_reads < values.len);
+    try testing.expect(Fixture.last_timeout > 0 and Fixture.last_timeout <= 0.01);
+
+    Fixture.role_delay_us = 0;
+    Fixture.role_reads = 0;
+    result = appWindows(42, &out, 0.25, 1.0);
+    try testing.expect(!result.is_incomplete and !result.is_truncated);
+    try testing.expectEqual(@as(usize, 2), result.count);
+    try testing.expectEqual(@as(u32, 17), out[0].wid);
+    try testing.expectEqual(@as(u32, 0), out[0].tab_count);
+
+    result = appWindows(42, out[0..1], 0.25, 1.0);
+    try testing.expect(result.is_truncated);
+    try testing.expect(!result.is_incomplete);
 }

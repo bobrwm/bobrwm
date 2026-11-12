@@ -9,6 +9,8 @@ const shim = @import("shim_api.zig");
 
 pub const max_windows = 128;
 const timeout_seconds: f32 = 0.25;
+// Leave room for a busy but responsive app while bounding writer-queue latency.
+const CAPTURE_BUDGET_SECONDS: f32 = 1.0;
 
 /// Why the list was requested, which decides what the main thread does with it.
 pub const Reason = enum(u8) {
@@ -24,6 +26,8 @@ pub const Snapshot = struct {
     count: usize = 0,
     /// The app listed more windows than fit.
     is_truncated: bool = false,
+    /// A failed or budget-limited scan cannot justify tab inference or removal.
+    is_incomplete: bool = true,
     /// Orders captures for eviction when every slot is taken.
     sequence: u64 = 0,
 
@@ -59,12 +63,14 @@ pub fn request(pid: i32, reason: Reason) bool {
     return app_queue.submit(pid, .app_windows);
 }
 
-/// Read and store `pid`'s windows. Runs on the app's queue.
-pub fn capture(pid: i32) void {
+/// Read and store `pid`'s windows. Runs on the app's queue. False when the
+/// budget or an AX failure prevented a complete observation.
+pub fn capture(pid: i32) bool {
     var snapshot: Snapshot = .{ .pid = pid };
-    const result = ax.appWindows(pid, &snapshot.windows, timeout_seconds);
+    const result = ax.appWindows(pid, &snapshot.windows, timeout_seconds, CAPTURE_BUDGET_SECONDS);
     snapshot.count = result.count;
     snapshot.is_truncated = result.is_truncated;
+    snapshot.is_incomplete = result.is_incomplete;
 
     c.os_unfair_lock_lock(&g_lock);
     defer c.os_unfair_lock_unlock(&g_lock);
@@ -81,6 +87,7 @@ pub fn capture(pid: i32) void {
     }
 
     slot.* = snapshot;
+    return !snapshot.is_incomplete;
 }
 
 /// Copy the latest snapshot of `pid` into `out`. False when none is stored.
@@ -157,6 +164,6 @@ fn answerRequest(app: app_queue.App) void {
     const reasons = takeReasons(app.pid);
     if (reasons.count() == 0) return;
 
-    capture(app.pid);
+    _ = capture(app.pid);
     shim.bw_emit_event_detail(shim.BW_EVENT_APP_WINDOWS_OBSERVED, app.pid, 0, encodeReasons(reasons));
 }

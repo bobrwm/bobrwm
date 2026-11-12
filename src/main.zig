@@ -5928,7 +5928,7 @@ fn appWindowSnapshot(
     out: []tab_detect.AppWindow,
 ) BoundedSnapshotResult {
     var count: usize = 0;
-    var truncated = listed.is_truncated;
+    var truncated = listed.is_truncated or listed.is_incomplete;
     for (listed.items()) |listed_window| {
         if (count == out.len) {
             truncated = true;
@@ -6041,15 +6041,18 @@ fn addNewWindowManagedWithAssignment(
         return false;
     };
 
-    defer untrackDeferredWindowCandidate(wid);
-
     // Its focus event may have arrived before it was managed.
     if (isActiveProcess(pid)) focus_query.request(pid, .activated);
 
     // Check if this new on-screen window replaces an existing same-PID window
     // that just went off-screen (i.e. a new tab was created and became active,
     // pushing the old tab to background). If so, form a tab group.
-    if (tryFormTabGroupOnCreate(pid, wid)) return false;
+    const joined = tryFormTabGroupOnCreate(pid, wid) orelse {
+        trackDeferredWindowCandidate(pid, wid, assigned_space);
+        return false;
+    };
+    defer untrackDeferredWindowCandidate(wid);
+    if (joined) return false;
 
     const ws = g_state.space(assigned_space.key) orelse return false;
     const win: window_mod.Window = .{
@@ -6241,40 +6244,40 @@ fn applyTabBarObservation(pid: i32) void {
 
 /// Check whether a window about to be adopted is a native tab of an
 /// already-managed window, and if so hand it the group's slot. True when it
-/// joined a group.
+/// joined a group; null when incomplete facts require another observation.
 ///
 /// Reads the app's window list as captured with the window's readiness answer.
-fn tryFormTabGroupOnCreate(pid: i32, new_wid: u32) bool {
+fn tryFormTabGroupOnCreate(pid: i32, new_wid: u32) ?bool {
     const span = trace.beginWindow("tab detect", pid, new_wid);
     defer _ = span.end();
 
     const new_frame = liveWindowFrame(new_wid) orelse {
         log.debug("tab detect: wid={d} has no live bounds", .{new_wid});
-        return false;
+        return null;
     };
     var listed: app_windows.Snapshot = undefined;
     if (!app_windows.latest(pid, &listed)) {
         log.debug("tab detect: no window list pid={d} wid={d}", .{ pid, new_wid });
-        return false;
+        return null;
     }
     log.debug("tab detect: wid={d} bounds=({d:.0},{d:.0},{d:.0},{d:.0})", .{
         new_wid, new_frame.x, new_frame.y, new_frame.width, new_frame.height,
     });
 
     const on_screen = OnScreenWindows.snapshot();
-    if (on_screen.truncated) return false;
+    if (on_screen.truncated) return null;
     var candidates: [128]tab_detect.Candidate = undefined;
     const candidate_snapshot = tabCandidates(pid, &on_screen, &candidates);
     if (candidate_snapshot.truncated) {
         log.warn("tab detect skipped: managed candidate snapshot truncated pid={d} limit={d}", .{ pid, candidates.len });
-        return false;
+        return null;
     }
 
     var app_facts: [app_windows.max_windows]tab_detect.AppWindow = undefined;
     const app_snapshot = appWindowSnapshot(&listed, &on_screen, &app_facts);
     if (app_snapshot.truncated) {
-        log.warn("tab detect skipped: AX window snapshot truncated pid={d} limit={d}", .{ pid, app_facts.len });
-        return false;
+        log.debug("tab detect skipped: incomplete AX window snapshot pid={d} limit={d}", .{ pid, app_facts.len });
+        return null;
     }
     const has_tab_group = tab_detect.appHasTabGroup(app_facts[0..app_snapshot.count]);
 
@@ -6619,7 +6622,7 @@ fn cleanupOffscreenWindows(pid: i32) bool {
 /// an AX timeout on a busy app cannot make every one of its windows look
 /// dropped at once.
 fn appListsWindow(listed: *const app_windows.Snapshot, wid: u32) bool {
-    if (listed.count == 0 or listed.is_truncated) return true;
+    if (listed.count == 0 or listed.is_truncated or listed.is_incomplete) return true;
     for (listed.items()) |listed_window| {
         if (listed_window.wid == wid) return true;
     }
@@ -7924,4 +7927,9 @@ fn writeWindowJson(
     try json.print("{d:.0}", .{win.frame.height});
     try json.endObject();
     try json.endObject();
+}
+
+test {
+    _ = ax_mod;
+    _ = app_windows;
 }

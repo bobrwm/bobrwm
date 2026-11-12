@@ -609,6 +609,20 @@ pub fn build(b: *std.Build) !void {
 
     const run_app_queue_tests = b.addRunArtifact(app_queue_tests);
 
+    // The fixture supplies AX entry points; CF ownership uses the real framework.
+    const ax_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/ax.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    ax_test_mod.addImport("c", c_mod);
+    ax_test_mod.linkFramework("CoreFoundation", .{});
+    ax_test_mod.addSystemFrameworkPath(.{ .cwd_relative = sdk_frameworks });
+    ax_test_mod.addLibraryPath(.{ .cwd_relative = sdk_lib });
+    const ax_tests = b.addTest(.{ .name = "ax-tests", .root_module = ax_test_mod });
+    const run_ax_tests = b.addRunArtifact(ax_tests);
+
     // window_server.zig queries the live WindowServer through CoreGraphics;
     // its test skips when no session is available.
     const window_server_test_mod = b.createModule(.{
@@ -727,6 +741,7 @@ pub fn build(b: *std.Build) !void {
     test_step.dependOn(&run_trace_tests.step);
     test_step.dependOn(&run_watchdog_tests.step);
     test_step.dependOn(&run_app_queue_tests.step);
+    test_step.dependOn(&run_ax_tests.step);
     test_step.dependOn(&run_window_server_tests.step);
     test_step.dependOn(&run_swipe_tests.step);
     test_step.dependOn(&run_osutil_tests.step);
