@@ -102,6 +102,7 @@ extern fn bw_menubar_set_settings(settings: Settings) void;
 extern fn bw_menubar_set_app_rules(rules: ?[*]const AppRule, count: usize) void;
 extern fn bw_menubar_set_message(message: [*:0]const u8) void;
 extern fn bw_menubar_set_config_status(success: bool, message: [*:0]const u8) void;
+extern fn bw_menubar_set_spaces_warnings(rearranges_automatically: bool, displays_share_spaces: bool) void;
 
 /// Strings handed across the ABI are borrowed for the duration of the call,
 /// but a whole row array is passed at once, so every name and shortcut key in
@@ -268,6 +269,13 @@ pub fn setMessage(message: [*:0]const u8) void {
 pub fn setConfigStatus(success: bool, message: [*:0]const u8) void {
     if (!g_initialized) return;
     bw_menubar_set_config_status(success, message);
+}
+
+/// Show or clear the warnings for Mission Control settings that break
+/// workspace numbering.
+pub fn setSpacesWarnings(rearranges_automatically: bool, displays_share_spaces: bool) void {
+    if (!g_initialized) return;
+    bw_menubar_set_spaces_warnings(rearranges_automatically, displays_share_spaces);
 }
 
 /// The config's key name, or null when unbound.

@@ -22,6 +22,53 @@ struct WorkspaceInfo: Identifiable {
     }
 }
 
+/// Mission Control settings that break workspace numbering, reported by the
+/// core. Both live in Desktop & Dock.
+enum SpacesWarning: CaseIterable, Identifiable {
+    case rearrangesAutomatically
+    case displaysShareSpaces
+
+    var id: Self { self }
+
+    /// Menu section header.
+    var title: String {
+        switch self {
+        case .rearrangesAutomatically: "Spaces Rearrange Automatically"
+        case .displaysShareSpaces: "Displays Share Spaces"
+        }
+    }
+
+    /// Settings and the status item tooltip.
+    var summary: String {
+        switch self {
+        case .rearrangesAutomatically: "Spaces rearrange automatically"
+        case .displaysShareSpaces: "Displays share Spaces"
+        }
+    }
+
+    /// Menu subtitle, one line.
+    var reason: String {
+        switch self {
+        case .rearrangesAutomatically: "Workspace numbers can change when BobrWM restarts."
+        case .displaysShareSpaces: "Turn on \u{201C}Displays have separate Spaces\u{201D}, then log out."
+        }
+    }
+
+    var detail: String {
+        switch self {
+        case .rearrangesAutomatically:
+            "Workspace numbers can change when BobrWM restarts. Turn off \u{201C}Automatically rearrange Spaces based on most recent use\u{201D} in Desktop & Dock."
+        case .displaysShareSpaces:
+            "BobrWM gives each display its own workspaces. Turn on \u{201C}Displays have separate Spaces\u{201D} in Desktop & Dock, then log out."
+        }
+    }
+
+    static func openSettings() {
+        guard let url = URL(string: "x-apple.systempreferences:com.apple.Desktop-Settings.extension") else { return }
+        NSWorkspace.shared.open(url)
+    }
+}
+
 struct WorkspaceRuntimeState {
     let applicationNames: [String]
     let windowCount: UInt32
@@ -185,6 +232,7 @@ final class SettingsModel: ObservableObject {
 
     @Published private(set) var workspaces: [WorkspaceInfo] = []
     @Published private(set) var accessibilityGranted = AXIsProcessTrusted()
+    @Published private(set) var spacesWarnings: [SpacesWarning] = []
     @Published var settings = EditableSettings()
     /// The values the core last confirmed. `settings` differs from this only
     /// while an edit is waiting to be applied or after an apply failed.
@@ -203,9 +251,10 @@ final class SettingsModel: ObservableObject {
         self.configPath = configPath
     }
 
-    init(configPath: String?, accessibilityGranted: Bool) {
+    init(configPath: String?, accessibilityGranted: Bool, spacesWarnings: [SpacesWarning] = []) {
         self.configPath = configPath
         self.accessibilityGranted = accessibilityGranted
+        self.spacesWarnings = spacesWarnings
     }
 
     func setWorkspaces(_ identities: [WorkspaceInfo]) {
@@ -265,6 +314,10 @@ final class SettingsModel: ObservableObject {
         accessibilityGranted = AXIsProcessTrusted()
     }
 
+    func setSpacesWarnings(_ warnings: [SpacesWarning]) {
+        spacesWarnings = warnings
+    }
+
     var diagnostics: String {
         let workspaceSummary = workspaces.map {
             "\($0.id):windows=\($0.windowCount):active=\($0.isActive):focused=\($0.isFocused)"
@@ -272,6 +325,7 @@ final class SettingsModel: ObservableObject {
         return """
         BobrWM \(appVersion)
         Accessibility: \(accessibilityGranted ? "granted" : "required")
+        Spaces warnings: \(spacesWarnings.isEmpty ? "none" : spacesWarnings.map(\.summary).joined(separator: ", "))
         Config: \(configPath == nil ? "built-in defaults" : "config.zon")
         Last reload: \(configStatus.succeeded ? "succeeded" : "failed") — \(configStatus.message)
         Workspaces:
@@ -353,6 +407,10 @@ struct SettingsActions {
             string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility"
         ) else { return }
         NSWorkspace.shared.open(url)
+    }
+
+    func openSpacesSettings() {
+        SpacesWarning.openSettings()
     }
 
     func copyDiagnostics(_ diagnostics: String) {
@@ -592,6 +650,21 @@ private struct GeneralPane: View {
     var body: some View {
         Form {
             ApplyFailureSection(model: model)
+            ForEach(model.spacesWarnings) { warning in
+                Section {
+                    LabeledContent {
+                        Button("Open System Settings…") { actions.openSpacesSettings() }
+                    } label: {
+                        Label {
+                            Text(warning.summary)
+                            Text(warning.detail)
+                        } icon: {
+                            Image(systemName: "exclamationmark.triangle.fill")
+                                .foregroundStyle(.orange)
+                        }
+                    }
+                }
+            }
             Section {
                 Toggle("Start BobrWM at login", isOn: $model.settings.startAtLogin)
             }

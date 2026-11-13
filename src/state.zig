@@ -42,6 +42,7 @@ pub const Epoch = model_mod.Epoch;
 pub const TimestampMs = model_mod.TimestampMs;
 pub const WindowId = model_mod.WindowId;
 pub const FocusEventSource = model_mod.FocusEventSource;
+pub const SpacesSettings = model_mod.SpacesSettings;
 pub const FocusDirection = model_mod.FocusDirection;
 pub const swipe = model_mod.swipe;
 pub const SwipeInput = model_mod.SwipeInput;
@@ -63,6 +64,7 @@ pub const WindowMoveEffect = model_mod.WindowMoveEffect;
 pub const PendingFocus = model_mod.PendingFocus;
 pub const WindowReadiness = model_mod.WindowReadiness;
 pub const WindowCandidate = model_mod.WindowCandidate;
+pub const ReadyWindowCandidate = model_mod.ReadyWindowCandidate;
 pub const ProcessRetry = model_mod.ProcessRetry;
 pub const ProcessIdentity = model_mod.ProcessIdentity;
 pub const DiscoveryQueue = model_mod.DiscoveryQueue;
@@ -200,9 +202,6 @@ pub fn reduce(model: *Model, event: Event) Transition {
         .request_pending_focus => workspace_reducer.reducePendingFocusRequest(&transition),
         .follow_focus_observed => |observation| workspace_reducer.reduceFollowFocusObserved(&transition, observation),
         .track_pending_role_window => |candidate| discovery_reducer.reducePendingRoleTracked(&transition, candidate),
-        .untrack_pending_role_window => |window_id| {
-            _ = transition.model.pending_role_windows.remove(window_id);
-        },
         .pending_role_observed => |observation| discovery_reducer.reducePendingRoleObserved(&transition, observation),
         .track_deferred_window_candidate => |candidate| discovery_reducer.reduceDeferredWindowTracked(&transition, candidate),
         .untrack_deferred_window_candidate => |window_id| {
@@ -234,6 +233,11 @@ pub fn reduce(model: *Model, event: Event) Transition {
         .focus_retry_observed => |observation| discovery_reducer.reduceFocusRetryObserved(&transition, observation),
         .process_observed => |identity| process_reducer.reduceProcessObserved(&transition, identity),
         .process_terminated => |process_id| process_reducer.reduceProcessTerminated(&transition, process_id),
+        .spaces_settings_observed => |settings| reduceSpacesSettingsObserved(&transition, settings),
+        .app_activated => |process_id| {
+            if (process_id > 0) transition.model.active_process_id = process_id;
+        },
+        .activation_focus_observed => |focus| reduceActivationFocusObserved(&transition, focus),
         .display_changed => |change| {
             transition.model.display_resettle_due_at_ms = change.resettle_at_ms;
             transition.model.display_resettle_cause = .display_change;
@@ -293,6 +297,10 @@ pub fn reduce(model: *Model, event: Event) Transition {
         },
         .request_cleanup_process => |process_id| reduceCleanupProcessRequested(&transition, process_id),
         .request_offscreen_cleanup => transition.model.cleanup_request.should_clean_offscreen = true,
+        // The answer can arrive after a workspace transition began.
+        .offscreen_window_list_observed => |process_id| if (!transition.model.isWorkspaceTransitionActive()) {
+            transition.addEffect(.{ .clean_offscreen_windows = process_id });
+        },
         .clear_cleanup_requests => transition.model.cleanup_request = .{},
         .flush_cleanup_requests => {
             const request = transition.model.cleanup_request;
@@ -322,6 +330,31 @@ pub fn reduce(model: *Model, event: Event) Transition {
     if (should_refresh_workspace_focus) workspace_reducer.refreshWorkspaceFocus(transition.model);
     invariants.assertModel(transition.model);
     return transition;
+}
+
+/// Each app answers on its own queue, so an earlier activation's answer can
+/// arrive after a later activation.
+fn reduceActivationFocusObserved(transition: *Transition, focus: @FieldType(Event, "activation_focus_observed")) void {
+    const active_process_id = transition.model.active_process_id;
+    if (active_process_id == null or active_process_id.? != focus.process_id) {
+        transition.addEffect(.{ .activation_focus_stale = .{
+            .process_id = focus.process_id,
+            .active_process_id = active_process_id,
+        } });
+        return;
+    }
+    transition.addEffect(.{ .activation_focus_accepted = .{
+        .process_id = focus.process_id,
+        .window_id = focus.window_id,
+    } });
+}
+
+fn reduceSpacesSettingsObserved(transition: *Transition, settings: SpacesSettings) void {
+    if (transition.model.spaces_settings) |current| {
+        if (std.meta.eql(current, settings)) return;
+    }
+    transition.model.spaces_settings = settings;
+    transition.addEffect(.{ .spaces_settings_changed = settings });
 }
 
 fn reduceCleanupProcessRequested(transition: *Transition, process_id: i32) void {
@@ -489,6 +522,27 @@ test "workspace summaries preserve globally unique active workspaces" {
     try testing.expectEqual(@as(u32, 1), summaries[1].window_count);
     try testing.expect(summaries[1].is_active);
     try testing.expect(summaries[1].is_focused);
+}
+
+test "adoption fills empty workspace focus without replacing it" {
+    const testing = std.testing;
+    var catalog: SpaceCatalog = .{};
+    catalog.add(.{ .key = .{ .id = 101 }, .workspace_id = 1, .display_id = 11 });
+    var model = reduceCopy(.{}, .{ .replace_space_catalog = &catalog }).model;
+
+    model = reduceCopy(model, .{ .adopt_window = .{
+        .window_id = 101,
+        .process_id = 1001,
+        .space_key = .{ .id = 101 },
+    } }).model;
+    try testing.expectEqual(@as(?WindowId, 101), model.focusedWorkspaceWindow(1));
+
+    model = reduceCopy(model, .{ .adopt_window = .{
+        .window_id = 102,
+        .process_id = 1002,
+        .space_key = .{ .id = 101 },
+    } }).model;
+    try testing.expectEqual(@as(?WindowId, 101), model.focusedWorkspaceWindow(1));
 }
 
 test "workspace process ids are deduplicated and exclude suppressed windows" {
@@ -1680,6 +1734,25 @@ test "workspace and focused display are reducer owned" {
     try testing.expectEqual(@as(u8, 0), transition.effect_count);
 }
 
+test "off-screen cleanup waits out a workspace transition" {
+    const testing = std.testing;
+    var catalog: SpaceCatalog = .{};
+    catalog.add(.{ .key = .{ .id = 1 }, .workspace_id = 1, .display_id = 11 });
+    catalog.add(.{ .key = .{ .id = 2 }, .workspace_id = 2, .display_id = 11 });
+    const model = reduceCopy(.{}, .{ .replace_space_catalog = &catalog }).model;
+
+    var transition = reduceCopy(model, .{ .offscreen_window_list_observed = 42 });
+    try testing.expectEqual(@as(i32, 42), transition.effects[0].clean_offscreen_windows);
+
+    const switching = reduceCopy(model, .{ .start_workspace_transition = .{
+        .kind = .switch_workspace,
+        .target = model.space(.{ .id = 2 }).?,
+        .at_ms = 100,
+    } }).model;
+    transition = reduceCopy(switching, .{ .offscreen_window_list_observed = 42 });
+    try testing.expectEqual(@as(u8, 0), transition.effect_count);
+}
+
 test "workspace transition settles from explicit focus and time events" {
     const testing = std.testing;
     var catalog: SpaceCatalog = .{};
@@ -1870,6 +1943,7 @@ test "deferred follow focus leaves the model with transition settlement" {
         .target = model.space(.{ .id = 2 }).?,
         .at_ms = 100,
     } }).model;
+    model = reduceCopy(model, .{ .app_activated = 10 }).model;
     const epoch = model.workspace_transition.?.epoch;
 
     var transition = reduceCopy(model, followFocusObservation(&model, .{ .id = 1 }, false));
@@ -1897,6 +1971,7 @@ test "native switch ignores follow focus until Space observation" {
     const testing = std.testing;
     var model = initializedModel(testTopology(101, null));
     model = reduceCopy(model, switchRequest(&model, 1, 2, 100)).model;
+    model = reduceCopy(model, .{ .app_activated = 10 }).model;
     const transition = reduceCopy(model, followFocusObservation(&model, .{ .id = 101 }, false));
 
     try testing.expect(!transition.model.hasDeferredFollowFocus());
@@ -1905,13 +1980,71 @@ test "native switch ignores follow focus until Space observation" {
 
 test "hidden focus without a transition requests a workspace switch" {
     const testing = std.testing;
-    const model = initializedModel(testTopology(101, null));
+    const model = reduceCopy(initializedModel(testTopology(101, null)), .{ .app_activated = 10 }).model;
     const transition = reduceCopy(model, followFocusObservation(&model, .{ .id = 102 }, false));
 
     try testing.expect(transition.model.pending_switch.?.request.target.key.eql(.{ .id = 102 }));
     try testing.expectEqual(std.meta.Tag(Effect).workspace_transition_started, std.meta.activeTag(transition.effects[0]));
     try testing.expectEqual(std.meta.Tag(Effect).observe_native_topology, std.meta.activeTag(transition.effects[1]));
     try testing.expect(!transition.model.hasDeferredFollowFocus());
+}
+
+test "activation focus is accepted only from the active app" {
+    const testing = std.testing;
+    var transition = reduceCopy(.{}, .{ .activation_focus_observed = .{ .process_id = 10, .window_id = 40 } });
+    try testing.expectEqual(@as(?i32, null), transition.effects[0].activation_focus_stale.active_process_id);
+
+    var model = reduceCopy(.{}, .{ .app_activated = 10 }).model;
+    model = reduceCopy(model, .{ .app_activated = 11 }).model;
+    model = reduceCopy(model, .{ .app_activated = 0 }).model;
+    try testing.expectEqual(@as(?i32, 11), model.active_process_id);
+
+    transition = reduceCopy(model, .{ .activation_focus_observed = .{ .process_id = 10, .window_id = 40 } });
+    try testing.expectEqual(@as(u8, 1), transition.effect_count);
+    try testing.expectEqual(@as(?i32, 11), transition.effects[0].activation_focus_stale.active_process_id);
+
+    transition = reduceCopy(model, .{ .activation_focus_observed = .{ .process_id = 11, .window_id = 0 } });
+    try testing.expectEqual(@as(u8, 1), transition.effect_count);
+    try testing.expectEqual(@as(WindowId, 0), transition.effects[0].activation_focus_accepted.window_id);
+}
+
+test "Spaces settings report their first reading and each change" {
+    const testing = std.testing;
+    const defaults: SpacesSettings = .{ .rearranges_automatically = true, .displays_share_spaces = false };
+    var transition = reduceCopy(.{}, .{ .spaces_settings_observed = defaults });
+    try testing.expectEqual(@as(?SpacesSettings, defaults), transition.model.spaces_settings);
+    try testing.expectEqual(@as(u8, 1), transition.effect_count);
+    try testing.expectEqual(defaults, transition.effects[0].spaces_settings_changed);
+
+    transition = reduceCopy(transition.model, .{ .spaces_settings_observed = defaults });
+    try testing.expectEqual(@as(u8, 0), transition.effect_count);
+
+    const shared: SpacesSettings = .{ .rearranges_automatically = true, .displays_share_spaces = true };
+    transition = reduceCopy(transition.model, .{ .spaces_settings_observed = shared });
+    try testing.expectEqual(@as(u8, 1), transition.effect_count);
+    try testing.expectEqual(shared, transition.effects[0].spaces_settings_changed);
+}
+
+test "hidden AX focus from an inactive app does not switch workspace" {
+    const testing = std.testing;
+    const model = reduceCopy(initializedModel(testTopology(101, null)), .{ .app_activated = 11 }).model;
+    const transition = reduceCopy(model, followFocusObservation(&model, .{ .id = 102 }, false));
+
+    try testing.expect(transition.model.pending_switch == null);
+    try testing.expect(!transition.model.hasDeferredFollowFocus());
+    try testing.expectEqual(@as(usize, 1), transition.effect_count);
+    try testing.expectEqual(std.meta.Tag(Effect).follow_focus_ignored_inactive_app, std.meta.activeTag(transition.effects[0]));
+}
+
+test "hidden focus from user input switches workspace for an inactive app" {
+    const testing = std.testing;
+    const model = reduceCopy(initializedModel(testTopology(101, null)), .{ .app_activated = 11 }).model;
+    var event = followFocusObservation(&model, .{ .id = 102 }, false);
+    event.follow_focus_observed.source = .keyboard;
+    const transition = reduceCopy(model, event);
+
+    try testing.expect(transition.model.pending_switch.?.request.target.key.eql(.{ .id = 102 }));
+    try testing.expectEqual(std.meta.Tag(Effect).workspace_transition_started, std.meta.activeTag(transition.effects[0]));
 }
 
 test "native window move retries then requests rollback" {
@@ -2543,10 +2676,13 @@ test "window discovery retries are reducer owned" {
         .attempts_remaining = 1,
     };
 
-    model = reduceCopy(model, .{ .track_pending_role_window = candidate }).model;
-    var transition = reduceCopy(model, .{ .pending_role_observed = .{
+    var transition = reduceCopy(model, .{ .track_pending_role_window = candidate });
+    try testing.expectEqual(candidate, transition.effects[0].request_pending_role_readiness);
+    model = transition.model;
+    transition = reduceCopy(model, .{ .pending_role_observed = .{
         .window_id = candidate.window_id,
         .readiness = .pending,
+        .is_resizable = true,
     } });
     try testing.expectEqual(@as(u8, 0), transition.effect_count);
     try testing.expectEqual(@as(u8, 0), transition.model.pending_role_windows.get(candidate.window_id).?.attempts_remaining);
@@ -2554,6 +2690,7 @@ test "window discovery retries are reducer owned" {
     transition = reduceCopy(transition.model, .{ .pending_role_observed = .{
         .window_id = candidate.window_id,
         .readiness = .pending,
+        .is_resizable = true,
     } });
     try testing.expectEqual(@as(?WindowCandidate, null), transition.model.pending_role_windows.get(candidate.window_id));
     try testing.expectEqual(std.meta.Tag(Effect).pending_role_expired, std.meta.activeTag(transition.effects[0]));
@@ -2563,9 +2700,10 @@ test "window discovery retries are reducer owned" {
         .window_id = candidate.window_id,
         .readiness = .ready,
         .is_visible = true,
+        .is_resizable = false,
     } });
     try testing.expect(transition.model.hasDeferredWindowCandidate(candidate.window_id));
-    try testing.expectEqual(std.meta.Tag(Effect).deferred_window_ready, std.meta.activeTag(transition.effects[0]));
+    try testing.expect(!transition.effects[0].deferred_window_ready.is_resizable);
 
     transition = reduceCopy(transition.model, .{ .deferred_window_promotion_failed = candidate.window_id });
     try testing.expectEqual(@as(u8, 0), transition.model.deferred_window_candidates.get(candidate.window_id).?.attempts_remaining);

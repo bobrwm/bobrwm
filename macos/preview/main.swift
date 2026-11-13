@@ -41,12 +41,14 @@ final class PreviewMenuActions: NSObject, StatusMenuActions {
     func openConfig(_ sender: NSMenuItem) {}
     func showAbout(_ sender: NSMenuItem) {}
     func showSettings(_ sender: NSMenuItem) {}
+    func openSpacesSettings(_ sender: NSMenuItem) {}
     func quit(_ sender: NSMenuItem) {}
 }
 
 /// Display order can differ from numeric workspace order.
-func makeStatusModel() -> StatusModel {
+func makeStatusModel(isSpacesWarningShown: Bool = false) -> StatusModel {
     let model = StatusModel()
+    model.isSpacesWarningShown = isSpacesWarningShown
     model.chips = makeSettingsModel(accessibilityGranted: true).workspaces
         .filter(\.isActive)
         .reversed()
@@ -76,7 +78,11 @@ struct StatusPreview: View {
 
 // `popUp` blocks until `cancelTracking`, so the capture runs from a timer.
 @MainActor
-func renderMenu(path: String, appearance: NSAppearance.Name) -> Bool {
+func renderMenu(
+    path: String,
+    appearance: NSAppearance.Name,
+    spacesWarnings: [SpacesWarning] = []
+) -> Bool {
     let model = makeSettingsModel(accessibilityGranted: true)
     let actions = PreviewMenuActions()
     let statusMenu = StatusMenu()
@@ -84,6 +90,9 @@ func renderMenu(path: String, appearance: NSAppearance.Name) -> Bool {
         workspaces: model.workspaces,
         target: actions
     )
+    statusMenu.setSpacesWarnings(spacesWarnings, target: actions)
+    // The first warning's row, or the first workspace row of the plain menu.
+    let highlightIndex = spacesWarnings.isEmpty ? 3 : 1
     NSApplication.shared.appearance = NSAppearance(named: appearance)
 
     // The menu window can take a few ticks to appear.
@@ -107,8 +116,8 @@ func renderMenu(path: String, appearance: NSAppearance.Name) -> Bool {
     // Private API, but this harness never ships.
     let highlight = Timer(timeInterval: 0.15, repeats: false) { _ in
         let selector = Selector(("highlightItem:"))
-        guard statusMenu.menu.responds(to: selector), statusMenu.menu.items.count > 3 else { return }
-        statusMenu.menu.perform(selector, with: statusMenu.menu.items[3])
+        guard statusMenu.menu.responds(to: selector), statusMenu.menu.items.count > highlightIndex else { return }
+        statusMenu.menu.perform(selector, with: statusMenu.menu.items[highlightIndex])
     }
     RunLoop.main.add(highlight, forMode: .common)
     RunLoop.main.add(capture, forMode: .common)
@@ -132,10 +141,14 @@ func renderMenu(path: String, appearance: NSAppearance.Name) -> Bool {
     }
 }
 
-func makeSettingsModel(accessibilityGranted: Bool) -> SettingsModel {
+func makeSettingsModel(
+    accessibilityGranted: Bool,
+    spacesWarnings: [SpacesWarning] = []
+) -> SettingsModel {
     let model = SettingsModel(
         configPath: "/Users/example/.config/bobrwm/config.zon",
-        accessibilityGranted: accessibilityGranted
+        accessibilityGranted: accessibilityGranted,
+        spacesWarnings: spacesWarnings
     )
     model.setWorkspaces(samples.map {
         WorkspaceInfo(id: $0.id, name: $0.name, shortcut: $0.shortcut)
@@ -316,7 +329,25 @@ func renderAll(into directory: String) -> Bool {
             path: "\(directory)/status-\(suffix).png",
             appearance: appearance
         ) && ok
+        ok = render(
+            StatusPreview(statusModel: makeStatusModel(isSpacesWarningShown: true), scheme: scheme)
+                .environment(\.colorScheme, scheme),
+            path: "\(directory)/status-spaces-warning-\(suffix).png",
+            appearance: appearance
+        ) && ok
         ok = renderMenu(path: "\(directory)/menu-\(suffix).png", appearance: appearance) && ok
+        ok = renderMenu(
+            path: "\(directory)/menu-spaces-warning-\(suffix).png",
+            appearance: appearance,
+            spacesWarnings: SpacesWarning.allCases
+        ) && ok
+        ok = renderPane(
+            .general,
+            model: makeSettingsModel(accessibilityGranted: true, spacesWarnings: SpacesWarning.allCases),
+            path: "\(directory)/settings-spaces-warning-\(suffix).png",
+            scheme: scheme,
+            appearance: appearance
+        ) && ok
         for pane in SettingsPane.allCases {
             ok = renderPane(
                 pane,

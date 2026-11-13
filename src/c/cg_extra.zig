@@ -124,6 +124,7 @@ pub extern fn CGGetDisplaysWithPoint(
 pub extern const kCGWindowNumber: c.CFStringRef;
 pub extern const kCGWindowLayer: c.CFStringRef;
 pub extern const kCGWindowOwnerPID: c.CFStringRef;
+pub extern const kCGWindowOwnerName: c.CFStringRef;
 pub extern const kCGWindowBounds: c.CFStringRef;
 pub extern const kCGWindowAlpha: c.CFStringRef;
 pub extern const kCGWindowIsOnscreen: c.CFStringRef;

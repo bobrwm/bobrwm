@@ -89,6 +89,15 @@ pub const DeferredFollowFocus = struct {
     transition_epoch: Epoch,
 };
 
+/// Mission Control settings that break workspace numbering when they differ
+/// from what BobrWM expects.
+pub const SpacesSettings = struct {
+    /// "Automatically rearrange Spaces based on most recent use".
+    rearranges_automatically: bool,
+    /// "Displays have separate Spaces" turned off.
+    displays_share_spaces: bool,
+};
+
 pub const FollowFocusObservation = struct {
     process_id: i32,
     window_id: WindowId,
@@ -414,6 +423,12 @@ pub const WindowCandidate = struct {
     attempts_remaining: u8,
 };
 
+/// A candidate its app reported ready to tile.
+pub const ReadyWindowCandidate = struct {
+    candidate: WindowCandidate,
+    is_resizable: bool,
+};
+
 pub const WindowCandidates = struct {
     entries: [max_pending_window_candidates]WindowCandidate = undefined,
     count: u16 = 0,
@@ -737,6 +752,10 @@ pub const Model = struct {
     pointer_drag: PointerDragState = .{},
     drag_preview: DragPreviewState = .{},
     menu_tracking: ?MenuTracking = null,
+    /// Null until first read.
+    spaces_settings: ?SpacesSettings = null,
+    /// The app macOS last reported activated; null until the first report.
+    active_process_id: ?i32 = null,
     swipe: swipe.State = .{},
     retile_request: RetileRequest = .{},
     cleanup_request: CleanupRequest = .{},
@@ -1107,10 +1126,11 @@ pub const Event = union(enum) {
     request_pending_focus,
     follow_focus_observed: FollowFocusObservation,
     track_pending_role_window: WindowCandidate,
-    untrack_pending_role_window: WindowId,
     pending_role_observed: struct {
         window_id: WindowId,
         readiness: WindowReadiness,
+        /// Meaningful only when ready.
+        is_resizable: bool,
     },
     track_deferred_window_candidate: WindowCandidate,
     untrack_deferred_window_candidate: WindowId,
@@ -1118,6 +1138,8 @@ pub const Event = union(enum) {
         window_id: WindowId,
         readiness: WindowReadiness,
         is_visible: bool,
+        /// Meaningful only when ready.
+        is_resizable: bool,
     },
     deferred_window_promotion_failed: WindowId,
     // The window is gone, so neither candidate queue can promote it.
@@ -1193,11 +1215,20 @@ pub const Event = union(enum) {
         is_open: bool,
     },
     process_terminated: i32,
+    spaces_settings_observed: SpacesSettings,
+    app_activated: i32,
+    /// An activated app's focused window; 0 when it reported none.
+    activation_focus_observed: struct {
+        process_id: i32,
+        window_id: WindowId,
+    },
     request_retile_all_displays,
     request_retile_display: DisplayId,
     flush_retile_requests,
     request_cleanup_process: i32,
     request_offscreen_cleanup,
+    /// An app's window list arrived for an off-screen cleanup.
+    offscreen_window_list_observed: i32,
     clear_cleanup_requests,
     flush_cleanup_requests,
     rebuild_layout: *const LayoutRebuild,
@@ -1227,6 +1258,18 @@ pub const WindowCatalogRejectionReason = enum {
 };
 
 pub const Effect = union(enum) {
+    /// A Mission Control setting changed or was read for the first time.
+    spaces_settings_changed: SpacesSettings,
+    /// The answer belongs to the active app; window 0 means it reported none.
+    activation_focus_accepted: struct {
+        process_id: i32,
+        window_id: WindowId,
+    },
+    /// An earlier activation's answer arrived after a later activation.
+    activation_focus_stale: struct {
+        process_id: i32,
+        active_process_id: ?i32,
+    },
     cancel_native_gesture: native_gesture.Direction,
     post_native_gesture: struct { epoch: Epoch, phase: native_gesture.Phase, direction: native_gesture.Direction, velocity: f64 },
     schedule_native_gesture: Epoch,
@@ -1297,9 +1340,12 @@ pub const Effect = union(enum) {
         observation: FollowFocusObservation,
         transition: WorkspaceTransition,
     },
-    pending_role_ready: WindowCandidate,
+    follow_focus_ignored_inactive_app: FollowFocusObservation,
+    /// Ask the candidate's app whether the window is ready.
+    request_pending_role_readiness: WindowCandidate,
+    pending_role_ready: ReadyWindowCandidate,
     pending_role_expired: WindowCandidate,
-    deferred_window_ready: WindowCandidate,
+    deferred_window_ready: ReadyWindowCandidate,
     deferred_window_expired: struct {
         candidate: WindowCandidate,
         reason: DeferredWindowExpiryReason,
@@ -1331,6 +1377,7 @@ pub const Effect = union(enum) {
     cancel_mouse_focus,
     retile_requested: RetileRequest,
     cleanup_requested: CleanupRequest,
+    clean_offscreen_windows: i32,
     cleanup_request_overflow: i32,
     geometry: geometry_mod.Effect,
     layout: tiling_mod.Effect,

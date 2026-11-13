@@ -20,7 +20,9 @@ pub fn reducePendingRoleTracked(transition: *Transition, candidate: WindowCandid
     }
     if (!transition.model.pending_role_windows.track(candidate, true)) {
         transition.addEffect(.{ .discovery_queue_full = .pending_role_windows });
+        return;
     }
+    transition.addEffect(.{ .request_pending_role_readiness = candidate });
 }
 
 pub fn reducePendingRoleObserved(
@@ -37,7 +39,10 @@ pub fn reducePendingRoleObserved(
         .reject => _ = transition.model.pending_role_windows.remove(observation.window_id),
         .ready => {
             const ready = transition.model.pending_role_windows.remove(observation.window_id).?;
-            transition.addEffect(.{ .pending_role_ready = ready });
+            transition.addEffect(.{ .pending_role_ready = .{
+                .candidate = ready,
+                .is_resizable = observation.is_resizable,
+            } });
         },
         .pending => {
             if (candidate.attempts_remaining > 0) {
@@ -79,7 +84,10 @@ pub fn reduceDeferredWindowObserved(
                 expireOrDecrementDeferredWindow(transition, candidate, .off_screen);
                 return;
             }
-            transition.addEffect(.{ .deferred_window_ready = candidate.* });
+            transition.addEffect(.{ .deferred_window_ready = .{
+                .candidate = candidate.*,
+                .is_resizable = observation.is_resizable,
+            } });
         },
     }
 }

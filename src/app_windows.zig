@@ -1,0 +1,216 @@
+//! An app's AX window list with each window's native tab count, read on the
+//! app's queue. Tab decisions on the main thread read the latest snapshot.
+
+const std = @import("std");
+const c = @import("c");
+const app_queue = @import("app_queue.zig");
+const ax = @import("ax.zig");
+const shim = @import("shim_api.zig");
+
+pub const max_windows = 128;
+const timeout_seconds: f32 = 0.25;
+// Leave room for a busy but responsive app while bounding writer-queue latency.
+const CAPTURE_BUDGET_SECONDS: f32 = 1.0;
+
+/// Why the list was requested, which decides what the main thread does with it.
+pub const Reason = enum(u8) {
+    tab_bar,
+    offscreen_cleanup,
+    /// A membership-only cleanup found a possible background tab or ghost.
+    offscreen_tabs,
+};
+
+pub const Reasons = std.EnumSet(Reason);
+
+pub const Snapshot = struct {
+    pid: i32 = 0,
+    windows: [max_windows]ax.AppWindow = undefined,
+    count: usize = 0,
+    details: ax.AppWindowDetails = .membership,
+    /// The app listed more windows than fit.
+    is_truncated: bool = false,
+    /// A failed or budget-limited scan cannot justify tab inference or removal.
+    is_incomplete: bool = true,
+    /// Orders captures for eviction when every slot is taken.
+    sequence: u64 = 0,
+
+    pub fn items(self: *const Snapshot) []const ax.AppWindow {
+        return self.windows[0..self.count];
+    }
+
+    /// Unknown membership must not turn a slow app's windows into ghosts.
+    pub fn listsWindow(self: *const Snapshot, wid: u32) bool {
+        if (self.is_incomplete or self.is_truncated) return true;
+        for (self.items()) |window| {
+            if (window.wid == wid) return true;
+        }
+        return false;
+    }
+
+    /// Tab inference needs only the captured bar counts, not fresh bounds for
+    /// every app window. Null leaves the decision for a complete observation.
+    pub fn hasTabGroup(self: *const Snapshot) ?bool {
+        if (self.details != .tabs or self.is_incomplete or self.is_truncated) return null;
+        for (self.items()) |window| {
+            if (window.tab_count > 1) return true;
+        }
+        return false;
+    }
+};
+
+const PendingReasons = struct {
+    pid: i32 = 0,
+    reasons: Reasons = .empty,
+};
+
+var g_lock: c.os_unfair_lock = .{};
+// One per app: a cleanup asks every app with a visible window at once, and a
+// snapshot evicted before its answer is applied would skip that app.
+var g_snapshots: [app_queue.max_apps]Snapshot = @splat(.{});
+var g_sequence: u64 = 0;
+var g_pending: [app_queue.max_apps]PendingReasons = @splat(.{});
+
+/// Main thread, before the first request.
+pub fn init() void {
+    _ = ax.strings();
+    app_queue.setHandler(.app_windows, answerRequest);
+}
+
+/// Capture `pid`'s windows on its queue and publish `app_windows_observed`
+/// with every reason asked for since the last answer. False when nothing was
+/// queued, so no answer will come.
+pub fn request(pid: i32, reason: Reason) bool {
+    std.debug.assert(pid > 0);
+    if (!addReason(pid, reason)) return false;
+    return app_queue.submit(pid, .app_windows);
+}
+
+/// Read and store `pid`'s windows. Runs on the app's queue. False when the
+/// budget or an AX failure prevented a complete observation.
+pub fn capture(pid: i32, details: ax.AppWindowDetails) bool {
+    var snapshot: Snapshot = .{ .pid = pid, .details = details };
+    const result = ax.appWindows(pid, &snapshot.windows, details, timeout_seconds, CAPTURE_BUDGET_SECONDS);
+    snapshot.count = result.count;
+    snapshot.is_truncated = result.is_truncated;
+    snapshot.is_incomplete = result.is_incomplete;
+
+    c.os_unfair_lock_lock(&g_lock);
+    defer c.os_unfair_lock_unlock(&g_lock);
+
+    g_sequence += 1;
+    snapshot.sequence = g_sequence;
+    var slot = &g_snapshots[0];
+    for (&g_snapshots) |*stored| {
+        if (stored.pid == pid) {
+            slot = stored;
+            break;
+        }
+        if (stored.sequence < slot.sequence) slot = stored;
+    }
+
+    slot.* = snapshot;
+    return !snapshot.is_incomplete;
+}
+
+/// Copy the latest snapshot of `pid` into `out`. False when none is stored.
+pub fn latest(pid: i32, out: *Snapshot) bool {
+    c.os_unfair_lock_lock(&g_lock);
+    defer c.os_unfair_lock_unlock(&g_lock);
+
+    for (&g_snapshots) |*stored| {
+        if (stored.pid != pid) continue;
+        out.* = stored.*;
+        return true;
+    }
+
+    return false;
+}
+
+/// Drop an ended process's snapshot; a later process may reuse the PID.
+pub fn forgetApp(pid: i32) void {
+    c.os_unfair_lock_lock(&g_lock);
+    defer c.os_unfair_lock_unlock(&g_lock);
+
+    for (&g_snapshots) |*stored| {
+        if (stored.pid == pid) stored.* = .{};
+    }
+
+    for (&g_pending) |*pending| {
+        if (pending.pid == pid) pending.* = .{};
+    }
+}
+
+/// Pack reasons into an event's detail byte.
+pub fn encodeReasons(reasons: Reasons) u8 {
+    return @intCast(reasons.bits.mask);
+}
+
+/// Unpack reasons from an event's detail byte.
+pub fn decodeReasons(detail: u8) Reasons {
+    return .{ .bits = .{ .mask = @truncate(detail) } };
+}
+
+fn addReason(pid: i32, reason: Reason) bool {
+    c.os_unfair_lock_lock(&g_lock);
+    defer c.os_unfair_lock_unlock(&g_lock);
+
+    var free: ?*PendingReasons = null;
+    for (&g_pending) |*pending| {
+        if (pending.pid == pid) {
+            pending.reasons.insert(reason);
+            return true;
+        }
+        if (free == null and pending.pid == 0) free = pending;
+    }
+
+    const slot = free orelse return false;
+    slot.* = .{ .pid = pid, .reasons = .initOne(reason) };
+    return true;
+}
+
+fn takeReasons(pid: i32) Reasons {
+    c.os_unfair_lock_lock(&g_lock);
+    defer c.os_unfair_lock_unlock(&g_lock);
+
+    for (&g_pending) |*pending| {
+        if (pending.pid != pid) continue;
+        const reasons = pending.reasons;
+        pending.* = .{};
+        return reasons;
+    }
+
+    return .empty;
+}
+
+fn answerRequest(app: app_queue.App) void {
+    const reasons = takeReasons(app.pid);
+    if (reasons.count() == 0) return;
+
+    const details: ax.AppWindowDetails = if (reasons.contains(.tab_bar) or reasons.contains(.offscreen_tabs)) .tabs else .membership;
+    _ = capture(app.pid, details);
+    shim.bw_emit_event_detail(shim.BW_EVENT_APP_WINDOWS_OBSERVED, app.pid, 0, encodeReasons(reasons));
+}
+
+test "captured tab bars distinguish standalone apps from incomplete observations" {
+    const testing = std.testing;
+    var snapshot: Snapshot = .{ .count = 2, .details = .tabs, .is_incomplete = false };
+    snapshot.windows[0] = .{ .wid = 17, .tab_count = 0 };
+    snapshot.windows[1] = .{ .wid = 29, .tab_count = 1 };
+    try testing.expectEqual(@as(?bool, false), snapshot.hasTabGroup());
+    try testing.expect(snapshot.listsWindow(17));
+    try testing.expect(!snapshot.listsWindow(41));
+
+    snapshot.windows[1].tab_count = 3;
+    try testing.expectEqual(@as(?bool, true), snapshot.hasTabGroup());
+    snapshot.is_incomplete = true;
+    try testing.expectEqual(@as(?bool, null), snapshot.hasTabGroup());
+    try testing.expect(snapshot.listsWindow(41));
+    snapshot.is_incomplete = false;
+    snapshot.is_truncated = true;
+    try testing.expectEqual(@as(?bool, null), snapshot.hasTabGroup());
+    snapshot.is_truncated = false;
+    snapshot.details = .membership;
+    try testing.expectEqual(@as(?bool, null), snapshot.hasTabGroup());
+    snapshot.count = 0;
+    try testing.expect(!snapshot.listsWindow(17));
+}

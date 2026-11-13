@@ -28,6 +28,7 @@ const FindWindowAndOwnerFn = *const fn (
 const DockSwipeDirection = native_gesture.Direction;
 const DockSwipePhase = native_gesture.Phase;
 const ManagedDisplayIsAnimatingFn = *const fn (c_int, c.CFStringRef) callconv(.c) bool;
+const GetSpaceManagementModeFn = *const fn (c_int) callconv(.c) c_int;
 
 const NativeSpaceSwitchPlan = struct {
     direction: DockSwipeDirection,
@@ -79,6 +80,7 @@ pub const SkyLight = struct {
     postEventRecordTo: ?PostEventRecordFn,
     copyManagedDisplaySpaces: ?CopyManagedDisplaySpacesFn,
     managedDisplayIsAnimating: ?ManagedDisplayIsAnimatingFn,
+    getSpaceManagementMode: ?GetSpaceManagementModeFn,
     copySpacesForWindows: ?CopySpacesForWindowsFn,
     moveWindowsToManagedSpace: ?MoveWindowsToManagedSpaceFn,
     bridgedSpaceCreateClass: ?objc.Class,
@@ -155,6 +157,7 @@ pub const SkyLight = struct {
             .postEventRecordTo = post_event,
             .copyManagedDisplaySpaces = copy_managed_display_spaces,
             .managedDisplayIsAnimating = lib.lookup(ManagedDisplayIsAnimatingFn, "SLSManagedDisplayIsAnimating"),
+            .getSpaceManagementMode = lib.lookup(GetSpaceManagementModeFn, "SLSGetSpaceManagementMode"),
             .copySpacesForWindows = copy_spaces_for_windows,
             .moveWindowsToManagedSpace = move_windows_to_managed_space,
             .bridgedSpaceCreateClass = bridged_space_create_class,
@@ -165,6 +168,18 @@ pub const SkyLight = struct {
             .bridgedMoveClass = bridged_move_class,
             .bridgedMoveSelectorSupported = bridged_move_selector_supported,
             .nativeSpacesSupported = native_spaces_supported,
+        };
+    }
+
+    /// Whether the running session gives each display its own Spaces. The
+    /// "Displays have separate Spaces" preference only applies after logging
+    /// out, so this can differ from it. Null when the mode is unavailable.
+    pub fn displaysHaveSeparateSpaces(self: *const SkyLight) ?bool {
+        const get_mode = self.getSpaceManagementMode orelse return null;
+        return switch (get_mode(self.mainConnectionID())) {
+            0 => false,
+            1 => true,
+            else => null,
         };
     }
 

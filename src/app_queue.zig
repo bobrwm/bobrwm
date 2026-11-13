@@ -29,6 +29,8 @@ pub const Job = enum {
     scan,
     /// window_readiness: answer readiness requests.
     readiness,
+    /// app_windows: read the app's window list and tab counts.
+    app_windows,
 };
 
 /// One app process as seen by a job. `index` names the app's slot until the

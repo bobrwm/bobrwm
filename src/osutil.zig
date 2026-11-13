@@ -276,6 +276,88 @@ pub fn appBundleId(pid: i32, buf: []u8) ?[]const u8 {
     return buf[0..copy_len];
 }
 
+/// Whether the process is a regular app, one with a Dock icon. Helpers,
+/// agents, and background processes are not tiled. An app can change its
+/// policy at runtime, so callers ask again rather than keep the answer.
+/// Safe off the main thread.
+pub fn isRegularApp(pid: i32) bool {
+    std.debug.assert(pid > 0);
+
+    const objc = @import("objc");
+    const pool = objc.AutoreleasePool.init();
+    defer pool.deinit();
+
+    const NSRunningApplication = objc.getClass("NSRunningApplication") orelse return false;
+    const app = NSRunningApplication.msgSend(objc.Object, "runningApplicationWithProcessIdentifier:", .{pid});
+    if (app.value == null) return false;
+
+    // NSApplicationActivationPolicyRegular == 0.
+    return app.msgSend(i64, "activationPolicy", .{}) == 0;
+}
+
+/// Bundle identifiers of processes, keyed by PID and start time so a reused
+/// PID never reads the previous process's identifier. An identifier is
+/// fixed for a process's lifetime, so entries leave only when the process
+/// ends.
+pub const BundleIdCache = struct {
+    entries: std.AutoHashMapUnmanaged(i32, Entry) = .empty,
+
+    const Entry = struct {
+        started_at_us: u64,
+        len: u16,
+        bytes: [max_len]u8,
+    };
+
+    pub const max_len = 256;
+
+    pub fn deinit(self: *BundleIdCache, allocator: std.mem.Allocator) void {
+        self.entries.deinit(allocator);
+    }
+
+    /// Copy the cached identifier into `buf`. Null on a miss or when the PID
+    /// now belongs to a different process.
+    pub fn get(self: *const BundleIdCache, pid: i32, started_at_us: u64, buf: *[max_len]u8) ?[]const u8 {
+        const entry = self.entries.get(pid) orelse return null;
+        if (entry.started_at_us != started_at_us) return null;
+
+        @memcpy(buf[0..entry.len], entry.bytes[0..entry.len]);
+        return buf[0..entry.len];
+    }
+
+    /// Cache only identifiers that were found: a process can report none
+    /// while it is still registering with the system. Out of memory only
+    /// costs the next lookup a query.
+    pub fn put(self: *BundleIdCache, allocator: std.mem.Allocator, pid: i32, started_at_us: u64, bundle_id: []const u8) void {
+        std.debug.assert(bundle_id.len <= max_len);
+        var entry: Entry = .{ .started_at_us = started_at_us, .len = @intCast(bundle_id.len), .bytes = undefined };
+        @memcpy(entry.bytes[0..bundle_id.len], bundle_id);
+        self.entries.put(allocator, pid, entry) catch {};
+    }
+
+    pub fn forget(self: *BundleIdCache, pid: i32) void {
+        _ = self.entries.remove(pid);
+    }
+};
+
+test "bundle ID cache serves a known process and never a reused PID" {
+    const testing = std.testing;
+    var cache: BundleIdCache = .{};
+    defer cache.deinit(testing.allocator);
+
+    var buf: [BundleIdCache.max_len]u8 = undefined;
+    try testing.expectEqual(@as(?[]const u8, null), cache.get(42, 100, &buf));
+
+    cache.put(testing.allocator, 42, 100, "com.example.First");
+    try testing.expectEqualStrings("com.example.First", cache.get(42, 100, &buf).?);
+    try testing.expectEqual(@as(?[]const u8, null), cache.get(42, 200, &buf));
+
+    cache.put(testing.allocator, 42, 200, "com.example.Second");
+    try testing.expectEqualStrings("com.example.Second", cache.get(42, 200, &buf).?);
+
+    cache.forget(42);
+    try testing.expectEqual(@as(?[]const u8, null), cache.get(42, 200, &buf));
+}
+
 test "process start time is stable for a live PID and null for a missing one" {
     const pid = std.c.getpid();
     const first = (try processStartTimeUs(pid)) orelse return error.TestUnexpectedResult;

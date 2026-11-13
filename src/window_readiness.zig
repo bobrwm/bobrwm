@@ -1,20 +1,18 @@
 //! Whether or not a window is ready to tile (based off of AX responses).
 //!
-//! `query` answers on the calling thread. `request` asks on the app's queue
-//! and publishes the answer as a `window_readiness_observed` event, so a slow
-//! app only stalls its own queue, not others.
+//! Requests are answered on the app's queue and published as
+//! `window_readiness_observed` events.
 
 const std = @import("std");
 const c = @import("c");
 const app_queue = @import("app_queue.zig");
+const app_windows = @import("app_windows.zig");
 const ax = @import("ax.zig");
+const osutil = @import("osutil.zig");
 const shim = @import("shim_api.zig");
-const state_mod = @import("state.zig");
 const window_server = @import("window_server.zig");
 
 const log = std.log.scoped(.window_readiness);
-
-pub const Readiness = state_mod.WindowReadiness;
 
 /// What asked, which decides how the main thread applies the answer.
 pub const Purpose = enum(u2) {
@@ -34,22 +32,27 @@ pub const Answer = enum(u2) {
 pub const Observation = struct {
     purpose: Purpose,
     answer: Answer,
+    /// Whether the app lets the window be resized. Meaningful only when ready.
+    is_resizable: bool = true,
 
     pub fn encode(self: Observation) u8 {
-        return @as(u8, @backingInt(self.purpose)) | (@as(u8, @backingInt(self.answer)) << 2);
+        return @as(u8, @backingInt(self.purpose)) |
+            (@as(u8, @backingInt(self.answer)) << 2) |
+            (@as(u8, @intFromBool(self.is_resizable)) << 4);
     }
 
     pub fn decode(detail: u8) Observation {
         return .{
             .purpose = @fromBackingInt(@intCast(@as(u2, @truncate(detail)))),
             .answer = @fromBackingInt(@intCast(@as(u2, @truncate(detail >> 2)))),
+            .is_resizable = detail & (1 << 4) != 0,
         };
     }
 };
 
 /// A responsive app answers well within it; a hung one holds only its own
 /// queue this long per message.
-pub const timeout_seconds: f32 = 0.25;
+const timeout_seconds: f32 = 0.25;
 
 /// Covers every candidate queue plus a cleanup pass over the managed windows.
 const max_requests = 1024;
@@ -74,8 +77,7 @@ pub fn init() void {
 }
 
 /// Ask whether `wid` is ready on its app's queue. A request already waiting
-/// for the window absorbs this one. The caller has checked that the app is a
-/// regular one; `query` assumes it.
+/// for the window absorbs this one.
 pub fn request(pid: i32, wid: u32, purpose: Purpose) void {
     std.debug.assert(pid > 0);
     std.debug.assert(wid > 0);
@@ -88,16 +90,13 @@ pub fn forgetApp(pid: i32) void {
     c.os_unfair_lock_lock(&g_lock);
     defer c.os_unfair_lock_unlock(&g_lock);
 
-    var index: usize = 0;
-    while (index < g_request_count) {
-        if (g_requests[index].pid != pid) {
-            index += 1;
-            continue;
-        }
-
-        g_request_count -= 1;
-        g_requests[index] = g_requests[g_request_count];
+    var kept: usize = 0;
+    for (g_requests[0..g_request_count]) |queued| {
+        if (queued.pid == pid) continue;
+        g_requests[kept] = queued;
+        kept += 1;
     }
+    g_request_count = kept;
 }
 
 fn queueRequest(pid: i32, wid: u32, purpose: Purpose) bool {
@@ -121,23 +120,25 @@ fn queueRequest(pid: i32, wid: u32, purpose: Purpose) bool {
     return true;
 }
 
+/// Take the app's oldest requests. Order is kept because adoption order sets
+/// layout placement.
 fn takeRequests(pid: i32, out: *[max_batch]Request) []Request {
     c.os_unfair_lock_lock(&g_lock);
     defer c.os_unfair_lock_unlock(&g_lock);
 
     var count: usize = 0;
-    var index: usize = 0;
-    while (index < g_request_count and count < out.len) {
-        if (g_requests[index].pid != pid) {
-            index += 1;
+    var kept: usize = 0;
+    for (g_requests[0..g_request_count]) |queued| {
+        if (queued.pid == pid and count < out.len) {
+            out[count] = queued;
+            count += 1;
             continue;
         }
 
-        out[count] = g_requests[index];
-        count += 1;
-        g_request_count -= 1;
-        g_requests[index] = g_requests[g_request_count];
+        g_requests[kept] = queued;
+        kept += 1;
     }
+    g_request_count = kept;
 
     return out[0..count];
 }
@@ -155,6 +156,7 @@ fn hasRequestFor(pid: i32) bool {
 /// Answer a batch of the app's requests, then requeue for the rest. Runs on
 /// that app's queue.
 fn answerRequests(app: app_queue.App) void {
+    const strings = ax.strings() orelse return;
     var batch_buffer: [max_batch]Request = undefined;
     const batch = takeRequests(app.pid, &batch_buffer);
     if (batch.len == 0) return;
@@ -162,6 +164,14 @@ fn answerRequests(app: app_queue.App) void {
     defer if (hasRequestFor(app.pid)) {
         _ = app_queue.submit(app.pid, .readiness);
     };
+
+    // Only regular apps' windows are tiled. Asked per batch because an app
+    // can change its policy at runtime, and before any AX message so a
+    // helper process is never queried.
+    if (!osutil.isRegularApp(app.pid)) {
+        for (batch) |queued| publish(queued, .reject, true);
+        return;
+    }
 
     var wids: [max_batch]u32 = undefined;
     for (batch, 0..) |queued, index| wids[index] = queued.wid;
@@ -177,36 +187,48 @@ fn answerRequests(app: app_queue.App) void {
         if (element) |ref| c.CFRelease(@ptrCast(ref));
     };
 
+    var answers: [max_batch]Answer = undefined;
+    var is_resizable: [max_batch]bool = undefined;
+    var is_adopting = false;
     for (batch, 0..) |queued, index| {
         const is_gone = if (live) |ids| std.mem.findScalar(u32, ids, queued.wid) == null else false;
-        const answer: Answer = if (is_gone) .gone else if (elements[index]) |win| switch (classify(win)) {
-            .reject => .reject,
-            .ready => .ready,
-            .pending => .pending,
-        } else .pending;
+        const answer: Answer = if (is_gone) .gone else if (elements[index]) |win| classify(win) else .pending;
+        answers[index] = answer;
+        const is_candidate = queued.purposes.contains(.pending_role) or queued.purposes.contains(.deferred);
+        // Cleanup does not use resizability; only adoption needs this message.
+        is_resizable[index] = !is_candidate or answer != .ready or ax.isAttributeSettable(elements[index].?, strings.size_attr);
+        if (answer == .ready and is_candidate) is_adopting = true;
+    }
 
-        var purposes = queued.purposes.iterator();
-        while (purposes.next()) |purpose| {
-            const observation: Observation = .{ .purpose = purpose, .answer = answer };
-            shim.bw_emit_event_detail(shim.BW_EVENT_WINDOW_READINESS_OBSERVED, queued.pid, queued.wid, observation.encode());
+    // Adoption decides native tabs from this, so it must be stored before
+    // the answers are published.
+    if (is_adopting and !app_windows.capture(app.pid, .tabs)) {
+        // Missing tab facts are not evidence that a ready window is standalone.
+        for (batch, 0..) |queued, index| {
+            if (queued.purposes.contains(.pending_role) or queued.purposes.contains(.deferred)) {
+                if (answers[index] == .ready) answers[index] = .pending;
+            }
         }
+    }
+
+    for (batch, 0..) |queued, index| publish(queued, answers[index], is_resizable[index]);
+}
+
+/// One event per purpose: each decides differently on the main thread.
+fn publish(queued: Request, answer: Answer, is_resizable: bool) void {
+    var purposes = queued.purposes.iterator();
+    while (purposes.next()) |purpose| {
+        const observation: Observation = .{
+            .purpose = purpose,
+            .answer = answer,
+            .is_resizable = is_resizable,
+        };
+        shim.bw_emit_event_detail(shim.BW_EVENT_WINDOW_READINESS_OBSERVED, queued.pid, queued.wid, observation.encode());
     }
 }
 
-/// Readiness of one window, answered on the calling thread.
-pub fn query(pid: i32, wid: u32, timeout: f32) Readiness {
-    std.debug.assert(pid > 0);
-    std.debug.assert(wid > 0);
-
-    var element: [1]?c.AXUIElementRef = undefined;
-    ax.findWindows(pid, &.{wid}, &element, timeout);
-    const win = element[0] orelse return .pending;
-    defer c.CFRelease(@ptrCast(win));
-    return classify(win);
-}
-
 /// Classify a window from its AX role and subrole.
-fn classify(win: c.AXUIElementRef) Readiness {
+fn classify(win: c.AXUIElementRef) Answer {
     const strings = ax.strings() orelse return .pending;
     // Native open/save panels are app-modal AX windows. They pass the dialog
     // heuristic below, but tiling them resizes the parent app while the user
