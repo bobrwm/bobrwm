@@ -134,7 +134,7 @@ func renderMenu(path: String, appearance: NSAppearance.Name) -> Bool {
 
 func makeSettingsModel(accessibilityGranted: Bool) -> SettingsModel {
     let model = SettingsModel(
-        configPath: "/Users/example/.config/bobrwm/config.zon",
+        configPath: "/Users/example/.config/bobrwm/init.lua",
         accessibilityGranted: accessibilityGranted
     )
     model.setWorkspaces(samples.map {
@@ -158,6 +158,12 @@ func makeSettingsModel(accessibilityGranted: Bool) -> SettingsModel {
         AppRule(appID: "com.apple.systempreferences", floats: true),
         AppRule(appID: "com.apple.calculator", floats: true),
         AppRule(appID: "com.apple.ActivityMonitor", workspace: 3, floats: true),
+    ])
+    model.setConfigSources([
+        .init(name: "layout", file: "", line: 0, kind: .defaults, isRule: false),
+        .init(name: "gaps.inner", file: "settings.json", line: 0, kind: .settings, isRule: false),
+        .init(name: "animation.enabled", file: "appearance.lua", line: 12, kind: .lua, isRule: false),
+        .init(name: "com.apple.Safari", file: "settings.json", line: 0, kind: .settings, isRule: true),
     ])
     return model
 }
@@ -326,6 +332,34 @@ func renderAll(into directory: String) -> Bool {
                 appearance: appearance
             ) && ok
         }
+        let sourcesPending = makeSettingsModel(accessibilityGranted: true)
+        sourcesPending.configSourcesOverridesOnly = true
+        sourcesPending.settings.innerGap = 12
+        sourcesPending.setConfigStatus(succeeded: false, message: "Could not save settings; previous settings kept")
+        ok = renderHosted(
+            ConfigSourcesPane(model: sourcesPending, actions: .preview)
+                .formStyle(.grouped).environment(\.colorScheme, scheme),
+            size: NSSize(width: settingsPaneWidth, height: 560),
+            path: "\(directory)/settings-sources-pending-\(suffix).png", appearance: appearance
+        ) && ok
+        let noOverrides = makeSettingsModel(accessibilityGranted: true)
+        noOverrides.configSourcesOverridesOnly = true
+        noOverrides.setConfigSources(noOverrides.configSources.filter { $0.kind != .settings })
+        noOverrides.setConfigStatus(succeeded: true, message: "Settings saved")
+        ok = renderHosted(
+            ConfigSourcesPane(model: noOverrides, actions: .preview)
+                .formStyle(.grouped).environment(\.colorScheme, scheme),
+            size: NSSize(width: settingsPaneWidth, height: 560),
+            path: "\(directory)/settings-sources-empty-\(suffix).png", appearance: appearance
+        ) && ok
+        let overridesOnly = makeSettingsModel(accessibilityGranted: true)
+        overridesOnly.configSourcesOverridesOnly = true
+        ok = renderHosted(
+            ConfigSourcesPane(model: overridesOnly, actions: .preview)
+                .formStyle(.grouped).environment(\.colorScheme, scheme),
+            size: NSSize(width: settingsPaneWidth, height: 560),
+            path: "\(directory)/settings-sources-overrides-\(suffix).png", appearance: appearance
+        ) && ok
         ok = renderPane(
             .general,
             model: makeSettingsModel(accessibilityGranted: false),

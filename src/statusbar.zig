@@ -9,6 +9,7 @@
 const std = @import("std");
 
 const config_mod = @import("config.zig");
+const config_layer = @import("config_layer.zig");
 const state_mod = @import("state.zig");
 const workspace_mod = @import("workspace.zig");
 
@@ -45,6 +46,7 @@ pub const Callbacks = extern struct {
     reload_config: *const fn () callconv(.c) bool,
     set_settings: *const fn (*const Settings) callconv(.c) bool,
     set_app_rules: *const fn (?[*]const AppRule, usize) callconv(.c) bool,
+    reset_override: *const fn ([*:0]const u8, bool) callconv(.c) bool,
     switch_to_workspace: *const fn (u8) callconv(.c) void,
     quit: *const fn () callconv(.c) void,
 };
@@ -54,6 +56,14 @@ pub const AppRule = extern struct {
     /// 0 when the rule does not pin a workspace.
     workspace: u8,
     floating: bool,
+};
+
+const ConfigSource = extern struct {
+    name: [*:0]const u8,
+    file: [*:0]const u8,
+    line: u32,
+    kind: u8,
+    is_rule: bool,
 };
 
 const Workspace = extern struct {
@@ -100,6 +110,7 @@ extern fn bw_menubar_set_workspaces(workspaces: ?[*]const Workspace, count: usiz
 extern fn bw_menubar_set_state(states: ?[*]const WorkspaceState, count: usize) void;
 extern fn bw_menubar_set_settings(settings: Settings) void;
 extern fn bw_menubar_set_app_rules(rules: ?[*]const AppRule, count: usize) void;
+extern fn bw_menubar_set_config_sources(sources: ?[*]const ConfigSource, count: usize) void;
 extern fn bw_menubar_set_message(message: [*:0]const u8) void;
 extern fn bw_menubar_set_config_status(success: bool, message: [*:0]const u8) void;
 
@@ -163,6 +174,46 @@ pub fn updateSettings(allocator: std.mem.Allocator, config: *const config_mod.Co
         .follow_app_resizes = config.follow_app_resizes,
         .auto_reload_config = config.auto_reload_config,
     });
+}
+
+/// Publish provenance separately from the editable values; names and locations
+/// come from the same merged configuration that supplied those values.
+pub fn updateSources(allocator: std.mem.Allocator, config: *const config_mod.Config, origins: *const config_layer.Origins(config_mod.Config), rule_origins: []const config_layer.Origin) void {
+    if (!g_initialized) return;
+    var arena: std.heap.ArenaAllocator = .init(allocator);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    var rows: std.ArrayList(ConfigSource) = .empty;
+    appendSources(config_mod.Config, "", scratch, origins.*, &rows) catch return;
+    for (config.app_rules, rule_origins) |rule, origin| {
+        rows.append(scratch, sourceRow(scratch, rule.app_id, origin, true) catch return) catch return;
+    }
+    bw_menubar_set_config_sources(rows.items.ptr, rows.items.len);
+}
+
+fn appendSources(comptime T: type, comptime prefix: []const u8, arena: std.mem.Allocator, origins: config_layer.Origins(T), rows: *std.ArrayList(ConfigSource)) !void {
+    inline for (@typeInfo(config_layer.Origins(T)).@"struct".field_names) |name| {
+        const path = prefix ++ name;
+        if (@typeInfo(@FieldType(T, name)) == .@"struct") {
+            try appendSources(@FieldType(T, name), path ++ ".", arena, @field(origins, name), rows);
+        } else {
+            try rows.append(arena, try sourceRow(arena, path, @field(origins, name), false));
+        }
+    }
+}
+
+fn sourceRow(arena: std.mem.Allocator, name: []const u8, origin: config_layer.Origin, is_rule: bool) !ConfigSource {
+    return .{
+        .name = try arena.dupeSentinel(u8, name, 0),
+        .file = try arena.dupeSentinel(u8, origin.location.file, 0),
+        .line = origin.location.line,
+        .kind = switch (origin.kind) {
+            .default => 0,
+            .lua => 1,
+            .settings_ui => 2,
+        },
+        .is_rule = is_rule,
+    };
 }
 
 fn updateAppRules(allocator: std.mem.Allocator, config: *const config_mod.Config) !void {

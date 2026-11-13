@@ -110,43 +110,67 @@ LOG_LEVEL=trace zig build   # alias of debug (extra trace-style diagnostics)
 
 ## Configuration
 
-Config is loaded from (in order):
+bobrwm is configured in Lua, in `init.lua`, loaded from (in order):
 
 1. `-c` / `--config` CLI argument
-2. `$XDG_CONFIG_HOME/bobrwm/config.zon`
-3. `~/.config/bobrwm/config.zon`
+2. `$XDG_CONFIG_HOME/bobrwm/init.lua`
+3. `~/.config/bobrwm/init.lua`
 
-If no config file is found, built-in defaults are used.
+If there is no `init.lua`, built-in defaults are used. Other Lua files beside
+it can be loaded with `require`, so `require("keys")` runs `keys.lua`.
 
-```zon
-.{
-    .workspace_names = .{ "term", "web", "code", "chat" },
-    .gaps = .{ .inner = 4, .outer = .{ .left = 4, .right = 4, .top = 4, .bottom = 4 } },
-    .keybinds = .{
-        .{ .key = "h", .mods = .{ .alt = true }, .action = .focus_left },
-    },
-    .app_rules = .{
-        .{ .app_id = "com.apple.Safari", .workspace = 2 },
-    },
-}
+```lua
+bobrwm.settings.set("workspace_names", { "term", "web", "code", "chat" })
+bobrwm.settings.set{ gaps = { inner = 4, outer = { left = 4, right = 4, top = 4, bottom = 4 } } }
+
+bobrwm.keymap.set("alt+h", "focus_left")
+bobrwm.keymap.set("alt+1", "focus_workspace", { workspace = 1 })
+bobrwm.keymap.del("alt+shift+r")
+
+bobrwm.app_rules.add{ app = "com.apple.Safari", workspace = 2 }
+bobrwm.app_rules.add{ app = "com.apple.systempreferences", float = true }
 ```
+
+Settings changed in the settings window are saved to `settings.json` beside
+`init.lua`, and override what `init.lua` sets. Lua runs sandboxed: there is no
+`io`, `os`, or `package`, and a runaway loop is stopped.
+
+The settings window's **Sources** pane shows where each setting and app rule
+comes from, including the Lua file and line. **Reset to Lua** removes just that
+entry from `settings.json`, restoring the Lua value or the built-in default.
+Removing a Lua-defined app rule in **Apps** saves a neutral override; it does
+not change `init.lua`. Reset that rule in **Sources** to restore it. Unchanged
+rules continue to follow Lua.
 
 To start from every option with its documentation and the default keybinds:
 
 ```bash
-bobrwm show-config --default --docs > ~/.config/bobrwm/config.zon
+bobrwm show-config --default --docs > ~/.config/bobrwm/init.lua
 ```
 
-`bobrwm show-config` prints the config bobrwm would load, and
+`bobrwm show-config` prints the config bobrwm would load, `bobrwm check-config`
+reports mistakes with the file and line they are on, and
 `bobrwm list-actions --docs` lists every keybind action.
+
+A bad `bobrwm.*` call is skipped and the rest of the file still loads. A Lua
+error, such as a syntax error, or a value outside the documented bounds fails
+the whole load: bobrwm keeps the last valid configuration and shows a temporary
+error in its menu-bar item, with details in the error log.
 
 Press `Alt+Shift+R` (the default `reload_config` binding) or run
 `bobrwm reload-config` to apply changes without restarting, or set
-`.auto_reload_config = true` to reload on every save. If the file
-contains invalid ZON or values outside the documented bounds, bobrwm keeps the
-last valid configuration and shows a temporary error in its menu-bar item;
-details remain in the error log. `bobrwm reload-config` is silent on success and
-exits non-zero with an error message when the new config cannot be loaded.
+`auto_reload_config = true` to reload whenever `init.lua`, `settings.json`,
+or a module loaded with `require` changes. Deleting `settings.json` removes its
+overrides; fixing or creating a required module retries a failed reload.
+`bobrwm reload-config` is silent on success and exits non-zero with an error
+message when the new config cannot be loaded.
+
+### Upgrading from `config.zon`
+
+bobrwm used to read `config.zon`. When it finds `config.zon` and no
+`init.lua`, it writes an equivalent `init.lua` at startup and leaves
+`config.zon` in place. `bobrwm migrate-config` does the same on demand, and
+`bobrwm migrate-config --print` shows the conversion without writing it.
 
 ### Workspaces
 

@@ -3,7 +3,7 @@
 //! website render the same text instead of maintaining copies that drift.
 //!
 //! The field lists come from comptime reflection over the real types, so the
-//! output always covers exactly what `config.zon` parses. The doc text comes
+//! output always covers exactly what the config can set. The doc text comes
 //! from parsing each type's source file with `std.zig.Ast`, since doc comments
 //! are not available through `@typeInfo`.
 //!
@@ -90,8 +90,8 @@ fn genEntries(
 }
 
 /// Flatten a config struct into dotted keys, descending into nested structs
-/// and the element structs of slices (`keybinds[].key`) since users write
-/// those fields in `config.zon` too.
+/// and the element structs of slices (`keybinds[].key`), whose fields
+/// `bobrwm.keymap.set` and `bobrwm.app_rules.add` take.
 fn configEntries(comptime T: type, comptime prefix: []const u8) []const KeyEntry {
     comptime {
         @setEvalBranchQuota(50_000);

@@ -132,6 +132,10 @@ final class MenuBarController: NSObject, StatusMenuActions {
         settingsModel.setAppRules(rules)
     }
 
+    func setConfigSources(_ sources: [ConfigSource]) {
+        settingsModel.setConfigSources(sources)
+    }
+
     private func applicationName(_ processID: Int32) -> String {
         let application = NSRunningApplication(processIdentifier: processID)
         return application?.localizedName
@@ -271,6 +275,19 @@ public func menuBarSetAppRules(_ rules: UnsafePointer<BWAppRule>?, _ count: Int)
             appID: String(cString: row.app_id),
             workspace: row.workspace == 0 ? nil : row.workspace,
             floats: row.floating
+        )
+    })
+}
+
+@_cdecl("bw_menubar_set_config_sources")
+public func menuBarSetConfigSources(_ sources: UnsafePointer<BWConfigSource>?, _ count: Int) {
+    controller?.setConfigSources(UnsafeBufferPointer(start: sources, count: count).map { row in
+        ConfigSource(
+            name: String(cString: row.name),
+            file: String(cString: row.file),
+            line: row.line,
+            kind: ConfigSource.Kind(rawValue: row.kind) ?? .defaults,
+            isRule: row.is_rule
         )
     })
 }

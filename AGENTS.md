@@ -83,7 +83,7 @@ const foo = Type{ .field = value };     // Avoid
 
 **Documentation:** Use `///` for public API, `//` for implementation notes. Always explain *why*, not just *what*.
 
-**Tests:** Inline in the same file, register in src/main.zig test block
+**Tests:** Inline in the same file, register in the src/tests.zig test block. `zig build test -Dtest-filter=<text>` runs a subset
 
 ## ObjC Interop
 
@@ -125,6 +125,18 @@ The native app, status item, and menu live in `macos/`. `build.zig` builds Zig a
 ## User-Facing Docs
 
 `///` doc comments on `Config` fields (including nested structs and slice-element structs), on `config.Action` tags, and on `command.Command` tags are the source of truth for user-facing docs. `src/helpgen.zig` extracts them at build time into the generated `help_strings` module. The client prints them (`bobrwm <command> --help`, `bobrwm list-actions --docs`, and `bobrwm show-config --default --docs` through `src/config_format.zig`), and `zig build docs` renders them as MDX pages in `zig-out/share/bobrwm/webdata/` (`config.mdx`, `actions.mdx`, `commands.mdx`) for the website, keys in declaration order, through `src/build/webgen/`. Indented code blocks become fenced blocks and paragraphs starting with `Note:` or `Warning:` become `<Note>`/`<Warning>` callouts. Every key must have a `///` doc comment: helpgen lists each missing one by file and line and fails the build. Nested keys are dotted, slice elements use `[]` (`keybinds[].mods.alt`). Write these comments for users, and keep implementation notes in `//`. Config types must be top-level declarations of a file in `src/` so helpgen can find their source; `zig build test` runs helpgen, so a type it cannot locate fails the build.
+
+## Config
+
+`init.lua` (written by people) and `settings.json` (written by the settings window) are layers merged over the defaults; a later layer wins per value, and each merged value remembers its file and line. The pipeline:
+
+- `src/lua_sandbox.zig`: the Lua state. No io/os/package/debug, text chunks only, memory and instruction budgets, `require` limited to the config directory. Every entry into Lua goes through its protected-call path so the budget always applies.
+- `src/config_apply.zig`: validates one setting, bind, or rule from a `std.json.Value` into a `config_layer.Layer`. Both loaders go through it, so a value means the same thing in Lua and JSON. A bad entry becomes a diagnostic and is skipped.
+- `src/config_lua.zig` / `src/config_json.zig`: turn `bobrwm.*` calls and `settings.json` into layer entries.
+- `src/config_layer.zig`: the layer type (a partial `Config` generated at comptime) and `merge`.
+- `src/config_load.zig`: paths, reading files, merge, `Validation` on the merged config, and `config.zon` migration.
+
+New settings need only a `Config` field with a `///` doc; the layer, Lua, JSON, `show-config`, and docs pick it up. Errors that fail a load (Lua errors, invalid JSON, invariant violations) keep the last good config.
 
 ## Window Management Invariants
 

@@ -43,12 +43,22 @@ typedef struct {
   bool floating;
 } BWAppRule;
 
+// Borrowed strings; Swift copies them before this call returns.
+typedef struct {
+  const char *name; // Dotted setting path, or bundle ID when is_rule is true.
+  const char *file;
+  uint32_t line;
+  uint8_t kind; // 0: built-in default, 1: Lua, 2: settings.json.
+  bool is_rule;
+} BWConfigSource;
+
 typedef struct {
   void (*retile)(void);
   void (*open_config)(void);
   bool (*reload_config)(void);
   bool (*set_settings)(const BWSettings *settings);
   bool (*set_app_rules)(const BWAppRule *rules, size_t count);
+  bool (*reset_override)(const char *name, bool is_rule);
   void (*switch_to_workspace)(uint8_t workspace_id);
   void (*quit)(void);
 } BWMenuBarCallbacks;
@@ -92,6 +102,7 @@ void bw_menubar_set_workspaces(const BWWorkspace *workspaces, size_t count);
 void bw_menubar_set_state(const BWWorkspaceState *states, size_t count);
 void bw_menubar_set_settings(BWSettings settings);
 void bw_menubar_set_app_rules(const BWAppRule *rules, size_t count);
+void bw_menubar_set_config_sources(const BWConfigSource *sources, size_t count);
 void bw_menubar_set_message(const char *message);
 void bw_menubar_set_config_status(bool success, const char *message);
 

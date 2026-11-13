@@ -176,6 +176,22 @@ struct AppRule: Identifiable, Equatable {
     var id: String { appID }
 }
 
+struct ConfigSource: Identifiable, Equatable {
+    enum Kind: UInt8 { case defaults, lua, settings }
+
+    let name: String
+    let file: String
+    let line: UInt32
+    let kind: Kind
+    let isRule: Bool
+
+    var id: String { "\(isRule ? "rule" : "setting"):\(name)" }
+    var location: String {
+        if kind == .defaults { return "Built-in defaults" }
+        return line == 0 ? file : "\(file):\(line)"
+    }
+}
+
 final class SettingsModel: ObservableObject {
     struct ConfigStatus {
         var succeeded: Bool
@@ -191,6 +207,8 @@ final class SettingsModel: ObservableObject {
     @Published private(set) var appliedSettings = EditableSettings()
     @Published var appRules: [AppRule] = []
     @Published private(set) var appliedAppRules: [AppRule] = []
+    @Published private(set) var configSources: [ConfigSource] = []
+    @Published var configSourcesOverridesOnly = false
     @Published private(set) var configStatus = ConfigStatus(
         succeeded: true,
         message: "Configuration loaded",
@@ -250,10 +268,25 @@ final class SettingsModel: ObservableObject {
         appRules = rules
     }
 
+    func setConfigSources(_ sources: [ConfigSource]) {
+        configSources = sources
+    }
+
+    var hasPendingEdits: Bool {
+        settings != appliedSettings || appRules != appliedAppRules
+    }
+
+    func resetOverride(_ source: ConfigSource, actions: SettingsActions) {
+        // A reset publishes a new snapshot. Don't discard unsaved edits or
+        // let a pending debounced save reinstate the override afterward.
+        guard !hasPendingEdits, source.kind == .settings else { return }
+        _ = actions.resetOverride(source)
+    }
+
     /// True when the last apply was rejected and the shown values no longer
     /// match what is running.
     var applyFailed: Bool {
-        !configStatus.succeeded && (settings != appliedSettings || appRules != appliedAppRules)
+        !configStatus.succeeded && hasPendingEdits
     }
 
     func revertSettings() {
@@ -272,7 +305,7 @@ final class SettingsModel: ObservableObject {
         return """
         BobrWM \(appVersion)
         Accessibility: \(accessibilityGranted ? "granted" : "required")
-        Config: \(configPath == nil ? "built-in defaults" : "config.zon")
+        Config: \(configPath == nil ? "built-in defaults" : "init.lua")
         Last reload: \(configStatus.succeeded ? "succeeded" : "failed") — \(configStatus.message)
         Workspaces:
         \(workspaceSummary)
@@ -289,6 +322,7 @@ struct SettingsActions {
     private let reloadConfigAction: () -> Void
     private let saveSettingsAction: (EditableSettings) -> Bool
     private let saveAppRulesAction: ([AppRule]) -> Bool
+    private let resetOverrideAction: (ConfigSource) -> Bool
     private let focusWorkspaceAction: (UInt8) -> Void
 
     init(callbacks: BWMenuBarCallbacks) {
@@ -308,19 +342,24 @@ struct SettingsActions {
             return rows.withUnsafeBufferPointer { callbacks.set_app_rules($0.baseAddress, $0.count) }
         }
         focusWorkspaceAction = { callbacks.switch_to_workspace($0) }
+        resetOverrideAction = { source in
+            source.name.withCString { callbacks.reset_override($0, source.isRule) }
+        }
     }
 
-    private init(
+    init(
         openConfig: @escaping () -> Void,
         reloadConfig: @escaping () -> Void,
         saveSettings: @escaping (EditableSettings) -> Bool,
         saveAppRules: @escaping ([AppRule]) -> Bool,
+        resetOverride: @escaping (ConfigSource) -> Bool,
         focusWorkspace: @escaping (UInt8) -> Void
     ) {
         openConfigAction = openConfig
         reloadConfigAction = reloadConfig
         saveSettingsAction = saveSettings
         saveAppRulesAction = saveAppRules
+        resetOverrideAction = resetOverride
         focusWorkspaceAction = focusWorkspace
     }
 
@@ -329,6 +368,7 @@ struct SettingsActions {
         reloadConfig: {},
         saveSettings: { _ in true },
         saveAppRules: { _ in true },
+        resetOverride: { _ in true },
         focusWorkspace: { _ in }
     )
 
@@ -336,6 +376,7 @@ struct SettingsActions {
     func reloadConfig() { reloadConfigAction() }
     func saveSettings(_ settings: EditableSettings) -> Bool { saveSettingsAction(settings) }
     func saveAppRules(_ rules: [AppRule]) -> Bool { saveAppRulesAction(rules) }
+    func resetOverride(_ source: ConfigSource) -> Bool { resetOverrideAction(source) }
     func focusWorkspace(_ id: UInt8) { focusWorkspaceAction(id) }
 
     func revealConfig(path: String?) {
@@ -367,6 +408,7 @@ enum SettingsPane: String, CaseIterable, Identifiable {
     case appearance
     case apps
     case workspaces
+    case sources
 
     var id: Self { self }
 
@@ -377,6 +419,7 @@ enum SettingsPane: String, CaseIterable, Identifiable {
         case .appearance: "Appearance"
         case .apps: "Apps"
         case .workspaces: "Workspaces"
+        case .sources: "Sources"
         }
     }
 
@@ -387,6 +430,7 @@ enum SettingsPane: String, CaseIterable, Identifiable {
         case .appearance: "paintbrush"
         case .apps: "square.grid.3x3"
         case .workspaces: "rectangle.3.group"
+        case .sources: "doc.text.magnifyingglass"
         }
     }
 }
@@ -415,7 +459,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         restorePosition(of: window)
 
         // Debounced so dragging a slider or holding a stepper rewrites
-        // config.zon once the value settles rather than on every step.
+        // settings.json once the value settles rather than on every step.
         applySubscription = model.$settings
             .debounce(for: .milliseconds(350), scheduler: RunLoop.main)
             .sink { [weak model] settings in
@@ -562,6 +606,7 @@ struct SettingsPaneView: View {
             case .appearance: AppearancePane(model: model)
             case .apps: AppsPane(model: model, selection: appRuleSelection)
             case .workspaces: WorkspacesPane(workspaces: model.workspaces)
+            case .sources: ConfigSourcesPane(model: model, actions: actions)
             }
         }
         .formStyle(.grouped)
@@ -577,10 +622,67 @@ private struct PaneHeight: ViewModifier {
     let pane: SettingsPane
 
     func body(content: Content) -> some View {
-        if pane == .apps {
+        if pane == .apps || pane == .sources {
             content.frame(maxHeight: 560)
         } else {
             content.fixedSize(horizontal: false, vertical: true)
+        }
+    }
+}
+
+struct ConfigSourcesPane: View {
+    @ObservedObject var model: SettingsModel
+    let actions: SettingsActions
+
+    private var sources: [ConfigSource] {
+        model.configSources.filter { !model.configSourcesOverridesOnly || $0.kind == .settings }
+    }
+
+    var body: some View {
+        Form {
+            ApplyFailureSection(model: model)
+            Section {
+                Text("Settings saved here override Lua. Reset removes just that override and uses Lua again, or built-in defaults if Lua doesn't set a value.")
+                    .foregroundStyle(.secondary)
+                Toggle("Show only overrides", isOn: $model.configSourcesOverridesOnly)
+            } header: {
+                Text("Configuration Sources")
+            }
+            if model.hasPendingEdits {
+                Text("Save or revert pending changes before resetting an override.")
+                    .foregroundStyle(.secondary)
+            }
+            if sources.isEmpty {
+                Text(model.configSourcesOverridesOnly ? "No settings.json overrides" : "No configuration sources available")
+                    .foregroundStyle(.secondary)
+            }
+            ForEach([false, true], id: \.self) { isRule in
+                let rows = sources.filter { $0.isRule == isRule }
+                if !rows.isEmpty {
+                    Section(isRule ? "App Rules" : "Settings") {
+                        ForEach(rows) { source in
+                            HStack(spacing: 12) {
+                                VStack(alignment: .leading, spacing: 4) {
+                                    Text(source.name).font(.system(.body, design: .monospaced))
+                                        .textSelection(.enabled)
+                                    Text(source.location).font(.caption).foregroundStyle(.secondary)
+                                }
+                                Spacer(minLength: 8)
+                                if source.kind == .settings {
+                                    Button("Reset to Lua") { model.resetOverride(source, actions: actions) }
+                                        .disabled(model.hasPendingEdits)
+                                        .accessibilityLabel("Reset \(source.name) to Lua or defaults")
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            Section {
+                LabeledContent("Last change") {
+                    StatusLabel(model.configStatus.message, succeeded: model.configStatus.succeeded)
+                }
+            }
         }
     }
 }
@@ -647,7 +749,7 @@ private struct GeneralPane: View {
             } header: {
                 Text("Configuration")
             } footer: {
-                Text("Changes made here are written to config.zon. Everything else in the file is left as is.")
+                Text("Changes made here are saved to settings.json and override init.lua.")
                     .foregroundStyle(.secondary)
             }
 
@@ -985,7 +1087,7 @@ private struct WorkspacesPane: View {
                     WorkspaceSettingsRow(workspace: workspace)
                 }
             } footer: {
-                Text("Names and shortcuts are defined in config.zon.")
+                Text("Names and shortcuts are defined in init.lua.")
                     .foregroundStyle(.secondary)
             }
         }

@@ -1,6 +1,6 @@
-//! Configuration for bobrwm.
-//! Reads a config.zon file from XDG_CONFIG_HOME/bobrwm/config.zon,
-//! ~/.config/bobrwm/config.zon, or a path passed via CLI.
+//! Configuration for bobrwm: the merged result of `init.lua` and the
+//! settings window over these defaults. See `config_load.zig` for how it is
+//! read, and `Validation` for the invariants a loaded config must hold.
 
 const std = @import("std");
 const shim = @import("shim_api.zig");
@@ -14,9 +14,8 @@ const log = std.log.scoped(.config);
 // Config types
 
 pub const Config = struct {
-    /// Use only the explicit `keybinds` entries instead of merging them with
-    /// the built-in defaults. If `keybinds` is omitted or empty, no shortcuts
-    /// are registered.
+    /// Drop the built-in keybinds, keeping only your own. In `init.lua`, call
+    /// `bobrwm.keymap.clear()` before your `bobrwm.keymap.set` calls.
     ///
     /// This also drops the default `reload_config` shortcut, so use
     /// `bobrwm reload-config` unless you bind `reload_config` yourself.
@@ -24,29 +23,28 @@ pub const Config = struct {
     /// Focus a window without raising it when the pointer enters it, including
     /// floating windows and windows excluded from tiling.
     focus_follows_mouse: bool = false,
-    /// Map a key and modifiers to an action.
+    /// Map a key and modifiers to an action with `bobrwm.keymap.set`, and remove
+    /// one with `bobrwm.keymap.del`.
     ///
-    /// Entries are merged with the built-in defaults. An entry with the same
-    /// key and modifiers as a default replaces it; any other entry adds a new
+    /// Binds are merged with the built-in defaults. A bind with the same key
+    /// and modifiers as a default replaces it; any other bind adds a new
     /// shortcut. See `disable_default_keybinds` to drop the defaults entirely.
     ///
-    ///     .keybinds = .{
-    ///         .{ .key = "1", .mods = .{ .alt = true }, .action = .focus_workspace, .arg = 1 },
-    ///         .{ .key = "h", .mods = .{ .alt = true }, .action = .focus_left },
-    ///         .{ .key = "return", .mods = .{ .alt = true }, .action = .toggle_split },
-    ///     },
+    ///     bobrwm.keymap.set("alt+1", "focus_workspace", { workspace = 1 })
+    ///     bobrwm.keymap.set("alt+h", "focus_left")
+    ///     bobrwm.keymap.set("alt+return", "toggle_split")
+    ///     bobrwm.keymap.del("alt+shift+r")
     keybinds: []const Keybind = &default_keybinds,
-    /// Per-app behavior keyed by bundle identifier. Each rule sets only what
-    /// it needs: a workspace, floating, or both. At most one rule per app.
+    /// Per-app behavior keyed by bundle identifier, set with `bobrwm.app_rules.add`.
+    /// Each rule sets only what it needs: a workspace, floating, or both. A
+    /// later rule for the same app replaces an earlier one.
     ///
-    ///     .app_rules = .{
-    ///         .{ .app_id = "com.apple.Safari", .workspace = 2 },
-    ///         .{ .app_id = "com.apple.systempreferences", .float = true },
-    ///     },
+    ///     bobrwm.app_rules.add{ app = "com.apple.Safari", workspace = 2 }
+    ///     bobrwm.app_rules.add{ app = "com.apple.systempreferences", float = true }
     app_rules: []const AppRule = &.{},
-    /// Deprecated alias for the workspace part of `app_rules`. Entries here are
-    /// merged into the app-rule lookups after `app_rules`, so a matching
-    /// `app_rules` entry wins.
+    /// The workspace part of `app_rules`, from before rules could also float
+    /// an app. Only read when migrating a `config.zon`, which turns each entry
+    /// into a `bobrwm.app_rules.add`.
     workspace_assignments: []const WorkspaceAssignment = &.{},
     /// Names for the managed workspaces. The number of names is the workspace
     /// count; when omitted, bobrwm manages 10 unnamed workspaces. At most 10.
@@ -54,7 +52,7 @@ pub const Config = struct {
     /// Workspace IDs stay 1-based, so four names create workspaces 1 through
     /// 4, and keybinds and app rules must reference workspaces in that range.
     ///
-    ///     .workspace_names = .{ "term", "web", "code", "chat" },
+    ///     bobrwm.settings.set("workspace_names", { "term", "web", "code", "chat" })
     ///
     /// Note: changing the number of workspaces requires a restart. Other
     /// settings reload live.
@@ -73,26 +71,23 @@ pub const Config = struct {
     dimmed_inactive: DimConfig = .{},
     /// Spacing in pixels between and around tiled windows.
     ///
-    ///     .gaps = .{
-    ///         .inner = 4,
-    ///         .outer = .{ .left = 4, .right = 4, .top = 4, .bottom = 4 },
-    ///     },
+    ///     bobrwm.settings.set{ gaps = { inner = 4, outer = { left = 4, right = 4, top = 4, bottom = 4 } } }
     gaps: Gaps = .{},
-    /// Tiling algorithm: `.bsp` for binary space partitioning, or `.monocle`
+    /// Tiling algorithm: `"bsp"` for binary space partitioning, or `"monocle"`
     /// to show each window fullscreen.
     layout: tiling.LayoutKind = .bsp,
-    /// Axis used when a BSP tile splits. `.auto` picks the axis from the
-    /// target tile's shape, `.horizontal` always splits left/right, and
-    /// `.vertical` always splits top/bottom.
+    /// Axis used when a BSP tile splits. `"auto"` picks the axis from the
+    /// target tile's shape, `"horizontal"` always splits left/right, and
+    /// `"vertical"` always splits top/bottom.
     bsp_split: tiling.SplitMode = .auto,
-    /// Which tile a new window splits: `.focused`, `.first`, `.last`, or
-    /// `.min_depth` (the shallowest leaf).
+    /// Which tile a new window splits: `"focused"`, `"first"`, `"last"`, or
+    /// `"min_depth"` (the shallowest leaf).
     bsp_insert_point: tiling.InsertionPointPolicy = .focused,
     /// Ratio for newly created BSP splits. Must be a finite value from 0.1
     /// through 0.9.
     bsp_split_ratio: f64 = 0.5,
-    /// Side a new window takes when it splits a tile: `.second` is
-    /// right/bottom, `.first` is left/top.
+    /// Side a new window takes when it splits a tile: `"second"` is
+    /// right/bottom, `"first"` is left/top.
     new_window_split: tiling.InsertChild = .second,
     /// When an app resizes one of its own tiled windows, for example to show
     /// or hide a sidebar, move the splits next to it so the window keeps its
@@ -117,9 +112,10 @@ pub const Config = struct {
     /// While registered, launchd restarts bobrwm if it crashes, but not after
     /// you quit it from the menu bar.
     start_at_login: bool = false,
-    /// Reload the config whenever this file is saved, including saves through
-    /// a symlink. An invalid save keeps the current config, as with the
-    /// `reload_config` action.
+    /// Reload when `init.lua`, `settings.json`, or a module loaded with
+    /// `require` changes, including saves through symlinks. Deleting a layer
+    /// removes its overrides. An invalid save keeps the current config, and
+    /// fixing a required module retries the reload.
     auto_reload_config: bool = false,
 
     /// Look up the assigned workspace for a given bundle identifier. `app_rules`
@@ -249,9 +245,9 @@ pub const Mods = struct {
 };
 
 pub const Action = enum(u8) {
-    /// Switch to the workspace numbered `arg`.
+    /// Switch to the workspace given as `{ workspace = n }`.
     focus_workspace = 20,
-    /// Move the focused window to the workspace numbered `arg`.
+    /// Move the focused window to the workspace given as `{ workspace = n }`.
     move_to_workspace = 21,
     /// Focus the window to the left.
     focus_left = 22,
@@ -268,8 +264,8 @@ pub const Action = enum(u8) {
     toggle_fullscreen = 27,
     /// Toggle the focused window between tiled and floating.
     toggle_float = 28,
-    /// Move the active workspace to display `arg` (1 through 8). `arg = 0`
-    /// moves it to the next display and `arg = 255` to the previous one.
+    /// Move the active workspace to the display given as `{ display = n }`:
+    /// 1 through 8, `"next"`, or `"previous"`.
     move_workspace_to_display = 29,
     /// Switch to the previous workspace. At the first workspace, the key
     /// passes through so native Spaces can handle it.
@@ -326,12 +322,13 @@ pub const Keybind = struct {
     /// Key name: a lowercase letter, a digit, `=`, `-`, `return`, `tab`,
     /// `space`, `delete`, `escape`, `left`, `right`, `up`, or `down`.
     key: []const u8,
-    /// Modifiers that must be held with `key`.
+    /// Modifiers that must be held with `key`, written before it in
+    /// `bobrwm.keymap.set`: `"ctrl+alt+shift+cmd+h"`.
     mods: Mods = .{},
     /// Action to run.
     action: Action,
-    /// Argument for actions that take one, such as a workspace or display
-    /// number. Ignored by other actions.
+    /// The workspace or display for actions that take one, given in
+    /// `bobrwm.keymap.set` as `{ workspace = n }` or `{ display = n }`.
     arg: u8 = 0,
 };
 
@@ -429,7 +426,7 @@ pub const DisplaySettings = struct {
 
 // Default keybinds (matches the previously hardcoded behaviour)
 
-const default_keybinds = blk: {
+pub const default_keybinds = blk: {
     var binds: []const Keybind = &.{};
 
     // alt+1..9 → focus workspace
@@ -574,19 +571,18 @@ pub fn workspaceCount(config: *const Config) u8 {
         @intCast(config.workspace_names.len);
 }
 
-/// Reject values that parse as valid ZON but violate runtime invariants.
+/// Reject values that load but violate runtime invariants.
 /// Validation happens before a config becomes visible to the main loop, so a
 /// bad reload leaves the last known-good config intact.
 pub fn validate(config: *const Config) !void {
-    const diagnostic = ConfigDiagnostics.validationDiagnostic(config) orelse return;
+    const diagnostic = Validation.validationDiagnostic(config) orelse return;
     return diagnostic.kind.asError();
 }
 
-/// Owns config-specific validation, source mapping, and ZON parse recovery.
-/// The normal load path only enters this machinery after parsing or validation
-/// fails; successful loads allocate no diagnostic state.
-const ConfigDiagnostics = struct {
-    const ValidationKind = enum {
+/// Runtime invariants of a loaded config. `config_load` reports each problem
+/// against the line in whichever layer set the offending value.
+pub const Validation = struct {
+    pub const ValidationKind = enum {
         too_many_workspaces,
         invalid_workspace_name,
         invalid_bsp_split_ratio,
@@ -617,43 +613,14 @@ const ConfigDiagnostics = struct {
                 .duplicate_workspace_assignment => error.DuplicateWorkspaceAssignment,
             };
         }
-
-        fn parentField(self: ValidationKind) ?[]const u8 {
-            return switch (self) {
-                .invalid_dim_level => "dimmed_inactive",
-                .unknown_key_name, .invalid_keybind_workspace, .invalid_keybind_display => "keybinds",
-                .empty_app_rule_id, .invalid_app_rule_workspace, .duplicate_app_rule => "app_rules",
-                .empty_workspace_assignment_id,
-                .invalid_workspace_assignment,
-                .duplicate_workspace_assignment,
-                => "workspace_assignments",
-                else => null,
-            };
-        }
-
-        fn field(self: ValidationKind) []const u8 {
-            return switch (self) {
-                .too_many_workspaces, .invalid_workspace_name => "workspace_names",
-                .invalid_bsp_split_ratio => "bsp_split_ratio",
-                .invalid_dim_level => "level",
-                .unknown_key_name => "key",
-                .invalid_keybind_workspace, .invalid_keybind_display => "arg",
-                .empty_app_rule_id,
-                .duplicate_app_rule,
-                .empty_workspace_assignment_id,
-                .duplicate_workspace_assignment,
-                => "app_id",
-                .invalid_app_rule_workspace, .invalid_workspace_assignment => "workspace",
-            };
-        }
     };
 
-    const ValidationDiagnostic = struct {
+    pub const ValidationDiagnostic = struct {
         kind: ValidationKind,
         index: ?usize = null,
     };
 
-    const ValidationSink = struct {
+    pub const ValidationSink = struct {
         context: *anyopaque,
         emitFn: *const fn (*anyopaque, ValidationDiagnostic) bool,
 
@@ -682,7 +649,7 @@ const ConfigDiagnostics = struct {
             @min(config.workspace_names.len, workspace.max_workspaces);
     }
 
-    fn visitValidationDiagnostics(config: *const Config, sink: *const ValidationSink) void {
+    pub fn visitValidationDiagnostics(config: *const Config, sink: *const ValidationSink) void {
         if (config.workspace_names.len > workspace.max_workspaces) {
             if (!sink.emit(.{ .kind = .too_many_workspaces })) return;
         }
@@ -782,100 +749,7 @@ const ConfigDiagnostics = struct {
         return true;
     }
 
-    const SourceLocation = struct {
-        line: usize,
-        column: usize,
-        line_start: usize,
-        line_end: usize,
-    };
-
-    fn sourceLocation(source: []const u8, offset: usize) SourceLocation {
-        var line: usize = 0;
-        var line_start: usize = 0;
-        for (source[0..@min(offset, source.len)], 0..) |char, i| {
-            if (char != '\n') continue;
-            line += 1;
-            line_start = i + 1;
-        }
-        const line_end = std.mem.indexOfScalarPos(u8, source, line_start, '\n') orelse source.len;
-        return .{ .line = line, .column = offset - line_start, .line_start = line_start, .line_end = line_end };
-    }
-
-    /// Find a field token rather than searching bytes, so examples in comments and
-    /// field-looking text inside strings cannot steal the diagnostic underline.
-    fn findFieldOffset(source: [:0]const u8, diagnostic: ValidationDiagnostic) ?usize {
-        const parent_field = diagnostic.kind.parentField();
-        const field = diagnostic.kind.field();
-        var tokenizer = std.zig.Tokenizer.init(source);
-        var previous_tag: std.zig.Token.Tag = .invalid;
-        var found_parent = parent_field == null;
-        var parent_depth: usize = 0;
-        var depth: usize = 0;
-        var item: usize = 0;
-        var in_target_item = diagnostic.index == null;
-
-        while (true) {
-            const token = tokenizer.next();
-            if (token.tag == .eof) return null;
-
-            if (token.tag == .identifier and previous_tag == .period) {
-                const name = source[token.loc.start..token.loc.end];
-                if (!found_parent and std.mem.eql(u8, name, parent_field.?)) {
-                    found_parent = true;
-                } else if (found_parent and in_target_item and std.mem.eql(u8, name, field)) {
-                    return token.loc.start - 1;
-                } else if (parent_field == null and std.mem.eql(u8, name, field)) {
-                    return token.loc.start - 1;
-                }
-            }
-
-            if (found_parent and parent_depth == 0 and token.tag == .l_brace) {
-                parent_depth = depth + 1;
-            } else if (parent_depth > 0 and diagnostic.index != null and
-                token.tag == .l_brace and depth == parent_depth and previous_tag == .period)
-            {
-                in_target_item = item == diagnostic.index.?;
-                item += 1;
-            }
-
-            if (token.tag == .l_brace) depth += 1;
-            if (token.tag == .r_brace) {
-                if (depth == parent_depth + 1) in_target_item = false;
-                depth -= 1;
-            }
-            previous_tag = token.tag;
-        }
-    }
-
-    fn writeSourceExcerpt(
-        writer: *std.Io.Writer,
-        path: []const u8,
-        source: []const u8,
-        location: SourceLocation,
-        underline_len: usize,
-    ) !void {
-        const line_number = location.line + 1;
-        try writer.print("  --> {s}:{d}:{d}\n", .{ path, line_number, location.column + 1 });
-        try writer.writeAll("   |\n");
-        try writer.print("{d: >3} | {s}\n", .{ line_number, source[location.line_start..location.line_end] });
-        try writer.writeAll("   | ");
-        try writer.splatByteAll(' ', location.column);
-        try writer.splatByteAll('^', @max(underline_len, 1));
-        try writer.writeByte('\n');
-    }
-
-    fn writeDiagnosticPath(writer: *std.Io.Writer, diagnostic: ValidationDiagnostic) !void {
-        if (diagnostic.kind.parentField()) |parent| {
-            try writer.print(".{s}", .{parent});
-            if (diagnostic.index) |index| try writer.print("[{d}]", .{index});
-            try writer.print(".{s}", .{diagnostic.kind.field()});
-        } else {
-            try writer.print(".{s}", .{diagnostic.kind.field()});
-            if (diagnostic.index) |index| try writer.print("[{d}]", .{index});
-        }
-    }
-
-    fn writeValidationMessage(writer: *std.Io.Writer, config: *const Config, diagnostic: ValidationDiagnostic) !void {
+    pub fn writeValidationMessage(writer: *std.Io.Writer, config: *const Config, diagnostic: ValidationDiagnostic) !void {
         switch (diagnostic.kind) {
             .too_many_workspaces => try writer.print("expected at most {d} workspaces, found {d}", .{
                 workspace.max_workspaces,
@@ -910,467 +784,7 @@ const ConfigDiagnostics = struct {
             }),
         }
     }
-
-    fn writeValidationDiagnostic(
-        writer: *std.Io.Writer,
-        path: []const u8,
-        source: [:0]const u8,
-        config: *const Config,
-        diagnostic: ValidationDiagnostic,
-    ) !void {
-        try writer.writeAll("error: invalid value for `");
-        try writeDiagnosticPath(writer, diagnostic);
-        try writer.writeAll("`\n");
-
-        if (findFieldOffset(source, diagnostic)) |offset| {
-            try writeSourceExcerpt(writer, path, source, sourceLocation(source, offset), diagnostic.kind.field().len + 1);
-        } else {
-            try writer.print("  --> {s}\n", .{path});
-        }
-        try writer.writeAll("   = ");
-        try writeValidationMessage(writer, config, diagnostic);
-        try writer.writeByte('\n');
-    }
-
-    fn writeParseDiagnostic(
-        writer: *std.Io.Writer,
-        path: []const u8,
-        source: []const u8,
-        _: *const std.zon.parse.Diagnostics,
-        parse_error: std.zon.parse.Diagnostics.Error,
-    ) !void {
-        switch (parseDiagnosticKind(parse_error)) {
-            .invalid_field => try writer.writeAll("warning: invalid field ignored\n"),
-            .invalid_value => try writer.writeAll("error: invalid value\n"),
-            .invalid_syntax => try writer.writeAll("error: invalid ZON syntax\n"),
-        }
-        try writeSourceExcerpt(writer, path, source, .{
-            .line = parse_error.loc.line,
-            .column = parse_error.loc.column,
-            .line_start = parse_error.loc.line_start,
-            .line_end = parse_error.loc.line_end,
-        }, 1);
-        try writer.print("   = {s}\n", .{parse_error.msg});
-
-        for (parse_error.notes) |note| {
-            try writer.print("   = note: {s}\n", .{note.msg});
-            // This supported-field list identifies SwipeConfig. The same names
-            // in other config objects should retain only the generic warning.
-            if (!std.mem.eql(u8, note.msg, "supported: 'enabled', 'reverse'")) continue;
-            if (std.mem.eql(u8, parse_error.msg, "unexpected field 'fingers'")) {
-                try writer.writeAll("   = note: swipe.fingers was removed; configure finger count in macOS System Settings > Trackpad > More Gestures > Swipe between full-screen applications\n");
-            } else if (std.mem.eql(u8, parse_error.msg, "unexpected field 'distance_pct'")) {
-                try writer.writeAll("   = note: swipe.distance_pct was removed; workspace switching now uses native gesture direction rather than a configured distance threshold\n");
-            }
-        }
-    }
-
-    const ParseDiagnosticKind = enum {
-        invalid_field,
-        invalid_value,
-        invalid_syntax,
-    };
-
-    fn parseDiagnosticKind(parse_error: std.zon.parse.Diagnostics.Error) ParseDiagnosticKind {
-        if (isUnexpectedField(parse_error)) return .invalid_field;
-        if (std.mem.indexOf(u8, parse_error.msg, "after initializer") != null) return .invalid_syntax;
-        return .invalid_value;
-    }
-
-    fn isUnexpectedField(parse_error: std.zon.parse.Diagnostics.Error) bool {
-        return std.mem.startsWith(u8, parse_error.msg, "unexpected field '");
-    }
-
-    fn blankSourceRange(source: []u8, start: usize, end: usize) void {
-        for (source[start..end]) |*char| {
-            if (char.* != '\n' and char.* != '\r') char.* = ' ';
-        }
-    }
-
-    /// Remove one unknown field initializer while preserving every byte offset, so
-    /// reparsing can reveal the next typed error without moving source locations.
-    fn maskUnknownField(source: [:0]u8, identifier_offset: usize) bool {
-        var tokenizer = std.zig.Tokenizer.init(source);
-        var found_identifier = false;
-        var found_equal = false;
-        var braces: usize = 0;
-        var brackets: usize = 0;
-        var parens: usize = 0;
-        const start = if (identifier_offset > 0 and source[identifier_offset - 1] == '.')
-            identifier_offset - 1
-        else
-            identifier_offset;
-
-        while (true) {
-            const token = tokenizer.next();
-            if (token.tag == .eof) return false;
-            if (!found_identifier) {
-                found_identifier = token.tag == .identifier and token.loc.start == identifier_offset;
-                continue;
-            }
-            if (!found_equal) {
-                found_equal = token.tag == .equal;
-                continue;
-            }
-
-            const at_value_depth = braces == 0 and brackets == 0 and parens == 0;
-            if (at_value_depth and token.tag == .comma) {
-                blankSourceRange(source, start, token.loc.end);
-                return true;
-            }
-            if (at_value_depth and token.tag == .r_brace) {
-                blankSourceRange(source, start, token.loc.start);
-                return true;
-            }
-            switch (token.tag) {
-                .l_brace => braces += 1,
-                .r_brace => braces -= 1,
-                .l_bracket => brackets += 1,
-                .r_bracket => brackets -= 1,
-                .l_paren => parens += 1,
-                .r_paren => parens -= 1,
-                else => {},
-            }
-        }
-    }
-
-    const ParseRecovery = enum {
-        valid,
-        ignored_unknown_fields,
-        fatal,
-    };
-
-    const ParseDiagnosticSink = struct {
-        context: *anyopaque,
-        emitFn: *const fn (*anyopaque, *const std.zon.parse.Diagnostics, std.zon.parse.Diagnostics.Error) bool,
-
-        fn emit(
-            self: ParseDiagnosticSink,
-            diagnostics: *const std.zon.parse.Diagnostics,
-            parse_error: std.zon.parse.Diagnostics.Error,
-        ) bool {
-            return self.emitFn(self.context, diagnostics, parse_error);
-        }
-    };
-
-    fn visitRecoveredParseDiagnostics(
-        source: [:0]const u8,
-        sink: *const ParseDiagnosticSink,
-    ) !ParseRecovery {
-        const allocator = std.heap.c_allocator;
-        const recovery_source = try allocator.dupeSentinel(u8, source, 0);
-        defer allocator.free(recovery_source);
-        var arena = std.heap.ArenaAllocator.init(allocator);
-        defer arena.deinit();
-        var ignored_unknown_fields = false;
-
-        while (true) {
-            _ = arena.reset(.retain_capacity);
-            const parse_allocator = arena.allocator();
-            var diagnostics: std.zon.parse.Diagnostics = undefined;
-            _ = std.zon.parse.fromSlice(Config, .{
-                .gpa = parse_allocator,
-                .arena = parse_allocator,
-                .source = recovery_source,
-                .diagnostics = &diagnostics,
-            }) catch |err| {
-                if (err != error.ParseZon) {
-                    return err;
-                }
-                var unknown_field_offset: ?usize = null;
-                var error_count: usize = 0;
-                for (diagnostics.errors) |parse_error| {
-                    error_count += 1;
-                    const offset = parse_error.loc.line_start + parse_error.loc.column;
-                    if (error_count == 1 and isUnexpectedField(parse_error)) {
-                        unknown_field_offset = offset;
-                    }
-                    if (!sink.emit(&diagnostics, parse_error)) {
-                        return error.DiagnosticAborted;
-                    }
-                }
-                if (error_count == 0) {
-                    return error.ParseZon;
-                }
-                if (error_count == 1) {
-                    if (unknown_field_offset) |offset| {
-                        if (maskUnknownField(recovery_source, offset)) {
-                            ignored_unknown_fields = true;
-                            continue;
-                        }
-                    }
-                }
-                return .fatal;
-            };
-            return if (ignored_unknown_fields) .ignored_unknown_fields else .valid;
-        }
-    }
-
-    const WriteParseContext = struct {
-        writer: *std.Io.Writer,
-        path: []const u8,
-        source: [:0]const u8,
-        failure: ?anyerror = null,
-
-        fn emit(
-            context: *anyopaque,
-            diagnostics: *const std.zon.parse.Diagnostics,
-            parse_error: std.zon.parse.Diagnostics.Error,
-        ) bool {
-            const self: *@This() = @ptrCast(@alignCast(context));
-            writeParseDiagnostic(self.writer, self.path, self.source, diagnostics, parse_error) catch |err| {
-                self.failure = err;
-                return false;
-            };
-            return true;
-        }
-    };
-
-    fn writeRecoveredParseDiagnostics(
-        writer: *std.Io.Writer,
-        path: []const u8,
-        source: [:0]const u8,
-    ) !ParseRecovery {
-        var context: WriteParseContext = .{ .writer = writer, .path = path, .source = source };
-        const sink: ParseDiagnosticSink = .{ .context = &context, .emitFn = WriteParseContext.emit };
-        const recovery = visitRecoveredParseDiagnostics(source, &sink) catch |err| {
-            if (err == error.DiagnosticAborted) return context.failure orelse err;
-            return err;
-        };
-        return recovery;
-    }
-
-    const LogValidationContext = struct {
-        path: []const u8,
-        source: [:0]const u8,
-        config: *const Config,
-    };
-
-    fn logValidationDiagnostic(context: *anyopaque, diagnostic: ValidationDiagnostic) bool {
-        const diagnostic_context: *const LogValidationContext = @ptrCast(@alignCast(context));
-        var buffer: [4096]u8 = undefined;
-        var writer: std.Io.Writer = .fixed(&buffer);
-        writeValidationDiagnostic(
-            &writer,
-            diagnostic_context.path,
-            diagnostic_context.source,
-            diagnostic_context.config,
-            diagnostic,
-        ) catch {
-            log.err("invalid configuration (diagnostic was too large to display)", .{});
-            return true;
-        };
-        log.err("{s}", .{writer.buffered()});
-        return true;
-    }
-
-    fn logValidationDiagnostics(path: []const u8, source: [:0]const u8, config: *const Config) void {
-        var context: LogValidationContext = .{ .path = path, .source = source, .config = config };
-        const sink: ValidationSink = .{ .context = &context, .emitFn = logValidationDiagnostic };
-        visitValidationDiagnostics(config, &sink);
-    }
-
-    const LogParseContext = struct {
-        path: []const u8,
-        source: [:0]const u8,
-
-        fn emit(
-            context: *anyopaque,
-            diagnostics: *const std.zon.parse.Diagnostics,
-            parse_error: std.zon.parse.Diagnostics.Error,
-        ) bool {
-            const self: *const @This() = @ptrCast(@alignCast(context));
-            var buffer: [4096]u8 = undefined;
-            var writer: std.Io.Writer = .fixed(&buffer);
-            writeParseDiagnostic(&writer, self.path, self.source, diagnostics, parse_error) catch {
-                log.err("config diagnostic at {s} was too large to display", .{self.path});
-                return true;
-            };
-            switch (parseDiagnosticKind(parse_error)) {
-                .invalid_field => log.warn("{s}", .{writer.buffered()}),
-                .invalid_value, .invalid_syntax => log.err("{s}", .{writer.buffered()}),
-            }
-            return true;
-        }
-    };
-
-    fn logParseDiagnostics(path: []const u8, source: [:0]const u8) ParseRecovery {
-        var context: LogParseContext = .{ .path = path, .source = source };
-        const sink: ParseDiagnosticSink = .{ .context = &context, .emitFn = LogParseContext.emit };
-        return visitRecoveredParseDiagnostics(source, &sink) catch |err| {
-            log.err("failed to produce config diagnostic for {s}: {}", .{ path, err });
-            return .fatal;
-        };
-    }
 };
-
-pub fn load(allocator: std.mem.Allocator, explicit_path: ?[]const u8) Config {
-    const path = resolvePath(allocator, explicit_path) catch return .{};
-    defer allocator.free(path);
-
-    return loadFromPath(allocator, path) orelse {
-        if (explicit_path != null) {
-            log.err("failed to load config from {s}, using defaults", .{path});
-        } else {
-            log.info("no config file found, using defaults", .{});
-        }
-        return .{};
-    };
-}
-
-/// Resolve the configured path even when it does not exist yet, allowing the
-/// daemon to notice a config file created after startup.
-pub fn resolvePath(allocator: std.mem.Allocator, explicit_path: ?[]const u8) ![:0]u8 {
-    if (explicit_path) |path| return allocator.dupeSentinel(u8, path, 0);
-
-    if (osutil.getenv("XDG_CONFIG_HOME")) |config_home| {
-        return std.fmt.allocPrintSentinel(allocator, "{s}/bobrwm/config.zon", .{config_home}, 0);
-    }
-
-    const home = osutil.getenv("HOME") orelse return error.MissingHome;
-    return std.fmt.allocPrintSentinel(allocator, "{s}/.config/bobrwm/config.zon", .{home}, 0);
-}
-
-pub fn loadFromPath(allocator: std.mem.Allocator, path: []const u8) ?Config {
-    log.info("loading config from {s}", .{path});
-
-    // libc-based read; std.fs.cwd was removed in Zig 0.16. Caller paths
-    // come from CLI / env so they fit easily in PATH_MAX.
-    const path_z = allocator.dupeSentinel(u8, path, 0) catch return null;
-    defer allocator.free(path_z);
-
-    // Source is intentionally not freed here: zon.parse may retain references
-    // into it for string fields. Caller passes an arena allocator whose
-    // deinit handles cleanup.
-    const source = osutil.readFileAllocSentinel(allocator, path_z, 1024 * 1024) orelse return null;
-    return parseSource(allocator, path, source);
-}
-
-/// Parse and validate config source as a reload does. `path` only labels
-/// diagnostics.
-pub fn parseSource(allocator: std.mem.Allocator, path: []const u8, source: [:0]const u8) ?Config {
-    // Parse strictly first so unknown fields are diagnosed. Only that error
-    // class gets a tolerant retry; invalid values and syntax remain fatal.
-    // Config holds slices, so both passes require the allocating parser.
-    var diagnostics: std.zon.parse.Diagnostics = undefined;
-    const parsed = parse: {
-        break :parse std.zon.parse.fromSlice(Config, .{
-            .gpa = allocator,
-            .arena = allocator,
-            .source = source,
-            .diagnostics = &diagnostics,
-        }) catch |err| {
-            if (err != error.ParseZon) {
-                log.err("failed to parse config {s}: {}", .{ path, err });
-                return null;
-            }
-            if (ConfigDiagnostics.logParseDiagnostics(path, source) != .ignored_unknown_fields) return null;
-
-            break :parse std.zon.parse.fromSlice(Config, .{
-                .gpa = allocator,
-                .arena = allocator,
-                .source = source,
-                .diagnostics = &diagnostics,
-                .ignore_unknown_fields = true,
-            }) catch |recovery_err| {
-                log.err("failed to recover config {s} after ignoring invalid fields: {}", .{ path, recovery_err });
-                return null;
-            };
-        };
-    };
-    if (ConfigDiagnostics.validationDiagnostic(&parsed) != null) {
-        ConfigDiagnostics.logValidationDiagnostics(path, source, &parsed);
-        return null;
-    }
-
-    log.info("loaded config: {d} keybind entries, {d} app rules, {d} workspace assignments", .{
-        parsed.keybinds.len,
-        parsed.app_rules.len,
-        parsed.workspace_assignments.len,
-    });
-    return parsed;
-}
-
-/// Rewrite the settings the native app edits, leaving the rest of `source`
-/// byte-for-byte intact. `allocator` should be an arena: intermediate copies
-/// are not freed.
-pub fn editSettingsSource(
-    allocator: std.mem.Allocator,
-    original: [:0]const u8,
-    previous: *const Config,
-    next: *const Config,
-) ![:0]const u8 {
-    try validate(next);
-    var source = original;
-
-    if (previous.layout != next.layout) {
-        source = try replaceRootField(allocator, source, "layout", try enumValue(allocator, next.layout));
-    }
-    if (previous.bsp_split != next.bsp_split) {
-        source = try replaceRootField(allocator, source, "bsp_split", try enumValue(allocator, next.bsp_split));
-    }
-    if (previous.bsp_insert_point != next.bsp_insert_point) {
-        source = try replaceRootField(allocator, source, "bsp_insert_point", try enumValue(allocator, next.bsp_insert_point));
-    }
-    if (previous.bsp_split_ratio != next.bsp_split_ratio) {
-        source = try replaceRootField(allocator, source, "bsp_split_ratio", try numberValue(allocator, next.bsp_split_ratio));
-    }
-    if (previous.new_window_split != next.new_window_split) {
-        source = try replaceRootField(allocator, source, "new_window_split", try enumValue(allocator, next.new_window_split));
-    }
-    if (!std.meta.eql(previous.dimmed_inactive, next.dimmed_inactive)) {
-        source = try replaceRootField(allocator, source, "dimmed_inactive", try std.fmt.allocPrintSentinel(
-            allocator,
-            ".{{ .enabled = {}, .level = {d} }}",
-            .{ next.dimmed_inactive.enabled, next.dimmed_inactive.level },
-            0,
-        ));
-    }
-    if (!std.meta.eql(previous.gaps, next.gaps)) {
-        source = try replaceRootField(allocator, source, "gaps", try std.fmt.allocPrintSentinel(
-            allocator,
-            ".{{ .inner = {d}, .outer = .{{ .left = {d}, .right = {d}, .top = {d}, .bottom = {d} }} }}",
-            .{
-                next.gaps.inner,
-                next.gaps.outer.left,
-                next.gaps.outer.right,
-                next.gaps.outer.top,
-                next.gaps.outer.bottom,
-            },
-            0,
-        ));
-    }
-    if (!std.meta.eql(previous.animation, next.animation)) {
-        source = try replaceRootField(allocator, source, "animation", try std.fmt.allocPrintSentinel(
-            allocator,
-            ".{{ .enabled = {}, .duration_ms = {d}, .easing = .{s} }}",
-            .{ next.animation.enabled, next.animation.duration_ms, @tagName(next.animation.easing) },
-            0,
-        ));
-    }
-    if (!std.meta.eql(previous.swipe, next.swipe)) {
-        source = try replaceRootField(allocator, source, "swipe", try std.fmt.allocPrintSentinel(
-            allocator,
-            ".{{ .enabled = {}, .reverse = {} }}",
-            .{ next.swipe.enabled, next.swipe.reverse },
-            0,
-        ));
-    }
-    inline for (.{ "focus_follows_mouse", "follow_app_resizes", "start_at_login", "auto_reload_config" }) |field| {
-        if (@field(previous, field) != @field(next, field)) {
-            source = try replaceRootField(allocator, source, field, if (@field(next, field)) "true" else "false");
-        }
-    }
-    if (!appRulesEqual(previous.app_rules, next.app_rules) or
-        previous.workspace_assignments.len != next.workspace_assignments.len)
-    {
-        source = try replaceRootField(allocator, source, "app_rules", try appRulesValue(allocator, next.app_rules));
-        if (next.workspace_assignments.len == 0) {
-            source = try removeRootField(allocator, source, "workspace_assignments");
-        }
-    }
-    return source;
-}
 
 /// `app_rules` plus any deprecated `workspace_assignments` entry no rule covers.
 pub fn effectiveAppRules(allocator: std.mem.Allocator, config: *const Config) ![]AppRule {
@@ -1386,332 +800,6 @@ pub fn effectiveAppRules(allocator: std.mem.Allocator, config: *const Config) ![
     return rules.toOwnedSlice(allocator);
 }
 
-fn appRulesEqual(a: []const AppRule, b: []const AppRule) bool {
-    if (a.len != b.len) return false;
-    for (a, b) |left, right| {
-        if (!std.mem.eql(u8, left.app_id, right.app_id)) return false;
-        if (left.workspace != right.workspace or left.float != right.float) return false;
-    }
-    return true;
-}
-
-fn appRulesValue(allocator: std.mem.Allocator, rules: []const AppRule) ![:0]const u8 {
-    if (rules.len == 0) return allocator.dupeSentinel(u8, ".{}", 0);
-
-    var out: std.Io.Writer.Allocating = .init(allocator);
-    errdefer out.deinit();
-    try out.writer.writeAll(".{\n");
-    for (rules) |rule| {
-        try out.writer.print("        .{{ .app_id = \"{f}\"", .{std.zig.fmtString(rule.app_id)});
-        if (rule.workspace) |workspace_id| try out.writer.print(", .workspace = {d}", .{workspace_id});
-        if (rule.float) try out.writer.writeAll(", .float = true");
-        try out.writer.writeAll(" },\n");
-    }
-    try out.writer.writeAll("    }");
-    return out.toOwnedSliceSentinel(0);
-}
-
-fn enumValue(allocator: std.mem.Allocator, value: anytype) ![:0]const u8 {
-    return std.fmt.allocPrintSentinel(allocator, ".{s}", .{@tagName(value)}, 0);
-}
-
-fn numberValue(allocator: std.mem.Allocator, value: anytype) ![:0]const u8 {
-    return std.fmt.allocPrintSentinel(allocator, "{d}", .{value}, 0);
-}
-
-fn replaceRootField(
-    allocator: std.mem.Allocator,
-    source: [:0]const u8,
-    field_name: []const u8,
-    replacement: []const u8,
-) ![:0]const u8 {
-    std.debug.assert(field_name.len > 0);
-    std.debug.assert(replacement.len > 0);
-    const range = try rootFieldValueRange(source, field_name);
-    if (range.value_start) |value_start| {
-        return std.fmt.allocPrintSentinel(
-            allocator,
-            "{s}{s}{s}",
-            .{ source[0..value_start], replacement, source[range.value_end..] },
-            0,
-        );
-    }
-
-    const line_prefix = if (range.root_close > 0 and source[range.root_close - 1] == '\n') "" else "\n";
-    const comma_at = lastFieldEnd(source, range.root_close);
-    const before = source[0 .. comma_at orelse range.root_close];
-    const between = if (comma_at) |at| source[at..range.root_close] else "";
-    return std.fmt.allocPrintSentinel(
-        allocator,
-        "{s}{s}{s}{s}    .{s} = {s},\n{s}",
-        .{
-            before,
-            if (comma_at != null) "," else "",
-            between,
-            line_prefix,
-            field_name,
-            replacement,
-            source[range.root_close..],
-        },
-        0,
-    );
-}
-
-/// Drop a top-level field, and its line when it has one to itself.
-fn removeRootField(allocator: std.mem.Allocator, source: [:0]const u8, field_name: []const u8) ![:0]const u8 {
-    const range = try rootFieldValueRange(source, field_name);
-    if (range.value_start == null) return source;
-
-    var end = range.value_end;
-    while (end < source.len and (source[end] == ' ' or source[end] == '\t')) end += 1;
-    if (end < source.len and source[end] == ',') end += 1;
-    var start = range.field_start;
-    var line_start = start;
-    while (line_start > 0 and (source[line_start - 1] == ' ' or source[line_start - 1] == '\t')) line_start -= 1;
-    var line_end = end;
-    while (line_end < source.len and (source[line_end] == ' ' or source[line_end] == '\t')) line_end += 1;
-    const owns_line = (line_start == 0 or source[line_start - 1] == '\n') and
-        (line_end == source.len or source[line_end] == '\n');
-    if (owns_line) {
-        start = line_start;
-        end = if (line_end < source.len) line_end + 1 else line_end;
-    }
-    return std.fmt.allocPrintSentinel(allocator, "{s}{s}", .{ source[0..start], source[end..] }, 0);
-}
-
-/// Where a comma is missing after the last root field, if anywhere.
-fn lastFieldEnd(source: [:0]const u8, root_close: usize) ?usize {
-    var tokenizer = std.zig.Tokenizer.init(source);
-    var last: ?std.zig.Token = null;
-    while (true) {
-        const token = tokenizer.next();
-        if (token.tag == .eof or token.loc.start >= root_close) break;
-        last = token;
-    }
-    const token = last orelse return null;
-    return switch (token.tag) {
-        .l_brace, .comma => null,
-        else => token.loc.end,
-    };
-}
-
-fn rootFieldValueRange(source: [:0]const u8, field_name: []const u8) !struct {
-    field_start: usize = 0,
-    value_start: ?usize,
-    value_end: usize,
-    root_close: usize,
-} {
-    var tokenizer = std.zig.Tokenizer.init(source);
-    var brace_depth: usize = 0;
-    var bracket_depth: usize = 0;
-    var paren_depth: usize = 0;
-    var root_opened = false;
-    var root_close: ?usize = null;
-
-    while (true) {
-        const token = tokenizer.next();
-        if (token.tag == .eof) break;
-        switch (token.tag) {
-            .l_brace => {
-                brace_depth += 1;
-                root_opened = true;
-            },
-            .r_brace => {
-                if (brace_depth == 0) return error.InvalidConfigSyntax;
-                if (brace_depth == 1 and bracket_depth == 0 and paren_depth == 0) {
-                    root_close = token.loc.start;
-                    break;
-                }
-                brace_depth -= 1;
-            },
-            .l_bracket => bracket_depth += 1,
-            .r_bracket => if (bracket_depth > 0) {
-                bracket_depth -= 1;
-            },
-            .l_paren => paren_depth += 1,
-            .r_paren => if (paren_depth > 0) {
-                paren_depth -= 1;
-            },
-            .period => {
-                if (!root_opened or brace_depth != 1 or bracket_depth != 0 or paren_depth != 0) continue;
-                const field_start = token.loc.start;
-                const name = tokenizer.next();
-                if (name.tag != .identifier) {
-                    updateDepths(name.tag, &brace_depth, &bracket_depth, &paren_depth);
-                    continue;
-                }
-                if (!std.mem.eql(u8, source[name.loc.start..name.loc.end], field_name)) continue;
-                const equal = tokenizer.next();
-                if (equal.tag != .equal) continue;
-                const value = tokenizer.next();
-                if (value.tag == .eof) return error.InvalidConfigSyntax;
-                var value_end = value.loc.end;
-                var value_braces: usize = 0;
-                var value_brackets: usize = 0;
-                var value_parens: usize = 0;
-                updateDepths(value.tag, &value_braces, &value_brackets, &value_parens);
-                while (true) {
-                    const next = tokenizer.next();
-                    if (next.tag == .eof) return error.InvalidConfigSyntax;
-                    if (next.tag == .comma and value_braces == 0 and value_brackets == 0 and value_parens == 0) {
-                        return .{ .field_start = field_start, .value_start = value.loc.start, .value_end = value_end, .root_close = 0 };
-                    }
-                    if (next.tag == .r_brace and value_braces == 0 and value_brackets == 0 and value_parens == 0) {
-                        return .{ .field_start = field_start, .value_start = value.loc.start, .value_end = value_end, .root_close = next.loc.start };
-                    }
-                    updateDepths(next.tag, &value_braces, &value_brackets, &value_parens);
-                    value_end = next.loc.end;
-                }
-            },
-            else => {},
-        }
-    }
-    return .{ .value_start = null, .value_end = 0, .root_close = root_close orelse return error.InvalidConfigSyntax };
-}
-
-fn updateDepths(
-    tag: std.zig.Token.Tag,
-    braces: *usize,
-    brackets: *usize,
-    parens: *usize,
-) void {
-    switch (tag) {
-        .l_brace => braces.* += 1,
-        .r_brace => if (braces.* > 0) {
-            braces.* -= 1;
-        },
-        .l_bracket => brackets.* += 1,
-        .r_bracket => if (brackets.* > 0) {
-            brackets.* -= 1;
-        },
-        .l_paren => parens.* += 1,
-        .r_paren => if (parens.* > 0) {
-            parens.* -= 1;
-        },
-        else => {},
-    }
-}
-
-test "replaceRootField preserves unrelated source and nested commas" {
-    const source: [:0]const u8 =
-        \\.{
-        \\    // keep this comment
-        \\    .gaps = .{ .inner = 4, .outer = .{ .left = 2 } },
-        \\    .layout = .bsp,
-        \\}
-    ;
-    const replaced = try replaceRootField(std.testing.allocator, source, "gaps", ".{ .inner = 8 }");
-    defer std.testing.allocator.free(replaced);
-    try std.testing.expectEqualStrings(
-        \\.{
-        \\    // keep this comment
-        \\    .gaps = .{ .inner = 8 },
-        \\    .layout = .bsp,
-        \\}
-    , replaced);
-}
-
-test "replaceRootField appends an omitted setting" {
-    const source: [:0]const u8 =
-        \\.{
-        \\    .layout = .bsp,
-        \\}
-    ;
-    const replaced = try replaceRootField(std.testing.allocator, source, "start_at_login", "true");
-    defer std.testing.allocator.free(replaced);
-    try std.testing.expectEqualStrings(
-        \\.{
-        \\    .layout = .bsp,
-        \\    .start_at_login = true,
-        \\}
-    , replaced);
-}
-
-test "replaceRootField adds the comma a last field without one needs" {
-    const source: [:0]const u8 = ".{ .layout = .bsp }";
-    const replaced = try replaceRootField(std.testing.allocator, source, "start_at_login", "true");
-    defer std.testing.allocator.free(replaced);
-    try std.testing.expectEqualStrings(
-        \\.{ .layout = .bsp, 
-        \\    .start_at_login = true,
-        \\}
-    , replaced);
-}
-
-test "editSettingsSource preserves unrelated configuration and produces valid ZON" {
-    var arena = std.heap.ArenaAllocator.init(t.allocator);
-    defer arena.deinit();
-    const original: [:0]const u8 =
-        \\.{
-        \\    // This user-authored section must survive app edits.
-        \\    .keybinds = .{
-        \\        .{ .key = "f", .mods = .{ .alt = true }, .action = .toggle_fullscreen },
-        \\    },
-        \\    .layout = .bsp
-        \\}
-    ;
-
-    const previous: Config = .{};
-    var next = previous;
-    next.layout = .monocle;
-    next.gaps.inner = 9;
-    next.start_at_login = true;
-    next.swipe.enabled = true;
-    next.focus_follows_mouse = true;
-    const written = try editSettingsSource(arena.allocator(), original, &previous, &next);
-    try t.expect(std.mem.indexOf(u8, written, "// This user-authored section must survive app edits.") != null);
-
-    const parsed = parseSource(arena.allocator(), "test", written) orelse return error.TestUnexpectedResult;
-    try t.expectEqual(tiling.LayoutKind.monocle, parsed.layout);
-    try t.expectEqual(@as(u16, 9), parsed.gaps.inner);
-    try t.expect(parsed.start_at_login);
-    try t.expect(parsed.swipe.enabled);
-    try t.expect(parsed.focus_follows_mouse);
-    try t.expectEqual(@as(usize, 1), parsed.keybinds.len);
-}
-
-test "editSettingsSource writes app rules and drops the deprecated alias" {
-    var arena = std.heap.ArenaAllocator.init(t.allocator);
-    defer arena.deinit();
-    const original: [:0]const u8 =
-        \\.{
-        \\    // Keep this.
-        \\    .workspace_assignments = .{
-        \\        .{ .app_id = "com.apple.mail", .workspace = 3 },
-        \\    },
-        \\    .layout = .bsp,
-        \\}
-    ;
-    const previous = parseSource(arena.allocator(), "test", original) orelse return error.TestUnexpectedResult;
-
-    var next = previous;
-    next.app_rules = try effectiveAppRules(arena.allocator(), &previous);
-    try t.expectEqual(@as(usize, 1), next.app_rules.len);
-    next.workspace_assignments = &.{};
-    next.app_rules = &.{
-        next.app_rules[0],
-        .{ .app_id = "com.example.\"quoted\"", .float = true },
-    };
-
-    const written = try editSettingsSource(arena.allocator(), original, &previous, &next);
-    try t.expect(std.mem.indexOf(u8, written, "// Keep this.") != null);
-    try t.expect(std.mem.indexOf(u8, written, "workspace_assignments") == null);
-
-    const parsed = parseSource(arena.allocator(), "test", written) orelse return error.TestUnexpectedResult;
-    try t.expectEqual(@as(usize, 2), parsed.app_rules.len);
-    try t.expectEqual(@as(?u8, 3), parsed.workspaceForApp("com.apple.mail"));
-    try t.expect(parsed.shouldFloatApp("com.example.\"quoted\""));
-    try t.expectEqual(tiling.LayoutKind.bsp, parsed.layout);
-}
-
-test "parseSource accepts unknown fields like a reload does" {
-    var arena = std.heap.ArenaAllocator.init(t.allocator);
-    defer arena.deinit();
-    const parsed = parseSource(arena.allocator(), "test", ".{ .layout = .monocle, .from_the_future = 1 }") orelse
-        return error.TestUnexpectedResult;
-    try t.expectEqual(tiling.LayoutKind.monocle, parsed.layout);
-}
-
 // Bundle ID helper
 
 pub fn getAppBundleId(pid: i32, buf: *[256]u8) ?[]const u8 {
@@ -1720,7 +808,7 @@ pub fn getAppBundleId(pid: i32, buf: *[256]u8) ?[]const u8 {
 
 // macOS virtual key code mapping
 
-fn keyNameToCode(name: []const u8) ?u16 {
+pub fn keyNameToCode(name: []const u8) ?u16 {
     const Map = struct { []const u8, u16 };
     const table: []const Map = &.{
         .{ "a", 0x00 },      .{ "s", 0x01 },      .{ "d", 0x02 },
@@ -1841,19 +929,6 @@ test "default config" {
     try t.expectEqual(animation.Easing.ease_out, cfg.animation.easing);
 }
 
-test "focus follows mouse can be enabled from ZON" {
-    var arena = std.heap.ArenaAllocator.init(t.allocator);
-    defer arena.deinit();
-    var diagnostics: std.zon.parse.Diagnostics = undefined;
-    const cfg = try std.zon.parse.fromSlice(Config, .{
-        .gpa = t.allocator,
-        .arena = arena.allocator(),
-        .source = ".{ .focus_follows_mouse = true }",
-        .diagnostics = &diagnostics,
-    });
-    try t.expect(cfg.focus_follows_mouse);
-}
-
 test "validate accepts defaults and a reduced workspace set" {
     const defaults: Config = .{};
     try validate(&defaults);
@@ -1873,63 +948,6 @@ test "validate rejects geometry values that are not bounded" {
     cfg = .{};
     cfg.dimmed_inactive.level = std.math.nan(f32);
     try t.expectError(error.InvalidDimLevel, validate(&cfg));
-}
-
-test "semantic validation renders every invalid field" {
-    const source: [:0]const u8 =
-        \\.{
-        \\    .bsp_split_ratio = 1.0,
-        \\    .dimmed_inactive = .{ .level = -0.1 },
-        \\    .keybinds = .{
-        \\        .{ .key = "F1", .action = .focus_left },
-        \\        .{ .key = "F2", .action = .focus_right },
-        \\    },
-        \\}
-    ;
-    var arena = std.heap.ArenaAllocator.init(t.allocator);
-    defer arena.deinit();
-    var diagnostics: std.zon.parse.Diagnostics = undefined;
-    const config = try std.zon.parse.fromSlice(Config, .{
-        .gpa = arena.allocator(),
-        .arena = arena.allocator(),
-        .source = source,
-        .diagnostics = &diagnostics,
-    });
-    const RenderContext = struct {
-        writer: *std.Io.Writer,
-        source: [:0]const u8,
-        config: *const Config,
-        failed: bool = false,
-
-        fn emit(context: *anyopaque, diagnostic: ConfigDiagnostics.ValidationDiagnostic) bool {
-            const self: *@This() = @ptrCast(@alignCast(context));
-            ConfigDiagnostics.writeValidationDiagnostic(
-                self.writer,
-                "/tmp/config.zon",
-                self.source,
-                self.config,
-                diagnostic,
-            ) catch {
-                self.failed = true;
-                return false;
-            };
-            return true;
-        }
-    };
-    var buffer: [8192]u8 = undefined;
-    var writer: std.Io.Writer = .fixed(&buffer);
-    var context: RenderContext = .{ .writer = &writer, .source = source, .config = &config };
-    const sink: ConfigDiagnostics.ValidationSink = .{ .context = &context, .emitFn = RenderContext.emit };
-
-    ConfigDiagnostics.visitValidationDiagnostics(&config, &sink);
-    try t.expect(!context.failed);
-    const rendered = writer.buffered();
-
-    try t.expectEqual(@as(usize, 4), std.mem.count(u8, rendered, "error: invalid value for `"));
-    try t.expect(std.mem.indexOf(u8, rendered, "`.bsp_split_ratio`") != null);
-    try t.expect(std.mem.indexOf(u8, rendered, "`.dimmed_inactive.level`") != null);
-    try t.expect(std.mem.indexOf(u8, rendered, "`.keybinds[0].key`") != null);
-    try t.expect(std.mem.indexOf(u8, rendered, "`.keybinds[1].key`") != null);
 }
 
 test "validate rejects invalid workspace references and duplicate rules" {
@@ -1988,159 +1006,6 @@ test "validate rejects unknown keys and invalid workspace name text" {
     const invalid_utf8 = [_]u8{0xff};
     const invalid_name: Config = .{ .workspace_names = &.{invalid_utf8[0..]} };
     try t.expectError(error.InvalidWorkspaceName, validate(&invalid_name));
-}
-
-test "parse recovery reports unknown fields at every nesting level" {
-    const source: [:0]const u8 =
-        \\.{
-        \\    .your_mom = "fat",
-        \\    .monster = "locco",
-        \\    .swipe = .{
-        \\        .nonsense = true,
-        \\        .also_bad = 12,
-        \\    },
-        \\    .gaps = .{
-        \\        .outer = .{ .wat = 1, .nope = 2 },
-        \\    },
-        \\}
-    ;
-    var buffer: [8192]u8 = undefined;
-    var writer: std.Io.Writer = .fixed(&buffer);
-    const recovery = try ConfigDiagnostics.writeRecoveredParseDiagnostics(&writer, "/tmp/config.zon", source);
-    const rendered = writer.buffered();
-
-    try t.expectEqual(ConfigDiagnostics.ParseRecovery.ignored_unknown_fields, recovery);
-    try t.expectEqual(@as(usize, 6), std.mem.count(u8, rendered, "warning: invalid field ignored"));
-    try t.expect(std.mem.indexOf(u8, rendered, "unexpected field 'your_mom'") != null);
-    try t.expect(std.mem.indexOf(u8, rendered, "unexpected field 'monster'") != null);
-    try t.expect(std.mem.indexOf(u8, rendered, "unexpected field 'nonsense'") != null);
-    try t.expect(std.mem.indexOf(u8, rendered, "unexpected field 'also_bad'") != null);
-    try t.expect(std.mem.indexOf(u8, rendered, "unexpected field 'wat'") != null);
-    try t.expect(std.mem.indexOf(u8, rendered, "unexpected field 'nope'") != null);
-    try t.expect(std.mem.indexOf(u8, rendered, "--> /tmp/config.zon:5:") != null);
-    try t.expect(std.mem.indexOf(u8, rendered, "|         .nonsense = true,") != null);
-}
-
-test "parse recovery explains removed swipe settings only in swipe config" {
-    const source: [:0]const u8 =
-        \\.{
-        \\    .fingers = 3,
-        \\    .swipe = .{
-        \\        .enabled = true,
-        \\        .fingers = 4,
-        \\        .distance_pct = 10,
-        \\    },
-        \\    .gaps = .{ .distance_pct = 5 },
-        \\}
-    ;
-    var buffer: [8192]u8 = undefined;
-    var writer: std.Io.Writer = .fixed(&buffer);
-    const recovery = try ConfigDiagnostics.writeRecoveredParseDiagnostics(&writer, "/tmp/config.zon", source);
-    const rendered = writer.buffered();
-
-    try t.expectEqual(ConfigDiagnostics.ParseRecovery.ignored_unknown_fields, recovery);
-    try t.expectEqual(@as(usize, 4), std.mem.count(u8, rendered, "warning: invalid field ignored"));
-    try t.expectEqual(@as(usize, 1), std.mem.count(u8, rendered, "swipe.fingers was removed"));
-    try t.expectEqual(@as(usize, 1), std.mem.count(u8, rendered, "swipe.distance_pct was removed"));
-    try t.expect(std.mem.indexOf(u8, rendered, "macOS System Settings > Trackpad > More Gestures") != null);
-    try t.expect(std.mem.indexOf(u8, rendered, "native gesture direction rather than a configured distance threshold") != null);
-    try t.expect(std.mem.indexOf(u8, rendered, "--> /tmp/config.zon:5:") != null);
-    try t.expect(std.mem.indexOf(u8, rendered, "--> /tmp/config.zon:6:") != null);
-}
-
-test "parse recovery continues from an unknown field to a typed error" {
-    const source: [:0]const u8 =
-        \\.{
-        \\    .unknown = .{ .nested = true },
-        \\    .layout = "bsp",
-        \\}
-    ;
-    var buffer: [4096]u8 = undefined;
-    var writer: std.Io.Writer = .fixed(&buffer);
-    const recovery = try ConfigDiagnostics.writeRecoveredParseDiagnostics(&writer, "/tmp/config.zon", source);
-    const rendered = writer.buffered();
-
-    try t.expectEqual(ConfigDiagnostics.ParseRecovery.fatal, recovery);
-    try t.expect(std.mem.indexOf(u8, rendered, "warning: invalid field ignored") != null);
-    try t.expect(std.mem.indexOf(u8, rendered, "error: invalid value") != null);
-    try t.expect(std.mem.indexOf(u8, rendered, "|     .layout = \"bsp\",") != null);
-}
-
-test "parse recovery masks a final nested initializer without a comma" {
-    const source: [:0]const u8 =
-        \\.{
-        \\    .swipe = .{
-        \\        .enabled = true,
-        \\        .unknown = .{
-        \\            .nested = true,
-        \\        }
-        \\    }
-        \\}
-    ;
-    var buffer: [4096]u8 = undefined;
-    var writer: std.Io.Writer = .fixed(&buffer);
-    const recovery = try ConfigDiagnostics.writeRecoveredParseDiagnostics(&writer, "/tmp/config.zon", source);
-    const rendered = writer.buffered();
-
-    try t.expectEqual(ConfigDiagnostics.ParseRecovery.ignored_unknown_fields, recovery);
-    try t.expectEqual(@as(usize, 1), std.mem.count(u8, rendered, "warning: invalid field ignored"));
-    try t.expect(std.mem.indexOf(u8, rendered, "unexpected field 'unknown'") != null);
-    try t.expect(std.mem.indexOf(u8, rendered, "--> /tmp/config.zon:4:") != null);
-    try t.expect(std.mem.indexOf(u8, rendered, "|         .unknown = .{") != null);
-}
-
-test "validation diagnostic identifies an indexed field and its source line" {
-    const source: [:0]const u8 =
-        \\.{
-        \\    .workspace_names = .{ "one", "two" },
-        \\    .keybinds = .{
-        \\        .{ .key = "h", .action = .focus_left },
-        \\        .{ .key = "3", .action = .focus_workspace, .arg = 3 },
-        \\    },
-        \\}
-    ;
-    const keybinds = [_]Keybind{
-        .{ .key = "h", .action = .focus_left },
-        .{ .key = "3", .action = .focus_workspace, .arg = 3 },
-    };
-    const config: Config = .{
-        .workspace_names = &.{ "one", "two" },
-        .keybinds = &keybinds,
-    };
-    const diagnostic = ConfigDiagnostics.validationDiagnostic(&config).?;
-
-    var buffer: [2048]u8 = undefined;
-    var writer: std.Io.Writer = .fixed(&buffer);
-    try ConfigDiagnostics.writeValidationDiagnostic(&writer, "/tmp/config.zon", source, &config, diagnostic);
-    const rendered = writer.buffered();
-
-    try t.expect(std.mem.indexOf(u8, rendered, "error: invalid value for `.keybinds[1].arg`") != null);
-    try t.expect(std.mem.indexOf(u8, rendered, "--> /tmp/config.zon:5:52") != null);
-    try t.expect(std.mem.indexOf(u8, rendered, "|         .{ .key = \"3\", .action = .focus_workspace, .arg = 3 },") != null);
-    try t.expect(std.mem.indexOf(u8, rendered, "workspace must be from 1 through 2, found 3") != null);
-}
-
-test "parse diagnostics report syntax errors without repairing the source" {
-    const source: [:0]const u8 =
-        \\.{
-        \\    .layout = .bsp
-        \\    .bsp_split = .auto,
-        \\    .gaps = .{
-        \\        .inner = 8
-        \\        .outer = .{},
-        \\    },
-        \\}
-    ;
-    var buffer: [4096]u8 = undefined;
-    var writer: std.Io.Writer = .fixed(&buffer);
-    const recovery = try ConfigDiagnostics.writeRecoveredParseDiagnostics(&writer, "/tmp/config.zon", source);
-    const rendered = writer.buffered();
-
-    try t.expectEqual(ConfigDiagnostics.ParseRecovery.fatal, recovery);
-    try t.expectEqual(@as(usize, 1), std.mem.count(u8, rendered, "error: invalid ZON syntax"));
-    try t.expect(std.mem.indexOf(u8, rendered, "expected ',' after initializer") != null);
-    try t.expect(std.mem.indexOf(u8, rendered, "--> /tmp/config.zon:") != null);
-    try t.expect(std.mem.indexOf(u8, rendered, "|     .bsp_split = .auto,") != null);
 }
 
 test "default_keybinds" {
@@ -2215,25 +1080,14 @@ test "disabled default keybinds leave omitted and empty keybinds unbound" {
     }
 }
 
-test "disabled default keybinds retain only explicit bindings parsed from ZON" {
-    const source =
-        \\.{
-        \\    .disable_default_keybinds = true,
-        \\    .keybinds = .{
-        \\        .{ .key = "1", .mods = .{ .alt = true }, .action = .focus_workspace, .arg = 3 },
-        \\        .{ .key = "f", .mods = .{ .ctrl = true }, .action = .toggle_float },
-        \\    },
-        \\}
-    ;
-    var arena = std.heap.ArenaAllocator.init(t.allocator);
-    defer arena.deinit();
-    var diagnostics: std.zon.parse.Diagnostics = undefined;
-    const cfg = try std.zon.parse.fromSlice(Config, .{
-        .gpa = arena.allocator(),
-        .arena = arena.allocator(),
-        .source = source,
-        .diagnostics = &diagnostics,
-    });
+test "disabled default keybinds retain only explicit bindings" {
+    const cfg: Config = .{
+        .disable_default_keybinds = true,
+        .keybinds = &.{
+            .{ .key = "1", .mods = .{ .alt = true }, .action = .focus_workspace, .arg = 3 },
+            .{ .key = "f", .mods = .{ .ctrl = true }, .action = .toggle_float },
+        },
+    };
     var table = try KeybindTable.init(t.allocator, &cfg);
     defer table.deinit(t.allocator);
 
@@ -2322,65 +1176,4 @@ test "buildKeybinds: unknown key name is skipped without consuming a slot" {
 
     try t.expectEqual(@as(usize, default_keybind_count + 1), merged.len);
     try t.expectEqual(keyNameToCode("f").?, merged[default_keybind_count].keycode);
-}
-
-test "loadFromPath: missing file" {
-    try t.expectEqual(@as(?Config, null), loadFromPath(t.allocator, "/tmp/bobrwm_no_such_file.zon"));
-}
-
-test "loadFromPath: custom zon" {
-    var arena = std.heap.ArenaAllocator.init(t.allocator);
-    defer arena.deinit();
-    const allocator = arena.allocator();
-
-    const zon =
-        \\.{
-        \\    .unknown_root = "ignored",
-        \\    .keybinds = .{
-        \\        .{ .key = "f", .mods = .{ .alt = true }, .action = .toggle_fullscreen },
-        \\        .{ .key = "space", .mods = .{ .alt = true, .shift = true }, .action = .toggle_float },
-        \\    },
-        \\    .workspace_assignments = .{
-        \\        .{ .app_id = "com.test.App", .workspace = 3 },
-        \\    },
-        \\    .swipe = .{ .enabled = true, .reverse = true, .fingres = 5 },
-        \\    .gaps = .{ .inner = 8, .outer = .{ .left = 4, .right = 4, .top = 4, .bottom = 4 } },
-        \\    .layout = .monocle,
-        \\    .bsp_split = .vertical,
-        \\    .bsp_insert_point = .last,
-        \\    .bsp_split_ratio = 0.6,
-        \\    .new_window_split = .first,
-        \\}
-    ;
-
-    // tmpDir.writeFile / realpathAlloc now require an Io instance which we
-    // don't thread through tests. Write to a deterministic /tmp path with
-    // libc instead.
-    const path: [:0]const u8 = "/tmp/bobrwm_test_custom_config.zon";
-    if (!osutil.writeFile(path.ptr, zon)) return error.TestUnexpectedResult;
-    defer osutil.deleteFile(path.ptr);
-
-    const cfg = loadFromPath(allocator, path) orelse
-        return error.TestUnexpectedResult;
-
-    try t.expectEqual(@as(usize, 2), cfg.keybinds.len);
-    try t.expectEqual(Action.toggle_fullscreen, cfg.keybinds[0].action);
-    try t.expectEqual(Action.toggle_float, cfg.keybinds[1].action);
-
-    try t.expectEqual(@as(usize, 1), cfg.workspace_assignments.len);
-    try t.expect(std.mem.eql(u8, "com.test.App", cfg.workspace_assignments[0].app_id));
-    try t.expectEqual(@as(u8, 3), cfg.workspace_assignments[0].workspace);
-    try t.expect(cfg.swipe.enabled);
-    try t.expect(cfg.swipe.reverse);
-
-    try t.expectEqual(@as(u16, 8), cfg.gaps.inner);
-    try t.expectEqual(@as(u16, 4), cfg.gaps.outer.left);
-    try t.expectEqual(@as(u16, 4), cfg.gaps.outer.right);
-    try t.expectEqual(@as(u16, 4), cfg.gaps.outer.top);
-    try t.expectEqual(@as(u16, 4), cfg.gaps.outer.bottom);
-    try t.expectEqual(tiling.LayoutKind.monocle, cfg.layout);
-    try t.expectEqual(tiling.SplitMode.vertical, cfg.bsp_split);
-    try t.expectEqual(tiling.InsertionPointPolicy.last, cfg.bsp_insert_point);
-    try t.expectApproxEqAbs(@as(f64, 0.6), cfg.bsp_split_ratio, 0.0001);
-    try t.expectEqual(tiling.InsertChild.first, cfg.new_window_split);
 }
