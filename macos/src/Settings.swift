@@ -157,6 +157,7 @@ struct EditableSettings: Equatable {
     var easing: EasingSetting = .easeOut
     var startAtLogin = false
     var focusFollowsMouse = false
+    var mouseFollowsDisplay = false
     var swipeEnabled = false
     var swipeReversed = false
     var followAppResizes = false
@@ -182,6 +183,7 @@ struct EditableSettings: Equatable {
         easing = EasingSetting(rawValue: raw.animation_easing) ?? .easeOut
         startAtLogin = raw.start_at_login
         focusFollowsMouse = raw.focus_follows_mouse
+        mouseFollowsDisplay = raw.mouse_follows_display
         swipeEnabled = raw.swipe_enabled
         swipeReversed = raw.swipe_reverse
         followAppResizes = raw.follow_app_resizes
@@ -207,6 +209,7 @@ struct EditableSettings: Equatable {
             animation_easing: easing.rawValue,
             start_at_login: startAtLogin,
             focus_follows_mouse: focusFollowsMouse,
+            mouse_follows_display: mouseFollowsDisplay,
             swipe_enabled: swipeEnabled,
             swipe_reverse: swipeReversed,
             follow_app_resizes: followAppResizes,
@@ -671,13 +674,14 @@ private struct GeneralPane: View {
 
             Section {
                 Toggle("Focus follows mouse", isOn: $model.settings.focusFollowsMouse)
+                Toggle("Move pointer to focused display", isOn: $model.settings.mouseFollowsDisplay)
                 Toggle("Swipe to switch workspaces", isOn: $model.settings.swipeEnabled)
                 Toggle("Reverse swipe direction", isOn: $model.settings.swipeReversed)
                     .disabled(!model.settings.swipeEnabled)
             } header: {
                 Text("Mouse and Trackpad")
             } footer: {
-                Text("Focus follows mouse focuses a window without raising it. Swiping uses the horizontal Spaces gesture.")
+                Text("Focus follows mouse focuses a window without raising it. Moving the pointer centers it on a display when a workspace switch focuses that display. Swiping uses the horizontal Spaces gesture.")
                     .foregroundStyle(.secondary)
             }
 

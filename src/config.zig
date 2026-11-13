@@ -24,6 +24,9 @@ pub const Config = struct {
     /// Focus a window without raising it when the pointer enters it, including
     /// floating windows and windows excluded from tiling.
     focus_follows_mouse: bool = false,
+    /// Move the pointer to the center of a display when switching to a
+    /// workspace on it moves focus there from another display.
+    mouse_follows_display: bool = false,
     /// Map a key and modifiers to an action.
     ///
     /// Entries are merged with the built-in defaults. An entry with the same
@@ -1356,7 +1359,7 @@ pub fn editSettingsSource(
             0,
         ));
     }
-    inline for (.{ "focus_follows_mouse", "follow_app_resizes", "start_at_login", "auto_reload_config" }) |field| {
+    inline for (.{ "focus_follows_mouse", "mouse_follows_display", "follow_app_resizes", "start_at_login", "auto_reload_config" }) |field| {
         if (@field(previous, field) != @field(next, field)) {
             source = try replaceRootField(allocator, source, field, if (@field(next, field)) "true" else "false");
         }
