@@ -3845,7 +3845,7 @@ fn handleEvent(ev: *const event_mod.Event) void {
         .app_windows_observed => {
             const reasons = app_windows.decodeReasons(ev.detail);
             if (reasons.contains(.tab_bar)) applyTabBarObservation(ev.pid);
-            if (reasons.contains(.offscreen_cleanup)) {
+            if (reasons.contains(.offscreen_cleanup) or reasons.contains(.offscreen_tabs)) {
                 dispatchStateEvent(.{ .offscreen_window_list_observed = ev.pid });
             }
         },
@@ -5938,7 +5938,7 @@ fn appWindowSnapshot(
     out: []tab_detect.AppWindow,
 ) BoundedSnapshotResult {
     var count: usize = 0;
-    var truncated = listed.is_truncated or listed.is_incomplete;
+    var truncated = listed.is_truncated or listed.is_incomplete or listed.details != .tabs;
     for (listed.items()) |listed_window| {
         if (count == out.len) {
             truncated = true;
@@ -6532,6 +6532,8 @@ fn cleanupWorkspaceWindowsForPid(pid: i32) bool {
 /// Ask each app with a standalone window on a visible Space for its window
 /// list. Cleanup for the app runs when it arrives.
 fn requestOffscreenCleanupLists() void {
+    var requested_pids: [app_queue.max_apps]i32 = undefined;
+    var requested_count: usize = 0;
     for (g_state.spaces.spaces[0..g_state.spaces.space_count]) |ws| {
         // macOS keeps windows on inactive Spaces off-screen.
         if (!spaceVisible(ws)) continue;
@@ -6541,6 +6543,10 @@ fn requestOffscreenCleanupLists() void {
             // Tab-group members can be intentionally off-screen when a sibling
             // tab is active; treating them as ghosts causes layout churn.
             if (g_state.windowTabGroup(wid) != null) continue;
+            if (std.mem.findScalar(i32, requested_pids[0..requested_count], win.pid) != null) continue;
+            if (requested_count == requested_pids.len) return;
+            requested_pids[requested_count] = win.pid;
+            requested_count += 1;
             _ = app_windows.request(win.pid, .offscreen_cleanup);
         }
     }
@@ -6558,6 +6564,9 @@ fn requestOffscreenCleanupLists() void {
 fn cleanupOffscreenWindows(pid: i32) bool {
     var listed: app_windows.Snapshot = undefined;
     if (!app_windows.latest(pid, &listed)) return false;
+    if (listed.is_incomplete or listed.is_truncated) return false;
+    const on_screen = OnScreenWindows.snapshot();
+    if (on_screen.truncated) return false;
 
     const Suspect = struct { wid: u32, is_on_screen: bool };
     var suspects: [128]Suspect = undefined;
@@ -6578,8 +6587,10 @@ fn cleanupOffscreenWindows(pid: i32) bool {
             // is never placed again: every geometry write for it is addressed to
             // a window that no longer exists, so the slot silently stops
             // responding to tiling, fullscreen and parking.
-            const is_on_screen = isInOnScreenWindowList(wid);
-            if (is_on_screen and appListsWindow(&listed, wid)) continue;
+            const is_on_screen = on_screen.contains(wid);
+            // A listed window is neither a ghost nor a native background tab,
+            // even if it is temporarily off-screen. No tab hierarchy is needed.
+            if (listed.listsWindow(wid)) continue;
 
             if (suspect_count < suspects.len) {
                 suspects[suspect_count] = .{ .wid = wid, .is_on_screen = is_on_screen };
@@ -6594,12 +6605,18 @@ fn cleanupOffscreenWindows(pid: i32) bool {
         log.warn("cleanup: offscreen batch truncated queued={d}", .{suspect_count});
     }
 
+    if (suspect_count > 0 and listed.details != .tabs) {
+        // Keep both ghosts and possible tabs until the app answers with tab facts.
+        _ = app_windows.request(pid, .offscreen_tabs);
+        return false;
+    }
+
     // Mutations are deferred so the snapshots above stay valid.
     var mutated = false;
     for (suspects[0..suspect_count]) |suspect| {
         const win = managedWindow(suspect.wid) orelse continue;
 
-        switch (adoptWindowAsBackgroundTab(win, &listed)) {
+        switch (adoptWindowAsBackgroundTab(win, &listed, &on_screen)) {
             .adopt => mutated = true,
             .keep => {},
             .reap => {
@@ -6622,20 +6639,6 @@ fn cleanupOffscreenWindows(pid: i32) bool {
     return mutated;
 }
 
-/// Whether an app still lists `wid`. A window it has dropped is either
-/// destroyed or a native background tab, which macOS omits from that list
-/// entirely. An unreadable or truncated list counts as listing the window, so
-/// an AX timeout on a busy app cannot make every one of its windows look
-/// dropped at once.
-fn appListsWindow(listed: *const app_windows.Snapshot, wid: u32) bool {
-    if (listed.count == 0 or listed.is_truncated or listed.is_incomplete) return true;
-    for (listed.items()) |listed_window| {
-        if (listed_window.wid == wid) return true;
-    }
-
-    return false;
-}
-
 /// Adopt a managed window as a member of an on-screen sibling's tab group.
 /// Returns true when adoption happened.
 ///
@@ -6649,44 +6652,32 @@ fn appListsWindow(listed: *const app_windows.Snapshot, wid: u32) bool {
 /// A window qualifies when its app's AXWindows list has dropped it (which is
 /// what a background tab looks like, and also what a destroyed ghost looks like)
 /// and an on-screen managed sibling occupies the same frame — the active tab.
-fn adoptWindowAsBackgroundTab(win: window_mod.Window, listed: *const app_windows.Snapshot) tab_detect.OffscreenOutcomeKind {
+fn adoptWindowAsBackgroundTab(
+    win: window_mod.Window,
+    listed: *const app_windows.Snapshot,
+    on_screen: *const OnScreenWindows,
+) tab_detect.OffscreenOutcomeKind {
+    if (listed.listsWindow(win.wid)) return .keep;
+    const has_tab_group = listed.hasTabGroup() orelse return .keep;
+    if (!has_tab_group) return .reap;
     const frame = liveWindowFrame(win.wid);
 
-    const on_screen = OnScreenWindows.snapshot();
-    if (on_screen.truncated) return .keep;
-    var app_facts: [app_windows.max_windows]tab_detect.AppWindow = undefined;
-    const app_snapshot = appWindowSnapshot(listed, &on_screen, &app_facts);
-    if (app_snapshot.truncated) {
-        log.warn("background-tab adoption skipped: AX window snapshot truncated pid={d} limit={d}", .{ win.pid, app_facts.len });
-        return .keep;
-    }
-    const listed_in_app = blk: {
-        for (app_facts[0..app_snapshot.count]) |app_window| {
-            if (app_window.wid == win.wid) break :blk true;
-        }
-        break :blk false;
-    };
-
     var candidates: [128]tab_detect.Candidate = undefined;
-    const candidate_snapshot = tabCandidates(win.pid, &on_screen, &candidates, true);
+    const candidate_snapshot = tabCandidates(win.pid, on_screen, &candidates, true);
     if (candidate_snapshot.truncated) {
         log.warn("background-tab adoption skipped: candidate snapshot truncated pid={d} limit={d}", .{ win.pid, candidates.len });
         return .keep;
     }
 
-    const has_tab_group = tab_detect.appHasTabGroup(app_facts[0..app_snapshot.count]);
     const sibling_wid = switch (tab_detect.classifyOffscreenManaged(
         win.wid,
         win.pid,
         frame,
-        listed_in_app,
+        false,
         has_tab_group,
         candidates[0..candidate_snapshot.count],
     )) {
-        .keep => {
-            log.debug("cleanup: keeping wid={d} pid={d}, the app still lists it", .{ win.wid, win.pid });
-            return .keep;
-        },
+        .keep => return .keep,
         .reap => return .reap,
         .adopt_into => |sibling_wid| sibling_wid,
     };

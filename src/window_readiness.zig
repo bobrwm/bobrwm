@@ -194,16 +194,15 @@ fn answerRequests(app: app_queue.App) void {
         const is_gone = if (live) |ids| std.mem.findScalar(u32, ids, queued.wid) == null else false;
         const answer: Answer = if (is_gone) .gone else if (elements[index]) |win| classify(win) else .pending;
         answers[index] = answer;
-        // Asked here so adoption on the main thread does not message the app.
-        is_resizable[index] = answer != .ready or ax.isAttributeSettable(elements[index].?, strings.size_attr);
-
         const is_candidate = queued.purposes.contains(.pending_role) or queued.purposes.contains(.deferred);
+        // Cleanup does not use resizability; only adoption needs this message.
+        is_resizable[index] = !is_candidate or answer != .ready or ax.isAttributeSettable(elements[index].?, strings.size_attr);
         if (answer == .ready and is_candidate) is_adopting = true;
     }
 
     // Adoption decides native tabs from this, so it must be stored before
     // the answers are published.
-    if (is_adopting and !app_windows.capture(app.pid)) {
+    if (is_adopting and !app_windows.capture(app.pid, .tabs)) {
         // Missing tab facts are not evidence that a ready window is standalone.
         for (batch, 0..) |queued, index| {
             if (queued.purposes.contains(.pending_role) or queued.purposes.contains(.deferred)) {

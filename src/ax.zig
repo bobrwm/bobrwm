@@ -281,6 +281,9 @@ pub const AppWindow = struct {
     tab_count: u32,
 };
 
+/// Membership is enough for healthy cleanup; tab reads are only for inference.
+pub const AppWindowDetails = enum { membership, tabs };
+
 pub const AppWindowsResult = struct {
     count: usize,
     /// The app listed more windows than fit in `out`.
@@ -291,7 +294,7 @@ pub const AppWindowsResult = struct {
 
 /// Read the app's AX window list and tab counts within a whole-scan budget.
 /// A timeout stops the scan so geometry and focus can use the app's queue.
-pub fn appWindows(pid: i32, out: []AppWindow, timeout_seconds: f32, budget_seconds: f32) AppWindowsResult {
+pub fn appWindows(pid: i32, out: []AppWindow, details: AppWindowDetails, timeout_seconds: f32, budget_seconds: f32) AppWindowsResult {
     std.debug.assert(pid > 0);
     std.debug.assert(timeout_seconds > 0 and budget_seconds > 0);
 
@@ -321,7 +324,7 @@ pub fn appWindows(pid: i32, out: []AppWindow, timeout_seconds: f32, budget_secon
         trace.countAx();
         // A failed ID read leaves membership unknown, even if later windows answer.
         if (_AXUIElementGetWindow(win, &wid) != c.kAXErrorSuccess or wid == 0) return result;
-        const tabs = tabCount(win, ax, &budget) catch return result;
+        const tabs = if (details == .tabs) tabCount(win, ax, &budget) catch return result else 0;
         out[result.count] = .{ .wid = wid, .tab_count = tabs };
         result.count += 1;
     }
@@ -396,6 +399,13 @@ test "app window snapshots stop on failure or deadline and distinguish complete 
         var fail_ids = false;
         var role_delay_us: c_uint = 0;
         var last_timeout: f32 = 0;
+        var observed_reasons: u8 = 0;
+
+        export fn bw_emit_event_detail(_: u8, _: i32, _: u32, detail: u8) void {
+            observed_reasons = detail;
+        }
+
+        fn barrier(_: ?*anyopaque) callconv(.c) void {}
 
         export fn AXUIElementCreateApplication(_: i32) c.AXUIElementRef {
             return @ptrCast(c.CFRetain(@ptrCast(windows)));
@@ -416,7 +426,8 @@ test "app window snapshots stop on failure or deadline and distinguish complete 
             const attributes = strings().?;
             const value: c.CFTypeRef = if (c.CFEqual(@ptrCast(attr), @ptrCast(attributes.windows_attr)) != 0)
                 @ptrCast(windows)
-            else if (c.CFEqual(@ptrCast(attr), @ptrCast(attributes.children_attr)) != 0)
+            else if (c.CFEqual(@ptrCast(attr), @ptrCast(attributes.children_attr)) != 0 or
+                c.CFEqual(@ptrCast(attr), @ptrCast(attributes.tabs_attr)) != 0)
                 @ptrCast(children)
             else if (c.CFEqual(@ptrCast(attr), @ptrCast(attributes.role_attr)) != 0) blk: {
                 role_reads += 1;
@@ -438,8 +449,14 @@ test "app window snapshots stop on failure or deadline and distinguish complete 
     defer c.CFRelease(@ptrCast(Fixture.children));
     var out: [4]AppWindow = undefined;
 
+    // Healthy membership stays available even when the tab hierarchy hangs.
     Fixture.fail_roles = true;
-    var result = appWindows(42, &out, 0.25, 1.0);
+    var result = appWindows(42, &out, .membership, 0.25, 1.0);
+    try testing.expect(!result.is_incomplete);
+    try testing.expectEqual(@as(usize, 2), result.count);
+    try testing.expectEqual(@as(u32, 17), out[1].wid);
+
+    result = appWindows(42, &out, .tabs, 0.25, 1.0);
     try testing.expect(result.is_incomplete);
     try testing.expectEqual(@as(usize, 0), result.count);
     // A timeout is not permission to spend another timeout on every sibling.
@@ -447,29 +464,63 @@ test "app window snapshots stop on failure or deadline and distinguish complete 
 
     Fixture.fail_roles = false;
     Fixture.fail_ids = true;
-    result = appWindows(42, &out, 0.25, 1.0);
+    result = appWindows(42, &out, .tabs, 0.25, 1.0);
     try testing.expect(result.is_incomplete);
     try testing.expectEqual(@as(usize, 0), result.count);
 
     Fixture.fail_ids = false;
     Fixture.role_reads = 0;
     Fixture.role_delay_us = 1000;
-    result = appWindows(42, &out, 0.25, 0.01);
+    result = appWindows(42, &out, .tabs, 0.25, 0.01);
     try testing.expect(result.is_incomplete);
     try testing.expect(Fixture.role_reads < values.len);
     try testing.expect(Fixture.last_timeout > 0 and Fixture.last_timeout <= 0.01);
 
     Fixture.role_delay_us = 0;
     Fixture.role_reads = 0;
-    result = appWindows(42, &out, 0.25, 1.0);
+    result = appWindows(42, &out, .tabs, 0.25, 1.0);
     try testing.expect(!result.is_incomplete and !result.is_truncated);
     try testing.expectEqual(@as(usize, 2), result.count);
     try testing.expectEqual(@as(u32, 17), out[0].wid);
     try testing.expectEqual(@as(u32, 0), out[0].tab_count);
 
-    result = appWindows(42, out[0..1], 0.25, 1.0);
+    result = appWindows(42, out[0..1], .tabs, 0.25, 1.0);
     try testing.expect(result.is_truncated);
     try testing.expect(!result.is_incomplete);
+
+    // Full observations must still detect real tab bars, not merely skip them.
+    const old_role = Fixture.role;
+    defer Fixture.role = old_role;
+    Fixture.role = c.CFStringCreateWithCString(null, "AXTabGroup", c.kCFStringEncodingUTF8).?;
+    defer c.CFRelease(@ptrCast(Fixture.role));
+    result = appWindows(42, &out, .tabs, 0.25, 1.0);
+    try testing.expect(!result.is_incomplete);
+    try testing.expectEqual(@as(u32, 40), out[0].tab_count);
+
+    // Exercise real per-app scheduling and the cleanup's enrichment round trip.
+    const app_windows = @import("app_windows.zig");
+    const app_queue = @import("app_queue.zig");
+    app_windows.init();
+    const pid = 424242;
+    const queue = app_queue.retainQueue(pid).?;
+    defer app_queue.releaseQueue(queue);
+    defer app_queue.forget(pid);
+    defer app_windows.forgetApp(pid);
+    try testing.expect(app_windows.request(pid, .offscreen_cleanup));
+    c.dispatch_sync_f(queue, null, Fixture.barrier);
+    var snapshot: app_windows.Snapshot = undefined;
+    try testing.expect(app_windows.latest(pid, &snapshot));
+    try testing.expectEqual(AppWindowDetails.membership, snapshot.details);
+    try testing.expectEqual(@as(usize, 2), snapshot.count);
+    try testing.expectEqual(@as(?bool, null), snapshot.hasTabGroup());
+    try testing.expect(app_windows.decodeReasons(Fixture.observed_reasons).contains(.offscreen_cleanup));
+
+    try testing.expect(app_windows.request(pid, .offscreen_tabs));
+    c.dispatch_sync_f(queue, null, Fixture.barrier);
+    try testing.expect(app_windows.latest(pid, &snapshot));
+    try testing.expectEqual(AppWindowDetails.tabs, snapshot.details);
+    try testing.expectEqual(@as(?bool, true), snapshot.hasTabGroup());
+    try testing.expect(app_windows.decodeReasons(Fixture.observed_reasons).contains(.offscreen_tabs));
 }
 
 test {

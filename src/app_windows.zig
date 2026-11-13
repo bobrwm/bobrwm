@@ -16,6 +16,8 @@ const CAPTURE_BUDGET_SECONDS: f32 = 1.0;
 pub const Reason = enum(u8) {
     tab_bar,
     offscreen_cleanup,
+    /// A membership-only cleanup found a possible background tab or ghost.
+    offscreen_tabs,
 };
 
 pub const Reasons = std.EnumSet(Reason);
@@ -24,6 +26,7 @@ pub const Snapshot = struct {
     pid: i32 = 0,
     windows: [max_windows]ax.AppWindow = undefined,
     count: usize = 0,
+    details: ax.AppWindowDetails = .membership,
     /// The app listed more windows than fit.
     is_truncated: bool = false,
     /// A failed or budget-limited scan cannot justify tab inference or removal.
@@ -35,10 +38,19 @@ pub const Snapshot = struct {
         return self.windows[0..self.count];
     }
 
+    /// Unknown membership must not turn a slow app's windows into ghosts.
+    pub fn listsWindow(self: *const Snapshot, wid: u32) bool {
+        if (self.is_incomplete or self.is_truncated) return true;
+        for (self.items()) |window| {
+            if (window.wid == wid) return true;
+        }
+        return false;
+    }
+
     /// Tab inference needs only the captured bar counts, not fresh bounds for
     /// every app window. Null leaves the decision for a complete observation.
     pub fn hasTabGroup(self: *const Snapshot) ?bool {
-        if (self.is_incomplete or self.is_truncated) return null;
+        if (self.details != .tabs or self.is_incomplete or self.is_truncated) return null;
         for (self.items()) |window| {
             if (window.tab_count > 1) return true;
         }
@@ -75,9 +87,9 @@ pub fn request(pid: i32, reason: Reason) bool {
 
 /// Read and store `pid`'s windows. Runs on the app's queue. False when the
 /// budget or an AX failure prevented a complete observation.
-pub fn capture(pid: i32) bool {
-    var snapshot: Snapshot = .{ .pid = pid };
-    const result = ax.appWindows(pid, &snapshot.windows, timeout_seconds, CAPTURE_BUDGET_SECONDS);
+pub fn capture(pid: i32, details: ax.AppWindowDetails) bool {
+    var snapshot: Snapshot = .{ .pid = pid, .details = details };
+    const result = ax.appWindows(pid, &snapshot.windows, details, timeout_seconds, CAPTURE_BUDGET_SECONDS);
     snapshot.count = result.count;
     snapshot.is_truncated = result.is_truncated;
     snapshot.is_incomplete = result.is_incomplete;
@@ -174,22 +186,31 @@ fn answerRequest(app: app_queue.App) void {
     const reasons = takeReasons(app.pid);
     if (reasons.count() == 0) return;
 
-    _ = capture(app.pid);
+    const details: ax.AppWindowDetails = if (reasons.contains(.tab_bar) or reasons.contains(.offscreen_tabs)) .tabs else .membership;
+    _ = capture(app.pid, details);
     shim.bw_emit_event_detail(shim.BW_EVENT_APP_WINDOWS_OBSERVED, app.pid, 0, encodeReasons(reasons));
 }
 
 test "captured tab bars distinguish standalone apps from incomplete observations" {
     const testing = std.testing;
-    var snapshot: Snapshot = .{ .count = 2, .is_incomplete = false };
+    var snapshot: Snapshot = .{ .count = 2, .details = .tabs, .is_incomplete = false };
     snapshot.windows[0] = .{ .wid = 17, .tab_count = 0 };
     snapshot.windows[1] = .{ .wid = 29, .tab_count = 1 };
     try testing.expectEqual(@as(?bool, false), snapshot.hasTabGroup());
+    try testing.expect(snapshot.listsWindow(17));
+    try testing.expect(!snapshot.listsWindow(41));
 
     snapshot.windows[1].tab_count = 3;
     try testing.expectEqual(@as(?bool, true), snapshot.hasTabGroup());
     snapshot.is_incomplete = true;
     try testing.expectEqual(@as(?bool, null), snapshot.hasTabGroup());
+    try testing.expect(snapshot.listsWindow(41));
     snapshot.is_incomplete = false;
     snapshot.is_truncated = true;
     try testing.expectEqual(@as(?bool, null), snapshot.hasTabGroup());
+    snapshot.is_truncated = false;
+    snapshot.details = .membership;
+    try testing.expectEqual(@as(?bool, null), snapshot.hasTabGroup());
+    snapshot.count = 0;
+    try testing.expect(!snapshot.listsWindow(17));
 }
