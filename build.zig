@@ -290,6 +290,7 @@ pub fn build(b: *std.Build) !void {
     });
     cli_mod.addImport("build_options", build_options_mod);
     cli_mod.addImport("help_strings", help_strings.module);
+    cli_mod.addImport("zlua", zlua_mod);
 
     const cli_exe = b.addExecutable(.{
         .name = cli_exe_name,
@@ -689,6 +690,7 @@ pub fn build(b: *std.Build) !void {
     });
     cli_test_mod.addImport("build_options", build_options_mod);
     cli_test_mod.addImport("help_strings", help_strings.module);
+    cli_test_mod.addImport("zlua", zlua_mod);
 
     const cli_tests = b.addTest(.{
         .name = "cli-tests",
@@ -754,6 +756,22 @@ pub fn build(b: *std.Build) !void {
 
     const run_config_json_tests = b.addRunArtifact(config_json_tests);
 
+    const config_load_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/config_load.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    config_load_test_mod.addImport("zlua", zlua_mod);
+    config_load_test_mod.addImport("help_strings", help_strings.module);
+
+    const config_load_tests = b.addTest(.{
+        .name = "config-load-tests",
+        .root_module = config_load_test_mod,
+    });
+
+    const run_config_load_tests = b.addRunArtifact(config_load_tests);
+
     const config_watch_test_mod = b.createModule(.{
         .root_source_file = b.path("src/config_watch.zig"),
         .target = target,
@@ -785,6 +803,7 @@ pub fn build(b: *std.Build) !void {
         .link_libc = true,
     });
     config_format_test_mod.addImport("help_strings", help_strings.module);
+    config_format_test_mod.addImport("zlua", zlua_mod);
 
     const config_format_tests = b.addTest(.{
         .name = "config-format-tests",
@@ -820,6 +839,7 @@ pub fn build(b: *std.Build) !void {
     test_step.dependOn(&run_config_apply_tests.step);
     test_step.dependOn(&run_config_lua_tests.step);
     test_step.dependOn(&run_config_json_tests.step);
+    test_step.dependOn(&run_config_load_tests.step);
     test_step.dependOn(&run_config_watch_tests.step);
     // Running the generator itself catches doc lookups broken by renamed
     // containers or fields, which the unit tests cannot see.
