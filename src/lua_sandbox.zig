@@ -5,6 +5,7 @@
 //! - setmetatable refuses __gc: finalizers run with hooks disabled.
 //! - Text chunks only; Lua does not verify bytecode.
 //! - Memory and per-exec instruction budgets.
+//! - `require` only reads from the embedder's `ModuleSource`.
 //!
 //! The instruction hook cannot interrupt pattern matching, which runs in C.
 
@@ -18,12 +19,23 @@ const Lua = zlua.Lua;
 
 const log = std.log.scoped(.lua);
 
-pub const Limits = struct {
+pub const Options = struct {
     /// Max live bytes for the whole state.
     memory_bytes: usize = 16 * 1024 * 1024,
     /// Max VM instructions per `exec`. 10M is tens of milliseconds.
     // NOTE: Arbritrary limit that was decided from testing locally. Just the first value that wasn't in the way.
     instructions: u31 = 10_000_000,
+    /// Where `require` finds modules. Without one, `require` raises.
+    modules: ?ModuleSource = null,
+};
+
+/// Reads modules for `require`. `readFn` gets a relative path such as
+/// `keys.lua` or `ui/bar.lua` and returns its contents allocated with `gpa`,
+/// or null if there is none. Module source is not counted against the memory
+/// budget, so `readFn` should cap what it reads.
+pub const ModuleSource = struct {
+    context: *anyopaque,
+    readFn: *const fn (context: *anyopaque, gpa: Allocator, path: []const u8) ?[]u8,
 };
 
 pub const InitError = error{ OutOfMemory, SandboxSetup };
@@ -40,10 +52,13 @@ pub const Diagnostic = struct {
 gpa: Allocator,
 budget: Budget,
 instructions: u31,
+modules: ?ModuleSource,
 lua: *Lua,
+/// Embedder state for Zig functions called from Lua; see `fromLua`.
+context: ?*anyopaque = null,
 
-pub fn init(gpa: Allocator, limits: Limits) InitError!*Self {
-    std.debug.assert(limits.instructions > 0);
+pub fn init(gpa: Allocator, options: Options) InitError!*Self {
+    std.debug.assert(options.instructions > 0);
 
     const self = try gpa.create(Self);
     errdefer gpa.destroy(self);
@@ -52,13 +67,16 @@ pub fn init(gpa: Allocator, limits: Limits) InitError!*Self {
         // Unlimited until the state exists: ziglua's Lua.init leaks when
         // lua_newstate fails (ce59a32).
         .budget = .{ .child = gpa, .limit = std.math.maxInt(usize) },
-        .instructions = limits.instructions,
+        .instructions = options.instructions,
+        .modules = options.modules,
         .lua = undefined,
     };
     self.lua = try Lua.init(self.budget.allocator());
     errdefer self.lua.deinit();
-    if (self.budget.used > limits.memory_bytes) return error.OutOfMemory;
-    self.budget.limit = limits.memory_bytes;
+    if (self.budget.used > options.memory_bytes) return error.OutOfMemory;
+    self.budget.limit = options.memory_bytes;
+    // Coroutines copy the main thread's extra space, so this reaches all.
+    @memcpy(self.lua.getExtraSpace()[0..@sizeOf(*Self)], std.mem.asBytes(&self));
 
     // Library setup can raise; unprotected, that aborts the process.
     self.lua.pushFunction(zlua.wrap(openSandbox));
@@ -81,11 +99,29 @@ pub fn exec(self: *Self, chunk_name: [:0]const u8, source: []const u8, diag: ?*D
         error.LuaSyntax => error.Syntax,
         error.OutOfMemory => error.OutOfMemory,
     });
+    return self.protectedRun(0, 0, diag);
+}
 
+/// Runs `function` in protected mode, for embedder setup such as registering
+/// bindings, which can raise on allocation failure.
+pub fn callZig(self: *Self, comptime function: fn (*Lua) i32, diag: ?*Diagnostic) ExecError!void {
+    std.debug.assert(self.lua.getTop() == 0);
+    self.lua.pushFunction(zlua.wrap(function));
+    return self.protectedRun(0, 0, diag);
+}
+
+/// The sandbox that owns `lua`, for Zig functions called from Lua.
+pub fn fromLua(lua: *Lua) *Self {
+    return std.mem.bytesToValue(*Self, lua.getExtraSpace()[0..@sizeOf(*Self)]);
+}
+
+/// Calls the function below its `nargs` arguments under a fresh instruction
+/// budget, leaving `nresults` results. Every entry into Lua goes through here.
+fn protectedRun(self: *Self, nargs: i32, nresults: i32, diag: ?*Diagnostic) ExecError!void {
     self.armInstructionBudget();
     defer self.lua.setHook(zlua.wrap(instructionHook), .{}, 0);
 
-    self.lua.protectedCall(.{}) catch |err| return self.fail(diag, switch (err) {
+    self.lua.protectedCall(.{ .args = nargs, .results = nresults }) catch |err| return self.fail(diag, switch (err) {
         error.OutOfMemory => error.OutOfMemory,
         error.LuaRuntime, error.LuaMsgHandler => error.Runtime,
     });
@@ -136,6 +172,9 @@ fn openSandbox(lua: *Lua) i32 {
     lua.pushClosure(zlua.wrap(setMetatable), 1);
     lua.setGlobal("setmetatable");
 
+    lua.pushFunction(zlua.wrap(luaRequire));
+    lua.setGlobal("require");
+
     _ = lua.getGlobal("string");
     lua.pushNil();
     lua.setField(-2, "dump");
@@ -158,6 +197,85 @@ fn setMetatable(lua: *Lua) i32 {
     lua.insert(1);
     lua.call(.{ .args = 2, .results = 1 });
     return 1;
+}
+
+const loaded_key = "bobrwm.sandbox.loaded";
+const max_module_name = 128;
+
+/// `require` limited to `modules`. Results are cached per sandbox; a private
+/// sentinel marks in-progress loads without conflicting with module results.
+fn luaRequire(lua: *Lua) i32 {
+    const name = lua.checkString(1);
+    const self = fromLua(lua);
+    const modules = self.modules orelse lua.raiseErrorStr("require is not available", .{});
+
+    _ = lua.getSubtable(zlua.registry_index, loaded_key);
+    const loaded_table = lua.getTop();
+    const cached = lua.getField(loaded_table, name);
+    if (cached == .light_userdata and (lua.toUserdata(Self, -1) catch unreachable) == self)
+        lua.raiseErrorStr("require cycle through '%s'", .{name.ptr});
+    // As in Lua's require, false is a valid result but does not cache a load.
+    if (lua.toBoolean(-1)) return 1;
+    lua.pop(1);
+
+    var buf: [max_module_name + ".lua".len + 2]u8 = undefined;
+    const chunk_name = moduleChunkName(&buf, name) orelse lua.raiseErrorStr("invalid module name '%s'", .{name.ptr});
+    lua.pushLightUserdata(self);
+    lua.setField(loaded_table, name);
+
+    // Free the source before anything that can raise: a raise skips Zig code.
+    const source = modules.readFn(modules.context, self.gpa, chunk_name[1..]) orelse {
+        forgetModule(lua, loaded_table, name);
+        lua.raiseErrorStr("module '%s' not found", .{name.ptr});
+    };
+    const loaded = lua.loadBuffer(source, chunk_name, .text);
+    self.gpa.free(source);
+    loaded catch {
+        forgetModule(lua, loaded_table, name);
+        lua.raiseError();
+    };
+    lua.protectedCall(.{ .results = 1 }) catch {
+        forgetModule(lua, loaded_table, name);
+        lua.raiseError();
+    };
+
+    if (lua.isNil(-1)) {
+        lua.pop(1);
+        lua.pushBoolean(true);
+    }
+    lua.pushValue(-1);
+    lua.setField(loaded_table, name);
+    return 1;
+}
+
+/// Clears the loading marker so a failed module can be required again.
+fn forgetModule(lua: *Lua, loaded_table: i32, name: [:0]const u8) void {
+    lua.pushNil();
+    lua.setField(loaded_table, name);
+}
+
+/// Maps `a.b` to `@a/b.lua`. Segments are [A-Za-z0-9_-]+, so a module name
+/// cannot reach outside the module root.
+fn moduleChunkName(buf: []u8, name: []const u8) ?[:0]const u8 {
+    if (name.len == 0 or name.len > max_module_name) return null;
+    var segment_len: usize = 0;
+    for (name, 0..) |char, i| {
+        switch (char) {
+            'a'...'z', 'A'...'Z', '0'...'9', '_', '-' => segment_len += 1,
+            '.' => {
+                if (segment_len == 0) return null;
+                segment_len = 0;
+            },
+            else => return null,
+        }
+        buf[i + 1] = if (char == '.') '/' else char;
+    }
+    if (segment_len == 0) return null;
+    buf[0] = '@';
+    const ext = ".lua";
+    @memcpy(buf[name.len + 1 ..][0..ext.len], ext);
+    buf[name.len + 1 + ext.len] = 0;
+    return buf[0 .. name.len + 1 + ext.len :0];
 }
 
 fn luaPrint(lua: *Lua) i32 {
@@ -259,7 +377,7 @@ test "only the intended libraries are reachable" {
         \\  assert(type(_G[name]) == "table", name)
         \\end
         \\for _, name in ipairs({
-        \\  "io", "os", "package", "debug", "require",
+        \\  "io", "os", "package", "debug",
         \\  "dofile", "loadfile", "load", "collectgarbage",
         \\}) do
         \\  assert(_G[name] == nil, name)
@@ -353,4 +471,90 @@ test "non-string error objects are not converted" {
     const sandbox = try Self.init(std.testing.allocator, .{});
     defer sandbox.deinit();
     try expectExecError(sandbox, error.Runtime, "error(42)", "(error object is a number value)");
+}
+
+const TestModules = struct {
+    files: []const struct { path: []const u8, source: []const u8 },
+
+    fn source(self: *TestModules) ModuleSource {
+        return .{ .context = self, .readFn = read };
+    }
+
+    fn read(context: *anyopaque, gpa: Allocator, path: []const u8) ?[]u8 {
+        const self: *TestModules = @ptrCast(@alignCast(context));
+        for (self.files) |file| {
+            if (std.mem.eql(u8, file.path, path)) return gpa.dupe(u8, file.source) catch null;
+        }
+        return null;
+    }
+};
+
+test "require loads each module once from the module source" {
+    var modules: TestModules = .{ .files = &.{
+        .{ .path = "keys.lua", .source = "loads = (loads or 0) + 1 return { key = 'alt+h' }" },
+        .{ .path = "ui/bar.lua", .source = "return 'bar'" },
+        .{ .path = "empty.lua", .source = "" },
+        .{ .path = "disabled.lua", .source = "false_loads = (false_loads or 0) + 1 return false" },
+    } };
+    const sandbox = try Self.init(std.testing.allocator, .{ .modules = modules.source() });
+    defer sandbox.deinit();
+    try expectExec(sandbox,
+        \\assert(require("keys").key == "alt+h")
+        \\assert(require("keys") == require("keys"))
+        \\assert(loads == 1)
+        \\assert(require("ui.bar") == "bar")
+        \\assert(require("empty") == true)
+        \\assert(require("disabled") == false)
+        \\assert(require("disabled") == false)
+        \\assert(false_loads == 2)
+    );
+}
+
+test "require errors name the module file" {
+    var modules: TestModules = .{ .files = &.{
+        .{ .path = "bad.lua", .source = "\nerror('boom')" },
+        .{ .path = "a.lua", .source = "require('b')" },
+        .{ .path = "b.lua", .source = "require('a')" },
+    } };
+    const sandbox = try Self.init(std.testing.allocator, .{ .modules = modules.source() });
+    defer sandbox.deinit();
+    try expectExecError(sandbox, error.Runtime, "require('bad')", "bad.lua:2: boom");
+    try expectExecError(sandbox, error.Runtime, "require('missing')", "module 'missing' not found");
+    try expectExecError(sandbox, error.Runtime, "require('../secrets')", "invalid module name");
+    try expectExecError(sandbox, error.Runtime, "require('a')", "require cycle through 'a'");
+    // A failed module is not cached as loading.
+    try expectExecError(sandbox, error.Runtime, "pcall(require, 'bad') require('bad')", "bad.lua:2: boom");
+}
+
+test "require is unavailable without a module source" {
+    const sandbox = try Self.init(std.testing.allocator, .{});
+    defer sandbox.deinit();
+    try expectExecError(sandbox, error.Runtime, "require('keys')", "require is not available");
+}
+
+test "module names map to paths inside the root" {
+    var buf: [max_module_name + 8]u8 = undefined;
+    try std.testing.expectEqualStrings("@keys.lua", moduleChunkName(&buf, "keys").?);
+    try std.testing.expectEqualStrings("@ui/bar-2.lua", moduleChunkName(&buf, "ui.bar-2").?);
+    for ([_][]const u8{ "", ".", "..", "a..b", ".a", "a.", "a/b", "../a", "a b" }) |name| {
+        try std.testing.expect(moduleChunkName(&buf, name) == null);
+    }
+}
+
+test "Zig functions reach the embedder through fromLua" {
+    const sandbox = try Self.init(std.testing.allocator, .{});
+    defer sandbox.deinit();
+    var calls: u32 = 0;
+    sandbox.context = &calls;
+    const count = struct {
+        fn count(lua: *Lua) i32 {
+            const counter: *u32 = @ptrCast(@alignCast(fromLua(lua).context.?));
+            counter.* += 1;
+            return 0;
+        }
+    }.count;
+    sandbox.lua.pushFunction(zlua.wrap(count));
+    sandbox.lua.setGlobal("count");
+    try expectExec(sandbox, "count() coroutine.wrap(count)()");
+    try std.testing.expectEqual(2, calls);
 }
