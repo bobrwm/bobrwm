@@ -32,6 +32,9 @@ pub const Diagnostic = struct {
 pub const Origin = struct {
     kind: Kind = .default,
     location: Location = .{},
+    /// Where a lower layer set the value this one replaced, so the settings
+    /// window can warn that an `init.lua` line has no effect.
+    overrides: ?Location = null,
 };
 
 /// A value a layer wrote, and where it wrote it.
@@ -189,7 +192,8 @@ fn mergeSettings(comptime T: type, target: *T, origins: *Origins(T), partial: Pa
             mergeSettings(@FieldType(T, name), &@field(target, name), &@field(origins, name), value, kind);
         } else if (value) |set| {
             @field(target, name) = set.value;
-            @field(origins, name) = .{ .kind = kind, .location = set.location };
+            const previous = @field(origins, name);
+            @field(origins, name) = .{ .kind = kind, .location = set.location, .overrides = overridden(previous, kind) };
         }
     }
 }
@@ -207,6 +211,13 @@ fn applyKeybindOp(arena: Allocator, keybinds: *Entries(Keybind), op: KeybindOp, 
         },
         .unbind_all => keybinds.list.clearRetainingCapacity(),
     }
+}
+
+/// A value replaced within its own layer, or a built-in default, is not an
+/// override worth reporting.
+fn overridden(previous: Origin, kind: Kind) ?Location {
+    if (previous.kind == .default or previous.kind == kind) return previous.overrides;
+    return previous.location;
 }
 
 fn sameTrigger(a: Keybind, b: Keybind) bool {
@@ -259,7 +270,9 @@ fn upsert(
 ) Allocator.Error!void {
     for (entries.list.items) |*entry| {
         if (same(entry.value, value)) {
-            entry.* = .{ .value = value, .origin = origin, .priority = priority };
+            var replacement = origin;
+            replacement.overrides = overridden(entry.origin, origin.kind);
+            entry.* = .{ .value = value, .origin = replacement, .priority = priority };
             return;
         }
     }
@@ -306,6 +319,29 @@ test "later layers win per setting and record where" {
     try std.testing.expectEqual(4, merged.origins.gaps.outer.left.location.line);
     try std.testing.expectEqual(.monocle, merged.config.layout);
     try std.testing.expectEqual(Kind.default, merged.origins.gaps.outer.right.kind);
+    // Only a value replaced from a lower layer is an override.
+    try std.testing.expectEqual(3, merged.origins.gaps.inner.overrides.?.line);
+    try std.testing.expectEqual(null, merged.origins.gaps.outer.left.overrides);
+    try std.testing.expectEqual(null, merged.origins.layout.overrides);
+}
+
+test "an override survives a later write in the same layer" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const gpa = std.testing.allocator;
+    var lua: Layer = .{ .kind = .lua };
+    defer lua.deinit(gpa);
+    lua.settings.layout = .{ .value = .monocle, .location = .{ .file = "init.lua", .line = 2 } };
+    try lua.rules.append(gpa, .{ .value = .{ .app_id = "a", .float = true }, .location = .{ .file = "init.lua", .line = 5 } });
+    var ui: Layer = .{ .kind = .settings_ui };
+    defer ui.deinit(gpa);
+    ui.settings.layout = .{ .value = .bsp };
+    try ui.rules.append(gpa, .{ .value = .{ .app_id = "a" } });
+    try ui.rules.append(gpa, .{ .value = .{ .app_id = "a", .workspace = 2 } });
+
+    const merged = try merge(arena.allocator(), &.{ &lua, &ui });
+    try std.testing.expectEqual(2, merged.origins.layout.overrides.?.line);
+    try std.testing.expectEqual(5, merged.rule_origins[0].overrides.?.line);
 }
 
 test "keybind operations apply in order across layers" {
@@ -402,5 +438,7 @@ test "rules replace by app id" {
     try std.testing.expectEqual(2, merged.config.app_rules.len);
     try std.testing.expectEqual(3, merged.config.app_rules[0].workspace.?);
     try std.testing.expectEqual(Kind.settings_ui, merged.rule_origins[0].kind);
+    try std.testing.expect(merged.rule_origins[0].overrides != null);
     try std.testing.expect(merged.config.app_rules[1].float);
+    try std.testing.expectEqual(null, merged.rule_origins[1].overrides);
 }

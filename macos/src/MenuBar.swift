@@ -142,6 +142,13 @@ final class MenuBarController: NSObject, StatusMenuActions {
         settingsModel.setAppRules(rules)
     }
 
+    func setConfigOverrides(_ overrides: [BWConfigOverride]) {
+        settingsModel.setConfigOverrides(
+            settings: overrides.filter { !$0.is_rule }.map { String(cString: $0.name) },
+            rules: overrides.filter(\.is_rule).map { String(cString: $0.name) }
+        )
+    }
+
     private func applicationName(_ processID: Int32) -> String {
         let application = NSRunningApplication(processIdentifier: processID)
         return application?.localizedName
@@ -284,6 +291,11 @@ public func menuBarSetAppRules(_ rules: UnsafePointer<BWAppRule>?, _ count: Int)
             floats: row.floating
         )
     })
+}
+
+@_cdecl("bw_menubar_set_config_overrides")
+public func menuBarSetConfigOverrides(_ overrides: UnsafePointer<BWConfigOverride>?, _ count: Int) {
+    controller?.setConfigOverrides(Array(UnsafeBufferPointer(start: overrides, count: count)))
 }
 
 @_cdecl("bw_menubar_set_message")

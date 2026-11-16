@@ -9,6 +9,7 @@
 const std = @import("std");
 
 const config_mod = @import("config.zig");
+const config_layer = @import("config_layer.zig");
 const state_mod = @import("state.zig");
 const workspace_mod = @import("workspace.zig");
 
@@ -56,6 +57,11 @@ pub const AppRule = extern struct {
     floating: bool,
 };
 
+const ConfigOverride = extern struct {
+    name: [*:0]const u8,
+    is_rule: bool,
+};
+
 const Workspace = extern struct {
     name: ?[*:0]const u8,
     shortcut_key: ?[*:0]const u8,
@@ -100,6 +106,7 @@ extern fn bw_menubar_set_workspaces(workspaces: ?[*]const Workspace, count: usiz
 extern fn bw_menubar_set_state(states: ?[*]const WorkspaceState, count: usize) void;
 extern fn bw_menubar_set_settings(settings: Settings) void;
 extern fn bw_menubar_set_app_rules(rules: ?[*]const AppRule, count: usize) void;
+extern fn bw_menubar_set_config_overrides(overrides: ?[*]const ConfigOverride, count: usize) void;
 extern fn bw_menubar_set_message(message: [*:0]const u8) void;
 extern fn bw_menubar_set_config_status(success: bool, message: [*:0]const u8) void;
 extern fn bw_menubar_set_spaces_warnings(rearranges_automatically: bool, displays_share_spaces: bool) void;
@@ -164,6 +171,37 @@ pub fn updateSettings(allocator: std.mem.Allocator, config: *const config_mod.Co
         .follow_app_resizes = config.follow_app_resizes,
         .auto_reload_config = config.auto_reload_config,
     });
+}
+
+/// Publish the settings and rules whose `settings.json` value masks one set
+/// in Lua, so the settings window can say the Lua value has no effect.
+pub fn updateOverrides(allocator: std.mem.Allocator, config: *const config_mod.Config, origins: *const config_layer.Origins(config_mod.Config), rule_origins: []const config_layer.Origin) void {
+    if (!g_initialized) return;
+    var arena: std.heap.ArenaAllocator = .init(allocator);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    var rows: std.ArrayList(ConfigOverride) = .empty;
+    appendOverrides(config_mod.Config, "", scratch, origins.*, &rows) catch return;
+    for (config.app_rules, rule_origins) |rule, origin| {
+        if (origin.overrides == null) continue;
+        rows.append(scratch, overrideRow(scratch, rule.app_id, true) catch return) catch return;
+    }
+    bw_menubar_set_config_overrides(rows.items.ptr, rows.items.len);
+}
+
+fn appendOverrides(comptime T: type, comptime prefix: []const u8, arena: std.mem.Allocator, origins: config_layer.Origins(T), rows: *std.ArrayList(ConfigOverride)) !void {
+    inline for (@typeInfo(config_layer.Origins(T)).@"struct".field_names) |name| {
+        const path = prefix ++ name;
+        if (@typeInfo(@FieldType(T, name)) == .@"struct") {
+            try appendOverrides(@FieldType(T, name), path ++ ".", arena, @field(origins, name), rows);
+        } else if (@field(origins, name).overrides != null) {
+            try rows.append(arena, try overrideRow(arena, path, false));
+        }
+    }
+}
+
+fn overrideRow(arena: std.mem.Allocator, name: []const u8, is_rule: bool) !ConfigOverride {
+    return .{ .name = try arena.dupeSentinel(u8, name, 0), .is_rule = is_rule };
 }
 
 fn updateAppRules(allocator: std.mem.Allocator, config: *const config_mod.Config) !void {

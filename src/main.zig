@@ -19,6 +19,7 @@ const config_watch = @import("config_watch.zig");
 const tab_detect = @import("tabgroup/detect.zig");
 const config_mod = @import("config.zig");
 const config_load = @import("config_load.zig");
+const config_layer = @import("config_layer.zig");
 const dim = @import("dim.zig");
 const statusbar = @import("statusbar.zig");
 const tile_preview = @import("tile_preview.zig");
@@ -1502,12 +1503,16 @@ const ConfigRuntime = struct {
     arena: std.heap.ArenaAllocator,
     config: config_mod.Config,
     keybind_table: config_mod.KeybindTable,
+    origins: config_layer.Origins(config_mod.Config) = .{},
+    rule_origins: []const config_layer.Origin = &.{},
     module_paths: []const [:0]const u8 = &.{},
 
     fn init(parent_allocator: std.mem.Allocator, paths: ?config_load.Paths, use_defaults_on_error: bool) !ConfigRuntime {
         var arena = std.heap.ArenaAllocator.init(parent_allocator);
         errdefer arena.deinit();
         const allocator = arena.allocator();
+        var origins: config_layer.Origins(config_mod.Config) = .{};
+        var rule_origins: []const config_layer.Origin = &.{};
         var module_paths: std.ArrayList([:0]const u8) = .empty;
         const config = if (paths) |p| blk: {
             var diagnostics: std.ArrayList(config_load.Diagnostic) = .empty;
@@ -1518,10 +1523,12 @@ const ConfigRuntime = struct {
                 break :blk config_mod.Config{};
             };
             config_load.logDiagnostics(diagnostics.items);
+            origins = merged.origins;
+            rule_origins = merged.rule_origins;
             break :blk merged.config;
         } else config_mod.Config{};
         const keybind_table = try config_mod.KeybindTable.init(allocator, &config);
-        return .{ .arena = arena, .config = config, .keybind_table = keybind_table, .module_paths = module_paths.items };
+        return .{ .arena = arena, .config = config, .keybind_table = keybind_table, .origins = origins, .rule_origins = rule_origins, .module_paths = module_paths.items };
     }
 
     /// The config with `settings_json` in place of `settings.json`.
@@ -1537,7 +1544,7 @@ const ConfigRuntime = struct {
             return err;
         };
         const keybind_table = try config_mod.KeybindTable.init(allocator, &merged.config);
-        return .{ .arena = arena, .config = merged.config, .keybind_table = keybind_table, .module_paths = module_paths.items };
+        return .{ .arena = arena, .config = merged.config, .keybind_table = keybind_table, .origins = merged.origins, .rule_origins = merged.rule_origins, .module_paths = module_paths.items };
     }
 
     fn deinit(self: *ConfigRuntime) void {
@@ -2151,6 +2158,7 @@ fn applyReloadedConfig(next: ConfigRuntime) void {
     if (layout_changed) rebuildTilingStatesForConfig();
     statusbar.updateWorkspaceMenu(workspaceCount(), &g_config);
     statusbar.updateSettings(g_allocator, &g_config);
+    statusbar.updateOverrides(g_allocator, &g_config, &replacement.origins, replacement.rule_origins);
     updateStatusBar();
     retile();
     if (dim.enabled) pushDimSnapshot();
@@ -2983,6 +2991,7 @@ fn startCore(config_path_arg: ?[]const u8) !void {
         g_allocator,
     );
     g_core_stage = .statusbar;
+    statusbar.updateOverrides(g_allocator, &g_config, &g_config_runtime.?.origins, g_config_runtime.?.rule_origins);
     updateStatusBar();
     spaces_settings.start(if (g_sky) |*sky| sky else null);
 

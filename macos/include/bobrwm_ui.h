@@ -43,6 +43,13 @@ typedef struct {
   bool floating;
 } BWAppRule;
 
+// A settings.json value that replaces one set in Lua.
+// Borrowed strings; Swift copies them before this call returns.
+typedef struct {
+  const char *name; // Dotted setting path, or bundle ID when is_rule is true.
+  bool is_rule;
+} BWConfigOverride;
+
 typedef struct {
   void (*retile)(void);
   void (*open_config)(void);
@@ -92,6 +99,7 @@ void bw_menubar_set_workspaces(const BWWorkspace *workspaces, size_t count);
 void bw_menubar_set_state(const BWWorkspaceState *states, size_t count);
 void bw_menubar_set_settings(BWSettings settings);
 void bw_menubar_set_app_rules(const BWAppRule *rules, size_t count);
+void bw_menubar_set_config_overrides(const BWConfigOverride *overrides, size_t count);
 void bw_menubar_set_message(const char *message);
 void bw_menubar_set_config_status(bool success, const char *message);
 // Mission Control settings that break workspace numbering: Spaces rearranged

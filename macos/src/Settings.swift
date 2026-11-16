@@ -239,6 +239,10 @@ final class SettingsModel: ObservableObject {
     @Published private(set) var appliedSettings = EditableSettings()
     @Published var appRules: [AppRule] = []
     @Published private(set) var appliedAppRules: [AppRule] = []
+    /// Dotted paths of settings saved here that replace a Lua value.
+    @Published private(set) var settingOverrides: Set<String> = []
+    /// Bundle IDs of app rules saved here that replace a Lua rule.
+    @Published private(set) var ruleOverrides: [String] = []
     @Published private(set) var configStatus = ConfigStatus(
         succeeded: true,
         message: "Configuration loaded",
@@ -297,6 +301,11 @@ final class SettingsModel: ObservableObject {
     func setAppRules(_ rules: [AppRule]) {
         appliedAppRules = rules
         appRules = rules
+    }
+
+    func setConfigOverrides(settings: [String], rules: [String]) {
+        settingOverrides = Set(settings)
+        ruleOverrides = rules
     }
 
     /// True when the last apply was rejected and the shown values no longer
@@ -667,12 +676,16 @@ private struct GeneralPane: View {
             }
             Section {
                 Toggle("Start BobrWM at login", isOn: $model.settings.startAtLogin)
+                    .overrideNote("start_at_login", model: model)
             }
 
             Section {
                 Toggle("Focus follows mouse", isOn: $model.settings.focusFollowsMouse)
+                    .overrideNote("focus_follows_mouse", model: model)
                 Toggle("Swipe to switch workspaces", isOn: $model.settings.swipeEnabled)
+                    .overrideNote("swipe.enabled", model: model)
                 Toggle("Reverse swipe direction", isOn: $model.settings.swipeReversed)
+                    .overrideNote("swipe.reverse", model: model)
                     .disabled(!model.settings.swipeEnabled)
             } header: {
                 Text("Mouse and Trackpad")
@@ -706,6 +719,7 @@ private struct GeneralPane: View {
                         .textSelection(.enabled)
                 }
                 Toggle("Reload when the file changes", isOn: $model.settings.autoReloadConfig)
+                    .overrideNote("auto_reload_config", model: model)
                 LabeledContent("Last reload") {
                     StatusLabel(model.configStatus.message, succeeded: model.configStatus.succeeded)
                         .help(model.configStatus.date.formatted(date: .abbreviated, time: .standard))
@@ -759,17 +773,22 @@ private struct TilingPane: View {
                 Picker("Layout", selection: $model.settings.layout) {
                     ForEach(LayoutSetting.allCases) { Text($0.title).tag($0) }
                 }
+                .overrideNote("layout", model: model)
                 Group {
                     Picker("Split direction", selection: $model.settings.split) {
                         ForEach(SplitSetting.allCases) { Text($0.title).tag($0) }
                     }
+                    .overrideNote("bsp_split", model: model)
                     Picker("Insert new windows at", selection: $model.settings.insertionPoint) {
                         ForEach(InsertionPointSetting.allCases) { Text($0.title).tag($0) }
                     }
+                    .overrideNote("bsp_insert_point", model: model)
                     Picker("Place new window", selection: $model.settings.newWindowPosition) {
                         ForEach(NewWindowPositionSetting.allCases) { Text($0.title).tag($0) }
                     }
+                    .overrideNote("new_window_split", model: model)
                     PercentSlider("Split ratio", value: $model.settings.splitRatio, in: 0.1...0.9)
+                        .overrideNote("bsp_split_ratio", model: model)
                 }
                 .disabled(settings.layout != .bsp)
             } footer: {
@@ -778,6 +797,7 @@ private struct TilingPane: View {
 
             Section {
                 Toggle("Follow app resizes", isOn: $model.settings.followAppResizes)
+                    .overrideNote("follow_app_resizes", model: model)
             } footer: {
                 Text("When an app resizes its own window, for example to show a sidebar, the neighboring splits make room instead of the window snapping back.")
                     .foregroundStyle(.secondary)
@@ -785,15 +805,20 @@ private struct TilingPane: View {
 
             Section {
                 NumberStepper("Between windows", value: $model.settings.innerGap, in: 0...128, unit: "pt")
+                    .overrideNote("gaps.inner", model: model)
             } header: {
                 Text("Gaps")
             }
 
             Section {
                 NumberStepper("Top", value: $model.settings.outerGapTop, in: 0...128, unit: "pt")
+                    .overrideNote("gaps.outer.top", model: model)
                 NumberStepper("Bottom", value: $model.settings.outerGapBottom, in: 0...128, unit: "pt")
+                    .overrideNote("gaps.outer.bottom", model: model)
                 NumberStepper("Left", value: $model.settings.outerGapLeft, in: 0...128, unit: "pt")
+                    .overrideNote("gaps.outer.left", model: model)
                 NumberStepper("Right", value: $model.settings.outerGapRight, in: 0...128, unit: "pt")
+                    .overrideNote("gaps.outer.right", model: model)
             } header: {
                 Text("Screen Edges")
             }
@@ -823,13 +848,16 @@ private struct AppearancePane: View {
             ApplyFailureSection(model: model)
             Section {
                 Toggle("Dim inactive windows", isOn: $model.settings.dimmingEnabled)
+                    .overrideNote("dimmed_inactive.enabled", model: model)
                 // 0% dims nothing and 100% blacks windows out.
                 PercentSlider("Dimming", value: $model.settings.dimmingLevel, in: 0.05...0.9)
+                    .overrideNote("dimmed_inactive.level", model: model)
                     .disabled(!settings.dimmingEnabled)
             }
 
             Section {
                 Toggle("Animate window movement", isOn: $model.settings.animationEnabled)
+                    .overrideNote("animation.enabled", model: model)
                 Group {
                     NumberStepper(
                         "Duration",
@@ -838,9 +866,11 @@ private struct AppearancePane: View {
                         step: 50,
                         unit: "ms"
                     )
+                    .overrideNote("animation.duration_ms", model: model)
                     Picker("Easing", selection: $model.settings.easing) {
                         ForEach(EasingSetting.allCases) { Text($0.title).tag($0) }
                     }
+                    .overrideNote("animation.easing", model: model)
                 }
                 .disabled(!settings.animationEnabled)
             }
@@ -910,6 +940,17 @@ private struct AppsPane: View {
             } footer: {
                 Text("Rules apply to windows an app opens from now on.")
                     .foregroundStyle(.secondary)
+            }
+
+            if !model.ruleOverrides.isEmpty {
+                Section("Overriding Lua") {
+                    ForEach(model.ruleOverrides, id: \.self) { appID in
+                        VStack(alignment: .leading, spacing: 6) {
+                            AppRuleLabel(appID: appID)
+                            OverrideLabel()
+                        }
+                    }
+                }
             }
         }
     }
@@ -1110,6 +1151,43 @@ private struct StatusLabel: View {
             Image(systemName: succeeded ? "checkmark.circle.fill" : "exclamationmark.triangle.fill")
                 .foregroundStyle(succeeded ? Color.green : Color.orange)
         }
+    }
+}
+
+extension View {
+    /// Notes under a control when its value is saved here and replaces one
+    /// set in Lua, which otherwise looks like the Lua edit had no effect.
+    func overrideNote(_ name: String, model: SettingsModel) -> some View {
+        modifier(OverrideNote(name: name, model: model))
+    }
+}
+
+private struct OverrideNote: ViewModifier {
+    let name: String
+    @ObservedObject var model: SettingsModel
+
+    func body(content: Content) -> some View {
+        if model.settingOverrides.contains(name) {
+            VStack(alignment: .leading, spacing: 6) {
+                content
+                OverrideLabel()
+            }
+        } else {
+            content
+        }
+    }
+}
+
+struct OverrideLabel: View {
+    var body: some View {
+        Label {
+            Text("Overrides Lua config")
+                .foregroundStyle(.secondary)
+        } icon: {
+            Image(systemName: "exclamationmark.triangle.fill")
+                .foregroundStyle(.orange)
+        }
+        .font(.caption)
     }
 }
 

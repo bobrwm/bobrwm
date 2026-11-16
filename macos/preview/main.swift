@@ -357,6 +357,21 @@ func renderAll(into directory: String) -> Bool {
                 appearance: appearance
             ) && ok
         }
+        // Values saved in the settings window that mask Lua.
+        let overridden = makeSettingsModel(accessibilityGranted: true)
+        overridden.setConfigOverrides(
+            settings: ["layout", "gaps.inner", "animation.enabled"],
+            rules: ["com.apple.Safari"]
+        )
+        for pane in [SettingsPane.tiling, .appearance, .apps] {
+            ok = renderPane(
+                pane,
+                model: overridden,
+                path: "\(directory)/settings-\(pane.rawValue)-overridden-\(suffix).png",
+                scheme: scheme,
+                appearance: appearance
+            ) && ok
+        }
         ok = renderPane(
             .general,
             model: makeSettingsModel(accessibilityGranted: false),

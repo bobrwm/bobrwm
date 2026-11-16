@@ -135,6 +135,11 @@ Settings changed in the settings window are saved to `settings.json` beside
 `init.lua`, and override what `init.lua` sets. Lua runs sandboxed: there is no
 `io`, `os`, or `package`, and a runaway loop is stopped.
 
+When a value saved in the settings window replaces one set in Lua, the
+settings window notes under the control that it overrides the Lua config.
+Removing a Lua-defined app rule in **Apps** saves a neutral override, listed
+under **Overriding Lua** in the same pane, and does not change `init.lua`.
+
 To start from every option with its documentation and the default keybinds:
 
 ```bash
