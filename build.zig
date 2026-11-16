@@ -725,6 +725,35 @@ pub fn build(b: *std.Build) !void {
 
     const run_config_apply_tests = b.addRunArtifact(config_apply_tests);
 
+    const config_lua_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/config_lua.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    config_lua_test_mod.addImport("zlua", zlua_mod);
+
+    const config_lua_tests = b.addTest(.{
+        .name = "config-lua-tests",
+        .root_module = config_lua_test_mod,
+    });
+
+    const run_config_lua_tests = b.addRunArtifact(config_lua_tests);
+
+    const config_json_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/config_json.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+
+    const config_json_tests = b.addTest(.{
+        .name = "config-json-tests",
+        .root_module = config_json_test_mod,
+    });
+
+    const run_config_json_tests = b.addRunArtifact(config_json_tests);
+
     const config_watch_test_mod = b.createModule(.{
         .root_source_file = b.path("src/config_watch.zig"),
         .target = target,
@@ -789,6 +818,8 @@ pub fn build(b: *std.Build) !void {
     test_step.dependOn(&run_lua_sandbox_tests.step);
     test_step.dependOn(&run_config_layer_tests.step);
     test_step.dependOn(&run_config_apply_tests.step);
+    test_step.dependOn(&run_config_lua_tests.step);
+    test_step.dependOn(&run_config_json_tests.step);
     test_step.dependOn(&run_config_watch_tests.step);
     // Running the generator itself catches doc lookups broken by renamed
     // containers or fields, which the unit tests cannot see.
