@@ -36,6 +36,8 @@ pub const Result = union(enum) {
     version,
     show_config: ShowConfigOptions,
     check_config,
+    // TODO(zon-migration): remove once config.zon users have migrated.
+    migrate_config: MigrateConfigOptions,
     list_actions: ListActionsOptions,
     /// A flag a local command does not accept.
     invalid_flag: struct { command: Command, flag: []const u8 },
@@ -46,6 +48,11 @@ pub const Result = union(enum) {
 pub const ShowConfigOptions = struct {
     default: bool = false,
     docs: bool = false,
+};
+
+// TODO(zon-migration): remove once config.zon users have migrated.
+pub const MigrateConfigOptions = struct {
+    print: bool = false,
 };
 
 pub const ListActionsOptions = struct {
@@ -69,12 +76,16 @@ fn parseCommand(command: Command, args: anytype) Result {
         .version => .version,
         .@"show-config" => .{ .show_config = .{} },
         .@"check-config" => .check_config,
+        // TODO(zon-migration): remove once config.zon users have migrated.
+        .@"migrate-config" => .{ .migrate_config = .{} },
         .@"list-actions" => .{ .list_actions = .{} },
     };
     while (args.next()) |arg| {
         if (isHelpFlag(arg)) return .{ .help = command };
         const known = switch (result) {
             .show_config => |*opts| setFlag(ShowConfigOptions, opts, arg),
+            // TODO(zon-migration): remove once config.zon users have migrated.
+            .migrate_config => |*opts| setFlag(MigrateConfigOptions, opts, arg),
             .list_actions => |*opts| setFlag(ListActionsOptions, opts, arg),
             else => false,
         };
@@ -133,6 +144,8 @@ pub fn run(result: Result) u8 {
         },
         .show_config => |opts| return showConfig(opts),
         .check_config => return checkConfig(),
+        // TODO(zon-migration): remove once config.zon users have migrated.
+        .migrate_config => |opts| return migrateConfig(opts),
         .list_actions => |opts| return listActions(opts),
         .invalid_flag => |invalid| {
             var buf: [256]u8 = undefined;
@@ -188,6 +201,7 @@ fn printCommandHelp(command: Command) void {
     }
 }
 
+// TODO(zon-migration): remove once config.zon users have migrated. Also drop migrate-config from help_text.
 const help_text =
     \\Usage: bobrwm [command] [options]
     \\
@@ -199,6 +213,7 @@ const help_text =
     \\  show-config [--default] [--docs]
     \\                            Print the config, or the defaults, as init.lua
     \\  check-config              Report mistakes in the config
+    \\  migrate-config [--print]  Convert config.zon to init.lua
     \\  list-actions [--docs]     List keybind actions
     \\
     \\Window Commands (IPC):
@@ -239,7 +254,7 @@ const help_text =
     \\  bobrwm show-config --default --docs > ~/.config/bobrwm/init.lua
     \\
     \\Run `bobrwm <command> --help` for details on show-config,
-    \\check-config, list-actions, help, or version.
+    \\check-config, migrate-config, list-actions, help, or version.
     \\
 ;
 
@@ -311,6 +326,42 @@ fn summarize(writer: *std.Io.Writer, paths: config_load.Paths, result: config_lo
     }
     const merged = result catch return;
     try writer.print("keybinds: {d}\nrules: {d}\n", .{ merged.config.keybinds.len, merged.config.app_rules.len });
+}
+
+// TODO(zon-migration): remove once config.zon users have migrated.
+fn migrateConfig(opts: MigrateConfigOptions) u8 {
+    var arena: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const paths = resolvePaths(alloc) orelse return 1;
+
+    const source = osutil.readFileAllocSentinel(alloc, paths.zon, 1024 * 1024) orelse {
+        writeStderr(std.fmt.allocPrint(alloc, "error: cannot read {s}\n", .{paths.zon}) catch "error: cannot read config.zon\n");
+        return 1;
+    };
+    var zon_diagnostics: std.zon.parse.Diagnostics = undefined;
+    const lua = config_load.migrate(alloc, source, &zon_diagnostics) catch |err| {
+        const message = if (err == error.InvalidZon)
+            std.fmt.allocPrint(alloc, "{f}", .{std.zon.parse.Diagnostics.Formatter{ .path = paths.zon, .errors = zon_diagnostics.errors }})
+        else
+            std.fmt.allocPrint(alloc, "error: {t}\n", .{err});
+        writeStderr(message catch "error: out of memory\n");
+        return 1;
+    };
+    if (opts.print) {
+        writeStdout(lua);
+        return 0;
+    }
+    if (osutil.pathExists(paths.lua)) {
+        writeStderr(std.fmt.allocPrint(alloc, "error: {s} already exists; use --print to see the conversion\n", .{paths.lua}) catch "error: init.lua already exists\n");
+        return 1;
+    }
+    if (!osutil.writeFile(paths.lua, lua)) {
+        writeStderr(std.fmt.allocPrint(alloc, "error: cannot write {s}\n", .{paths.lua}) catch "error: cannot write init.lua\n");
+        return 1;
+    }
+    writeStdout(std.fmt.allocPrint(alloc, "wrote {s}\n", .{paths.lua}) catch "wrote init.lua\n");
+    return 0;
 }
 
 fn resolvePaths(alloc: std.mem.Allocator) ?config_load.Paths {

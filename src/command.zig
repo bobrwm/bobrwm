@@ -54,6 +54,19 @@ pub const Command = enum {
     /// Exits non-zero if there are any errors.
     @"check-config",
 
+    // TODO(zon-migration): remove once config.zon users have migrated.
+    /// Usage: bobrwm migrate-config [--print]
+    ///
+    /// Convert `config.zon`, the config format before `init.lua`, into
+    /// `init.lua`. bobrwm no longer reads `config.zon` and warns at startup
+    /// when it is the only config. `config.zon` is left in place, and an
+    /// existing `init.lua` is never overwritten.
+    ///
+    /// Flags:
+    ///
+    ///   --print  Print the converted config instead of writing `init.lua`.
+    @"migrate-config",
+
     /// Usage: bobrwm list-actions [--docs]
     ///
     /// List the actions a keybind can run, the second argument of

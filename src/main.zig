@@ -2229,6 +2229,16 @@ fn watchFailedModules(paths: []const [:0]const u8) void {
         log.warn("could not watch failed Lua modules; fixes may need a manual reload", .{});
 }
 
+// TODO(zon-migration): remove once config.zon users have migrated.
+/// bobrwm no longer reads `config.zon`; point the user at the converter
+/// instead of silently running on defaults.
+fn warnIfUnmigrated() void {
+    const paths = g_config_paths orelse return;
+    if (!config_load.hasUnmigratedZon(paths)) return;
+    log.warn("{s} is no longer read; run `{s}` to convert it to init.lua", .{ paths.zon, config_load.migrate_command });
+    statusbar.setConfigStatus(false, "config.zon is no longer read. Run `" ++ config_load.migrate_command ++ "` to convert it.");
+}
+
 fn configFileChanged() void {
     _ = reloadConfig();
 }
@@ -2978,6 +2988,8 @@ fn startCore(config_path_arg: ?[]const u8) !void {
         g_allocator,
     );
     g_core_stage = .statusbar;
+    // TODO(zon-migration): remove once config.zon users have migrated.
+    warnIfUnmigrated();
     updateStatusBar();
     spaces_settings.start(if (g_sky) |*sky| sky else null);
 
