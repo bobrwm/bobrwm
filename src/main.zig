@@ -2859,6 +2859,11 @@ fn startCore(config_path_arg: ?[]const u8) !void {
     // -- Config --
     g_config_paths = config_load.Paths.resolve(g_allocator, config_path_arg) catch null;
     g_core_stage = .config_path;
+    if (g_config_paths) |paths| {
+        var migration_arena: std.heap.ArenaAllocator = .init(g_allocator);
+        defer migration_arena.deinit();
+        config_load.migrateIfNeeded(migration_arena.allocator(), paths);
+    }
     g_config_runtime = try ConfigRuntime.init(g_allocator, g_config_paths, true);
     g_core_stage = .config;
     g_config = g_config_runtime.?.config;

@@ -158,6 +158,13 @@ overrides; fixing or creating a required module retries a failed reload.
 `bobrwm reload-config` is silent on success and exits non-zero with an error
 message when the new config cannot be loaded.
 
+### Upgrading from `config.zon`
+
+bobrwm used to read `config.zon`. When it finds `config.zon` and no
+`init.lua`, it writes an equivalent `init.lua` at startup and leaves
+`config.zon` in place. `bobrwm migrate-config` does the same on demand, and
+`bobrwm migrate-config --print` shows the conversion without writing it.
+
 ### Workspaces
 
 Each bobrwm workspace is assigned to exactly one ordinary Mission Control

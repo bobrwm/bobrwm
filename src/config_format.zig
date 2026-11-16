@@ -1,5 +1,6 @@
 //! Writes a `Config` as `init.lua` source, optionally with each option's
-//! documentation as comments. Backs `bobrwm show-config`.
+//! documentation as comments. Backs `bobrwm show-config`, and migrates a
+//! `config.zon` by writing out the config it parsed to.
 //!
 //! Modeled on ghostty's `+show-config --default --docs`.
 

@@ -42,7 +42,8 @@ pub const Config = struct {
     ///     bobrwm.app_rules.add{ app = "com.apple.systempreferences", float = true }
     app_rules: []const AppRule = &.{},
     /// The workspace part of `app_rules`, from before rules could also float
-    /// an app. `init.lua` cannot set it; use `bobrwm.app_rules.add`.
+    /// an app. Only read when migrating a `config.zon`, which turns each entry
+    /// into a `bobrwm.app_rules.add`.
     workspace_assignments: []const WorkspaceAssignment = &.{},
     /// Names for the managed workspaces. The number of names is the workspace
     /// count; when omitted, bobrwm manages 10 unnamed workspaces. At most 10.
