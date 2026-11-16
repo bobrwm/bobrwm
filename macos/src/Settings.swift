@@ -326,7 +326,7 @@ final class SettingsModel: ObservableObject {
         BobrWM \(appVersion)
         Accessibility: \(accessibilityGranted ? "granted" : "required")
         Spaces warnings: \(spacesWarnings.isEmpty ? "none" : spacesWarnings.map(\.summary).joined(separator: ", "))
-        Config: \(configPath == nil ? "built-in defaults" : "config.zon")
+        Config: \(configPath == nil ? "built-in defaults" : "init.lua")
         Last reload: \(configStatus.succeeded ? "succeeded" : "failed") — \(configStatus.message)
         Workspaces:
         \(workspaceSummary)
@@ -473,7 +473,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         restorePosition(of: window)
 
         // Debounced so dragging a slider or holding a stepper rewrites
-        // config.zon once the value settles rather than on every step.
+        // settings.json once the value settles rather than on every step.
         applySubscription = model.$settings
             .debounce(for: .milliseconds(350), scheduler: RunLoop.main)
             .sink { [weak model] settings in
@@ -720,7 +720,7 @@ private struct GeneralPane: View {
             } header: {
                 Text("Configuration")
             } footer: {
-                Text("Changes made here are written to config.zon. Everything else in the file is left as is.")
+                Text("Changes made here are saved to settings.json and override init.lua.")
                     .foregroundStyle(.secondary)
             }
 
@@ -1058,7 +1058,7 @@ private struct WorkspacesPane: View {
                     WorkspaceSettingsRow(workspace: workspace)
                 }
             } footer: {
-                Text("Names and shortcuts are defined in config.zon.")
+                Text("Names and shortcuts are defined in init.lua.")
                     .foregroundStyle(.secondary)
             }
         }

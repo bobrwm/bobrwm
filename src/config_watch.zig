@@ -147,9 +147,8 @@ pub const Watcher = struct {
         if (std.meta.eql(current, self.last_seen)) return;
         self.last_seen = current;
 
-        // A missing file is usually mid-save for editors that delete before
-        // writing. Keep the running config and reload once the file reappears.
-        if (current == null) return;
+        // After the save debounce, deletion is a real change too: missing
+        // config layers are empty, not a reason to retain stale overrides.
         log.debug("config file changed; reloading {s}", .{self.path});
         self.reload();
     }
@@ -286,7 +285,7 @@ const TestEvents = struct {
     }
 };
 
-test "watchers reload for saves recreation and changed dependency graphs" {
+test "watchers reload for saves deletion recreation and changed dependency graphs" {
     const osutil = @import("osutil.zig");
     const allocator = std.testing.allocator;
     const dir = try std.fmt.allocPrintSentinel(allocator, "/tmp/bobrwm-watch-{d}", .{std.c.getpid()}, 0);
@@ -317,7 +316,7 @@ test "watchers reload for saves recreation and changed dependency graphs" {
     try std.testing.expect(osutil.writeFileAtomically(allocator, module, "return 3"));
     try TestEvents.expectReload();
     osutil.deleteFile(settings);
-    try TestEvents.expectQuiet();
+    try TestEvents.expectReload();
     try std.testing.expect(osutil.writeFile(settings, "{}"));
     try TestEvents.expectReload();
     // Failed loads add attempted modules without discarding last-good ones.
