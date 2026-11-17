@@ -18,6 +18,7 @@ const signal_transport = @import("signal_transport.zig");
 const config_watch = @import("config_watch.zig");
 const tab_detect = @import("tabgroup/detect.zig");
 const config_mod = @import("config.zig");
+const config_load = @import("config_load.zig");
 const dim = @import("dim.zig");
 const statusbar = @import("statusbar.zig");
 const tile_preview = @import("tile_preview.zig");
@@ -1381,7 +1382,7 @@ var g_workspace_observer: ?objc.Object = null;
 var g_ipc: ipc.Server = undefined;
 var g_config: config_mod.Config = .{};
 var g_config_runtime: ?ConfigRuntime = null;
-var g_config_path: ?[:0]const u8 = null;
+var g_config_paths: ?config_load.Paths = null;
 var g_mouse_down_location: c.CGPoint = .{ .x = 0, .y = 0 };
 var g_mouse_move_location: c.CGPoint = .{ .x = 0, .y = 0 };
 var g_mouse_drag_event_emitted = false;
@@ -1455,6 +1456,8 @@ var g_mouse_tap_port: c.CFMachPortRef = null;
 /// Global because its dispatch sources keep a pointer to it after startCore
 /// returns.
 var g_config_watcher: config_watch.Watcher = .{};
+var g_settings_watcher: config_watch.Watcher = .{};
+var g_module_watchers: config_watch.WatcherSet = .{};
 var g_layout_entries: std.ArrayList(tiling.LayoutEntry) = .empty;
 var g_event_drain_active = false;
 // Consecutive adoption answers share CG membership until another event or a
@@ -1499,30 +1502,42 @@ const ConfigRuntime = struct {
     arena: std.heap.ArenaAllocator,
     config: config_mod.Config,
     keybind_table: config_mod.KeybindTable,
+    module_paths: []const [:0]const u8 = &.{},
 
-    fn init(parent_allocator: std.mem.Allocator, path: ?[]const u8, use_defaults_on_error: bool) !ConfigRuntime {
+    fn init(parent_allocator: std.mem.Allocator, paths: ?config_load.Paths, use_defaults_on_error: bool) !ConfigRuntime {
         var arena = std.heap.ArenaAllocator.init(parent_allocator);
         errdefer arena.deinit();
         const allocator = arena.allocator();
-        const config = if (path) |p| blk: {
-            break :blk config_mod.loadFromPath(allocator, p) orelse {
-                if (!use_defaults_on_error) return error.InvalidConfig;
+        var module_paths: std.ArrayList([:0]const u8) = .empty;
+        const config = if (paths) |p| blk: {
+            var diagnostics: std.ArrayList(config_load.Diagnostic) = .empty;
+            const merged = config_load.load(parent_allocator, allocator, p, &diagnostics, &module_paths) catch |err| {
+                watchFailedModules(module_paths.items);
+                config_load.logDiagnostics(diagnostics.items);
+                if (err == error.OutOfMemory or !use_defaults_on_error) return err;
                 break :blk config_mod.Config{};
             };
+            config_load.logDiagnostics(diagnostics.items);
+            break :blk merged.config;
         } else config_mod.Config{};
         const keybind_table = try config_mod.KeybindTable.init(allocator, &config);
-        return .{ .arena = arena, .config = config, .keybind_table = keybind_table };
+        return .{ .arena = arena, .config = config, .keybind_table = keybind_table, .module_paths = module_paths.items };
     }
 
-    // Copies `source` into the arena because parsed strings point into it.
-    fn initFromSource(parent_allocator: std.mem.Allocator, path: []const u8, source: [:0]const u8) !ConfigRuntime {
+    /// The config with `settings_json` in place of `settings.json`.
+    fn initWithSettings(parent_allocator: std.mem.Allocator, paths: config_load.Paths, settings_json: []const u8) !ConfigRuntime {
         var arena = std.heap.ArenaAllocator.init(parent_allocator);
         errdefer arena.deinit();
         const allocator = arena.allocator();
-        const owned = try allocator.dupeSentinel(u8, source, 0);
-        const config = config_mod.parseSource(allocator, path, owned) orelse return error.InvalidConfig;
-        const keybind_table = try config_mod.KeybindTable.init(allocator, &config);
-        return .{ .arena = arena, .config = config, .keybind_table = keybind_table };
+        var diagnostics: std.ArrayList(config_load.Diagnostic) = .empty;
+        defer config_load.logDiagnostics(diagnostics.items);
+        var module_paths: std.ArrayList([:0]const u8) = .empty;
+        const merged = config_load.loadWithSettings(parent_allocator, allocator, paths, settings_json, &diagnostics, &module_paths) catch |err| {
+            watchFailedModules(module_paths.items);
+            return err;
+        };
+        const keybind_table = try config_mod.KeybindTable.init(allocator, &merged.config);
+        return .{ .arena = arena, .config = merged.config, .keybind_table = keybind_table, .module_paths = module_paths.items };
     }
 
     fn deinit(self: *ConfigRuntime) void {
@@ -2141,7 +2156,7 @@ fn applyReloadedConfig(next: ConfigRuntime) void {
     if (dim.enabled) pushDimSnapshot();
 
     previous.deinit();
-    log.info("config reloaded from {s}", .{g_config_path.?});
+    log.info("config reloaded from {s}", .{g_config_paths.?.dir});
 }
 
 var g_config_error_generation: usize = 0;
@@ -2165,13 +2180,14 @@ fn notifyConfigReloadFailed(message: [*:0]const u8) void {
 }
 
 fn reloadConfig() bool {
-    const path = g_config_path orelse return false;
-    var next = ConfigRuntime.init(g_allocator, path, false) catch |err| {
+    const paths = g_config_paths orelse return false;
+    var next = ConfigRuntime.init(g_allocator, paths, false) catch |err| {
         log.err("config reload failed, keeping current config: {}", .{err});
         notifyConfigReloadFailed("Configuration is invalid; previous settings kept");
         return false;
     };
     if (!canApplyLive(&next.config)) {
+        watchFailedModules(next.module_paths);
         next.deinit();
         return false;
     }
@@ -2194,12 +2210,23 @@ fn canApplyLive(config: *const config_mod.Config) bool {
 }
 
 fn syncConfigWatcher() void {
-    const path = g_config_path orelse return;
+    const paths = g_config_paths orelse return;
     if (g_config.auto_reload_config) {
-        g_config_watcher.start(path, configFileChanged);
+        g_config_watcher.start(paths.lua, configFileChanged);
+        g_settings_watcher.start(paths.json, configFileChanged);
+        g_module_watchers.replace(g_allocator, g_config_runtime.?.module_paths, configFileChanged) catch
+            log.warn("could not watch all Lua modules; changes may need a manual reload", .{});
     } else {
         g_config_watcher.stop();
+        g_settings_watcher.stop();
+        g_module_watchers.deinit(g_allocator);
     }
+}
+
+fn watchFailedModules(paths: []const [:0]const u8) void {
+    if (!g_config.auto_reload_config) return;
+    g_module_watchers.add(g_allocator, paths, configFileChanged) catch
+        log.warn("could not watch failed Lua modules; fixes may need a manual reload", .{});
 }
 
 fn configFileChanged() void {
@@ -2830,10 +2857,9 @@ fn startCore(config_path_arg: ?[]const u8) !void {
     ipc.g_dispatch = ipcDispatch;
 
     // -- Config --
-    const config_path = config_mod.resolvePath(g_allocator, config_path_arg) catch null;
-    g_config_path = config_path;
+    g_config_paths = config_load.Paths.resolve(g_allocator, config_path_arg) catch null;
     g_core_stage = .config_path;
-    g_config_runtime = try ConfigRuntime.init(g_allocator, config_path, true);
+    g_config_runtime = try ConfigRuntime.init(g_allocator, g_config_paths, true);
     g_core_stage = .config;
     g_config = g_config_runtime.?.config;
 
@@ -2939,7 +2965,7 @@ fn startCore(config_path_arg: ?[]const u8) !void {
     statusbar.init(
         workspaceCount(),
         &g_config,
-        if (g_config_path) |path| path.ptr else null,
+        if (g_config_paths) |paths| paths.lua.ptr else null,
         .{
             .retile = statusBarRetile,
             .open_config = statusBarOpenConfig,
@@ -2967,6 +2993,9 @@ fn stopCore() void {
     if (g_core_lifecycle == .stopping or g_core_lifecycle == .stopped) return;
     g_core_lifecycle = .stopping;
 
+    g_config_watcher.stop();
+    g_settings_watcher.stop();
+    g_module_watchers.deinit(g_allocator);
     if (coreReached(.statusbar)) {
         statusbar.deinit();
     }
@@ -3005,8 +3034,8 @@ fn stopCore() void {
         g_config_runtime = null;
     }
     if (coreReached(.config_path)) {
-        if (g_config_path) |path| g_allocator.free(path);
-        g_config_path = null;
+        if (g_config_paths) |paths| paths.deinit(g_allocator);
+        g_config_paths = null;
     }
     if (coreReached(.ipc)) {
         g_ipc.deinit(g_allocator);
@@ -3274,7 +3303,7 @@ fn statusBarReloadConfig() callconv(.c) bool {
 }
 
 fn statusBarSetSettings(settings: *const statusbar.Settings) callconv(.c) bool {
-    const path = g_config_path orelse {
+    const paths = g_config_paths orelse {
         notifyConfigReloadFailed("Configuration path is unavailable");
         return false;
     };
@@ -3308,30 +3337,34 @@ fn statusBarSetSettings(settings: *const statusbar.Settings) callconv(.c) bool {
     next.follow_app_resizes = settings.follow_app_resizes;
     next.auto_reload_config = settings.auto_reload_config;
 
-    return saveSettings(path, &next);
+    return saveSettings(paths, &next);
 }
 
-// Validates like a reload before writing, so a rejected change never reaches
-// disk and comes back on restart.
-fn saveSettings(path: []const u8, next: *const config_mod.Config) bool {
+// The settings window writes its own layer, `settings.json`, which overrides
+// `init.lua`. Validates like a reload before writing, so a rejected change
+// never reaches disk and comes back on restart.
+fn saveSettings(paths: config_load.Paths, next: *const config_mod.Config) bool {
     var arena = std.heap.ArenaAllocator.init(g_allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    const path_z = allocator.dupeSentinel(u8, path, 0) catch return settingsSaveFailed(error.OutOfMemory);
-    const original = osutil.readFileAllocSentinel(allocator, path_z, 1024 * 1024) orelse ".{\n}\n";
-    const source = config_mod.editSettingsSource(allocator, original, &g_config, next) catch |err|
+    const existing = osutil.readFileAlloc(allocator, paths.json, 1024 * 1024);
+    if (existing == null and osutil.pathExists(paths.json)) return settingsSaveFailed(error.ReadConfigFailed);
+    const json = config_load.editSettings(allocator, existing, &g_config, next) catch |err|
         return settingsSaveFailed(err);
+    return saveSettingsJson(allocator, paths, json);
+}
 
-    var candidate = ConfigRuntime.initFromSource(g_allocator, path, source) catch |err|
+fn saveSettingsJson(allocator: std.mem.Allocator, paths: config_load.Paths, json: []const u8) bool {
+    var candidate = ConfigRuntime.initWithSettings(g_allocator, paths, json) catch |err|
         return settingsSaveFailed(err);
     if (!canApplyLive(&candidate.config)) {
+        watchFailedModules(candidate.module_paths);
         candidate.deinit();
         return false;
     }
 
-    const directory_ok = if (std.fs.path.dirname(path)) |parent| osutil.makePath(allocator, parent) else true;
-    if (!directory_ok or !osutil.writeFileAtomically(allocator, path, source)) {
+    if (!osutil.makePath(allocator, paths.dir) or !osutil.writeFileAtomically(allocator, paths.json, json)) {
         candidate.deinit();
         return settingsSaveFailed(error.WriteConfigFailed);
     }
@@ -3348,7 +3381,7 @@ fn settingsSaveFailed(err: anyerror) bool {
 }
 
 fn statusBarSetAppRules(rows: ?[*]const statusbar.AppRule, count: usize) callconv(.c) bool {
-    const path = g_config_path orelse {
+    const paths = g_config_paths orelse {
         notifyConfigReloadFailed("Configuration path is unavailable");
         return false;
     };
@@ -3366,11 +3399,9 @@ fn statusBarSetAppRules(rows: ?[*]const statusbar.AppRule, count: usize) callcon
         }
     }
 
-    // The list already includes the deprecated assignments.
     var next = g_config;
     next.app_rules = rules;
-    next.workspace_assignments = &.{};
-    return saveSettings(path, &next);
+    return saveSettings(paths, &next);
 }
 
 fn invalidAppSettings() bool {
@@ -3391,10 +3422,16 @@ fn statusBarQuit() callconv(.c) void {
 }
 
 fn openConfigFile() void {
-    const path = g_config_path orelse {
+    const paths = g_config_paths orelse {
         log.warn("cannot open config file because its path could not be resolved", .{});
         return;
     };
+    const path = paths.lua;
+    // A missing file has nothing to open; start one so the editor does.
+    if (!osutil.pathExists(path)) {
+        _ = osutil.makePath(g_allocator, paths.dir);
+        if (!osutil.writeFile(path, config_load.starter_file)) log.warn("could not create {s}", .{path});
+    }
     const NSWorkspace = objc.getClass("NSWorkspace") orelse return;
     const NSString = objc.getClass("NSString") orelse return;
     const NSURL = objc.getClass("NSURL") orelse return;

@@ -15,14 +15,15 @@ const osutil = @import("osutil.zig");
 const runtime_paths = @import("runtime_paths.zig");
 const config = @import("config.zig");
 const config_format = @import("config_format.zig");
+const config_load = @import("config_load.zig");
 const help_strings = @import("help_strings");
 const Command = @import("command.zig").Command;
 
 pub const std_options = std.Options{
     .log_level = log_options.level,
-    // `show-config` loads the config in-process; keep its progress lines out
-    // of the terminal but still surface parse and validation errors.
-    .log_scope_levels = &.{.{ .scope = .config, .level = .warn }},
+    // Config commands load the config in-process and print its diagnostics
+    // themselves; keep the loader's own log lines out of the terminal.
+    .log_scope_levels = &.{.{ .scope = .config, .level = .err }},
 };
 
 const log = std.log.scoped(.cli);
@@ -34,6 +35,7 @@ pub const Result = union(enum) {
     help: ?Command,
     version,
     show_config: ShowConfigOptions,
+    check_config,
     list_actions: ListActionsOptions,
     /// A flag a local command does not accept.
     invalid_flag: struct { command: Command, flag: []const u8 },
@@ -66,6 +68,7 @@ fn parseCommand(command: Command, args: anytype) Result {
         .help => .{ .help = null },
         .version => .version,
         .@"show-config" => .{ .show_config = .{} },
+        .@"check-config" => .check_config,
         .@"list-actions" => .{ .list_actions = .{} },
     };
     while (args.next()) |arg| {
@@ -129,6 +132,7 @@ pub fn run(result: Result) u8 {
             return 0;
         },
         .show_config => |opts| return showConfig(opts),
+        .check_config => return checkConfig(),
         .list_actions => |opts| return listActions(opts),
         .invalid_flag => |invalid| {
             var buf: [256]u8 = undefined;
@@ -193,7 +197,8 @@ const help_text =
     \\  help                      Show this help message
     \\  version                   Show version information
     \\  show-config [--default] [--docs]
-    \\                            Print the config, or the defaults, as config.zon
+    \\                            Print the config, or the defaults, as init.lua
+    \\  check-config              Report mistakes in the config
     \\  list-actions [--docs]     List keybind actions
     \\
     \\Window Commands (IPC):
@@ -227,14 +232,14 @@ const help_text =
     \\  -h, --help                Show this help message
     \\  --version                 Show version information
     \\
-    \\Configuration is read from $XDG_CONFIG_HOME/bobrwm/config.zon
-    \\or ~/.config/bobrwm/config.zon by default. To start one with every
-    \\option documented, run:
+    \\Configuration is read from init.lua in $XDG_CONFIG_HOME/bobrwm or
+    \\~/.config/bobrwm, with settings.json from the settings window on top.
+    \\To start one with every option documented, run:
     \\
-    \\  bobrwm show-config --default --docs > ~/.config/bobrwm/config.zon
+    \\  bobrwm show-config --default --docs > ~/.config/bobrwm/init.lua
     \\
     \\Run `bobrwm <command> --help` for details on show-config,
-    \\list-actions, help, or version.
+    \\check-config, list-actions, help, or version.
     \\
 ;
 
@@ -248,9 +253,9 @@ fn showConfig(opts: ShowConfigOptions) u8 {
     const cfg: config.Config = if (opts.default) .{} else loadUserConfig(alloc) orelse return 1;
     var out: std.Io.Writer.Allocating = .init(alloc);
     const written = if (opts.docs)
-        config_format.write(&out.writer, &cfg, help_strings.Config)
+        config_format.write(&out.writer, &cfg, help_strings.Config, .{})
     else
-        config_format.write(&out.writer, &cfg, null);
+        config_format.write(&out.writer, &cfg, null, .{});
     written catch {
         writeStderr("error: out of memory\n");
         return 1;
@@ -259,19 +264,72 @@ fn showConfig(opts: ShowConfigOptions) u8 {
     return 0;
 }
 
-/// The config the window manager would load. A missing file means defaults,
-/// like the daemon; an invalid one is an error, since printing defaults then
-/// would misrepresent what is running. `loadFromPath` logs the diagnostics.
+/// The config the window manager would load. An invalid one is an error,
+/// since printing defaults then would misrepresent what is running.
 fn loadUserConfig(alloc: std.mem.Allocator) ?config.Config {
-    const path = config.resolvePath(alloc, null) catch {
+    const paths = resolvePaths(alloc) orelse return null;
+    var diagnostics: std.ArrayList(config_load.Diagnostic) = .empty;
+    const merged = config_load.load(alloc, alloc, paths, &diagnostics, null) catch {
+        writeDiagnostics(alloc, diagnostics.items);
+        writeStderr("error: the config has errors\n");
+        return null;
+    };
+    writeDiagnostics(alloc, diagnostics.items);
+    return merged.config;
+}
+
+fn checkConfig() u8 {
+    var arena: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const paths = resolvePaths(alloc) orelse return 1;
+
+    var diagnostics: std.ArrayList(config_load.Diagnostic) = .empty;
+    const result = config_load.load(alloc, alloc, paths, &diagnostics, null);
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    const written = summarize(&out.writer, paths, result);
+    written catch {
+        writeStderr("error: out of memory\n");
+        return 1;
+    };
+    writeStdout(out.written());
+    writeDiagnostics(alloc, diagnostics.items);
+
+    for (diagnostics.items) |diagnostic| {
+        if (diagnostic.severity == .@"error") {
+            writeStderr("error: the config has errors\n");
+            return 1;
+        }
+    }
+    _ = result catch return 1;
+    return 0;
+}
+
+fn summarize(writer: *std.Io.Writer, paths: config_load.Paths, result: config_load.LoadError!@import("config_layer.zig").Merged) !void {
+    for ([_][:0]const u8{ paths.lua, paths.json }) |path| {
+        try writer.print("{s}: {s}\n", .{ path, if (osutil.pathExists(path)) "found" else "not found" });
+    }
+    const merged = result catch return;
+    try writer.print("keybinds: {d}\nrules: {d}\n", .{ merged.config.keybinds.len, merged.config.app_rules.len });
+}
+
+fn resolvePaths(alloc: std.mem.Allocator) ?config_load.Paths {
+    return config_load.Paths.resolve(alloc, null) catch {
         writeStderr("error: cannot resolve config path: HOME is not set\n");
         return null;
     };
-    if (!osutil.pathExists(path)) return .{};
-    return config.loadFromPath(alloc, path) orelse {
-        writeStderr("error: config file is invalid; see the errors above\n");
-        return null;
-    };
+}
+
+/// `file:line: severity: message`, one per line, on stderr.
+fn writeDiagnostics(alloc: std.mem.Allocator, diagnostics: []const config_load.Diagnostic) void {
+    for (diagnostics) |diagnostic| {
+        const line = std.fmt.allocPrint(alloc, "{f}{t}: {s}\n", .{
+            config_load.fmtLocation(diagnostic.location),
+            diagnostic.severity,
+            diagnostic.message,
+        }) catch return;
+        writeStderr(line);
+    }
 }
 
 fn listActions(opts: ListActionsOptions) u8 {

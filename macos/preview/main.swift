@@ -146,7 +146,7 @@ func makeSettingsModel(
     spacesWarnings: [SpacesWarning] = []
 ) -> SettingsModel {
     let model = SettingsModel(
-        configPath: "/Users/example/.config/bobrwm/config.zon",
+        configPath: "/Users/example/.config/bobrwm/init.lua",
         accessibilityGranted: accessibilityGranted,
         spacesWarnings: spacesWarnings
     )
