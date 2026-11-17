@@ -429,7 +429,7 @@ pub const DisplaySettings = struct {
 
 // Default keybinds (matches the previously hardcoded behaviour)
 
-const default_keybinds = blk: {
+pub const default_keybinds = blk: {
     var binds: []const Keybind = &.{};
 
     // alt+1..9 → focus workspace
@@ -1714,7 +1714,7 @@ test "parseSource accepts unknown fields like a reload does" {
 
 // macOS virtual key code mapping
 
-fn keyNameToCode(name: []const u8) ?u16 {
+pub fn keyNameToCode(name: []const u8) ?u16 {
     const Map = struct { []const u8, u16 };
     const table: []const Map = &.{
         .{ "a", 0x00 },      .{ "s", 0x01 },      .{ "d", 0x02 },
