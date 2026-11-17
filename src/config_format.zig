@@ -1,5 +1,6 @@
 //! Writes a `Config` as `init.lua` source, optionally with each option's
-//! documentation as comments. Backs `bobrwm show-config`.
+//! documentation as comments. Backs `bobrwm show-config`, and migrates a
+//! `config.zon` by writing out the config it parsed to.
 //!
 //! Modeled on ghostty's `+show-config --default --docs`.
 
@@ -10,6 +11,7 @@ const config_layer = @import("config_layer.zig");
 const Writer = std.Io.Writer;
 
 pub const Options = struct {
+    // TODO(zon-migration): remove once config.zon users have migrated. Only migrate uses all_settings = false.
     /// Write settings still at their default too, so the output is a complete
     /// reference. Off, the output holds only what differs from the defaults.
     all_settings: bool = true,
@@ -146,6 +148,7 @@ fn writeBind(writer: *Writer, keybind: config.Keybind) Writer.Error!void {
     try writer.writeAll(")\n");
 }
 
+// TODO(zon-migration): remove once config.zon users have migrated. Drop the workspace_assignments handling.
 /// One `bobrwm.app_rules.add` per app. A `workspace_assignments` entry (the deprecated
 /// alias) supplies the workspace of an app rule that has none, matching how
 /// `Config.workspaceForApp` falls through to it.

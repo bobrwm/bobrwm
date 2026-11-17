@@ -25,6 +25,9 @@ pub const Paths = struct {
     dir: [:0]const u8,
     lua: [:0]const u8,
     json: [:0]const u8,
+    // TODO(zon-migration): remove once config.zon users have migrated.
+    /// The pre-Lua config, read only by `migrate-config`.
+    zon: [:0]const u8,
 
     /// `explicit` names `init.lua` (from `--config`). Otherwise the files live
     /// in `$XDG_CONFIG_HOME/bobrwm`, or `~/.config/bobrwm`. The files need not
@@ -39,11 +42,13 @@ pub const Paths = struct {
         errdefer allocator.free(dir);
         const lua = if (explicit) |path| try allocator.dupeSentinel(u8, path, 0) else try join(allocator, dir, "init.lua");
         errdefer allocator.free(lua);
-        return .{ .dir = dir, .lua = lua, .json = try join(allocator, dir, "settings.json") };
+        const json = try join(allocator, dir, "settings.json");
+        errdefer allocator.free(json);
+        return .{ .dir = dir, .lua = lua, .json = json, .zon = try join(allocator, dir, "config.zon") };
     }
 
     pub fn deinit(self: Paths, allocator: Allocator) void {
-        inline for (.{ self.dir, self.lua, self.json }) |path| allocator.free(path);
+        inline for (.{ self.dir, self.lua, self.json, self.zon }) |path| allocator.free(path);
     }
 
     fn join(allocator: Allocator, dir: []const u8, name: []const u8) ![:0]u8 {
@@ -271,6 +276,16 @@ fn writeLocation(location: config_layer.Location, writer: *std.Io.Writer) std.Io
     try writer.writeAll(": ");
 }
 
+// TODO(zon-migration): remove once config.zon users have migrated.
+/// True when only the pre-Lua `config.zon` exists. bobrwm no longer reads
+/// it and does not convert it on its own, so the user is told to run
+/// `migrate_command`.
+pub fn hasUnmigratedZon(paths: Paths) bool {
+    return !osutil.pathExists(paths.lua) and osutil.pathExists(paths.zon);
+}
+
+pub const migrate_command = "bobrwm migrate-config";
+
 /// Written when the menu bar opens a config that does not exist yet.
 pub const starter_file =
     \\-- bobrwm config. `bobrwm show-config --default --docs` lists every setting.
@@ -278,6 +293,36 @@ pub const starter_file =
     \\-- bobrwm.settings.set{ gaps = { inner = 8 } }
     \\-- bobrwm.keymap.set("alt+1", "focus_workspace", { workspace = 1 })
     \\-- bobrwm.app_rules.add{ app = "com.apple.finder", float = true }
+    \\
+;
+
+// TODO(zon-migration): remove once config.zon users have migrated.
+pub const MigrateError = error{ OutOfMemory, InvalidZon };
+
+/// Converts `config.zon` source to `init.lua` source holding only what
+/// differs from the defaults. Fields that no longer exist are dropped. On
+/// `InvalidZon`, `diagnostics` says why.
+pub fn migrate(arena: Allocator, source: [:0]const u8, diagnostics: *std.zon.parse.Diagnostics) MigrateError![]const u8 {
+    const parsed = std.zon.parse.fromSlice(config.Config, .{
+        .gpa = arena,
+        .arena = arena,
+        .source = source,
+        .diagnostics = diagnostics,
+        .ignore_unknown_fields = true,
+    }) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.ParseZon => return error.InvalidZon,
+    };
+    var out: std.Io.Writer.Allocating = .init(arena);
+    out.writer.writeAll(migration_header) catch return error.OutOfMemory;
+    config_format.write(&out.writer, &parsed, null, .{ .all_settings = false }) catch return error.OutOfMemory;
+    return out.written();
+}
+
+const migration_header =
+    \\-- Migrated from config.zon, which bobrwm no longer reads.
+    \\-- `bobrwm show-config --default --docs` lists every setting.
+    \\
     \\
 ;
 
@@ -432,6 +477,52 @@ test "built-in binds past the workspace count are not errors" {
     defer t.arena.deinit();
     _ = try t.run(.{ .lua = "bobrwm.settings.set('workspace_names', { 'a', 'b' })" });
     try std.testing.expectEqual(0, t.diagnostics.items.len);
+}
+
+// TODO(zon-migration): remove once config.zon users have migrated.
+test "config.zon migrates to an equivalent init.lua" {
+    var t: TestLoad = .{ .arena = .init(std.testing.allocator) };
+    defer t.arena.deinit();
+    var zon_diagnostics: std.zon.parse.Diagnostics = undefined;
+    const lua = try migrate(t.arena.allocator(),
+        \\.{
+        \\    .gaps = .{ .inner = 6 },
+        \\    .swipe = .{ .enabled = true, .fingers = 3 },
+        \\    .keybinds = .{
+        \\        .{ .key = "1", .mods = .{ .alt = true }, .action = .focus_workspace, .arg = 1 },
+        \\    },
+        \\    .workspace_assignments = .{ .{ .app_id = "com.apple.Safari", .workspace = 2 } },
+        \\}
+    , &zon_diagnostics);
+    try std.testing.expectEqualStrings(migration_header ++
+        \\bobrwm.settings.set{
+        \\  swipe = {
+        \\    enabled = true,
+        \\  },
+        \\  gaps = {
+        \\    inner = 6,
+        \\  },
+        \\}
+        \\
+        \\bobrwm.keymap.set("alt+1", "focus_workspace", { workspace = 1 })
+        \\
+        \\bobrwm.app_rules.add{ app = "com.apple.Safari", workspace = 2 }
+        \\
+    , lua);
+
+    const merged = try t.run(.{ .lua = lua });
+    try std.testing.expectEqual(6, merged.config.gaps.inner);
+    try std.testing.expectEqual(2, merged.config.workspaceForApp("com.apple.Safari").?);
+    try std.testing.expectEqual(0, t.diagnostics.items.len);
+}
+
+// TODO(zon-migration): remove once config.zon users have migrated.
+test "unparseable config.zon is not migrated" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    var diagnostics: std.zon.parse.Diagnostics = undefined;
+    try std.testing.expectError(error.InvalidZon, migrate(arena.allocator(), ".{ .gaps = ", &diagnostics));
+    try std.testing.expectEqual(1, diagnostics.errors.len);
 }
 
 test "paths resolve beside an explicit init.lua" {

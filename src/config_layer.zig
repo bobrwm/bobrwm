@@ -53,6 +53,7 @@ pub fn Origins(comptime T: type) type {
     return Mirror(T, .origin);
 }
 
+// TODO(zon-migration): remove once config.zon users have migrated. Drop workspace_assignments.
 // Merged as ordered operations rather than per value. `workspace_assignments`
 // is the deprecated alias of `app_rules`, and `disable_default_keybinds` is
 // `unbind_all` in a layer.
