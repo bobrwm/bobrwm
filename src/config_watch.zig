@@ -279,6 +279,15 @@ const TestEvents = struct {
         count = 0;
     }
 
+    /// Handles whatever events are pending and returns without waiting
+    /// again, so a settle timer they arm cannot also fire here however late
+    /// this thread is scheduled. A timed wait can oversleep the delay on a
+    /// loaded machine.
+    fn handlePending() !void {
+        const result = c.CFRunLoopRunInMode(c.kCFRunLoopDefaultMode, 2, 1);
+        try std.testing.expectEqual(c.kCFRunLoopRunHandledSource, result);
+    }
+
     fn expectQuiet() !void {
         runFor(0.3);
         try std.testing.expectEqual(0, count);
@@ -329,7 +338,8 @@ test "watchers reload for saves deletion recreation and changed dependency graph
     try TestEvents.expectReload();
     // A successful graph replacement cancels even an armed settle timer.
     try std.testing.expect(osutil.writeFile(module, "return 5"));
-    TestEvents.runFor(0.03);
+    try TestEvents.handlePending();
+    try std.testing.expectEqual(0, TestEvents.count);
     try watchers.replace(allocator, &.{missing}, TestEvents.reload);
     try TestEvents.expectQuiet();
     try std.testing.expect(osutil.writeFile(module, "return 6"));
