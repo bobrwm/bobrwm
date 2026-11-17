@@ -128,8 +128,12 @@ pub fn writeFileAtomically(allocator: std.mem.Allocator, path: []const u8, bytes
 }
 
 test "writeFileAtomically replaces a symlink's target and keeps its mode" {
-    const target: [:0]const u8 = "/tmp/bobrwm_test_atomic_target.zon";
-    const link: [:0]const u8 = "/tmp/bobrwm_test_atomic_link.zon";
+    // Per process: test binaries that import this file run this test too,
+    // concurrently.
+    var target_buf: [64]u8 = undefined;
+    var link_buf: [64]u8 = undefined;
+    const target = try std.fmt.bufPrintSentinel(&target_buf, "/tmp/bobrwm_test_atomic_target_{d}.zon", .{std.c.getpid()}, 0);
+    const link = try std.fmt.bufPrintSentinel(&link_buf, "/tmp/bobrwm_test_atomic_link_{d}.zon", .{std.c.getpid()}, 0);
     defer deleteFile(target.ptr);
     defer deleteFile(link.ptr);
     deleteFile(link.ptr);

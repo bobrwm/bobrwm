@@ -697,6 +697,16 @@ pub fn build(b: *std.Build) !void {
 
     const run_cli_tests = b.addRunArtifact(cli_tests);
 
+    const config_watch_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/config_watch.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    configureAppModule(config_watch_test_mod, app_module_dependencies);
+    const config_watch_tests = b.addTest(.{ .name = "config-watch-tests", .root_module = config_watch_test_mod });
+    const run_config_watch_tests = b.addRunArtifact(config_watch_tests);
+
     const lua_sandbox_test_mod = b.createModule(.{
         .root_source_file = b.path("src/lua_sandbox.zig"),
         .target = target,
@@ -749,6 +759,7 @@ pub fn build(b: *std.Build) !void {
     test_step.dependOn(&run_cli_tests.step);
     test_step.dependOn(&run_config_format_tests.step);
     test_step.dependOn(&run_lua_sandbox_tests.step);
+    test_step.dependOn(&run_config_watch_tests.step);
     // Running the generator itself catches doc lookups broken by renamed
     // containers or fields, which the unit tests cannot see.
     test_step.dependOn(&help_strings.run.step);
