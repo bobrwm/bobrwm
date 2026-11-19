@@ -99,7 +99,13 @@ pub const State = struct {
 
     /// Retain the newest event metadata, but enqueue only the first mouse move
     /// awaiting main-loop handling so stale samples cannot fill the queue.
+    /// Samples inside the already-hovered window are dropped: with no intent in
+    /// flight the main loop would classify them as unchanged (or blocked with
+    /// nothing to cancel), so queuing them only spends a drain per pointer
+    /// sample. A zero id still queues because the main loop must hit-test it.
     pub fn queueMouseMove(self: *State, window_id: u32) bool {
+        if (!self.mouse_move_pending and self.intent == null and
+            window_id != 0 and window_id == self.hovered_window_id) return false;
         self.event_window_id = window_id;
         if (self.mouse_move_pending) return false;
         self.mouse_move_pending = true;
@@ -243,6 +249,22 @@ test "mouse moves coalesce until consumed" {
     try std.testing.expectEqual(@as(u32, 20), state.eventWindowId());
     try std.testing.expectEqual(HoverUpdate.entered, state.updateHover(20, false));
     try std.testing.expect(state.queueMouseMove(30));
+}
+
+test "moves within the hovered window queue only while they can matter" {
+    var state: State = .{};
+    try std.testing.expectEqual(HoverUpdate.entered, state.updateHover(20, false));
+    try std.testing.expect(!state.queueMouseMove(20));
+    // Zero needs the main-loop hit test, which may resolve to another window.
+    try std.testing.expect(state.queueMouseMove(0));
+    _ = state.updateHover(20, false);
+    // An in-flight intent can be canceled by a blocked sample, so keep it.
+    _ = state.beginIntent(7, 20, 0, .awaiting_confirmation);
+    try std.testing.expect(state.queueMouseMove(20));
+    _ = state.updateHover(20, false);
+    _ = state.cancelIntent();
+    state.rearm(20);
+    try std.testing.expect(state.queueMouseMove(20));
 }
 
 test "fallback logging is emitted once per reset" {
