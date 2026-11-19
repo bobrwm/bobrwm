@@ -1489,8 +1489,8 @@ const CoreStage = enum(u8) {
     config,
     layout,
     signal_transport,
-    workspace_observer,
     ax_observer,
+    workspace_observer,
     ipc_transport,
     statusbar,
 };
@@ -2931,6 +2931,11 @@ fn startCore(config_path_arg: ?[]const u8) !void {
     try signal_transport.init(requestAppTermination);
     g_core_stage = .signal_transport;
 
+    // Discovery observes each app it finds. Adoption waits for the app's
+    // readiness answer, so no window is managed yet to observe apps from later.
+    ax_observer.init();
+    g_core_stage = .ax_observer;
+
     // -- Discover existing windows and tile --
     captureWorkspaceApplicationInventory();
     // The app frontmost at launch never reports an activation.
@@ -2956,9 +2961,7 @@ fn startCore(config_path_arg: ?[]const u8) !void {
         if (!isActiveProcess(pid)) workspaceActiveAppChanged(pid);
     }
 
-    // -- Sources (observers, CGEventTap, waker, IPC) --
-    ax_observer.init();
-    g_core_stage = .ax_observer;
+    // -- Sources (CGEventTap, waker, IPC) --
     initWakerSource();
     configureSwipeEventTap(g_config.swipe.enabled);
     setupHotkeyEventTap();
@@ -2969,7 +2972,6 @@ fn startCore(config_path_arg: ?[]const u8) !void {
     try g_ipc_transport.start(g_ipc.fd, signalWaker);
     g_core_stage = .ipc_transport;
     refreshRolePolling();
-    observeDiscoveredApps();
 
     // Status bar (zig-objc) --
     statusbar.init(
@@ -7221,17 +7223,6 @@ fn followingAppResize(space_key: state_mod.SpaceKey) bool {
 fn retileAllDisplays() void {
     for (g_displays[0..g_display_count]) |display| {
         retileDisplay(display.id);
-    }
-}
-
-fn observeDiscoveredApps() void {
-    for (g_state.spaces.spaces[0..g_state.spaces.space_count]) |ws| {
-        const snapshot = workspaceWindows(ws);
-        for (snapshot.items()) |wid| {
-            if (managedWindow(wid)) |win| {
-                ax_observer.observeApp(win.pid);
-            }
-        }
     }
 }
 
