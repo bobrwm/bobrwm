@@ -67,6 +67,9 @@ pub fn setHandler(job: Job, handler: Handler) void {
 /// with another app, in which case nothing was queued. Safe from any thread.
 pub fn submit(pid: i32, job: Job) bool {
     std.debug.assert(pid > 0);
+    // A job without a handler would be dropped silently once it runs; startup
+    // observing apps before ax_observer registered its handler went unnoticed.
+    std.debug.assert(g_handlers.get(job) != null);
 
     c.os_unfair_lock_lock(&g_lock);
     defer c.os_unfair_lock_unlock(&g_lock);
@@ -170,8 +173,7 @@ fn drainSlot(context: ?*anyopaque) callconv(.c) void {
 
     var jobs = pending.iterator();
     while (jobs.next()) |job| {
-        const handler = g_handlers.get(job) orelse continue;
-        handler(app);
+        g_handlers.get(job).?(app);
     }
 
     c.os_unfair_lock_lock(&g_lock);
