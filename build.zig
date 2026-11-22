@@ -610,6 +610,25 @@ pub fn build(b: *std.Build) !void {
 
     const run_app_queue_tests = b.addRunArtifact(app_queue_tests);
 
+    // ipc_transport.zig monitors the listening socket via a libdispatch read source.
+    const ipc_transport_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/ipc_transport.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    ipc_transport_test_mod.addImport("c", c_mod);
+    ipc_transport_test_mod.addImport("cg_extra", cg_extra_mod);
+    ipc_transport_test_mod.addSystemFrameworkPath(.{ .cwd_relative = sdk_frameworks });
+    ipc_transport_test_mod.addLibraryPath(.{ .cwd_relative = sdk_lib });
+
+    const ipc_transport_tests = b.addTest(.{
+        .name = "ipc-transport-tests",
+        .root_module = ipc_transport_test_mod,
+    });
+
+    const run_ipc_transport_tests = b.addRunArtifact(ipc_transport_tests);
+
     // The fixture supplies AX entry points; CF ownership uses the real framework.
     const ax_test_mod = b.createModule(.{
         .root_source_file = b.path("src/ax.zig"),
@@ -827,6 +846,7 @@ pub fn build(b: *std.Build) !void {
     test_step.dependOn(&run_trace_tests.step);
     test_step.dependOn(&run_watchdog_tests.step);
     test_step.dependOn(&run_app_queue_tests.step);
+    test_step.dependOn(&run_ipc_transport_tests.step);
     test_step.dependOn(&run_ax_tests.step);
     test_step.dependOn(&run_window_server_tests.step);
     test_step.dependOn(&run_swipe_tests.step);
