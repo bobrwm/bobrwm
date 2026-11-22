@@ -40,6 +40,7 @@ const dock_swipe_progress: f64 = 1.401298464324817e-45;
 const dock_swipe_modern_progress: f64 = 0.000016;
 const serialized_event_capacity: usize = 4096;
 const native_window_batch_capacity: usize = 256;
+const hidden_space_batch_capacity: usize = 8;
 pub const space_query_window_capacity: usize = 1024;
 
 /// Identifies our synthetic gestures without relying on event arrival order.
@@ -87,6 +88,9 @@ pub const SkyLight = struct {
     bridgedSpaceCreateSelectorSupported: bool,
     bridgedSpaceDestroyClass: ?objc.Class,
     bridgedSpaceDestroySelectorSupported: bool,
+    bridgedSpaceMoveClass: ?objc.Class,
+    bridgedSpaceMoveSelectorSupported: bool,
+    bridgedSpaceHideClass: ?objc.Class,
     performBridgedMove: ?PerformBridgedMoveFn,
     bridgedMoveClass: ?objc.Class,
     bridgedMoveSelectorSupported: bool,
@@ -136,6 +140,12 @@ pub const SkyLight = struct {
             objc.c.class_getInstanceMethod(cls.value, objc.sel("performWithWMBridgeDelegate").value) != null
         else
             false;
+        const bridged_space_move_class = objc.getClass("SLSBridgedMoveManagedSpaceToDisplayIndexOperation");
+        const bridged_space_move_selector_supported = if (bridged_space_move_class) |cls|
+            objc.c.class_getInstanceMethod(cls.value, objc.sel("performWithWMBridgeDelegate").value) != null
+        else
+            false;
+        const bridged_space_hide_class = objc.getClass("SLSBridgedHideSpacesOperation");
         const bridged_move_class = objc.getClass("SLSBridgedMoveWindowsToManagedSpaceOperation");
         const bridged_move_selector_supported = if (bridged_move_class) |cls|
             objc.c.class_getInstanceMethod(cls.value, objc.sel("performWithWMBridgeDelegate").value) != null
@@ -164,6 +174,9 @@ pub const SkyLight = struct {
             .bridgedSpaceCreateSelectorSupported = bridged_space_create_selector_supported,
             .bridgedSpaceDestroyClass = bridged_space_destroy_class,
             .bridgedSpaceDestroySelectorSupported = bridged_space_destroy_selector_supported,
+            .bridgedSpaceMoveClass = bridged_space_move_class,
+            .bridgedSpaceMoveSelectorSupported = bridged_space_move_selector_supported,
+            .bridgedSpaceHideClass = bridged_space_hide_class,
             .performBridgedMove = perform_bridged_move,
             .bridgedMoveClass = bridged_move_class,
             .bridgedMoveSelectorSupported = bridged_move_selector_supported,
@@ -299,6 +312,70 @@ pub const SkyLight = struct {
         defer operation.msgSend(void, "release", .{});
 
         operation.msgSend(void, "performWithWMBridgeDelegate", .{});
+        return true;
+    }
+
+    /// Whether whole Spaces can move between displays and positions, which
+    /// workspace moves need.
+    pub fn supportsNativeSpaceMoves(self: *const SkyLight) bool {
+        return self.bridgedSpaceMoveClass != null and self.bridgedSpaceMoveSelectorSupported and
+            self.bridgedSpaceCreateSelectorSupported and self.bridgedSpaceDestroySelectorSupported;
+    }
+
+    /// Move a Space, with its windows, to `index` among `display_id`'s Spaces.
+    /// WindowServer applies the move asynchronously but in submission order.
+    /// Moving a display's current Space away makes that display show the
+    /// Space before it, or after it when it was first, without animating.
+    pub fn moveNativeSpace(self: *const SkyLight, space_id: u64, display_id: u32, index: u32) bool {
+        if (space_id == 0) return false;
+        const bridged_class = self.bridgedSpaceMoveClass orelse return false;
+        if (!self.bridgedSpaceMoveSelectorSupported) return false;
+
+        const display_uuid = cg_extra.CGDisplayCreateUUIDFromDisplayID(display_id) orelse return false;
+        defer c.CFRelease(display_uuid);
+        const display_name = c.CFUUIDCreateString(null, display_uuid) orelse return false;
+        defer c.CFRelease(display_name);
+
+        const allocated = bridged_class.msgSend(objc.Object, "alloc", .{});
+        if (allocated.value == null) return false;
+        const operation = allocated.msgSend(objc.Object, "initWithSpaceID:displayIdentifier:index:", .{
+            space_id,
+            objc.Object.fromId(@constCast(display_name)),
+            index,
+        });
+        if (operation.value == null) return false;
+        defer operation.msgSend(void, "release", .{});
+
+        _ = operation.msgSend(objc.Object, "performWithWMBridgeDelegate", .{});
+        return true;
+    }
+
+    /// Order out the windows of Spaces that are not current. WindowServer can
+    /// keep drawing a window after it, or its Space, moves to a hidden Space.
+    pub fn hideNativeSpaces(self: *const SkyLight, space_ids: []const u64) bool {
+        if (space_ids.len == 0 or space_ids.len > hidden_space_batch_capacity) return false;
+        const bridged_class = self.bridgedSpaceHideClass orelse return false;
+
+        var values: [hidden_space_batch_capacity]?*const anyopaque = undefined;
+        var value_count: usize = 0;
+        defer for (values[0..value_count]) |value| c.CFRelease(value);
+
+        for (space_ids) |*space_id| {
+            const number = c.CFNumberCreate(null, c.kCFNumberSInt64Type, space_id) orelse return false;
+            values[value_count] = number;
+            value_count += 1;
+        }
+
+        const spaces = c.CFArrayCreate(null, &values, @intCast(value_count), &c.kCFTypeArrayCallBacks) orelse return false;
+        defer c.CFRelease(spaces);
+
+        const allocated = bridged_class.msgSend(objc.Object, "alloc", .{});
+        if (allocated.value == null) return false;
+        const operation = allocated.msgSend(objc.Object, "initWithSpaces:", .{spaces});
+        if (operation.value == null) return false;
+        defer operation.msgSend(void, "release", .{});
+
+        _ = operation.msgSend(objc.Object, "performWithWMBridgeDelegate", .{});
         return true;
     }
 
@@ -501,6 +578,20 @@ pub const NativeSpaceTopology = struct {
         const display = self.managedDisplayInfo(display_id) orelse return null;
         const spaces = self.spacesForDisplay(display) orelse return null;
         return spaceAtOrdinal(spaces, ordinal, self.keys.id, self.keys.space_type);
+    }
+
+    /// Every Space on a display in Mission Control order, fullscreen ones
+    /// included, which is the order Space move indices count in.
+    pub fn spaceIds(self: *const NativeSpaceTopology, display_id: u32, out: []u64) ?[]u64 {
+        const display = self.managedDisplayInfo(display_id) orelse return null;
+        const spaces = self.spacesForDisplay(display) orelse return null;
+        const count: usize = @intCast(c.CFArrayGetCount(@ptrCast(spaces)));
+        if (count > out.len) return null;
+        for (0..count) |index| {
+            const space: CFDictionaryRef = @ptrCast(c.CFArrayGetValueAtIndex(@ptrCast(spaces), @intCast(index)) orelse return null);
+            out[index] = spaceId(space, self.keys.id) orelse return null;
+        }
+        return out[0..count];
     }
 
     /// Return the number of ordinary native Spaces observed on a display.

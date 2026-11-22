@@ -22,7 +22,14 @@ pub const max_pending_native_window_moves = 256;
 pub const native_switch_timeout_ms: u64 = 3200;
 pub const native_observation_delay_ms: u64 = 50;
 pub const native_window_move_attempts_max: u8 = 3;
-pub const native_workspace_move_timeout_ms: u64 = 3200;
+/// The Space moves land within tens of ms; past this something refused them.
+pub const native_workspace_move_timeout_ms: u64 = 1000;
+/// WindowServer applies Space moves within a few ms of the call, so a move
+/// is observed at this pace for its first stretch, then at the slower pace
+/// until its deadline.
+pub const native_workspace_move_fast_observe_ms: u64 = 10;
+pub const native_workspace_move_fast_window_ms: u64 = 100;
+pub const native_workspace_move_slow_observe_ms: u64 = 100;
 pub const workspace_transition_settle_ms: u64 = 400;
 pub const display_event_debounce_ms: u64 = 50;
 
@@ -258,18 +265,118 @@ pub const PendingNativeWindowMoves = struct {
     }
 };
 
-pub const PendingNativeWorkspaceMove = struct {
-    source: SpaceRef,
-    target: SpaceRef,
-    epoch: Epoch,
-    deadline_at_ms: TimestampMs,
-    has_started: bool = false,
-    is_rolling_back: bool = false,
+/// A Space a workspace move step acts on.
+pub const SpaceOperand = union(enum) {
+    space: NativeSpaceId,
+    /// The Space the move creates for an exchange.
+    temporary,
 };
 
-pub const NativeWorkspaceMoveObservation = enum {
-    confirmed,
-    pending,
+pub const SpacePlacement = struct { space: SpaceOperand, anchor: SpaceOperand };
+
+/// One step of a workspace move. The shell submits every step at once;
+/// WindowServer applies them in order.
+pub const SpaceMoveStep = union(enum) {
+    /// Move a Space just before or after another, on that Space's display.
+    move_before: SpacePlacement,
+    move_after: SpacePlacement,
+    move_to_end: struct { space: SpaceOperand, display_id: DisplayId },
+    create_temporary: DisplayId,
+    destroy_temporary,
+};
+
+pub const max_space_move_steps = 5;
+
+/// Spaces whose windows the shell orders out after bobrwm moves a window or
+/// a Space onto a hidden Space: WindowServer can keep drawing those windows.
+pub const HiddenSpaces = struct {
+    ids: [3]NativeSpaceId = undefined,
+    count: u8 = 0,
+
+    pub fn slice(self: *const HiddenSpaces) []const NativeSpaceId {
+        return self.ids[0..self.count];
+    }
+
+    /// Adds the Space unless a display shows it or it is already listed.
+    pub fn addIfHidden(self: *HiddenSpaces, topology: *const NativeTopology, space_id: NativeSpaceId) void {
+        for (topology.displays[0..topology.display_count]) |display| {
+            if (display.observed_space_id == space_id) return;
+        }
+        for (self.slice()) |id| {
+            if (id == space_id) return;
+        }
+        std.debug.assert(self.count < self.ids.len);
+        self.ids[self.count] = space_id;
+        self.count += 1;
+    }
+};
+
+/// Moves the source display's visible workspace to the target display by
+/// moving its Space. Windows stay on their Spaces, so nothing is left behind
+/// and a failed move cannot strand a window.
+///
+/// macOS shows a display's neighboring Space, without animating, when its
+/// current Space moves away: the one before it, or after it when it was
+/// first. The moving Space goes just before the target's visible Space,
+/// which then steps away and back so the target display falls back to it.
+pub const PendingNativeWorkspaceMove = struct {
+    /// The moving workspace, on the source display's visible Space.
+    source: SpaceRef,
+    /// The displaced workspace, on the target display's visible Space.
+    target: SpaceRef,
+    /// The workspace the source display must show afterwards when the move
+    /// chooses it: an empty workspace, or the displaced one when the displays
+    /// trade. Null when macOS falls back to the source display's neighbor.
+    backfill: ?SpaceRef = null,
+    steps: [max_space_move_steps]SpaceMoveStep = undefined,
+    step_count: u8 = 0,
+    epoch: Epoch = 0,
+    started_at_ms: TimestampMs = 0,
+    deadline_at_ms: TimestampMs = 0,
+    has_started: bool = false,
+    /// When the shell next reads the topology. Set only while the move waits
+    /// for it to land.
+    observe_at_ms: ?TimestampMs = null,
+
+    pub fn stepList(self: *const PendingNativeWorkspaceMove) []const SpaceMoveStep {
+        return self.steps[0..self.step_count];
+    }
+
+    pub fn addStep(self: *PendingNativeWorkspaceMove, step: SpaceMoveStep) void {
+        std.debug.assert(self.step_count < self.steps.len);
+        self.steps[self.step_count] = step;
+        self.step_count += 1;
+    }
+
+    /// The source display's only workspace leaves and no empty workspace can
+    /// take its place, so the displaced workspace takes the source display.
+    pub fn isExchange(self: PendingNativeWorkspaceMove) bool {
+        const backfill = self.backfill orelse return false;
+        return backfill.key.eql(self.target.key);
+    }
+};
+
+/// Which display a workspace move targets, as the user asked for it.
+pub const DisplayChoice = union(enum) {
+    next,
+    previous,
+    /// Zero-based position in the command's display order.
+    slot: u8,
+};
+
+/// Displays in the order the user numbers them.
+pub const DisplayOrder = struct {
+    display_ids: [workspace_mod.max_displays]DisplayId = @splat(0),
+    display_count: u8 = 0,
+
+    pub fn ids(self: *const DisplayOrder) []const DisplayId {
+        return self.display_ids[0..self.display_count];
+    }
+};
+
+pub const WorkspaceMoveCommand = struct {
+    target: DisplayChoice,
+    display_order: DisplayOrder,
 };
 
 pub const NativeWindowMoveRequest = struct {
@@ -817,6 +924,19 @@ pub const Model = struct {
         return self.deferred_window_candidates.get(window_id) != null;
     }
 
+    /// The pending workspace move's next check, once it is due.
+    pub fn dueNativeWorkspaceMoveObservation(self: *const Model, at_ms: TimestampMs) ?ObservationTimer {
+        const timer = self.nativeWorkspaceMoveObservation() orelse return null;
+        if (at_ms < timer.due_at_ms) return null;
+        return timer;
+    }
+
+    pub fn nativeWorkspaceMoveObservation(self: *const Model) ?ObservationTimer {
+        const pending = self.pending_native_workspace_move orelse return null;
+        const due_at_ms = pending.observe_at_ms orelse return null;
+        return .{ .epoch = pending.epoch, .due_at_ms = due_at_ms };
+    }
+
     pub fn dueObservation(self: *const Model, at_ms: TimestampMs) ?ObservationTimer {
         const timer = self.observation_timer orelse return null;
         if (at_ms < timer.due_at_ms) return null;
@@ -1098,25 +1218,23 @@ pub const Event = union(enum) {
         succeeded: bool,
         layout: ?LayoutInsertion = null,
     },
+    /// Moves the focused display's workspace; rejected while another
+    /// workspace operation is in flight.
     request_native_workspace_move: struct {
-        source: SpaceRef,
-        target: SpaceRef,
+        command: WorkspaceMoveCommand,
         at_ms: TimestampMs,
     },
     native_workspace_move_started: struct {
         epoch: Epoch,
+        /// False when the shell could not submit every step.
         succeeded: bool,
         at_ms: TimestampMs,
     },
     native_workspace_move_observed: struct {
         epoch: Epoch,
-        observation: NativeWorkspaceMoveObservation,
+        /// Null when WindowServer's topology could not be read or mapped.
+        topology: ?*const NativeTopology,
         at_ms: TimestampMs,
-    },
-    native_workspace_move_rollback_result: struct {
-        epoch: Epoch,
-        succeeded: bool,
-        at_ms: TimestampMs = 0,
     },
     display_reconcile_unavailable: struct {
         at_ms: TimestampMs,
@@ -1311,16 +1429,15 @@ pub const Effect = union(enum) {
     native_window_move_rolled_back: PendingNativeWindowMove,
     native_window_move_rollback_deferred: PendingNativeWindowMove,
     native_window_move_rejected: NativeWindowMoveRequest,
-    move_native_workspace_contents: PendingNativeWorkspaceMove,
-    rollback_native_workspace_contents: PendingNativeWorkspaceMove,
+    move_native_workspace_spaces: PendingNativeWorkspaceMove,
     native_workspace_move_completed: PendingNativeWorkspaceMove,
-    native_workspace_move_failed: struct {
-        move: PendingNativeWorkspaceMove,
-        rollback_succeeded: bool,
-    },
+    hide_native_spaces: HiddenSpaces,
+    /// The topology did not land as planned; the topology poll reconciles
+    /// whatever WindowServer ended up with.
+    native_workspace_move_failed: PendingNativeWorkspaceMove,
     native_workspace_move_rejected: struct {
-        source: SpaceRef,
-        target: SpaceRef,
+        target: DisplayChoice,
+        source_display_id: ?DisplayId,
     },
     apply_pending_focus: PendingFocus,
     window_focus_deferred: struct {
@@ -1383,7 +1500,7 @@ pub const Effect = union(enum) {
     layout: tiling_mod.Effect,
 };
 
-pub const max_effects = 6;
+pub const max_effects = 7;
 
 /// Reducer context. `model` is mutated in place: it is several hundred KiB, and
 /// copying it in and out of every reduce dominated dispatch cost.

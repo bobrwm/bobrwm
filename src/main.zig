@@ -3865,11 +3865,19 @@ fn handleEvent(ev: *const event_mod.Event) void {
             dispatchStateEvent(.{ .native_space_changed = nativeStateNowMs() });
         },
         .geometry_resample_due => reconcileDueGeometryObservations(),
+        .workspace_move_observation_due => {
+            if (processDueNativeWorkspaceMoveObservation()) return;
+            // Same rules as the native observation timer: a replaced timer
+            // must not re-arm, and an early fire re-arms.
+            if (ev.wid != g_workspace_move_observation_generation) return;
+            g_scheduled_workspace_move_observation = null;
+            scheduleNativeWorkspaceMoveObservation();
+        },
         .geometry_write_failed => handleGeometryWriteFailed(ev.wid),
         .role_poll_tick => {
             reconcileDueGeometryObservations();
             processPendingNativeWindowMoves();
-            processPendingNativeWorkspaceMove();
+            _ = processDueNativeWorkspaceMoveObservation();
             if (processDueNativeStateObservation()) return;
             if (processDueDisplayResettle()) return;
             if (nativeSwitchPending()) return;
@@ -4157,86 +4165,175 @@ fn processPendingNativeWindowMoves() void {
     }
 }
 
+/// Submits every step of the move inside the key press, then reads the
+/// topology right away. WindowServer applies the steps in order within a few
+/// ms, so the move usually lands on that first read.
 fn executeNativeWorkspaceMove(pending: state_mod.PendingNativeWorkspaceMove) void {
-    const succeeded = moveNativeWorkspaceContents(pending, true);
+    const succeeded = submitSpaceMoveSteps(pending);
+    if (!succeeded) log.warn("native workspace move: could not submit Space moves", .{});
     dispatchStateEvent(.{ .native_workspace_move_started = .{
         .epoch = pending.epoch,
         .succeeded = succeeded,
         .at_ms = nativeStateNowMs(),
     } });
+    _ = processDueNativeWorkspaceMoveObservation();
 }
 
-fn executeNativeWorkspaceMoveRollback(pending: state_mod.PendingNativeWorkspaceMove) void {
-    const succeeded = moveNativeWorkspaceContents(pending, false);
-    dispatchStateEvent(.{ .native_workspace_move_rollback_result = .{
-        .epoch = pending.epoch,
-        .succeeded = succeeded,
-        .at_ms = nativeStateNowMs(),
-    } });
-}
+/// Each display's Spaces in Mission Control order, updated as steps are
+/// submitted so later steps index against where earlier ones put things,
+/// before WindowServer reports them.
+const SpaceOrder = struct {
+    const spaces_max = 32;
 
-fn moveNativeWorkspaceContents(pending: state_mod.PendingNativeWorkspaceMove, is_forward: bool) bool {
-    const source_target = if (is_forward) pending.target else pending.source;
-    const target_target = if (is_forward) pending.source else pending.target;
-    var source_window_ids: [state_mod.max_managed_windows]u32 = undefined;
-    var target_window_ids: [state_mod.max_managed_windows]u32 = undefined;
-    const source_windows = g_state.workspaceWindowIds(pending.source.key, &source_window_ids);
-    const target_windows = g_state.workspaceWindowIds(pending.target.key, &target_window_ids);
+    display_ids: [workspace_mod.max_displays]u32 = undefined,
+    space_ids: [workspace_mod.max_displays][spaces_max]u64 = undefined,
+    counts: [workspace_mod.max_displays]usize = @splat(0),
+    display_count: usize = 0,
 
-    for (source_windows) |wid| {
-        if (!moveTabGroupToNativeSpace(wid, source_target)) {
-            return false;
+    fn capture() ?SpaceOrder {
+        var snapshot = g_sky.?.nativeSpaceTopology() orelse return null;
+        defer snapshot.deinit();
+        var self: SpaceOrder = .{};
+        for (g_displays[0..g_display_count]) |display| {
+            const index = self.display_count;
+            self.display_ids[index] = display.id;
+            self.counts[index] = (snapshot.spaceIds(display.id, &self.space_ids[index]) orelse return null).len;
+            self.display_count += 1;
         }
+        return self;
     }
-    for (target_windows) |wid| {
-        if (!moveTabGroupToNativeSpace(wid, target_target)) {
-            return false;
+
+    fn locate(self: *const SpaceOrder, space_id: u64) ?struct { display: usize, index: usize } {
+        for (0..self.display_count) |display| {
+            const index = std.mem.indexOfScalar(u64, self.space_ids[display][0..self.counts[display]], space_id) orelse continue;
+            return .{ .display = display, .index = index };
+        }
+        return null;
+    }
+
+    fn displayIndex(self: *const SpaceOrder, display_id: u32) ?usize {
+        return std.mem.indexOfScalar(u32, self.display_ids[0..self.display_count], display_id);
+    }
+
+    fn remove(self: *SpaceOrder, space_id: u64) void {
+        const location = self.locate(space_id) orelse return;
+        const spaces = &self.space_ids[location.display];
+        std.mem.copyForwards(u64, spaces[location.index .. self.counts[location.display] - 1], spaces[location.index + 1 .. self.counts[location.display]]);
+        self.counts[location.display] -= 1;
+    }
+
+    fn insert(self: *SpaceOrder, display: usize, index: usize, space_id: u64) bool {
+        const count = self.counts[display];
+        if (count == spaces_max or index > count) return false;
+        const spaces = &self.space_ids[display];
+        std.mem.copyBackwards(u64, spaces[index + 1 .. count + 1], spaces[index..count]);
+        spaces[index] = space_id;
+        self.counts[display] += 1;
+        return true;
+    }
+};
+
+fn submitSpaceMoveSteps(pending: state_mod.PendingNativeWorkspaceMove) bool {
+    const sky = &g_sky.?;
+    var order = SpaceOrder.capture() orelse return false;
+    var temporary_space_id: ?u64 = null;
+
+    for (pending.stepList()) |step| {
+        switch (step) {
+            .create_temporary => |display_id| {
+                const space_id = sky.createNativeSpace(display_id) orelse return false;
+                temporary_space_id = space_id;
+                const display = order.displayIndex(display_id) orelse return false;
+                if (!order.insert(display, order.counts[display], space_id)) return false;
+            },
+            .destroy_temporary => {
+                const space_id = temporary_space_id orelse return false;
+                if (!sky.destroyNativeSpace(space_id)) return false;
+                order.remove(space_id);
+            },
+            .move_before, .move_after => |placement| {
+                const space_id = resolveSpaceOperand(placement.space, temporary_space_id) orelse return false;
+                const anchor_id = resolveSpaceOperand(placement.anchor, temporary_space_id) orelse return false;
+                order.remove(space_id);
+                const anchor = order.locate(anchor_id) orelse return false;
+                const index = if (step == .move_after) anchor.index + 1 else anchor.index;
+                if (!submitSpaceMove(&order, space_id, anchor.display, index)) return false;
+            },
+            .move_to_end => |placement| {
+                const space_id = resolveSpaceOperand(placement.space, temporary_space_id) orelse return false;
+                order.remove(space_id);
+                const display = order.displayIndex(placement.display_id) orelse return false;
+                if (!submitSpaceMove(&order, space_id, display, order.counts[display])) return false;
+            },
         }
     }
     return true;
 }
 
-fn processPendingNativeWorkspaceMove() void {
-    const pending = g_state.pendingNativeWorkspaceMove() orelse return;
-    if (!pending.has_started or pending.is_rolling_back) return;
+fn resolveSpaceOperand(operand: state_mod.SpaceOperand, temporary_space_id: ?u64) ?u64 {
+    return switch (operand) {
+        .space => |space_id| space_id,
+        .temporary => temporary_space_id,
+    };
+}
 
+fn submitSpaceMove(order: *SpaceOrder, space_id: u64, display: usize, index: usize) bool {
+    const display_id = order.display_ids[display];
+    if (!order.insert(display, index, space_id)) return false;
+    log.debug("native workspace move: Space {d} to display {d} index {d}", .{ space_id, display_id, index });
+    return g_sky.?.moveNativeSpace(space_id, display_id, @intCast(index));
+}
+
+/// Read the topology when the model says the pending move is due a check.
+/// Returns true when it read.
+fn processDueNativeWorkspaceMoveObservation() bool {
+    const now_ms = nativeStateNowMs();
+    _ = g_state.dueNativeWorkspaceMoveObservation(now_ms) orelse return false;
+    const pending = g_state.pendingNativeWorkspaceMove().?;
+    const topology = captureNativeTopology(.preserve_space_ids);
     dispatchStateEvent(.{ .native_workspace_move_observed = .{
         .epoch = pending.epoch,
-        .observation = if (nativeWorkspaceContentsConfirmed(pending)) .confirmed else .pending,
-        .at_ms = nativeStateNowMs(),
+        .topology = if (topology) |*value| value else null,
+        .at_ms = now_ms,
     } });
+    return true;
 }
 
-fn nativeWorkspaceContentsConfirmed(pending: state_mod.PendingNativeWorkspaceMove) bool {
-    var source_window_ids: [state_mod.max_managed_windows]u32 = undefined;
-    var target_window_ids: [state_mod.max_managed_windows]u32 = undefined;
-    const source_windows = g_state.workspaceWindowIds(pending.source.key, &source_window_ids);
-    const target_windows = g_state.workspaceWindowIds(pending.target.key, &target_window_ids);
+var g_scheduled_workspace_move_observation: ?state_mod.ObservationTimer = null;
+var g_workspace_move_observation_generation: u32 = 0;
 
-    for (source_windows) |wid| {
-        const move: state_mod.PendingNativeWindowMove = .{
-            .window_id = wid,
-            .source = pending.source,
-            .target = pending.target,
-            .epoch = pending.epoch,
-        };
-        if (nativeTabGroupMoveConfirmed(wid, move) != true) return false;
+/// Fire the move's next check at the time the model set. The role poll would
+/// run it up to 100ms late.
+fn scheduleNativeWorkspaceMoveObservation() void {
+    const timer = g_state.nativeWorkspaceMoveObservation() orelse return;
+    if (g_scheduled_workspace_move_observation) |scheduled| {
+        if (std.meta.eql(scheduled, timer)) return;
     }
-    for (target_windows) |wid| {
-        const move: state_mod.PendingNativeWindowMove = .{
-            .window_id = wid,
-            .source = pending.target,
-            .target = pending.source,
-            .epoch = pending.epoch,
-        };
-        if (nativeTabGroupMoveConfirmed(wid, move) != true) return false;
-    }
-    return true;
+    g_scheduled_workspace_move_observation = timer;
+    g_workspace_move_observation_generation +%= 1;
+
+    const delay_ms = timer.due_at_ms -| nativeStateNowMs();
+    c.dispatch_after_f(
+        c.dispatch_time(c.DISPATCH_TIME_NOW, @intCast(delay_ms * std.time.ns_per_ms)),
+        cg_extra.dispatch_get_main_queue(),
+        @ptrFromInt(g_workspace_move_observation_generation),
+        workspaceMoveObservationTimerFired,
+    );
+}
+
+fn workspaceMoveObservationTimerFired(context: ?*anyopaque) callconv(.c) void {
+    const generation: u32 = @intCast(@intFromPtr(context));
+    bw_emit_event(shim.BW_EVENT_WORKSPACE_MOVE_OBSERVATION_DUE, 0, generation);
 }
 
 fn completeNativeWorkspaceMove(pending: state_mod.PendingNativeWorkspaceMove) void {
-    const moved_ref = g_state.space(pending.target.key) orelse return;
-    _ = g_state.space(pending.source.key) orelse return;
+    // The moved workspace keeps its Space, now on the target display.
+    const moved_ref = g_state.space(pending.source.key) orelse return;
+    log.debug("native workspace move landed workspace={d} display={d} elapsed_ms={d}", .{
+        moved_ref.workspace_id,
+        moved_ref.display_id,
+        nativeStateNowMs() -| pending.started_at_ms,
+    });
 
     assertDisplayCoverage();
     retile();
@@ -4250,7 +4347,7 @@ fn reconcileDisplays(cause: state_mod.DisplayReconcileCause) void {
     if (!reconcileDisplayChange(cause)) return;
     switch (cause) {
         .display_change => returnDisplacedWindows(),
-        .topology_repair => reconcileNativeWindowAssignmentsFromWindowServer(false),
+        .topology_repair => {},
     }
     discoverWindows(.runtime);
     retile();
@@ -4685,6 +4782,7 @@ fn drainStateEffects() void {
     }
     refreshRolePolling();
     scheduleNativeObservation();
+    scheduleNativeWorkspaceMoveObservation();
     hideTransitioningDim();
 }
 
@@ -4799,20 +4897,22 @@ fn executeStateEffect(effect: state_mod.Effect) void {
             request.source.workspace_id,
             request.target.workspace_id,
         }),
-        .move_native_workspace_contents => |pending| executeNativeWorkspaceMove(pending),
-        .rollback_native_workspace_contents => |pending| executeNativeWorkspaceMoveRollback(pending),
+        .move_native_workspace_spaces => |pending| executeNativeWorkspaceMove(pending),
         .native_workspace_move_completed => |pending| completeNativeWorkspaceMove(pending),
-        .native_workspace_move_failed => |failure| {
-            log.warn("native workspace move failed source={d} target={d} rollback={}", .{
-                failure.move.source.workspace_id,
-                failure.move.target.workspace_id,
-                failure.rollback_succeeded,
-            });
-            if (!failure.rollback_succeeded) reconcileObservedNativeTopology();
+        .hide_native_spaces => |hidden| {
+            if (!g_sky.?.hideNativeSpaces(hidden.slice())) log.warn("hide native Spaces failed count={d}", .{hidden.count});
         },
-        .native_workspace_move_rejected => |request| log.warn("native workspace move rejected source={d} target={d}", .{
-            request.source.workspace_id,
-            request.target.workspace_id,
+        .native_workspace_move_failed => |failure| {
+            log.warn("native workspace move failed source={d} target={d}", .{
+                failure.source.workspace_id,
+                failure.target.workspace_id,
+            });
+            // Windows never left their Spaces; adopt wherever the Spaces are.
+            reconcileNativeSpaceTopologyIfNeeded();
+        },
+        .native_workspace_move_rejected => |request| log.debug("native workspace move rejected target={any} source_display={?d}", .{
+            request.target,
+            request.source_display_id,
         }),
         .apply_pending_focus => |pending| applyPendingFocusEntry(pending),
         .window_focus_deferred => |deferred| executeWindowFocusDeferred(deferred),
@@ -5484,49 +5584,12 @@ fn failNativeSwitch(failure: @FieldType(state_mod.Effect, "native_switch_failed"
 
 fn reconcileObservedNativeTopology() void {
     const started_ns = nanoTimestamp();
-    reconcileNativeWindowAssignmentsFromWindowServer(true);
     discoverWindows(.runtime);
     retile();
     updateStatusBar();
 
     const elapsed_ms = @divTrunc(nanoTimestamp() - started_ns, std.time.ns_per_ms);
     log.debug("[trace] native topology reconcile elapsed_ms={}", .{elapsed_ms});
-}
-
-fn reconcileNativeWindowAssignmentsFromWindowServer(should_require_visible: bool) void {
-    const sky = &g_sky.?;
-    var topology = sky.nativeSpaceTopology() orelse {
-        log.warn("native workspace reconcile could not snapshot window assignments", .{});
-        return;
-    };
-    defer topology.deinit();
-
-    const on_screen = if (should_require_visible) OnScreenWindows.snapshot() else OnScreenWindows{};
-    if (should_require_visible and on_screen.truncated) return;
-    var repairs: [256]struct { wid: u32, target: state_mod.SpaceRef } = undefined;
-    var repair_count: usize = 0;
-
-    for (g_state.windows.items()) |managed_window| {
-        const win = managed_window.snapshot();
-        const managed = g_state.window(win.wid) orelse continue;
-        if (g_state.windowTabLeader(win.wid) != win.wid) continue;
-        if (g_state.pendingNativeWindowMove(win.wid) != null) continue;
-        const visible_wid = g_state.windowTabActive(win.wid);
-        if (should_require_visible and !on_screen.contains(visible_wid)) continue;
-
-        const target = nativeWorkspaceForWindowInTopology(&topology, visible_wid) orelse continue;
-        if (managed.space_key.eql(target.key)) continue;
-        if (repair_count == repairs.len) {
-            log.warn("native workspace assignment repair truncated limit={d}", .{repairs.len});
-            break;
-        }
-        repairs[repair_count] = .{ .wid = win.wid, .target = target };
-        repair_count += 1;
-    }
-
-    for (repairs[0..repair_count]) |repair| {
-        reassignManagedWindowToNativeWorkspace(repair.wid, repair.target);
-    }
 }
 
 /// Send windows back to their workspace's Space after a display change. macOS
@@ -5586,31 +5649,6 @@ fn nativeSpaceIdForWindowInTopology(topology: *const skylight.NativeSpaceTopolog
         if (topology.spaceIdForWindow(sky, wid, display.id)) |space_id| return space_id;
     }
     return null;
-}
-
-fn nativeWorkspaceForWindowInTopology(
-    topology: *const skylight.NativeSpaceTopology,
-    wid: u32,
-) ?state_mod.SpaceRef {
-    const space_id = nativeSpaceIdForWindowInTopology(topology, wid) orelse return null;
-    return g_state.space(.{ .id = space_id });
-}
-
-fn reassignManagedWindowToNativeWorkspace(wid: u32, target: state_mod.SpaceRef) void {
-    const win = managedWindow(wid) orelse return;
-    const managed = g_state.window(win.wid) orelse return;
-    if (managed.space_key.eql(target.key)) return;
-
-    const target_ws = g_state.space(target.key) orelse return;
-    if (!assignManagedWindowSpace(wid, target_ws)) return;
-
-    if (focusedWorkspaceWindow(target_ws) == null) recordWorkspaceFocus(target_ws, wid);
-
-    log.debug("native workspace assignment repaired wid={d} source_space={d} target={d}", .{
-        wid,
-        managed.space_key.id,
-        target.workspace_id,
-    });
 }
 
 fn processDueNativeStateObservation() bool {
@@ -7470,36 +7508,35 @@ fn moveWindowToDisplay(target_display_slot: u8) void {
     _ = moveManagedWindowToDisplay(ctx.focused_wid, target_display_id);
 }
 
-fn moveWorkspaceToDisplay(target_display_slot: usize) void {
-    if (target_display_slot >= g_display_count) return;
-
-    const source_display_id = focusedDisplayId();
-    const target_display_id = g_displays[target_display_slot].id;
-    if (source_display_id == target_display_id) return;
-
-    const moving_workspace_id = activeWorkspaceIdForDisplay(source_display_id);
-    const displaced_workspace_id = activeWorkspaceIdForDisplay(target_display_id);
-    const source = spaceForWorkspace(source_display_id, moving_workspace_id) orelse return;
-    const target = spaceForWorkspace(target_display_id, displaced_workspace_id) orelse return;
+/// The reducer resolves the source and target when the move starts, which
+/// can be after earlier queued moves have shifted focus.
+fn requestWorkspaceMove(target: state_mod.DisplayChoice) void {
+    if (!g_sky.?.supportsNativeSpaceMoves()) {
+        log.warn("move workspace to display needs native Space moves, unavailable on this macOS", .{});
+        return;
+    }
+    var order: state_mod.DisplayOrder = .{};
+    for (g_displays[0..g_display_count]) |display| {
+        order.display_ids[order.display_count] = display.id;
+        order.display_count += 1;
+    }
     dispatchStateEvent(.{ .request_native_workspace_move = .{
-        .source = source,
-        .target = target,
+        .command = .{ .target = target, .display_order = order },
         .at_ms = nativeStateNowMs(),
     } });
 }
 
+fn moveWorkspaceToDisplay(target_display_slot: usize) void {
+    if (target_display_slot > std.math.maxInt(u8)) return;
+    requestWorkspaceMove(.{ .slot = @intCast(target_display_slot) });
+}
+
 fn moveWorkspaceToDisplayNext() void {
-    if (g_display_count <= 1) return;
-    const source_slot = displayIndexById(focusedDisplayId()) orelse return;
-    const target_slot = (source_slot + 1) % g_display_count;
-    moveWorkspaceToDisplay(target_slot);
+    requestWorkspaceMove(.next);
 }
 
 fn moveWorkspaceToDisplayPrev() void {
-    if (g_display_count <= 1) return;
-    const source_slot = displayIndexById(focusedDisplayId()) orelse return;
-    const target_slot = if (source_slot == 0) g_display_count - 1 else source_slot - 1;
-    moveWorkspaceToDisplay(target_slot);
+    requestWorkspaceMove(.previous);
 }
 
 fn swapDirection(direction: state_mod.FocusDirection) void {

@@ -55,6 +55,11 @@ pub const WorkspaceTransitionSettlementReason = model_mod.WorkspaceTransitionSet
 pub const WorkspaceTransitionSettlement = model_mod.WorkspaceTransitionSettlement;
 pub const PendingNativeWindowMove = model_mod.PendingNativeWindowMove;
 pub const PendingNativeWorkspaceMove = model_mod.PendingNativeWorkspaceMove;
+pub const SpaceMoveStep = model_mod.SpaceMoveStep;
+pub const SpaceOperand = model_mod.SpaceOperand;
+pub const DisplayChoice = model_mod.DisplayChoice;
+pub const DisplayOrder = model_mod.DisplayOrder;
+pub const WorkspaceMoveCommand = model_mod.WorkspaceMoveCommand;
 pub const NativeWindowMoveObservation = model_mod.NativeWindowMoveObservation;
 pub const DeferredWindowExpiryReason = model_mod.DeferredWindowExpiryReason;
 pub const WorkspaceSwitchEffect = model_mod.WorkspaceSwitchEffect;
@@ -197,7 +202,6 @@ pub fn reduce(model: *Model, event: Event) Transition {
             workspace_reducer.reduceNativeWorkspaceMoveObserved(&transition, observation);
             should_refresh_workspace_focus = true;
         },
-        .native_workspace_move_rollback_result => |result| workspace_reducer.reduceNativeWorkspaceMoveRollbackResult(&transition, result),
         .window_focus_observed => |observation| workspace_reducer.reduceWindowFocusObserved(&transition, observation),
         .request_pending_focus => workspace_reducer.reducePendingFocusRequest(&transition),
         .follow_focus_observed => |observation| workspace_reducer.reduceFollowFocusObserved(&transition, observation),
@@ -1607,97 +1611,337 @@ test "switch effect preserves target Space identity across displays" {
     try testing.expectEqual(@as(WorkspaceId, 5), effect.request.target.workspace_id);
 }
 
-test "native workspace move commits placement and ownership atomically" {
-    const testing = std.testing;
-    var model = initializedModel(testTopology(101, 201));
-    model = reduceCopy(model, .{ .adopt_window = .{
-        .window_id = 101,
-        .process_id = 1001,
-        .space_key = .{ .id = 101 },
-        .layout = testLayoutInsertion(.bsp),
-    } }).model;
-    model = reduceCopy(model, .{ .adopt_window = .{
-        .window_id = 201,
-        .process_id = 2001,
-        .space_key = .{ .id = 201 },
-        .layout = testLayoutInsertion(.bsp),
-    } }).model;
-    model = reduceCopy(model, .{ .record_workspace_focus = .{
-        .workspace_id = 1,
-        .window_id = 101,
-    } }).model;
-    model = reduceCopy(model, .{ .record_workspace_focus = .{
-        .workspace_id = 4,
-        .window_id = 201,
-    } }).model;
-
-    var transition = reduceCopy(model, .{ .request_native_workspace_move = .{
-        .source = model.space(.{ .id = 101 }).?,
-        .target = model.space(.{ .id = 201 }).?,
-        .at_ms = 100,
-    } });
-    try testing.expectEqual(@as(u8, 2), transition.effect_count);
-    try testing.expectEqual(std.meta.Tag(Effect).move_native_workspace_contents, std.meta.activeTag(transition.effects[1]));
-    const epoch = transition.model.pending_native_workspace_move.?.epoch;
-
-    transition = reduceCopy(transition.model, .{ .native_workspace_move_started = .{
-        .epoch = epoch,
-        .succeeded = true,
-        .at_ms = 110,
-    } });
-    try testing.expect(transition.model.pending_native_workspace_move.?.has_started);
-
-    transition = reduceCopy(transition.model, .{ .native_workspace_move_observed = .{
-        .epoch = epoch,
-        .observation = .confirmed,
-        .at_ms = 200,
-    } });
-
-    try testing.expect(transition.model.pending_native_workspace_move == null);
-    try testing.expectEqual(@as(?WorkspaceId, 4), transition.model.activeWorkspace(1));
-    try testing.expectEqual(@as(?WorkspaceId, 1), transition.model.activeWorkspace(2));
-    try testing.expectEqual(@as(WorkspaceId, 4), transition.model.space(.{ .id = 101 }).?.workspace_id);
-    try testing.expectEqual(@as(WorkspaceId, 1), transition.model.space(.{ .id = 201 }).?.workspace_id);
-    try testing.expect(transition.model.window(101).?.space_key.eql(.{ .id = 201 }));
-    try testing.expect(transition.model.window(201).?.space_key.eql(.{ .id = 101 }));
-    try testing.expect(transition.model.layout.contains(.{ .id = 201 }, 101));
-    try testing.expect(transition.model.layout.contains(.{ .id = 101 }, 201));
-    try testing.expectEqual(@as(?WindowId, 101), transition.model.focusedWorkspaceWindow(1));
-    try testing.expectEqual(@as(?WindowId, 201), transition.model.focusedWorkspaceWindow(4));
-    try testing.expectEqual(std.meta.Tag(Effect).native_workspace_move_completed, std.meta.activeTag(transition.effects[0]));
+/// A move key press for the focused display's workspace, with displays
+/// numbered in topology order.
+fn workspaceMoveRequest(model: *const Model, target: DisplayChoice, at_ms: TimestampMs) Event {
+    var order: DisplayOrder = .{};
+    for (model.native_topology.displays[0..model.native_topology.display_count]) |display| {
+        order.display_ids[order.display_count] = display.display_id;
+        order.display_count += 1;
+    }
+    return .{ .request_native_workspace_move = .{
+        .command = .{ .target = target, .display_order = order },
+        .at_ms = at_ms,
+    } };
 }
 
-test "native workspace move timeout rolls physical contents back" {
+/// One window per listed Space, with the Space's ID, focused on its workspace.
+fn adoptTestWindows(model: *Model, space_ids: []const NativeSpaceId) void {
+    for (space_ids) |space_id| {
+        const window_id: WindowId = @intCast(space_id);
+        _ = reduce(model, .{ .adopt_window = .{
+            .window_id = window_id,
+            .process_id = @intCast(space_id + 1000),
+            .space_key = .{ .id = space_id },
+            .layout = testLayoutInsertion(.bsp),
+        } });
+        _ = reduce(model, .{ .record_workspace_focus = .{
+            .workspace_id = model.space(.{ .id = space_id }).?.workspace_id,
+            .window_id = window_id,
+        } });
+    }
+}
+
+/// Displays 1, 2, ... with the listed Spaces, numbered in order and each
+/// showing its first Space.
+fn testDisplays(displays: []const []const NativeSpaceId) NativeTopology {
+    var topology: NativeTopology = .{};
+    var workspace_id: WorkspaceId = 1;
+    for (displays, 1..) |space_ids, display_id| {
+        var display = DisplayTopology.init(@intCast(display_id), space_ids[0]);
+        for (space_ids) |space_id| {
+            display.addSpace(.{ .id = space_id, .workspace_id = workspace_id });
+            workspace_id += 1;
+        }
+        topology.addDisplay(display);
+    }
+    return topology;
+}
+
+/// Displays 1, 2, ... each listing `{ space_id, workspace_id }` pairs in
+/// Mission Control order and showing its first Space.
+fn observedTopology(displays: []const []const [2]u64) NativeTopology {
+    var topology: NativeTopology = .{};
+    for (displays, 1..) |spaces, display_id| {
+        var display = DisplayTopology.init(@intCast(display_id), spaces[0][0]);
+        for (spaces) |space| display.addSpace(.{ .id = space[0], .workspace_id = @intCast(space[1]) });
+        topology.addDisplay(display);
+    }
+    return topology;
+}
+
+fn startTestWorkspaceMove(model: *Model, at_ms: TimestampMs) void {
+    const pending = model.pending_native_workspace_move.?;
+    _ = reduce(model, .{ .native_workspace_move_started = .{ .epoch = pending.epoch, .succeeded = true, .at_ms = at_ms } });
+}
+
+fn observeTestWorkspaceMove(model: *Model, topology: ?*const NativeTopology, at_ms: TimestampMs) Transition {
+    return reduce(model, .{ .native_workspace_move_observed = .{
+        .epoch = model.pending_native_workspace_move.?.epoch,
+        .topology = topology,
+        .at_ms = at_ms,
+    } });
+}
+
+fn expectEffectTags(transition: Transition, expected: []const std.meta.Tag(Effect)) !void {
+    try std.testing.expectEqual(expected.len, transition.effect_count);
+    for (expected, transition.effects[0..transition.effect_count]) |tag, effect| {
+        try std.testing.expectEqual(tag, std.meta.activeTag(effect));
+    }
+}
+
+fn expectSteps(pending: PendingNativeWorkspaceMove, expected: []const SpaceMoveStep) !void {
+    try std.testing.expectEqual(expected.len, pending.step_count);
+    for (expected, pending.stepList()) |want, got| try std.testing.expectEqualDeep(want, got);
+}
+
+/// Workspace 1 (Space 101) moves from display 1 onto display 2, which shows
+/// workspace 4 (Space 201), and lands.
+fn landTestWorkspaceMove(model: *Model) !Transition {
+    model.* = initializedModel(testTopology(101, 201));
+    adoptTestWindows(model, &.{ 101, 102, 201 });
+    _ = reduce(model, workspaceMoveRequest(model, .{ .slot = 1 }, 100));
+    startTestWorkspaceMove(model, 105);
+    const landed = observedTopology(&.{
+        &.{ .{ 102, 2 }, .{ 103, 3 } },
+        &.{ .{ 101, 1 }, .{ 201, 4 }, .{ 202, 5 }, .{ 203, 6 } },
+    });
+    return observeTestWorkspaceMove(model, &landed, 110);
+}
+
+test "workspace move hands the target display over to the moving Space" {
     const testing = std.testing;
-    const model = initializedModel(testTopology(101, 201));
-    var transition = reduceCopy(model, .{ .request_native_workspace_move = .{
-        .source = model.space(.{ .id = 101 }).?,
-        .target = model.space(.{ .id = 201 }).?,
-        .at_ms = 100,
-    } });
-    const pending = transition.model.pending_native_workspace_move.?;
-    transition = reduceCopy(transition.model, .{ .native_workspace_move_started = .{
-        .epoch = pending.epoch,
-        .succeeded = true,
-        .at_ms = 110,
-    } });
-    transition = reduceCopy(transition.model, .{ .native_workspace_move_observed = .{
-        .epoch = pending.epoch,
-        .observation = .pending,
-        .at_ms = pending.deadline_at_ms,
-    } });
+    var model = initializedModel(testTopology(101, 201));
+    try expectEffectTags(
+        reduce(&model, workspaceMoveRequest(&model, .{ .slot = 1 }, 100)),
+        &.{ .workspace_transition_started, .move_native_workspace_spaces },
+    );
+    const pending = model.pending_native_workspace_move.?;
+    try testing.expect(pending.backfill == null);
+    // The transition guards the moving workspace, not the displaced one.
+    try testing.expect(model.workspace_transition.?.target.key.eql(.{ .id = 101 }));
+    try expectSteps(pending, &.{
+        .{ .move_before = .{ .space = .{ .space = 101 }, .anchor = .{ .space = 201 } } },
+        .{ .move_to_end = .{ .space = .{ .space = 201 }, .display_id = 1 } },
+        .{ .move_after = .{ .space = .{ .space = 201 }, .anchor = .{ .space = 101 } } },
+    });
+}
 
-    try testing.expect(transition.model.pending_native_workspace_move.?.is_rolling_back);
-    try testing.expectEqual(std.meta.Tag(Effect).rollback_native_workspace_contents, std.meta.activeTag(transition.effects[0]));
+test "workspace move lands when the target display shows the moved Space" {
+    const testing = std.testing;
+    var model: Model = undefined;
+    const transition = try landTestWorkspaceMove(&model);
 
-    transition = reduceCopy(transition.model, .{ .native_workspace_move_rollback_result = .{
-        .epoch = pending.epoch,
-        .succeeded = true,
-    } });
-    try testing.expect(transition.model.pending_native_workspace_move == null);
-    try testing.expectEqual(@as(WorkspaceId, 1), transition.model.space(.{ .id = 101 }).?.workspace_id);
-    try testing.expectEqual(@as(WorkspaceId, 4), transition.model.space(.{ .id = 201 }).?.workspace_id);
-    try testing.expectEqual(std.meta.Tag(Effect).native_workspace_move_failed, std.meta.activeTag(transition.effects[1]));
+    try expectEffectTags(transition, &.{ .native_workspace_move_completed, .hide_native_spaces });
+    // The displaced Space stepped off the target display while current.
+    try testing.expectEqualSlices(NativeSpaceId, &.{201}, transition.effects[1].hide_native_spaces.slice());
+    try testing.expect(model.pending_native_workspace_move == null);
+    // It followed the moved Space to the target display.
+    const settling = model.workspace_transition.?;
+    try testing.expect(settling.target.key.eql(.{ .id = 101 }));
+    try testing.expectEqual(@as(DisplayId, 2), settling.target.display_id);
+    try testing.expectEqual(@as(WorkspaceId, 1), settling.target.workspace_id);
+    try testing.expectEqual(@as(?WorkspaceId, 2), model.activeWorkspace(1));
+    try testing.expectEqual(@as(?WorkspaceId, 1), model.activeWorkspace(2));
+    try testing.expectEqual(@as(?DisplayId, 2), model.focusedDisplay());
+    try testing.expectEqual(@as(DisplayId, 2), model.space(.{ .id = 101 }).?.display_id);
+    try testing.expectEqual(@as(WorkspaceId, 1), model.space(.{ .id = 101 }).?.workspace_id);
+    const target_display = model.native_topology.findDisplay(2).?;
+    try testing.expectEqual(@as(NativeSpaceId, 101), target_display.spaces[0].id);
+    try testing.expectEqual(@as(NativeSpaceId, 201), target_display.spaces[1].id);
+    // Windows and layouts stay keyed by their Space.
+    try testing.expect(model.window(101).?.space_key.eql(.{ .id = 101 }));
+    try testing.expect(model.window(201).?.space_key.eql(.{ .id = 201 }));
+    try testing.expect(model.layout.contains(.{ .id = 101 }, 101));
+    try testing.expectEqual(@as(?WindowId, 101), model.focusedWorkspaceWindow(1));
+    try testing.expectEqual(@as(?WindowId, 201), model.focusedWorkspaceWindow(4));
+}
+
+test "workspace move waits through intermediate topologies" {
+    const testing = std.testing;
+    var model = initializedModel(testTopology(101, 201));
+    _ = reduce(&model, workspaceMoveRequest(&model, .{ .slot = 1 }, 100));
+    startTestWorkspaceMove(&model, 105);
+
+    // The target already shows W, but X has not returned to it yet.
+    const midway = observedTopology(&.{
+        &.{ .{ 102, 2 }, .{ 103, 3 }, .{ 201, 4 } },
+        &.{ .{ 101, 1 }, .{ 202, 5 }, .{ 203, 6 } },
+    });
+    try expectEffectTags(observeTestWorkspaceMove(&model, &midway, 110), &.{});
+    try testing.expectEqual(@as(?TimestampMs, 120), model.pending_native_workspace_move.?.observe_at_ms);
+    try testing.expectEqual(@as(?WorkspaceId, 1), model.activeWorkspace(1));
+}
+
+test "only workspace backfills its display with an empty workspace's Space" {
+    const testing = std.testing;
+    var model = initializedModel(testDisplays(&.{ &.{101}, &.{ 201, 202 } }));
+    adoptTestWindows(&model, &.{ 101, 201 });
+
+    _ = reduce(&model, workspaceMoveRequest(&model, .{ .slot = 1 }, 100));
+    const pending = model.pending_native_workspace_move.?;
+    try testing.expect(pending.backfill.?.key.eql(.{ .id = 202 }));
+    try expectSteps(pending, &.{
+        .{ .move_after = .{ .space = .{ .space = 202 }, .anchor = .{ .space = 101 } } },
+        .{ .move_before = .{ .space = .{ .space = 101 }, .anchor = .{ .space = 201 } } },
+        .{ .move_to_end = .{ .space = .{ .space = 201 }, .display_id = 1 } },
+        .{ .move_after = .{ .space = .{ .space = 201 }, .anchor = .{ .space = 101 } } },
+    });
+
+    startTestWorkspaceMove(&model, 105);
+    const landed = observedTopology(&.{
+        &.{.{ 202, 3 }},
+        &.{ .{ 101, 1 }, .{ 201, 2 } },
+    });
+    const transition = observeTestWorkspaceMove(&model, &landed, 110);
+    try expectEffectTags(transition, &.{ .native_workspace_move_completed, .hide_native_spaces });
+    try testing.expectEqualSlices(NativeSpaceId, &.{201}, transition.effects[1].hide_native_spaces.slice());
+    try testing.expectEqual(@as(?WorkspaceId, 3), model.activeWorkspace(1));
+    try testing.expectEqual(@as(?WorkspaceId, 1), model.activeWorkspace(2));
+    try testing.expectEqual(@as(DisplayId, 1), model.space(.{ .id = 202 }).?.display_id);
+}
+
+test "only workspace trades displays when no workspace is empty" {
+    const testing = std.testing;
+    var model = initializedModel(testDisplays(&.{ &.{101}, &.{201} }));
+    adoptTestWindows(&model, &.{ 101, 201 });
+
+    _ = reduce(&model, workspaceMoveRequest(&model, .{ .slot = 1 }, 100));
+    const pending = model.pending_native_workspace_move.?;
+    try testing.expect(pending.isExchange());
+    try expectSteps(pending, &.{
+        .{ .create_temporary = 1 },
+        .{ .move_before = .{ .space = .{ .space = 101 }, .anchor = .{ .space = 201 } } },
+        .{ .move_to_end = .{ .space = .{ .space = 201 }, .display_id = 1 } },
+        .{ .move_to_end = .{ .space = .temporary, .display_id = 2 } },
+        .destroy_temporary,
+    });
+
+    startTestWorkspaceMove(&model, 105);
+    const landed = observedTopology(&.{ &.{.{ 201, 2 }}, &.{.{ 101, 1 }} });
+    try expectEffectTags(observeTestWorkspaceMove(&model, &landed, 110), &.{.native_workspace_move_completed});
+    try testing.expectEqual(@as(?WorkspaceId, 2), model.activeWorkspace(1));
+    try testing.expectEqual(@as(?WorkspaceId, 1), model.activeWorkspace(2));
+    try testing.expect(model.window(101).?.space_key.eql(.{ .id = 101 }));
+    try testing.expect(model.window(201).?.space_key.eql(.{ .id = 201 }));
+}
+
+test "move key pressed while a move is in flight is rejected" {
+    const testing = std.testing;
+    var model = initializedModel(testTopology(101, 201));
+    _ = reduce(&model, workspaceMoveRequest(&model, .next, 100));
+    const epoch = model.pending_native_workspace_move.?.epoch;
+
+    try expectEffectTags(reduce(&model, workspaceMoveRequest(&model, .next, 105)), &.{.native_workspace_move_rejected});
+    try testing.expectEqual(epoch, model.pending_native_workspace_move.?.epoch);
+}
+
+test "move key pressed right after a move lands moves it back in order" {
+    const testing = std.testing;
+    var model: Model = undefined;
+    _ = try landTestWorkspaceMove(&model);
+
+    // The first move's transition is still settling; the second supersedes it.
+    try expectEffectTags(reduce(&model, workspaceMoveRequest(&model, .next, 120)), &.{
+        .workspace_transition_settled,
+        .workspace_transition_started,
+        .move_native_workspace_spaces,
+    });
+    const next = model.pending_native_workspace_move.?;
+    try testing.expect(next.source.key.eql(.{ .id = 101 }));
+    try testing.expect(next.target.key.eql(.{ .id = 102 }));
+    try expectSteps(next, &.{
+        .{ .move_before = .{ .space = .{ .space = 101 }, .anchor = .{ .space = 102 } } },
+        .{ .move_to_end = .{ .space = .{ .space = 102 }, .display_id = 2 } },
+        .{ .move_after = .{ .space = .{ .space = 102 }, .anchor = .{ .space = 101 } } },
+    });
+}
+
+test "move to a display that does not exist is rejected" {
+    const testing = std.testing;
+    var model = initializedModel(testTopology(101, 201));
+    const transition = reduce(&model, workspaceMoveRequest(&model, .{ .slot = 7 }, 100));
+    try expectEffectTags(transition, &.{.native_workspace_move_rejected});
+    try testing.expect(model.pending_native_workspace_move == null);
+}
+
+test "workspace move fails when its steps cannot be submitted" {
+    const testing = std.testing;
+    var model = initializedModel(testTopology(101, 201));
+    const original = model.native_topology;
+    _ = reduce(&model, workspaceMoveRequest(&model, .{ .slot = 1 }, 100));
+    const pending = model.pending_native_workspace_move.?;
+
+    const transition = reduce(&model, .{ .native_workspace_move_started = .{ .epoch = pending.epoch, .succeeded = false, .at_ms = 110 } });
+    try expectEffectTags(transition, &.{ .workspace_transition_settled, .native_workspace_move_failed });
+    try testing.expect(model.pending_native_workspace_move == null);
+    try testing.expect(model.workspace_transition == null);
+    try testing.expect(model.native_topology.eql(&original));
+}
+
+test "workspace move that never lands fails at its deadline" {
+    const testing = std.testing;
+    var model = initializedModel(testTopology(101, 201));
+    const original = model.native_topology;
+    _ = reduce(&model, workspaceMoveRequest(&model, .{ .slot = 1 }, 100));
+    startTestWorkspaceMove(&model, 105);
+    const deadline_at_ms = model.pending_native_workspace_move.?.deadline_at_ms;
+
+    try expectEffectTags(observeTestWorkspaceMove(&model, &original, deadline_at_ms - 1), &.{});
+    try expectEffectTags(observeTestWorkspaceMove(&model, null, deadline_at_ms), &.{
+        .workspace_transition_settled,
+        .native_workspace_move_failed,
+    });
+    try testing.expect(model.pending_native_workspace_move == null);
+    try testing.expect(model.native_topology.eql(&original));
+}
+
+test "workspace move is observed when it starts, then fast, then at the slow pace" {
+    const testing = std.testing;
+    var model = initializedModel(testTopology(101, 201));
+    _ = reduce(&model, workspaceMoveRequest(&model, .{ .slot = 1 }, 100));
+    try testing.expect(model.nativeWorkspaceMoveObservation() == null);
+
+    startTestWorkspaceMove(&model, 105);
+    try testing.expectEqual(@as(TimestampMs, 105), model.dueNativeWorkspaceMoveObservation(105).?.due_at_ms);
+
+    _ = observeTestWorkspaceMove(&model, null, 105);
+    try testing.expect(model.dueNativeWorkspaceMoveObservation(114) == null);
+    try testing.expectEqual(@as(TimestampMs, 115), model.dueNativeWorkspaceMoveObservation(115).?.due_at_ms);
+
+    _ = observeTestWorkspaceMove(&model, null, 200);
+    try testing.expectEqual(@as(TimestampMs, 300), model.nativeWorkspaceMoveObservation().?.due_at_ms);
+
+    const deadline_at_ms = model.pending_native_workspace_move.?.deadline_at_ms;
+    _ = observeTestWorkspaceMove(&model, null, deadline_at_ms - 1);
+    try testing.expectEqual(deadline_at_ms, model.nativeWorkspaceMoveObservation().?.due_at_ms);
+}
+
+test "space changes during a workspace move do not schedule their own observation" {
+    const testing = std.testing;
+    var model = initializedModel(testTopology(101, 201));
+    _ = reduce(&model, workspaceMoveRequest(&model, .{ .slot = 1 }, 100));
+    try expectEffectTags(reduce(&model, .{ .native_space_changed = 105 }), &.{});
+    try testing.expect(model.observation_timer == null);
+}
+
+test "topology observed during a workspace move is not adopted" {
+    const testing = std.testing;
+    var model = initializedModel(testTopology(101, 201));
+    _ = reduce(&model, workspaceMoveRequest(&model, .{ .slot = 1 }, 100));
+    const before = model.native_topology;
+
+    const midway = observedTopology(&.{
+        &.{ .{ 102, 2 }, .{ 103, 3 }, .{ 201, 4 } },
+        &.{ .{ 101, 1 }, .{ 202, 5 }, .{ 203, 6 } },
+    });
+    try expectEffectTags(reduce(&model, .{ .native_topology_observed = .{
+        .topology = &midway,
+        .epoch = 0,
+        .at_ms = 105,
+        .is_animating = false,
+    } }), &.{});
+    try testing.expect(model.native_topology.eql(&before));
 }
 
 test "Space catalog preserves physical identity when placement changes" {
@@ -2131,6 +2375,8 @@ test "native window move confirmation and ownership change terminate intent" {
     } });
     try testing.expect(transition.model.pendingNativeWindowMove(42) == null);
     try testing.expectEqual(std.meta.Tag(Effect).native_window_move_confirmed, std.meta.activeTag(transition.effects[0]));
+    // Workspace 2 is not shown, so its Space is ordered out behind the window.
+    try testing.expectEqualSlices(NativeSpaceId, &.{102}, transition.effects[1].hide_native_spaces.slice());
 
     model = reduceCopy(transition.model, trackNativeWindowMove(&transition.model, 42, 1, 2)).model;
     epoch = model.pendingNativeWindowMove(42).?.epoch;
@@ -2493,39 +2739,24 @@ test "queued observed target still waits for idle after a failed switch" {
 test "workspace hotkeys wait for cross-display moves and follow logical identity" {
     const testing = std.testing;
     var model = initializedModel(testTopology(101, 201));
-    try expectTestEffect(&model, .{ .request_native_workspace_move = .{
-        .source = model.spaceForWorkspace(1, 1).?,
-        .target = model.spaceForWorkspace(2, 4).?,
-        .at_ms = 100,
-    } }, .workspace_transition_started);
+    try expectTestEffect(&model, workspaceMoveRequest(&model, .{ .slot = 1 }, 100), .workspace_transition_started);
     const pending = model.pending_native_workspace_move.?;
     try expectTestEffect(&model, .{ .native_workspace_move_started = .{ .epoch = pending.epoch, .succeeded = true, .at_ms = 110 } }, null);
     try expectTestEffect(&model, .{ .request_workspace_switch = .{ .target = model.spaceForWorkspace(1, 2).?, .at_ms = 120 } }, null);
     try expectTestEffect(&model, .{ .request_workspace_switch = .{ .target = model.spaceForWorkspace(1, 1).?, .at_ms = 130 } }, null);
     try testing.expectEqual(pending.epoch, model.workspace_transition.?.epoch);
     try testing.expect(model.pending_switch == null);
-    try expectTestEffect(&model, .{ .workspace_transition_timer_fired = .{ .epoch = pending.epoch, .at_ms = pending.deadline_at_ms } }, null);
+    try expectTestEffect(&model, .{ .workspace_transition_timer_fired = .{ .epoch = pending.epoch, .at_ms = pending.deadline_at_ms - 1 } }, null);
     try testing.expect(model.workspace_transition != null);
-    try expectTestEffect(&model, .{ .native_workspace_move_observed = .{ .epoch = pending.epoch, .observation = .confirmed, .at_ms = 200 } }, .native_workspace_move_completed);
+    const landed = observedTopology(&.{
+        &.{ .{ 102, 2 }, .{ 103, 3 } },
+        &.{ .{ 101, 1 }, .{ 201, 4 }, .{ 202, 5 }, .{ 203, 6 } },
+    });
+    try expectTestEffect(&model, .{ .native_workspace_move_observed = .{ .epoch = pending.epoch, .topology = &landed, .at_ms = 200 } }, .native_workspace_move_completed);
     try testing.expect(model.pending_native_workspace_move == null);
     try testing.expectEqual(@as(DisplayId, 2), model.workspace_transition.?.target.display_id);
     try testing.expectEqual(@as(WorkspaceId, 1), model.workspace_transition.?.target.workspace_id);
     try testing.expect(model.queued_switch == null);
-}
-
-test "failed workspace move waits for actual rollback result" {
-    const testing = std.testing;
-    var model = initializedModel(testTopology(101, 201));
-    try expectTestEffect(&model, .{ .request_native_workspace_move = .{
-        .source = model.spaceForWorkspace(1, 1).?,
-        .target = model.spaceForWorkspace(2, 4).?,
-        .at_ms = 100,
-    } }, .workspace_transition_started);
-    const epoch = model.pending_native_workspace_move.?.epoch;
-    try expectTestEffect(&model, .{ .native_workspace_move_started = .{ .epoch = epoch, .succeeded = false, .at_ms = 110 } }, .rollback_native_workspace_contents);
-    try testing.expect(model.pending_native_workspace_move.?.is_rolling_back);
-    const transition = reduceCopy(model, .{ .native_workspace_move_rollback_result = .{ .epoch = epoch, .succeeded = false, .at_ms = 120 } });
-    try testing.expect(!transition.effects[1].native_workspace_move_failed.rollback_succeeded);
 }
 
 test "ordinary observations preserve surviving workspace shortcut identities" {
@@ -2640,11 +2871,7 @@ test "display reconnect preserves the latest requested workspace with a new epoc
 test "disconnect cancels a workspace move before its transition becomes invalid" {
     const testing = std.testing;
     var model = initializedModel(testTopology(101, 201));
-    try expectTestEffect(&model, .{ .request_native_workspace_move = .{
-        .source = model.spaceForWorkspace(1, 1).?,
-        .target = model.spaceForWorkspace(2, 4).?,
-        .at_ms = 100,
-    } }, .workspace_transition_started);
+    try expectTestEffect(&model, workspaceMoveRequest(&model, .{ .slot = 1 }, 100), .workspace_transition_started);
     const epoch = model.pending_native_workspace_move.?.epoch;
     try expectTestEffect(&model, switchRequest(&model, 1, 2, 110), null);
     var topology: NativeTopology = .{};
