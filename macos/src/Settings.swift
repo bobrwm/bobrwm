@@ -884,6 +884,9 @@ private struct AppsPane: View {
                     }
                     .onDeleteCommand { unpin(selection.workspace) }
                     .frame(height: fittedTableHeight(rows: pinned.count, header: true))
+                } else {
+                    Text("No workspace rules. Click + to add an app.")
+                        .foregroundStyle(.secondary)
                 }
                 AddRemoveButtons(
                     excluded: Set(pinned.map(\.appID)),
@@ -905,6 +908,9 @@ private struct AppsPane: View {
                     .tableColumnHeaders(.hidden)
                     .onDeleteCommand { unfloat(selection.floating) }
                     .frame(height: fittedTableHeight(rows: floating.count, header: false))
+                } else {
+                    Text("No floating rules. Click + to add an app.")
+                        .foregroundStyle(.secondary)
                 }
                 AddRemoveButtons(
                     excluded: Set(floating.map(\.appID)),
