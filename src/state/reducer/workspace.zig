@@ -30,6 +30,10 @@ const WorkspaceTransition = model_mod.WorkspaceTransition;
 const WorkspaceTransitionSettlementReason = model_mod.WorkspaceTransitionSettlementReason;
 const PendingNativeWindowMove = model_mod.PendingNativeWindowMove;
 const PendingNativeWorkspaceMove = model_mod.PendingNativeWorkspaceMove;
+const HiddenSpaces = model_mod.HiddenSpaces;
+const WorkspaceMoveCommand = model_mod.WorkspaceMoveCommand;
+const SpaceOperand = model_mod.SpaceOperand;
+const NativeTopology = model_mod.NativeTopology;
 const NativeWindowMoveRequest = model_mod.NativeWindowMoveRequest;
 const PendingFocus = model_mod.PendingFocus;
 const WindowCandidate = model_mod.WindowCandidate;
@@ -100,6 +104,9 @@ pub fn reduceSwitchRequest(
 }
 
 pub fn reduceSpaceChanged(transition: *Transition, at_ms: TimestampMs) void {
+    // A workspace move makes displays fall back to other Spaces and observes
+    // the topology itself.
+    if (transition.model.pending_native_workspace_move != null) return;
     if (transition.model.pending_switch) |pending| {
         transition.model.observation_timer = null;
         transition.addEffect(.{ .observe_native_topology = pending.epoch });
@@ -131,6 +138,13 @@ pub fn reduceTopologyObserved(
 ) void {
     if (transition.model.pending_switch) |pending| {
         if (event.epoch != pending.epoch) return;
+    }
+    // Mid-move topology is transitional and the move adopts the landed one.
+    // Only a lost display is adopted so the sync below can cancel the move.
+    if (transition.model.pending_native_workspace_move) |pending| {
+        const has_source = event.topology.findDisplay(pending.source.display_id) != null;
+        const has_target = event.topology.findDisplay(pending.target.display_id) != null;
+        if (has_source and has_target) return;
     }
     const has_changed = !transition.model.native_topology.eql(event.topology);
     transition.model.native_topology = event.topology.*;
@@ -316,16 +330,28 @@ pub fn syncNativeWorkspaceTopology(transition: *Transition) void {
     pruneWindowCandidates(&transition.model.pending_role_windows, &catalog);
     pruneWindowCandidates(&transition.model.deferred_window_candidates, &catalog);
     if (transition.model.pending_native_workspace_move) |pending| {
-        const source = catalog.find(pending.source.key);
-        const target = catalog.find(pending.target.key);
-        if (source == null or target == null or source.?.display_id != pending.source.display_id or target.?.display_id != pending.target.display_id) {
+        if (!nativeWorkspaceMoveIsIntact(&transition.model.native_topology, &catalog, pending)) {
             transition.model.pending_native_workspace_move = null;
             settleWorkspaceTransition(transition, pending.epoch, .target_unavailable);
-            transition.addEffect(.{ .native_workspace_move_failed = .{ .move = pending, .rollback_succeeded = false } });
+            transition.addEffect(.{ .native_workspace_move_failed = pending });
         }
     }
     refreshWorkspaceTransition(transition);
     refreshPendingNativeWindowMoves(transition.model);
+}
+
+/// Both displays must remain. The move changes which display its Spaces are
+/// on, so for them only existence is checked.
+fn nativeWorkspaceMoveIsIntact(
+    topology: *const NativeTopology,
+    catalog: *const SpaceCatalog,
+    pending: PendingNativeWorkspaceMove,
+) bool {
+    if (topology.findDisplay(pending.source.display_id) == null) return false;
+    if (topology.findDisplay(pending.target.display_id) == null) return false;
+    if (catalog.find(pending.source.key) == null or catalog.find(pending.target.key) == null) return false;
+    const backfill = pending.backfill orelse return true;
+    return catalog.find(backfill.key) != null;
 }
 
 pub fn reduceTopologyUnavailable(
@@ -449,6 +475,9 @@ pub fn reduceNativeWindowMoveObserved(
         .confirmed => {
             _ = transition.model.pending_native_window_moves.remove(event.window_id);
             transition.addEffect(.{ .native_window_move_confirmed = pending });
+            var hidden: HiddenSpaces = .{};
+            hidden.addIfHidden(&transition.model.native_topology, pending.target.key.id);
+            if (hidden.count > 0) transition.addEffect(.{ .hide_native_spaces = hidden });
         },
         .window_missing, .ownership_changed => {
             _ = transition.model.pending_native_window_moves.remove(event.window_id);
@@ -511,51 +540,141 @@ pub fn reduceNativeWorkspaceMoveRequest(
     transition: *Transition,
     request: @FieldType(Event, "request_native_workspace_move"),
 ) void {
-    const source = transition.model.space(request.source.key) orelse {
+    const source_display_id = transition.model.focusedDisplay();
+    const plan = if (isWorkspaceMoveBlocked(transition.model))
+        null
+    else
+        planNativeWorkspaceMove(transition.model, request.command, source_display_id);
+    var pending = plan orelse {
         transition.addEffect(.{ .native_workspace_move_rejected = .{
-            .source = request.source,
-            .target = request.target,
+            .target = request.command.target,
+            .source_display_id = source_display_id,
         } });
         return;
     };
-    const target = transition.model.space(request.target.key) orelse {
-        transition.addEffect(.{ .native_workspace_move_rejected = .{
-            .source = request.source,
-            .target = request.target,
-        } });
-        return;
-    };
-    const is_invalid = transition.model.pending_native_workspace_move != null or
-        transition.model.pending_switch != null or
-        transition.model.pending_native_window_moves.count != 0 or
-        transition.model.workspace_transition != null or
-        source.key.eql(target.key) or
-        source.display_id == target.display_id;
-    if (is_invalid) {
-        transition.addEffect(.{ .native_workspace_move_rejected = .{
-            .source = source,
-            .target = target,
-        } });
-        return;
-    }
 
-    const epoch = takeEpoch(transition.model);
-    const pending: PendingNativeWorkspaceMove = .{
-        .source = source,
-        .target = target,
-        .epoch = epoch,
-        .deadline_at_ms = request.at_ms +| native_workspace_move_timeout_ms,
-    };
+    if (transition.model.workspace_transition) |settling| {
+        settleWorkspaceTransition(transition, settling.epoch, .superseded);
+    }
+    pending.epoch = takeEpoch(transition.model);
+    pending.started_at_ms = request.at_ms;
+    pending.deadline_at_ms = request.at_ms +| native_workspace_move_timeout_ms;
     transition.model.pending_native_workspace_move = pending;
+    // The transition guards the moving workspace. Its Space keeps its key,
+    // so the transition follows it to the target display when the topology
+    // syncs.
     startWorkspaceTransition(
         transition,
         .move_workspace_to_display,
-        target,
+        pending.source,
         request.at_ms,
         native_workspace_move_timeout_ms,
-        epoch,
+        pending.epoch,
     );
-    transition.addEffect(.{ .move_native_workspace_contents = pending });
+    transition.addEffect(.{ .move_native_workspace_spaces = pending });
+}
+
+/// A move waits for the previous workspace operation to land. A completed
+/// transition's settle tail does not block; the move's own transition
+/// supersedes it and keeps synthetic AX events suppressed.
+fn isWorkspaceMoveBlocked(model: *const Model) bool {
+    if (model.pending_native_workspace_move != null) return true;
+    if (model.pending_switch != null or model.queued_switch != null) return true;
+    if (model.pending_native_window_moves.count != 0) return true;
+    const current = model.workspace_transition orelse return false;
+    return current.completion_reason == null;
+}
+
+fn resolveTargetDisplay(command: WorkspaceMoveCommand, source_display_id: DisplayId) ?DisplayId {
+    const display_ids = command.display_order.ids();
+    if (display_ids.len < 2) return null;
+    const source_index = std.mem.indexOfScalar(DisplayId, display_ids, source_display_id) orelse return null;
+    const target_index = switch (command.target) {
+        .slot => |slot| slot,
+        .next => (source_index + 1) % display_ids.len,
+        .previous => (source_index + display_ids.len - 1) % display_ids.len,
+    };
+    if (target_index >= display_ids.len) return null;
+    return display_ids[target_index];
+}
+
+/// Plans the move of the source display's visible workspace W onto the
+/// target display, which shows X. Null rejects it.
+fn planNativeWorkspaceMove(
+    model: *const Model,
+    command: WorkspaceMoveCommand,
+    source_display_id: ?DisplayId,
+) ?PendingNativeWorkspaceMove {
+    const source_display_value = source_display_id orelse return null;
+    const target_display_id = resolveTargetDisplay(command, source_display_value) orelse return null;
+    if (source_display_value == target_display_id) return null;
+    const source_workspace_id = model.activeWorkspace(source_display_value) orelse return null;
+    const source = model.spaceForWorkspace(source_display_value, source_workspace_id) orelse return null;
+    const target_workspace_id = model.activeWorkspace(target_display_id) orelse return null;
+    const target = model.spaceForWorkspace(target_display_id, target_workspace_id) orelse return null;
+    const source_display = model.native_topology.findDisplay(source.display_id) orelse return null;
+    const target_display = model.native_topology.findDisplay(target.display_id) orelse return null;
+    // The target gains a Space; capture past this many would lose one.
+    if (target_display.space_count == target_display.spaces.len) return null;
+
+    const moving: SpaceOperand = .{ .space = source.key.id };
+    const displaced: SpaceOperand = .{ .space = target.key.id };
+    var pending: PendingNativeWorkspaceMove = .{ .source = source, .target = target };
+    if (source_display.space_count > 1) {
+        addHandoverSteps(&pending, moving, displaced);
+        return pending;
+    }
+
+    // W is the source display's only workspace, so the source needs a Space
+    // to fall back to. An empty workspace's Space joins it, just after W.
+    if (emptyHiddenWorkspace(model)) |donor| {
+        pending.backfill = donor;
+        pending.addStep(.{ .move_after = .{ .space = .{ .space = donor.key.id }, .anchor = moving } });
+        addHandoverSteps(&pending, moving, displaced);
+        return pending;
+    }
+
+    // Operator decision: with no empty workspace, the two displays trade. A
+    // temporary Space holds the source display while X crosses over, then
+    // steps away so the source falls back to X.
+    pending.backfill = target;
+    pending.addStep(.{ .create_temporary = source.display_id });
+    pending.addStep(.{ .move_before = .{ .space = moving, .anchor = displaced } });
+    pending.addStep(.{ .move_to_end = .{ .space = displaced, .display_id = source.display_id } });
+    pending.addStep(.{ .move_to_end = .{ .space = .temporary, .display_id = target.display_id } });
+    pending.addStep(.destroy_temporary);
+    return pending;
+}
+
+/// W goes just before X, so when X steps off the target display it falls
+/// back to W; X then returns just after W. The source display falls back
+/// to its own neighbor when W leaves.
+fn addHandoverSteps(pending: *PendingNativeWorkspaceMove, moving: SpaceOperand, displaced: SpaceOperand) void {
+    pending.addStep(.{ .move_before = .{ .space = moving, .anchor = displaced } });
+    pending.addStep(.{ .move_to_end = .{ .space = displaced, .display_id = pending.source.display_id } });
+    pending.addStep(.{ .move_after = .{ .space = displaced, .anchor = moving } });
+}
+
+/// The highest-numbered hidden workspace without managed windows; giving it
+/// away cannot strand anything the user arranged.
+fn emptyHiddenWorkspace(model: *const Model) ?SpaceRef {
+    var best: ?SpaceRef = null;
+    for (model.spaces.spaces[0..model.spaces.space_count]) |space| {
+        if (model.activeWorkspace(space.display_id) == space.workspace_id) continue;
+        if (spaceHasWindows(model, space.key)) continue;
+        if (best) |current| {
+            if (current.workspace_id > space.workspace_id) continue;
+        }
+        best = space;
+    }
+    return best;
+}
+
+fn spaceHasWindows(model: *const Model, key: SpaceKey) bool {
+    for (model.windows.items()) |window| {
+        if (window.space_key.eql(key)) return true;
+    }
+    return false;
 }
 
 pub fn reduceNativeWorkspaceMoveStarted(
@@ -563,15 +682,15 @@ pub fn reduceNativeWorkspaceMoveStarted(
     result: @FieldType(Event, "native_workspace_move_started"),
 ) void {
     var pending = transition.model.pending_native_workspace_move orelse return;
-    if (pending.epoch != result.epoch) return;
+    if (pending.epoch != result.epoch or pending.has_started) return;
     if (!result.succeeded) {
-        pending.is_rolling_back = true;
-        transition.model.pending_native_workspace_move = pending;
-        transition.addEffect(.{ .rollback_native_workspace_contents = pending });
+        failNativeWorkspaceMove(transition, pending, result.at_ms);
         return;
     }
 
+    // Observed as soon as the shell reads this, still inside the key press.
     pending.has_started = true;
+    pending.observe_at_ms = result.at_ms;
     transition.model.pending_native_workspace_move = pending;
 }
 
@@ -580,56 +699,70 @@ pub fn reduceNativeWorkspaceMoveObserved(
     event: @FieldType(Event, "native_workspace_move_observed"),
 ) void {
     var pending = transition.model.pending_native_workspace_move orelse return;
-    if (pending.epoch != event.epoch or !pending.has_started or pending.is_rolling_back) return;
+    if (pending.epoch != event.epoch or !pending.has_started) return;
 
-    if (event.observation == .pending) {
-        if (event.at_ms < pending.deadline_at_ms) return;
-        pending.is_rolling_back = true;
-        transition.model.pending_native_workspace_move = pending;
-        transition.addEffect(.{ .rollback_native_workspace_contents = pending });
+    const topology = event.topology;
+    const has_landed = if (topology) |observed| nativeWorkspaceMoveLanded(pending, observed) else false;
+    if (has_landed) {
+        transition.model.native_topology = topology.?.*;
+        finishNativeWorkspaceMove(transition, pending, event.at_ms);
         return;
     }
-
-    if (!transition.model.native_topology.swapWorkspacePlacements(pending.source.key, pending.target.key)) {
-        pending.is_rolling_back = true;
-        transition.model.pending_native_workspace_move = pending;
-        transition.addEffect(.{ .rollback_native_workspace_contents = pending });
+    if (event.at_ms >= pending.deadline_at_ms) {
+        failNativeWorkspaceMove(transition, pending, event.at_ms);
         return;
     }
-    if (!layout_reducer.applyEvent(transition, .{ .swap_layouts = .{
-        .first_key = pending.source.key,
-        .second_key = pending.target.key,
-    } })) {
-        _ = transition.model.native_topology.swapWorkspacePlacements(pending.source.key, pending.target.key);
-        pending.is_rolling_back = true;
-        transition.model.pending_native_workspace_move = pending;
-        transition.addEffect(.{ .rollback_native_workspace_contents = pending });
-        return;
-    }
-    transition.model.windows.swapSpaceKeys(pending.source.key, pending.target.key);
-    transition.model.pending_native_workspace_move = null;
-    syncNativeWorkspaceTopology(transition);
-    const moved = transition.model.space(pending.target.key).?;
-    transition.model.workspace_topology.focused_display_id = moved.display_id;
-    completeWorkspaceTransition(transition.model, pending.epoch, .native_space_changed, event.at_ms);
-    transition.addEffect(.{ .native_workspace_move_completed = pending });
-    resumeQueuedWorkspaceSwitch(transition, event.at_ms);
+    pending.observe_at_ms = nextWorkspaceMoveObservationAt(pending, event.at_ms);
+    transition.model.pending_native_workspace_move = pending;
 }
 
-pub fn reduceNativeWorkspaceMoveRollbackResult(
-    transition: *Transition,
-    result: @FieldType(Event, "native_workspace_move_rollback_result"),
-) void {
-    const pending = transition.model.pending_native_workspace_move orelse return;
-    if (pending.epoch != result.epoch or !pending.is_rolling_back) return;
+fn nextWorkspaceMoveObservationAt(pending: PendingNativeWorkspaceMove, at_ms: TimestampMs) TimestampMs {
+    const is_fast = at_ms -| pending.started_at_ms < model_mod.native_workspace_move_fast_window_ms;
+    const delay_ms = if (is_fast)
+        model_mod.native_workspace_move_fast_observe_ms
+    else
+        model_mod.native_workspace_move_slow_observe_ms;
+    return @min(at_ms +| delay_ms, pending.deadline_at_ms);
+}
 
+/// The target display shows W, X sits on the side it should, and the source
+/// shows the backfill the move chose. Intermediate states never match: X
+/// returns to the target display only in the last step.
+fn nativeWorkspaceMoveLanded(pending: PendingNativeWorkspaceMove, topology: *const NativeTopology) bool {
+    const target_display = topology.findDisplay(pending.target.display_id) orelse return false;
+    if (target_display.observed_space_id != pending.source.key.id) return false;
+    if (target_display.workspaceForSpace(pending.source.key.id) != pending.source.workspace_id) return false;
+
+    const source_display = topology.findDisplay(pending.source.display_id) orelse return false;
+    if (pending.isExchange()) {
+        return source_display.observed_space_id == pending.target.key.id;
+    }
+    if (target_display.workspaceForSpace(pending.target.key.id) != pending.target.workspace_id) return false;
+    const backfill = pending.backfill orelse return source_display.observed_space_id != pending.source.key.id;
+    return source_display.observed_space_id == backfill.key.id;
+}
+
+fn finishNativeWorkspaceMove(transition: *Transition, pending: PendingNativeWorkspaceMove, at_ms: TimestampMs) void {
+    transition.model.pending_native_workspace_move = null;
+    syncNativeWorkspaceTopology(transition);
+    transition.model.workspace_topology.focused_display_id = pending.target.display_id;
+    completeWorkspaceTransition(transition.model, pending.epoch, .native_space_changed, at_ms);
+    transition.addEffect(.{ .native_workspace_move_completed = pending });
+
+    // Spaces that moved while current can come back hidden but still drawn.
+    var hidden: HiddenSpaces = .{};
+    hidden.addIfHidden(&transition.model.native_topology, pending.source.key.id);
+    hidden.addIfHidden(&transition.model.native_topology, pending.target.key.id);
+    if (pending.backfill) |backfill| hidden.addIfHidden(&transition.model.native_topology, backfill.key.id);
+    if (hidden.count > 0) transition.addEffect(.{ .hide_native_spaces = hidden });
+    resumeQueuedWorkspaceSwitch(transition, at_ms);
+}
+
+fn failNativeWorkspaceMove(transition: *Transition, pending: PendingNativeWorkspaceMove, at_ms: TimestampMs) void {
     transition.model.pending_native_workspace_move = null;
     settleWorkspaceTransition(transition, pending.epoch, .native_switch_failed);
-    transition.addEffect(.{ .native_workspace_move_failed = .{
-        .move = pending,
-        .rollback_succeeded = result.succeeded,
-    } });
-    resumeQueuedWorkspaceSwitch(transition, result.at_ms);
+    transition.addEffect(.{ .native_workspace_move_failed = pending });
+    resumeQueuedWorkspaceSwitch(transition, at_ms);
 }
 
 fn resumeQueuedWorkspaceSwitch(transition: *Transition, at_ms: TimestampMs) void {

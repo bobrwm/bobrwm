@@ -266,6 +266,15 @@ pub const Action = enum(u8) {
     toggle_float = 28,
     /// Move the active workspace to the display given as `{ display = n }`:
     /// 1 through 8, `"next"`, or `"previous"`.
+    /// The workspace moves with its desktop, so every window on it comes
+    /// along. It lands just before the workspace that display showed, which
+    /// stays right after it, hidden. The display you left shows the desktop
+    /// beside the one that moved. Neither display animates.
+    ///
+    /// A display always shows a workspace. When you move the only one it
+    /// has, it takes over the highest-numbered empty workspace instead; with
+    /// no empty workspace anywhere, it takes the workspace the other display
+    /// was showing, so the two displays trade.
     move_workspace_to_display = 29,
     /// Switch to the previous workspace. At the first workspace, the key
     /// passes through so native Spaces can handle it.

@@ -53,7 +53,6 @@ pub const Event = union(enum) {
         window_id: WindowId,
         options: InsertOptions,
     },
-    swap_layouts: struct { first_key: SpaceKey, second_key: SpaceKey },
     rekey_layout: struct { source_key: SpaceKey, target_key: SpaceKey },
     set_active: struct { space_key: SpaceKey, window_id: WindowId },
     replace_window_id: struct {
@@ -159,13 +158,6 @@ pub fn reduce(model: *Self, event: Event) ?Effect {
             ) catch |err| {
                 model.* = original;
                 return rejectionEffect(movement.target_key, movement.window_id, err);
-            };
-        },
-        .swap_layouts => |swap| {
-            const original = model.*;
-            model.swapLayouts(swap.first_key, swap.second_key) catch |err| {
-                model.* = original;
-                return rejectionEffect(swap.first_key, null, err);
             };
         },
         .rekey_layout => |replacement| {
@@ -384,15 +376,6 @@ fn moveWindow(
 
     self.remove(source_key, window_id);
     try self.insert(target_key, kind, window_id, options);
-}
-
-fn swapLayouts(self: *Self, first_key: SpaceKey, second_key: SpaceKey) !void {
-    if (first_key.eql(second_key)) return;
-    const first_index = try self.ensureLayoutIndex(first_key);
-    const second_index = try self.ensureLayoutIndex(second_key);
-    const previous = self.layouts[first_index].state;
-    self.layouts[first_index].state = self.layouts[second_index].state;
-    self.layouts[second_index].state = previous;
 }
 
 fn setActive(self: *Self, space_key: SpaceKey, window_id: WindowId) void {

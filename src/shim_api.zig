@@ -33,6 +33,7 @@ pub const BW_EVENT_FOCUS_RETRY_UNANSWERED: u8 = @backingInt(event_mod.EventKind.
 pub const BW_EVENT_WINDOW_READINESS_OBSERVED: u8 = @backingInt(event_mod.EventKind.window_readiness_observed);
 pub const BW_EVENT_APP_WINDOWS_OBSERVED: u8 = @backingInt(event_mod.EventKind.app_windows_observed);
 pub const BW_EVENT_SPACES_SETTINGS_OBSERVED: u8 = @backingInt(event_mod.EventKind.spaces_settings_observed);
+pub const BW_EVENT_WORKSPACE_MOVE_OBSERVATION_DUE: u8 = @backingInt(event_mod.EventKind.workspace_move_observation_due);
 
 pub const BW_HK_FOCUS_WORKSPACE: u8 = @backingInt(event_mod.EventKind.hk_focus_workspace);
 pub const BW_HK_FOCUS_PREVIOUS_WORKSPACE: u8 = @backingInt(event_mod.EventKind.hk_focus_previous_workspace);

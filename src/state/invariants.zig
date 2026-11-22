@@ -139,6 +139,14 @@ fn verifyModel(model: *const Model) void {
         std.debug.assert(pending.source.display_id != pending.target.display_id);
         std.debug.assert(model.workspace_transition != null);
         std.debug.assert(model.workspace_transition.?.epoch == pending.epoch);
+        std.debug.assert(pending.step_count > 0);
+        if (pending.observe_at_ms) |observe_at_ms| {
+            std.debug.assert(pending.has_started);
+            std.debug.assert(observe_at_ms <= pending.deadline_at_ms);
+        }
+        if (pending.backfill) |backfill| {
+            std.debug.assert(backfill.workspace_id != pending.source.workspace_id);
+        }
     }
     if (model.workspace_transition) |workspace_transition| {
         std.debug.assert(workspace_transition.epoch != 0);

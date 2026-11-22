@@ -187,23 +187,6 @@ pub const NativeTopology = struct {
         return null;
     }
 
-    pub fn swapWorkspacePlacements(self: *NativeTopology, source_key: SpaceKey, target_key: SpaceKey) bool {
-        var source: ?*Space = null;
-        var target: ?*Space = null;
-        for (self.displays[0..self.display_count]) |*display| {
-            for (display.spaces[0..display.space_count]) |*space| {
-                if (space.id == source_key.id) source = space;
-                if (space.id == target_key.id) target = space;
-            }
-        }
-        if (source == null or target == null) return false;
-
-        const workspace_id = source.?.workspace_id;
-        source.?.workspace_id = target.?.workspace_id;
-        target.?.workspace_id = workspace_id;
-        return true;
-    }
-
     pub fn eql(self: *const NativeTopology, other: *const NativeTopology) bool {
         if (self.display_count != other.display_count) return false;
 
