@@ -169,6 +169,8 @@ pub const WorkspaceFocus = struct {
 
 pub const SwitchRequest = struct {
     target: SpaceRef,
+    /// The window the switch follows, focused once it lands.
+    follow_window_id: ?WindowId = null,
 };
 
 pub const PendingSwitch = struct {
@@ -178,6 +180,9 @@ pub const PendingSwitch = struct {
     has_retried: bool = false,
     phase: enum { waiting_for_idle, preparing, delivering, observing } = .waiting_for_idle,
     gesture: ?native_gesture.Delivery = null,
+    /// The swipe as planned, kept after delivery to tell which Spaces lie on
+    /// its path.
+    plan: ?native_gesture.Plan = null,
 };
 
 pub const WorkspaceTransitionKind = enum {
@@ -383,6 +388,10 @@ pub const NativeWindowMoveRequest = struct {
     window_id: WindowId,
     source: SpaceRef,
     target: SpaceRef,
+    /// Set when the user may be on the window: one just launched or switched
+    /// to, sent to its app rule's workspace. The display follows it when its
+    /// app is active, as of this time.
+    follow_at_ms: ?TimestampMs = null,
 };
 
 pub const NativeWindowMoveObservation = enum {
@@ -1432,6 +1441,10 @@ pub const Effect = union(enum) {
     move_native_workspace_spaces: PendingNativeWorkspaceMove,
     native_workspace_move_completed: PendingNativeWorkspaceMove,
     hide_native_spaces: HiddenSpaces,
+    focus_followed_window: struct {
+        process_id: i32,
+        window_id: WindowId,
+    },
     /// The topology did not land as planned; the topology poll reconciles
     /// whatever WindowServer ended up with.
     native_workspace_move_failed: PendingNativeWorkspaceMove,
