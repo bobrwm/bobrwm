@@ -33,7 +33,9 @@ const WorkspaceTransitionSettlementReason = model_mod.WorkspaceTransitionSettlem
 const PendingNativeWindowMove = model_mod.PendingNativeWindowMove;
 const PendingNativeWorkspaceMove = model_mod.PendingNativeWorkspaceMove;
 const HiddenSpaces = model_mod.HiddenSpaces;
-const WindowPlacement = model_mod.WindowPlacement;
+const WindowPlacementObservation = model_mod.WindowPlacementObservation;
+const NewWindowAdoption = model_mod.NewWindowAdoption;
+const OffscreenCleanup = model_mod.OffscreenCleanup;
 const WorkspaceMoveCommand = model_mod.WorkspaceMoveCommand;
 const SpaceOperand = model_mod.SpaceOperand;
 const NativeTopology = model_mod.NativeTopology;
@@ -509,21 +511,144 @@ pub fn reduceNativeWindowMoveTracked(
     });
 }
 
-/// Move a window that is out of sight to its app rule's Space before its
-/// workspace is shown, so adoption finds it in place instead of moving it
-/// away from the user. Managed and visible windows have their own paths.
-pub fn reduceRulePlacementObserved(transition: *Transition, placement: WindowPlacement) void {
-    if (transition.model.window(placement.window_id) != null) return;
-    const source = transition.model.space(placement.source.key) orelse return;
-    const target = transition.model.space(placement.target.key) orelse return;
-    if (source.key.eql(target.key)) return;
-    if (transition.model.native_topology.isSpaceShown(source.key.id)) return;
+/// The app rule's workspace wins over the window's own Space. The display
+/// follows a moved window when its app is active: the user just launched it
+/// or switched to it.
+pub fn reduceNewWindowAdopted(transition: *Transition, adoption: NewWindowAdoption) void {
+    const native_space = transition.model.space(adoption.native_space.key) orelse {
+        transition.addEffect(.{ .window_catalog_rejected = .{
+            .window_id = adoption.window_id,
+            .reason = .space_missing,
+        } });
+        return;
+    };
+    const rule_space = if (adoption.rule_workspace_id) |workspace_id| transition.model.logicalWorkspace(workspace_id) else null;
+    const target = rule_space orelse native_space;
 
-    transition.addEffect(.{ .place_native_window = .{
-        .window_id = placement.window_id,
-        .source = source,
+    window_reducer.reduceWindowAdopted(transition, .{
+        .window_id = adoption.window_id,
+        .process_id = adoption.process_id,
+        .space_key = target.key,
+        .frame = adoption.frame,
+        .mode = adoption.mode,
+    });
+    if (transition.model.window(adoption.window_id) == null) return;
+    if (target.key.eql(native_space.key)) return;
+
+    reduceNativeWindowMoveTracked(transition, .{
+        .window_id = adoption.window_id,
+        .source = native_space,
         .target = target,
-    } });
+        .follow_at_ms = adoption.at_ms,
+    });
+}
+
+/// A managed window is adopted where the user or macOS put it, unless macOS
+/// piled it there after a display change. At startup an unmanaged window out
+/// of sight goes to its app rule's Space, so showing that Space finds it in
+/// place.
+pub fn reduceWindowPlacementObserved(transition: *Transition, observation: WindowPlacementObservation) void {
+    const model = transition.model;
+    const space_id = observation.space_id orelse return;
+    const observed_space = model.space(.{ .id = space_id });
+
+    const window = model.window(observation.window_id) orelse {
+        if (observation.reason != .startup) return;
+        const source = observed_space orelse return;
+        const target = model.logicalWorkspace(observation.rule_workspace_id orelse return) orelse return;
+        if (source.key.eql(target.key)) return;
+        if (model.native_topology.isSpaceShown(source.key.id)) return;
+        transition.addEffect(.{ .place_native_window = .{ .window_id = observation.window_id, .target = target } });
+        return;
+    };
+    if (window.tab_leader_window_id != window.window_id) return;
+    if (window.space_key.id == space_id) return;
+    if (model.pendingNativeWindowMove(window.window_id) != null) return;
+
+    switch (observation.reason) {
+        .startup => {},
+        .display_changed => {
+            const home = model.space(window.space_key) orelse return;
+            if (observed_space) |source| {
+                reduceNativeWindowMoveTracked(transition, .{ .window_id = window.window_id, .source = source, .target = home });
+                return;
+            }
+            transition.addEffect(.{ .place_native_window = .{ .window_id = window.window_id, .target = home } });
+        },
+        .settled, .topology_changed => {
+            // Mid-operation placement is transitional; the operation
+            // reconciles when it lands.
+            if (model.pending_switch != null or model.observation_timer != null) return;
+            // A window off screen may report a Space it is merely leaving.
+            if (observation.reason == .settled and !observation.is_on_screen) return;
+            _ = adoptMovedWindow(transition, window.window_id, space_id);
+        },
+    }
+}
+
+// Returns the window's new workspace, or null when it stays where it is.
+fn adoptMovedWindow(transition: *Transition, window_id: WindowId, space_id: ?NativeSpaceId) ?SpaceRef {
+    const model = transition.model;
+    const window = model.window(model.windowTabLeader(window_id)) orelse return null;
+    const target = model.space(.{ .id = space_id orelse return null }) orelse return null;
+    if (window.space_key.eql(target.key)) return null;
+    if (model.pendingNativeWindowMove(window.window_id) != null) return null;
+    if (model.pending_native_workspace_move != null) return null;
+
+    window_reducer.reduceWindowSpaceAssigned(transition, .{ .window_id = window.window_id, .space_key = target.key });
+    if (!model.window(window.window_id).?.space_key.eql(target.key)) return null;
+    refreshWorkspaceFocus(model);
+    if (model.focusedWorkspaceWindow(target.workspace_id) == null) {
+        window_reducer.reduceWorkspaceFocusRecorded(transition, .{
+            .workspace_id = target.workspace_id,
+            .window_id = window.window_id,
+        });
+    }
+    return target;
+}
+
+pub fn reduceCleanupRequestsFlushed(transition: *Transition) void {
+    const model = transition.model;
+    var request = model.cleanup_request;
+    model.cleanup_request = .{};
+    if (model.isWorkspaceTransitionActive()) return;
+
+    if (request.should_clean_offscreen) {
+        for (model.windows.items()) |window| {
+            if (!model.isOffscreenCleanupCandidate(window.window_id)) continue;
+            const process_ids = request.offscreen_process_ids[0..request.offscreen_process_count];
+            if (std.mem.findScalar(i32, process_ids, window.process_id) != null) continue;
+            if (request.offscreen_process_count == request.offscreen_process_ids.len) break;
+            request.offscreen_process_ids[request.offscreen_process_count] = window.process_id;
+            request.offscreen_process_count += 1;
+        }
+    }
+    if (request.process_count == 0 and request.offscreen_process_count == 0) return;
+    transition.addEffect(.{ .cleanup_requested = request });
+}
+
+/// The answer can arrive after a workspace transition began.
+pub fn reduceOffscreenWindowListObserved(transition: *Transition, process_id: i32) void {
+    const model = transition.model;
+    if (model.isWorkspaceTransitionActive()) return;
+
+    var cleanup: OffscreenCleanup = .{ .process_id = process_id };
+    for (model.windows.items()) |window| {
+        if (window.process_id != process_id) continue;
+        if (!model.isOffscreenCleanupCandidate(window.window_id)) continue;
+        if (cleanup.window_count == cleanup.window_ids.len) break;
+        cleanup.window_ids[cleanup.window_count] = window.window_id;
+        cleanup.window_count += 1;
+    }
+    if (cleanup.window_count == 0) return;
+    transition.addEffect(.{ .clean_offscreen_windows = cleanup });
+}
+
+/// The app closed the window to the background without telling anyone, or
+/// hid itself. Like a minimized window it gives up its slot until it is back.
+pub fn reduceWindowOffscreenObserved(transition: *Transition, window_id: WindowId) void {
+    if (!transition.model.isOffscreenCleanupCandidate(window_id)) return;
+    window_reducer.reduceWindowRemoved(transition, window_id);
 }
 
 pub fn reduceNativeWindowMoveObserved(
@@ -579,7 +704,6 @@ pub fn reduceNativeWindowMoveRollbackResult(
         window_reducer.reduceWindowSpaceAssigned(transition, .{
             .window_id = pending.window_id,
             .space_key = pending.source.key,
-            .layout = event.layout,
         });
         const restored = transition.model.window(pending.window_id) orelse return;
         if (restored.space_key.eql(pending.source.key)) {
@@ -968,6 +1092,13 @@ pub fn reduceFollowFocusObserved(
             .pending_target = pending.request.target,
         } });
         return;
+    }
+
+    // The user moved the window: it belongs where it is, and macOS is taking
+    // the display there.
+    if (adoptMovedWindow(transition, observation.leader_window_id, observation.space_id)) |space| {
+        observation.target = space;
+        observation.is_target_visible = transition.model.native_topology.isSpaceShown(space.key.id);
     }
 
     const workspace_transition = transition.model.workspace_transition;

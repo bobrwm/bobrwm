@@ -237,13 +237,8 @@ fn managedWindow(window_id: u32) ?window_mod.Window {
 }
 
 fn updateManagedWindow(window: window_mod.Window) bool {
-    const managed = g_state.window(window.wid) orelse return false;
-    const layout: ?state_mod.LayoutInsertion = if (managed.tab_leader_window_id == window.wid and
-        managed.mode != .tiled and window.mode == .tiled)
-        layoutInsertion(managed.space_key, window.wid) catch return false
-    else
-        null;
-    dispatchStateEvent(.{ .update_window = .{ .window = window, .layout = layout } });
+    if (g_state.window(window.wid) == null) return false;
+    dispatchStateEvent(.{ .update_window = .{ .window = window } });
     const updated = g_state.windowSnapshot(window.wid) orelse return false;
     return std.meta.eql(updated, window);
 }
@@ -643,6 +638,8 @@ fn switchToWindowWorkspaceIfHidden(win: window_mod.Window, focused_wid: u32, sou
     std.debug.assert(win.wid != 0);
     std.debug.assert(focused_wid != 0);
     const space = managedWindowSpace(win.wid) orelse return;
+    var topology = g_sky.?.nativeSpaceTopology();
+    defer if (topology) |*value| value.deinit();
 
     dispatchStateEvent(.{ .follow_focus_observed = .{
         .process_id = win.pid,
@@ -652,6 +649,7 @@ fn switchToWindowWorkspaceIfHidden(win: window_mod.Window, focused_wid: u32, sou
         .target = space,
         .is_target_visible = spaceVisible(space),
         .at_ms = nativeStateNowMs(),
+        .space_id = if (topology) |*value| nativeSpaceIdForWindowInTopology(value, focused_wid) else null,
     } });
 }
 
@@ -1169,6 +1167,19 @@ fn resolveDisplaySettings() void {
     for (g_displays[0..g_display_count]) |*display| {
         display.settings = g_config.displaySettings();
     }
+    publishDisplayLayouts();
+}
+
+fn publishDisplayLayouts() void {
+    var display_layouts: state_mod.DisplayLayouts = .{};
+    for (g_displays[0..g_display_count]) |display| {
+        std.debug.assert(display_layouts.add(.{
+            .display_id = display.id,
+            .content_frame = contentFrame(display.visible, display.settings.gaps.outer),
+            .inner_gap = @floatFromInt(display.settings.gaps.inner),
+        }));
+    }
+    dispatchStateEvent(.{ .observe_display_layouts = &display_layouts });
 }
 
 /// Inner gap for layout requests on a display. A detached display also has no
@@ -1179,6 +1190,7 @@ fn displayInnerGap(display_id: u32) f64 {
 }
 
 fn refreshDisplays() void {
+    defer publishDisplayLayouts();
     const NSScreen = objc.getClass("NSScreen") orelse {
         useFallbackDisplay();
         return;
@@ -1401,24 +1413,6 @@ fn moveTabGroupToNativeSpace(wid: u32, target: state_mod.SpaceRef) bool {
         return sky.moveWindowsToNativeSpace(group.members(), space_id);
     }
     return sky.moveWindowToNativeSpace(wid, space_id);
-}
-
-fn requestNativeWindowMove(
-    wid: u32,
-    source: state_mod.SpaceRef,
-    target: state_mod.SpaceRef,
-    follow_at_ms: ?state_mod.TimestampMs,
-) void {
-    g_adoption_on_screen = null;
-    source.assertValid();
-    target.assertValid();
-    const leader_wid = g_state.windowTabLeader(wid);
-    dispatchStateEvent(.{ .track_native_window_move = .{
-        .window_id = leader_wid,
-        .source = source,
-        .target = target,
-        .follow_at_ms = follow_at_ms,
-    } });
 }
 
 fn nativeTabGroupMoveConfirmed(wid: u32, pending: state_mod.PendingNativeWindowMove) ?bool {
@@ -2144,6 +2138,9 @@ fn applyReloadedConfig(next: ConfigRuntime) void {
     dispatchStateEvent(.{ .configure_layout_interaction = .{
         .split_mode = g_config.bsp_split,
         .insert_point = g_config.bsp_insert_point,
+        .kind = g_config.layout,
+        .insert_child = g_config.new_window_split,
+        .split_ratio = g_config.bsp_split_ratio,
     } });
     g_animator.finishAll();
     g_animator.init(g_config.animation);
@@ -2882,6 +2879,9 @@ fn startCore(config_path_arg: ?[]const u8) !void {
     dispatchStateEvent(.{ .configure_layout_interaction = .{
         .split_mode = g_config.bsp_split,
         .insert_point = g_config.bsp_insert_point,
+        .kind = g_config.layout,
+        .insert_child = g_config.new_window_split,
+        .split_ratio = g_config.bsp_split_ratio,
     } });
     g_config.applyKeybinds(&g_config_runtime.?.keybind_table);
     g_animator.init(g_config.animation);
@@ -3476,41 +3476,9 @@ fn openConfigFile() void {
     }
 }
 
-fn tilingInsertOptions(space_key: state_mod.SpaceKey, wid: u32) !tiling.InsertOptions {
-    const ws = g_state.space(space_key) orelse return error.InvalidWorkspace;
-    const anchor_wid = blk: {
-        switch (g_state.bsp_insert_point) {
-            .focused => {
-                const focused_wid = focusedWorkspaceWindow(ws) orelse break :blk null;
-                if (focused_wid == wid) break :blk null;
-                break :blk focused_wid;
-            },
-            .first => break :blk g_state.layout.firstWid(space_key),
-            .last => break :blk g_state.layout.lastWid(space_key),
-            .min_depth => break :blk null,
-        }
-    };
-    return .{
-        .split_mode = g_state.bsp_split_mode,
-        .child = g_config.new_window_split,
-        .anchor_wid = anchor_wid,
-        .root_frame = displayContentFrame(ws.display_id),
-        .inner_gap = displayInnerGap(ws.display_id),
-        .split_ratio = g_config.bsp_split_ratio,
-    };
-}
-
-fn layoutInsertion(space_key: state_mod.SpaceKey, wid: u32) !state_mod.LayoutInsertion {
-    return .{
-        .kind = g_config.layout,
-        .options = try tilingInsertOptions(space_key, wid),
-    };
-}
-
 fn adoptWindowIdentity(
     win: window_mod.Window,
     space_key: state_mod.SpaceKey,
-    layout: ?state_mod.LayoutInsertion,
     tab_group: ?*const state_mod.WindowTabGroupObservation,
 ) bool {
     if (g_state.window(win.wid) != null) return false;
@@ -3523,7 +3491,6 @@ fn adoptWindowIdentity(
         .is_fullscreen = win.is_fullscreen,
         .mode = win.mode,
         .float_frame = win.float_frame,
-        .layout = layout,
         .tab_group = tab_group,
     } });
     const adopted = g_state.window(win.wid) orelse return false;
@@ -3566,15 +3533,8 @@ fn tabGroupObservation(
 }
 
 fn detachWindowTab(window_id: u32) bool {
-    const window = g_state.window(window_id) orelse return false;
-    const layout: ?state_mod.LayoutInsertion = if (window.mode == .tiled)
-        layoutInsertion(window.space_key, window_id) catch return false
-    else
-        null;
-    dispatchStateEvent(.{ .detach_window_tab = .{
-        .window_id = window_id,
-        .layout = layout,
-    } });
+    if (g_state.window(window_id) == null) return false;
+    dispatchStateEvent(.{ .detach_window_tab = .{ .window_id = window_id } });
     const detached = g_state.window(window_id) orelse return false;
     return detached.tab_leader_window_id == window_id and !detached.is_suppressed;
 }
@@ -3596,31 +3556,15 @@ fn assignManagedWindowSpace(wid: u32, space: state_mod.SpaceRef) bool {
     const managed = g_state.window(wid) orelse return false;
 
     if (!managed.space_key.eql(space.key)) {
-        const leader_window_id = g_state.windowTabLeader(wid);
-        const leader = g_state.window(leader_window_id) orelse return false;
-        const layout: ?state_mod.LayoutInsertion = if (g_state.layout.contains(leader.space_key, leader_window_id))
-            layoutInsertion(space.key, leader_window_id) catch return false
-        else
-            null;
         dispatchStateEvent(.{ .assign_window_space = .{
             .window_id = wid,
             .space_key = space.key,
-            .layout = layout,
         } });
         const assigned = g_state.window(wid) orelse return false;
         if (!assigned.space_key.eql(space.key)) return false;
     }
 
     return true;
-}
-
-fn adoptWindow(ws: state_mod.SpaceRef, win: window_mod.Window) !void {
-    std.debug.assert(managedWindow(win.wid) == null);
-    const layout: ?state_mod.LayoutInsertion = if (win.mode == .tiled)
-        try layoutInsertion(ws.key, win.wid)
-    else
-        null;
-    if (!adoptWindowIdentity(win, ws.key, layout, null)) return error.WindowCatalogRejected;
 }
 
 fn setTilingActive(space_key: state_mod.SpaceKey, wid: u32) void {
@@ -3821,7 +3765,7 @@ fn handleEvent(ev: *const event_mod.Event) void {
                     // and let processDeferredWindowCandidates re-derive on
                     // promotion (it goes through addNewWindowManaged again).
                     const display_id = inferDisplayIdForWindow(ev.wid) orelse focusedDisplayId();
-                    const ws = resolveWorkspaceForWindow(ev.pid, ev.wid, display_id) orelse return;
+                    const ws = windowCandidateSpace(ev.wid, display_id) orelse return;
                     trackDeferredWindowCandidate(ev.pid, ev.wid, ws);
                     log.debug("window created: deferred pid={} wid={} while mouse is down (tab tear-off guard)", .{ ev.pid, ev.wid });
                 }
@@ -3965,7 +3909,13 @@ fn handleEvent(ev: *const event_mod.Event) void {
                 ev.pid, ev.kind == .menu_opened, g_state.menu_tracking != null,
             });
         },
-        .app_visibility_changed => g_dim_dirty = true,
+        .app_visibility_changed => {
+            // Hidden apps give up their slots and are adopted back when shown.
+            g_dim_dirty = true;
+            requestOffscreenCleanup();
+            discoverWindows(.runtime);
+            retile();
+        },
         .window_moved, .window_resized => {
             // Every animation tick sets the AX frame, which echoes back here
             // as moved/resized notifications (once per display refresh per
@@ -4072,16 +4022,10 @@ fn handleEvent(ev: *const event_mod.Event) void {
 // Window mode (tiled / floating / fullscreen)
 
 fn setWindowMode(wid: u32, target: window_mod.WindowMode) void {
-    const win = managedWindow(wid) orelse return;
-    const space = managedWindowSpace(wid) orelse return;
-    const layout: ?state_mod.LayoutInsertion = if (win.mode != .tiled and target == .tiled)
-        layoutInsertion(space.key, wid) catch return
-    else
-        null;
+    if (managedWindow(wid) == null) return;
     dispatchStateEvent(.{ .set_window_mode = .{
         .window_id = wid,
         .mode = target,
-        .layout = layout,
     } });
 }
 
@@ -4353,8 +4297,8 @@ fn completeNativeWorkspaceMove(pending: state_mod.PendingNativeWorkspaceMove) vo
 fn reconcileDisplays(cause: state_mod.DisplayReconcileCause) void {
     if (!reconcileDisplayChange(cause)) return;
     switch (cause) {
-        .display_change => returnDisplacedWindows(),
-        .topology_repair => {},
+        .display_change => observeWindowPlacements(.display_changed),
+        .topology_repair => observeWindowPlacements(.topology_changed),
     }
     discoverWindows(.runtime);
     retile();
@@ -4911,14 +4855,14 @@ fn executeStateEffect(effect: state_mod.Effect) void {
             focusWindow(focus.process_id, focus.window_id);
         },
         .place_native_window => |placement| {
-            log.debug("startup rule placement wid={d} space={d} -> workspace={d} space={d}", .{
+            g_adoption_on_screen = null;
+            log.debug("native window placement wid={d} -> workspace={d} space={d}", .{
                 placement.window_id,
-                placement.source.key.id,
                 placement.target.workspace_id,
                 placement.target.key.id,
             });
-            if (!g_sky.?.moveWindowToNativeSpace(placement.window_id, placement.target.key.id)) {
-                log.warn("startup rule placement failed wid={d}", .{placement.window_id});
+            if (!moveTabGroupToNativeSpace(placement.window_id, placement.target)) {
+                log.warn("native window placement failed wid={d}", .{placement.window_id});
             }
         },
         .hide_native_spaces => |hidden| {
@@ -5043,7 +4987,7 @@ fn executeStateEffect(effect: state_mod.Effect) void {
         },
         .retile_requested => |request| executeRetileRequest(request),
         .cleanup_requested => |request| executeCleanupRequest(request),
-        .clean_offscreen_windows => |pid| if (cleanupOffscreenWindows(pid)) requestRetileAllDisplays(),
+        .clean_offscreen_windows => |cleanup| if (cleanupOffscreenWindows(&cleanup)) requestRetileAllDisplays(),
         .spaces_settings_changed => |settings| {
             if (settings.rearranges_automatically) {
                 log.warn("macOS rearranges Spaces by recent use; workspace numbers can change when BobrWM restarts", .{});
@@ -5170,7 +5114,9 @@ fn executeCleanupRequest(request: state_mod.CleanupRequest) void {
     for (request.process_ids[0..request.process_count]) |process_id| {
         if (cleanupWorkspaceWindowsForPid(process_id)) removed_any = true;
     }
-    if (request.should_clean_offscreen) requestOffscreenCleanupLists();
+    for (request.offscreen_process_ids[0..request.offscreen_process_count]) |process_id| {
+        _ = app_windows.request(process_id, .offscreen_cleanup);
+    }
     if (removed_any) requestRetileAllDisplays();
 }
 
@@ -5369,6 +5315,7 @@ fn executeWindowFocusAccepted(accepted: @FieldType(state_mod.Effect, "window_foc
 }
 
 fn executeNativeWindowMove(pending: state_mod.PendingNativeWindowMove) void {
+    g_adoption_on_screen = null;
     if (moveTabGroupToNativeSpace(pending.window_id, pending.target)) return;
 
     log.warn("native window move: initial write failed wid={d} workspace={d}", .{
@@ -5393,16 +5340,11 @@ fn retryNativeWindowMove(pending: state_mod.PendingNativeWindowMove) void {
 }
 
 fn executeNativeWindowMoveRollback(pending: state_mod.PendingNativeWindowMove) void {
-    const layout: ?state_mod.LayoutInsertion = if (g_state.layout.contains(pending.target.key, pending.window_id))
-        layoutInsertion(pending.source.key, pending.window_id) catch null
-    else
-        null;
     const succeeded = rollbackNativeWindowMove(pending.window_id, pending);
     dispatchStateEvent(.{ .native_window_move_rollback_result = .{
         .window_id = pending.window_id,
         .epoch = pending.epoch,
         .succeeded = succeeded,
-        .layout = layout,
     } });
 }
 
@@ -5576,6 +5518,9 @@ fn completeNativeSwitch(space: state_mod.SpaceRef, epoch: state_mod.Epoch) void 
     const started_ns = nanoTimestamp();
     if (g_state.space(space.key) == null) return;
 
+    // Windows dragged between Spaces in Mission Control change no topology;
+    // a shown Space is the first chance to see where they went.
+    observeWindowPlacements(.settled);
     discoverWindows(.native_switch);
     clearDragPreview();
     requestRetileDisplay(space.display_id);
@@ -5606,6 +5551,7 @@ fn failNativeSwitch(failure: @FieldType(state_mod.Effect, "native_switch_failed"
 
 fn reconcileObservedNativeTopology() void {
     const started_ns = nanoTimestamp();
+    observeWindowPlacements(.settled);
     discoverWindows(.runtime);
     retile();
     updateStatusBar();
@@ -5614,54 +5560,34 @@ fn reconcileObservedNativeTopology() void {
     log.debug("[trace] native topology reconcile elapsed_ms={}", .{elapsed_ms});
 }
 
-/// Send windows back to their workspace's Space after a display change. macOS
-/// piles the windows of a vanished display onto a surviving Space, and a
-/// reconnected display can take over a workspace whose windows are still on
-/// the old Space. Adopting WindowServer placement here would merge workspaces.
-fn returnDisplacedWindows() void {
-    const sky = &g_sky.?;
-    var topology = sky.nativeSpaceTopology() orelse {
-        log.warn("display reconcile could not snapshot window placement", .{});
+fn observeWindowPlacements(reason: state_mod.WindowPlacementReason) void {
+    var topology = g_sky.?.nativeSpaceTopology() orelse {
+        log.warn("window placement: WindowServer snapshot unavailable reason={s}", .{@tagName(reason)});
         return;
     };
     defer topology.deinit();
+    const on_screen = OnScreenWindows.snapshot();
 
-    var returns: [256]struct { wid: u32, source_space_id: u64, target: state_mod.SpaceRef } = undefined;
-    var return_count: usize = 0;
+    // Collected first: each observation can change the window catalog.
+    var observations: [state_mod.max_managed_windows]state_mod.WindowPlacementObservation = undefined;
+    var observation_count: usize = 0;
     for (g_state.windows.items()) |managed_window| {
-        const wid = managed_window.snapshot().wid;
-        const managed = g_state.window(wid) orelse continue;
+        const wid = managed_window.window_id;
         if (g_state.windowTabLeader(wid) != wid) continue;
-        if (g_state.pendingNativeWindowMove(wid) != null) continue;
-        const target = g_state.space(managed.space_key) orelse continue;
-        const source_space_id = nativeSpaceIdForWindowInTopology(&topology, g_state.windowTabActive(wid)) orelse continue;
-        if (source_space_id == target.key.id) continue;
-        if (return_count == returns.len) {
-            log.warn("display reconcile window return truncated limit={d}", .{returns.len});
-            break;
-        }
-        returns[return_count] = .{ .wid = wid, .source_space_id = source_space_id, .target = target };
-        return_count += 1;
+        const visible_wid = g_state.windowTabActive(wid);
+        // Settling adopts only visible windows; skip the Space query for the rest.
+        if (reason == .settled and (on_screen.truncated or !on_screen.contains(visible_wid))) continue;
+        observations[observation_count] = .{
+            .window_id = wid,
+            .space_id = nativeSpaceIdForWindowInTopology(&topology, visible_wid),
+            .is_on_screen = !on_screen.truncated and on_screen.contains(visible_wid),
+            .reason = reason,
+        };
+        observation_count += 1;
     }
 
-    for (returns[0..return_count]) |displaced| {
-        log.debug("display reconcile: returning wid={d} space={d} -> workspace={d} space={d}", .{
-            displaced.wid,
-            displaced.source_space_id,
-            displaced.target.workspace_id,
-            displaced.target.key.id,
-        });
-        // A source bound to a workspace gets a tracked move that rolls back if
-        // it does not land; an unbound leftover Space has no workspace to roll
-        // back to, so that move is best effort.
-        if (g_state.space(.{ .id = displaced.source_space_id })) |source| {
-            requestNativeWindowMove(displaced.wid, source, displaced.target, null);
-        } else if (!moveTabGroupToNativeSpace(displaced.wid, displaced.target)) {
-            log.warn("display reconcile: window return failed wid={d} workspace={d}", .{
-                displaced.wid,
-                displaced.target.workspace_id,
-            });
-        }
+    for (observations[0..observation_count]) |observation| {
+        dispatchStateEvent(.{ .window_placement_observed = observation });
     }
 }
 
@@ -5797,13 +5723,12 @@ fn placeHiddenWindowsByRule() void {
     defer topology.deinit();
 
     for (candidates[0..discovery.count]) |candidate| {
-        const space_id = nativeSpaceIdForWindowInTopology(&topology, candidate.wid) orelse continue;
-        const source = g_state.space(.{ .id = space_id }) orelse continue;
-        const target = configuredWorkspace(candidate.pid, source.display_id) orelse continue;
-        dispatchStateEvent(.{ .rule_placement_observed = .{
+        const rule_workspace_id = ruleWorkspaceId(candidate.pid) orelse continue;
+        dispatchStateEvent(.{ .window_placement_observed = .{
             .window_id = candidate.wid,
-            .source = source,
-            .target = target,
+            .space_id = nativeSpaceIdForWindowInTopology(&topology, candidate.wid),
+            .rule_workspace_id = rule_workspace_id,
+            .reason = .startup,
         } });
     }
 }
@@ -5827,6 +5752,19 @@ fn captureWorkspaceApplicationInventory() void {
     var queried_pids: [max_workspace_application_inventory]i32 = undefined;
     var queried_pid_count: usize = 0;
 
+    // Discovery only sees on-screen windows, so an app whose windows are all
+    // on hidden Spaces would go unobserved, and its new windows unnoticed.
+    var observed_pids: [max_workspace_application_inventory]i32 = undefined;
+    var observed_pid_count: usize = 0;
+    for (candidates[0..discovery.count]) |candidate| {
+        if (std.mem.findScalar(i32, observed_pids[0..observed_pid_count], candidate.pid) != null) continue;
+        if (observed_pid_count == observed_pids.len) break;
+        observed_pids[observed_pid_count] = candidate.pid;
+        observed_pid_count += 1;
+        observeProcess(candidate.pid);
+        ax_observer.observeApp(candidate.pid);
+    }
+
     for (candidates[0..discovery.count]) |candidate| {
         if (std.mem.findScalar(i32, queried_pids[0..queried_pid_count], candidate.pid) != null) continue;
         if (queried_pid_count == queried_pids.len) break;
@@ -5842,10 +5780,11 @@ fn captureWorkspaceApplicationInventory() void {
             .width = focused.w,
             .height = focused.h,
         });
-        const space = resolveWorkspaceForWindow(candidate.pid, focused_window_id, display_id) orelse continue;
+        const space = windowCandidateSpace(focused_window_id, display_id) orelse continue;
         if (g_workspace_application_inventory_count == g_workspace_application_inventory.len) break;
         g_workspace_application_inventory[g_workspace_application_inventory_count] = .{
-            .workspace_id = space.workspace_id,
+            // Startup placement puts rule-pinned windows on their rule's Space.
+            .workspace_id = ruleWorkspaceId(candidate.pid) orelse space.workspace_id,
             .process_id = candidate.pid,
         };
         g_workspace_application_inventory_count += 1;
@@ -5952,7 +5891,7 @@ fn discoverWindows(context: DiscoveryContext) void {
 
         const frame: window_mod.Window.Frame = .{ .x = info.x, .y = info.y, .width = info.w, .height = info.h };
         const discovered_display = displayIdForFrame(frame);
-        const target_ws = resolveWorkspaceForWindow(info.pid, info.wid, discovered_display) orelse {
+        const target_ws = windowCandidateSpace(info.wid, discovered_display) orelse {
             log.debug("discover: ignored pid={d} wid={d} on unmanaged native Space", .{ info.pid, info.wid });
             continue;
         };
@@ -6125,16 +6064,16 @@ fn shouldFloatWindow(pid: i32, frame: window_mod.Window.Frame, is_resizable: boo
     return !is_resizable and (frame.width <= 500 or frame.height <= 500);
 }
 
-fn addNewWindowManagedWithAssignment(
+fn adoptReadyWindow(
     pid: i32,
     wid: u32,
-    assigned_space: state_mod.SpaceRef,
+    candidate_space: state_mod.SpaceRef,
     is_resizable: bool,
 ) bool {
     const span = trace.beginWindow("addNewWindow", pid, wid);
     defer _ = span.end();
 
-    assigned_space.assertValid();
+    candidate_space.assertValid();
     if (managedWindow(wid) != null) {
         log.debug("addNewWindow: already managed pid={d} wid={d}", .{ pid, wid });
         return false;
@@ -6142,7 +6081,7 @@ fn addNewWindowManagedWithAssignment(
     if (nativeSwitchPending()) {
         // A readiness answer left its queue before it got here, so a switch
         // that began after the request would otherwise lose the window.
-        trackDeferredWindowCandidate(pid, wid, assigned_space);
+        trackDeferredWindowCandidate(pid, wid, candidate_space);
         log.debug("addNewWindow: deferred pid={d} wid={d} during native switch", .{ pid, wid });
         return false;
     }
@@ -6153,12 +6092,12 @@ fn addNewWindowManagedWithAssignment(
     const on_screen = g_adoption_on_screen orelse OnScreenWindows.snapshot();
     if (g_event_drain_active) g_adoption_on_screen = on_screen;
     if (on_screen.truncated or !on_screen.contains(wid)) {
-        trackDeferredWindowCandidate(pid, wid, assigned_space);
+        trackDeferredWindowCandidate(pid, wid, candidate_space);
         log.debug("addNewWindow: deferred pid={d} wid={d} while off-screen or visibility unknown", .{ pid, wid });
         return false;
     }
     var window_frame: window_mod.Window.Frame = .{ .x = 0, .y = 0, .width = 0, .height = 0 };
-    const display_id = assigned_space.display_id;
+    const display_id = candidate_space.display_id;
     if (g_sky) |sky| {
         var rect: skylight.CGRect = undefined;
         trace.countSkylight();
@@ -6176,7 +6115,7 @@ fn addNewWindowManagedWithAssignment(
     // Proceeding would record garbage geometry. Track before the untrack-defer
     // below so bounded re-evaluation survives this early return.
     if (g_sky != null and (window_frame.width <= 1 or window_frame.height <= 1)) {
-        trackDeferredWindowCandidate(pid, wid, assigned_space);
+        trackDeferredWindowCandidate(pid, wid, candidate_space);
         log.debug("addNewWindow: deferred pid={d} wid={d} unsettled bounds ({d:.0}x{d:.0})", .{
             pid, wid, window_frame.width, window_frame.height,
         });
@@ -6185,7 +6124,7 @@ fn addNewWindowManagedWithAssignment(
 
     const source_display_id = inferDisplayIdForWindow(wid) orelse display_id;
     const source_ws = nativeWorkspaceForWindow(wid, source_display_id) orelse {
-        trackDeferredWindowCandidate(pid, wid, assigned_space);
+        trackDeferredWindowCandidate(pid, wid, candidate_space);
         log.debug("addNewWindow: deferred pid={d} wid={d} unsettled native Space", .{ pid, wid });
         return false;
     };
@@ -6197,32 +6136,32 @@ fn addNewWindowManagedWithAssignment(
     // that just went off-screen (i.e. a new tab was created and became active,
     // pushing the old tab to background). If so, form a tab group.
     const joined = tryFormTabGroupOnCreate(pid, wid, window_frame, &on_screen) orelse {
-        trackDeferredWindowCandidate(pid, wid, assigned_space);
+        trackDeferredWindowCandidate(pid, wid, candidate_space);
         return false;
     };
     defer untrackDeferredWindowCandidate(wid);
     if (joined) return false;
 
-    const ws = g_state.space(assigned_space.key) orelse return false;
-    const win: window_mod.Window = .{
-        .wid = wid,
-        .pid = pid,
+    dispatchStateEvent(.{ .adopt_new_window = .{
+        .window_id = wid,
+        .process_id = pid,
         .frame = window_frame,
         .mode = if (shouldFloatWindow(pid, window_frame, is_resizable)) .floating else .tiled,
-    };
-
-    adoptWindow(ws, win) catch |err| {
-        log.err("addNewWindow: failed to adopt pid={d} wid={d}: {}", .{ pid, wid, err });
+        .native_space = source_ws,
+        .rule_workspace_id = ruleWorkspaceId(pid),
+        .at_ms = nativeStateNowMs(),
+    } });
+    const adopted = g_state.window(wid) orelse {
+        log.err("addNewWindow: failed to adopt pid={d} wid={d}", .{ pid, wid });
         return false;
     };
-    // The user may be on this window: it was just launched or switched to.
-    if (!source_ws.key.eql(ws.key)) requestNativeWindowMove(wid, source_ws, ws, nativeStateNowMs());
+    const ws = g_state.space(adopted.space_key).?;
 
     log.debug("addNewWindow: {s} pid={d} wid={d} on workspace {d} display {d} frame=({d:.0},{d:.0},{d:.0},{d:.0})", .{
-        @tagName(win.mode),  pid,
-        wid,                 ws.workspace_id,
-        ws.display_id,       window_frame.x,
-        window_frame.y,      window_frame.width,
+        @tagName(adopted.mode), pid,
+        wid,                    ws.workspace_id,
+        ws.display_id,          window_frame.x,
+        window_frame.y,         window_frame.width,
         window_frame.height,
     });
     return true;
@@ -6234,15 +6173,11 @@ fn addNewWindowManaged(pid: i32, wid: u32, is_resizable: bool) bool {
     // on the workspace that owns the destination monitor, not on whichever
     // display happened to be focused when the window was created.
     const display_id = inferDisplayIdForWindow(wid) orelse focusedDisplayId();
-    const ws = resolveWorkspaceForWindow(pid, wid, display_id) orelse {
+    const ws = windowCandidateSpace(wid, display_id) orelse {
         log.debug("addNewWindow: ignored pid={d} wid={d} on unmanaged native Space", .{ pid, wid });
         return false;
     };
-
-    // A rule-pinned app's transient launch position is meaningless: place it
-    // on the display that currently owns its assigned workspace, not wherever
-    // it happened to launch.
-    return addNewWindowManagedWithAssignment(pid, wid, ws, is_resizable);
+    return adoptReadyWindow(pid, wid, ws, is_resizable);
 }
 
 /// Queue `wid` for adoption once its app reports it ready.
@@ -6252,7 +6187,7 @@ fn addNewWindow(pid: i32, wid: u32) void {
 
     // Use the window's own display, not the focused one.
     const display_id = inferDisplayIdForWindow(wid) orelse focusedDisplayId();
-    const ws = resolveWorkspaceForWindow(pid, wid, display_id) orelse {
+    const ws = windowCandidateSpace(wid, display_id) orelse {
         log.debug("addNewWindow: ignored pid={d} wid={d} on unmanaged native Space", .{ pid, wid });
         return;
     };
@@ -6381,7 +6316,7 @@ fn applyTabBarObservation(pid: i32) void {
                 move.selected_window_id,
                 move.selected_window_id,
             ) orelse continue;
-            if (!adoptWindowIdentity(discovered, leader_space.key, null, &observation)) continue;
+            if (!adoptWindowIdentity(discovered, leader_space.key, &observation)) continue;
         }
 
         if (g_state.windowTabLeader(move.selected_window_id) != group.leader_window_id) continue;
@@ -6468,7 +6403,7 @@ fn joinTabGroup(pid: i32, sibling_wid: u32, new_wid: u32, new_frame: window_mod.
         .mode = sibling.mode,
     };
     const observation = tabGroupObservation(sibling_wid, new_wid, new_wid) orelse return false;
-    if (!adoptWindowIdentity(member, ws.key, null, &observation)) return false;
+    if (!adoptWindowIdentity(member, ws.key, &observation)) return false;
 
     const leader = g_state.windowTabLeader(sibling_wid);
     const member_count = if (g_state.windowTabGroup(leader)) |group| group.member_count else 1;
@@ -6669,27 +6604,6 @@ fn cleanupWorkspaceWindowsForPid(pid: i32) bool {
 
 /// Ask each app with a standalone window on a visible Space for its window
 /// list. Cleanup for the app runs when it arrives.
-fn requestOffscreenCleanupLists() void {
-    var requested_pids: [app_queue.max_apps]i32 = undefined;
-    var requested_count: usize = 0;
-    for (g_state.spaces.spaces[0..g_state.spaces.space_count]) |ws| {
-        // macOS keeps windows on inactive Spaces off-screen.
-        if (!spaceVisible(ws)) continue;
-
-        for (workspaceWindows(ws).items()) |wid| {
-            const win = managedWindow(wid) orelse continue;
-            // Tab-group members can be intentionally off-screen when a sibling
-            // tab is active; treating them as ghosts causes layout churn.
-            if (g_state.windowTabGroup(wid) != null) continue;
-            if (std.mem.findScalar(i32, requested_pids[0..requested_count], win.pid) != null) continue;
-            if (requested_count == requested_pids.len) return;
-            requested_pids[requested_count] = win.pid;
-            requested_count += 1;
-            _ = app_windows.request(win.pid, .offscreen_cleanup);
-        }
-    }
-}
-
 /// Remove `pid`'s managed windows that are no longer physically on-screen, and
 /// hand a slot held by a background tab back to the tab group it belongs to.
 ///
@@ -6699,79 +6613,46 @@ fn requestOffscreenCleanupLists() void {
 /// A background tab looks the same to WindowServer, so every suspect goes
 /// through adoptWindowAsBackgroundTab, which keeps a window the app still lists,
 /// adopts a genuine background tab into its group, and reaps the rest.
-fn cleanupOffscreenWindows(pid: i32) bool {
+fn cleanupOffscreenWindows(cleanup: *const state_mod.OffscreenCleanup) bool {
+    const pid = cleanup.process_id;
     var listed: app_windows.Snapshot = undefined;
     if (!app_windows.latest(pid, &listed)) return false;
     if (listed.is_incomplete or listed.is_truncated) return false;
     const on_screen = OnScreenWindows.snapshot();
     if (on_screen.truncated) return false;
 
-    const Suspect = struct { wid: u32, is_on_screen: bool };
-    var suspects: [128]Suspect = undefined;
-    var suspect_count: usize = 0;
-    var truncated = false;
-
-    for (g_state.spaces.spaces[0..g_state.spaces.space_count]) |ws| {
-        if (!spaceVisible(ws)) continue;
-
-        for (workspaceWindows(ws).items()) |wid| {
-            const win = managedWindow(wid) orelse continue;
-            if (win.pid != pid) continue;
-            if (g_state.windowTabGroup(wid) != null) continue;
-
-            // An on-screen window is healthy unless its app has stopped listing
-            // it. A window whose native tab bar moved on still reports the
-            // group's on-screen state for a while, and a slot left in its name
-            // is never placed again: every geometry write for it is addressed to
-            // a window that no longer exists, so the slot silently stops
-            // responding to tiling, fullscreen and parking.
-            const is_on_screen = on_screen.contains(wid);
-            // A listed window is neither a ghost nor a native background tab,
-            // even if it is temporarily off-screen. No tab hierarchy is needed.
-            if (listed.listsWindow(wid)) continue;
-
-            if (suspect_count < suspects.len) {
-                suspects[suspect_count] = .{ .wid = wid, .is_on_screen = is_on_screen };
-                suspect_count += 1;
-            } else {
-                truncated = true;
-            }
-        }
-    }
-
-    if (truncated) {
-        log.warn("cleanup: offscreen batch truncated queued={d}", .{suspect_count});
-    }
-
-    if (suspect_count > 0 and listed.details != .tabs) {
-        // Keep both ghosts and possible tabs until the app answers with tab facts.
+    // A window the app stopped listing may be a native background tab, which
+    // tab facts tell apart. Keep every window until the app answers with them.
+    for (cleanup.windowIds()) |wid| {
+        if (listed.listsWindow(wid) or listed.details == .tabs) continue;
         _ = app_windows.request(pid, .offscreen_tabs);
         return false;
     }
 
     // Mutations are deferred so the snapshots above stay valid.
     var mutated = false;
-    for (suspects[0..suspect_count]) |suspect| {
-        const win = managedWindow(suspect.wid) orelse continue;
-
-        switch (adoptWindowAsBackgroundTab(win, &listed, &on_screen)) {
-            .adopt => mutated = true,
-            .keep => {},
-            .reap => {
-                // Only the off-screen scan reaps. An on-screen window is not a
-                // ghost however little its app admits to it, and dropping one
-                // would unmanage a window the user is looking at.
-                if (suspect.is_on_screen) {
-                    log.debug("cleanup: keeping on-screen wid={d} pid={d} the app no longer lists", .{
-                        win.wid, win.pid,
-                    });
-                    continue;
-                }
-                log.debug("cleanup: removing wid={d} pid={d} reason=offscreen", .{ win.wid, win.pid });
-                removeWindow(suspect.wid);
+    for (cleanup.windowIds()) |wid| {
+        const win = managedWindow(wid) orelse continue;
+        // A window whose native tab bar moved on can stay on screen under its
+        // old ID while its app stops listing it: give its slot to its group.
+        if (!listed.listsWindow(wid)) switch (adoptWindowAsBackgroundTab(win, &listed, &on_screen)) {
+            .adopt => {
                 mutated = true;
+                continue;
             },
+            .keep => continue,
+            .reap => {},
+        };
+        // On screen, it is not a ghost however little its app admits to it.
+        if (on_screen.contains(wid)) continue;
+
+        dispatchStateEvent(.{ .window_offscreen_observed = wid });
+        if (managedWindow(wid) != null) {
+            log.debug("cleanup: keeping off-screen wid={d} pid={d}", .{ wid, pid });
+            continue;
         }
+        log.debug("cleanup: removed wid={d} pid={d} reason=offscreen", .{ wid, pid });
+        mutated = true;
     }
 
     return mutated;
@@ -6981,6 +6862,7 @@ fn reconcileDisplayChange(cause: state_mod.DisplayReconcileCause) bool {
     const native_topology = (if (stepNativeSpaceCapacity() == .ready) captureNativeTopology(.preserve_space_ids) else null) orelse {
         g_displays = previous_displays;
         g_display_count = previous_display_count;
+        publishDisplayLayouts();
         dispatchStateEvent(.{ .display_reconcile_unavailable = .{
             .at_ms = nativeStateNowMs(),
             .cause = cause,
@@ -7389,31 +7271,24 @@ fn checkTabDragOut(_: i32, wid: u32) bool {
 
 // Workspace resolution (config-based app → workspace mapping)
 
-/// Return the workspace a window should be placed on, checking
-/// config workspace_assignments by bundle ID before falling back
-/// to the active workspace for the target display.
-fn configuredWorkspace(pid: i32, display_id: u32) ?state_mod.SpaceRef {
-    if (g_config.hasAppWorkspaceRules()) {
-        var id_buf: [256]u8 = undefined;
-        if (appBundleId(pid, &id_buf)) |bundle_id| {
-            if (g_config.workspaceForApp(bundle_id)) |ws_id| {
-                return spaceForCommand(display_id, ws_id);
-            }
-        }
-    }
-    return null;
+fn ruleWorkspaceId(pid: i32) ?u8 {
+    if (!g_config.hasAppWorkspaceRules()) return null;
+    var id_buf: [256]u8 = undefined;
+    const bundle_id = appBundleId(pid, &id_buf) orelse return null;
+    return g_config.workspaceForApp(bundle_id);
 }
 
-fn resolveWorkspaceForWindow(pid: i32, wid: u32, display_id: u32) ?state_mod.SpaceRef {
+// Bookkeeping for a window awaiting adoption; the reducer decides where it is
+// adopted.
+fn windowCandidateSpace(wid: u32, display_id: u32) ?state_mod.SpaceRef {
     const native_space_id = g_sky.?.nativeSpaceIdForWindow(wid, display_id);
     if (native_space_id) |space_id| {
         if (g_state.space(.{ .id = space_id }) == null) return null;
     }
 
-    // A fullscreen window has no ordinary membership. Do not let app rules
-    // or active-workspace fallback adopt it into the hidden desktop.
+    // A fullscreen window has no ordinary membership. Do not let the
+    // active-workspace fallback adopt it into the hidden desktop.
     if (native_space_id == null and g_state.native_topology.observedWorkspace(display_id) == null) return null;
-    if (configuredWorkspace(pid, display_id)) |ws| return ws;
     if (native_space_id) |space_id| {
         if (g_state.space(.{ .id = space_id })) |ws| return ws;
     }
@@ -7499,14 +7374,9 @@ fn moveWindowToWorkspace(target_id: u8) void {
     log.debug("move workspace target wid={d} pid={d} source={d} target={d}", .{ wid, win.pid, ws.workspace_id, target_id });
 
     const target_ws = spaceForCommand(ws.display_id, target_id) orelse return;
-    const layout: ?state_mod.LayoutInsertion = if (g_state.layout.contains(ws.key, wid))
-        layoutInsertion(target_ws.key, wid) catch return
-    else
-        null;
     dispatchStateEvent(.{ .request_window_move = .{
         .window_id = wid,
         .target = target_ws,
-        .layout = layout,
         .should_move_native = true,
     } });
 }
@@ -7526,14 +7396,9 @@ fn reassignManagedWindowToDisplay(wid: u32, target_display_id: u32, should_follo
     std.debug.assert(target_workspace_id > 0 and target_workspace_id <= workspaceCount());
 
     const target_ws = spaceForWorkspace(target_display_id, target_workspace_id) orelse return false;
-    const layout: ?state_mod.LayoutInsertion = if (g_state.layout.contains(source_ws.key, wid))
-        layoutInsertion(target_ws.key, wid) catch return false
-    else
-        null;
     dispatchStateEvent(.{ .request_window_move = .{
         .window_id = wid,
         .target = target_ws,
-        .layout = layout,
         .should_move_native = false,
         .should_follow_focus = should_follow_focus,
     } });

@@ -56,7 +56,10 @@ pub const WorkspaceTransitionSettlement = model_mod.WorkspaceTransitionSettlemen
 pub const PendingNativeWindowMove = model_mod.PendingNativeWindowMove;
 pub const PendingNativeWorkspaceMove = model_mod.PendingNativeWorkspaceMove;
 pub const SpaceMoveStep = model_mod.SpaceMoveStep;
-pub const WindowPlacement = model_mod.WindowPlacement;
+pub const WindowPlacementObservation = model_mod.WindowPlacementObservation;
+pub const WindowPlacementReason = model_mod.WindowPlacementReason;
+pub const NewWindowAdoption = model_mod.NewWindowAdoption;
+pub const OffscreenCleanup = model_mod.OffscreenCleanup;
 pub const SpaceOperand = model_mod.SpaceOperand;
 pub const DisplayChoice = model_mod.DisplayChoice;
 pub const DisplayOrder = model_mod.DisplayOrder;
@@ -79,6 +82,7 @@ pub const CleanupRequest = model_mod.CleanupRequest;
 pub const LayoutRebuild = model_mod.LayoutRebuild;
 pub const ObservationTimer = model_mod.ObservationTimer;
 pub const LayoutInsertion = model_mod.LayoutInsertion;
+pub const DisplayLayouts = model_mod.DisplayLayouts;
 pub const Model = model_mod.Model;
 pub const Event = model_mod.Event;
 pub const SwitchFailureReason = model_mod.SwitchFailureReason;
@@ -192,7 +196,15 @@ pub fn reduce(model: *Model, event: Event) Transition {
         .complete_workspace_transition => |completion| workspace_reducer.reduceWorkspaceTransitionCompletion(&transition, completion),
         .workspace_transition_timer_fired => |timer| workspace_reducer.reduceWorkspaceTransitionTimer(&transition, timer),
         .track_native_window_move => |request| workspace_reducer.reduceNativeWindowMoveTracked(&transition, request),
-        .rule_placement_observed => |placement| workspace_reducer.reduceRulePlacementObserved(&transition, placement),
+        .window_placement_observed => |observation| {
+            workspace_reducer.reduceWindowPlacementObserved(&transition, observation);
+            should_refresh_workspace_focus = true;
+        },
+        .adopt_new_window => |adoption| workspace_reducer.reduceNewWindowAdopted(&transition, adoption),
+        .window_offscreen_observed => |window_id| {
+            workspace_reducer.reduceWindowOffscreenObserved(&transition, window_id);
+            should_refresh_workspace_focus = true;
+        },
         .cancel_native_window_move => |window_id| {
             _ = transition.model.pending_native_window_moves.remove(window_id);
         },
@@ -264,7 +276,11 @@ pub fn reduce(model: *Model, event: Event) Transition {
         .configure_layout_interaction => |configuration| {
             transition.model.bsp_split_mode = configuration.split_mode;
             transition.model.bsp_insert_point = configuration.insert_point;
+            transition.model.layout_kind = configuration.kind;
+            transition.model.layout_insert_child = configuration.insert_child;
+            transition.model.layout_split_ratio = configuration.split_ratio;
         },
+        .observe_display_layouts => |display_layouts| transition.model.display_layouts = display_layouts.*,
         .toggle_split_mode => transition.model.bsp_split_mode = switch (transition.model.bsp_split_mode) {
             .auto => .horizontal,
             .horizontal => .vertical,
@@ -304,19 +320,9 @@ pub fn reduce(model: *Model, event: Event) Transition {
         .request_cleanup_process => |process_id| reduceCleanupProcessRequested(&transition, process_id),
         .request_offscreen_cleanup => transition.model.cleanup_request.should_clean_offscreen = true,
         // The answer can arrive after a workspace transition began.
-        .offscreen_window_list_observed => |process_id| if (!transition.model.isWorkspaceTransitionActive()) {
-            transition.addEffect(.{ .clean_offscreen_windows = process_id });
-        },
+        .offscreen_window_list_observed => |process_id| workspace_reducer.reduceOffscreenWindowListObserved(&transition, process_id),
         .clear_cleanup_requests => transition.model.cleanup_request = .{},
-        .flush_cleanup_requests => {
-            const request = transition.model.cleanup_request;
-            transition.model.cleanup_request = .{};
-            if (!transition.model.isWorkspaceTransitionActive() and
-                (request.process_count > 0 or request.should_clean_offscreen))
-            {
-                transition.addEffect(.{ .cleanup_requested = request });
-            }
-        },
+        .flush_cleanup_requests => workspace_reducer.reduceCleanupRequestsFlushed(&transition),
         .rebuild_layout => |rebuild| layout_reducer.rebuild(&transition, rebuild),
         .layout_command => |command| {
             if (layout_reducer.applyEvent(&transition, command.event)) {
@@ -661,7 +667,6 @@ test "window lifecycle transitions update catalog geometry focus and layout atom
         .process_id = 1001,
         .space_key = first_space,
         .frame = .{ .x = 10, .y = 20, .width = 800, .height = 600 },
-        .layout = testLayoutInsertion(.bsp),
     } }).model;
     try testing.expect(model.window(101) != null);
     try testing.expect(model.geometry.get(101) != null);
@@ -676,7 +681,6 @@ test "window lifecycle transitions update catalog geometry focus and layout atom
     window.mode = .tiled;
     model = reduceCopy(model, .{ .update_window = .{
         .window = window,
-        .layout = testLayoutInsertion(.bsp),
     } }).model;
     model = reduceCopy(model, .{ .record_workspace_focus = .{
         .workspace_id = 1,
@@ -688,7 +692,6 @@ test "window lifecycle transitions update catalog geometry focus and layout atom
     model = reduceCopy(model, .{ .assign_window_space = .{
         .window_id = 101,
         .space_key = second_space,
-        .layout = testLayoutInsertion(.bsp),
     } }).model;
     try testing.expect(model.window(101).?.space_key.eql(second_space));
     try testing.expect(!model.layout.contains(first_space, 101));
@@ -719,13 +722,11 @@ test "layout rebuild replaces every Space atomically" {
         .window_id = 101,
         .process_id = 1001,
         .space_key = space_key,
-        .layout = testLayoutInsertion(.bsp),
     } }).model;
     model = reduceCopy(model, .{ .adopt_window = .{
         .window_id = 102,
         .process_id = 1002,
         .space_key = space_key,
-        .layout = testLayoutInsertion(.bsp),
     } }).model;
 
     var rebuild: LayoutRebuild = .{
@@ -760,13 +761,13 @@ test "layout rejection leaves window adoption unchanged" {
         .window_id = 101,
         .process_id = 1001,
         .space_key = space_key,
-        .layout = testLayoutInsertion(.bsp),
     } }).model;
+    // The space's layout is BSP; a monocle insertion cannot join it.
+    model.layout_kind = .monocle;
     const rejected = reduceCopy(model, .{ .adopt_window = .{
         .window_id = 102,
         .process_id = 1002,
         .space_key = space_key,
-        .layout = testLayoutInsertion(.monocle),
     } });
 
     try testing.expectEqual(@as(u8, 1), rejected.effect_count);
@@ -790,13 +791,11 @@ test "cross-domain validation rejects ownership divergence" {
         .window_id = 101,
         .process_id = 1001,
         .space_key = first_space,
-        .layout = testLayoutInsertion(.bsp),
     } }).model;
     model = reduceCopy(model, .{ .adopt_window = .{
         .window_id = 102,
         .process_id = 1001,
         .space_key = first_space,
-        .layout = testLayoutInsertion(.bsp),
     } }).model;
     try testing.expect(invariants.crossDomainStateIsValid(&model));
 
@@ -850,7 +849,6 @@ test "tab transitions transfer layout ownership atomically" {
         .window_id = 101,
         .process_id = 1001,
         .space_key = space_key,
-        .layout = testLayoutInsertion(.bsp),
     } }).model;
     var group: WindowTabGroupObservation = .{
         .leader_window_id = 101,
@@ -872,7 +870,6 @@ test "tab transitions transfer layout ownership atomically" {
 
     model = reduceCopy(model, .{ .detach_window_tab = .{
         .window_id = 102,
-        .layout = testLayoutInsertion(.bsp),
     } }).model;
     try testing.expectEqual(@as(usize, 2), model.layout.windowCount(space_key));
     try testing.expect(model.layout.contains(space_key, 101));
@@ -898,7 +895,6 @@ test "adoption with a rejected tab group leaves the model untouched" {
         .window_id = 101,
         .process_id = 1001,
         .space_key = space_key,
-        .layout = testLayoutInsertion(.bsp),
     } });
     // The new window belongs to another process, so the group is invalid.
     var group: WindowTabGroupObservation = .{
@@ -913,7 +909,6 @@ test "adoption with a rejected tab group leaves the model untouched" {
         .window_id = 102,
         .process_id = 2002,
         .space_key = space_key,
-        .layout = testLayoutInsertion(.bsp),
         .tab_group = &group,
     } });
 
@@ -939,13 +934,11 @@ test "tab grouping reconciles workspace and layout ownership atomically" {
         .window_id = 101,
         .process_id = 1001,
         .space_key = first_space,
-        .layout = testLayoutInsertion(.bsp),
     } }).model;
     model = reduceCopy(model, .{ .adopt_window = .{
         .window_id = 102,
         .process_id = 1001,
         .space_key = second_space,
-        .layout = testLayoutInsertion(.bsp),
     } }).model;
 
     var group: WindowTabGroupObservation = .{
@@ -1369,55 +1362,172 @@ test "switch replans at once when the display settles off the swipe path" {
     try testing.expect(replanned.request.target.key.eql(.{ .id = 102 }));
 }
 
-test "startup places an unmanaged hidden window on its rule's Space" {
-    var model = initializedModel(testTopology(101, null));
-    const placement: WindowPlacement = .{
-        .window_id = 900,
-        .source = model.space(.{ .id = 102 }).?,
-        .target = model.space(.{ .id = 103 }).?,
-    };
-    var copy = model;
-    try expectEffectTags(reduce(&copy, .{ .rule_placement_observed = placement }), &.{.place_native_window});
-
-    // The user can see it: adoption places it and follows.
-    var visible = placement;
-    visible.source = model.space(.{ .id = 101 }).?;
-    copy = model;
-    try expectEffectTags(reduce(&copy, .{ .rule_placement_observed = visible }), &.{});
-
-    var in_place = placement;
-    in_place.target = placement.source;
-    copy = model;
-    try expectEffectTags(reduce(&copy, .{ .rule_placement_observed = in_place }), &.{});
-
-    adoptTestWindows(&model, &.{102});
-    var managed = placement;
-    managed.window_id = 102;
-    try expectEffectTags(reduce(&model, .{ .rule_placement_observed = managed }), &.{});
+fn placementObservation(window_id: WindowId, space_id: NativeSpaceId, reason: WindowPlacementReason) Event {
+    return .{ .window_placement_observed = .{
+        .window_id = window_id,
+        .space_id = space_id,
+        .is_on_screen = true,
+        .reason = reason,
+    } };
 }
 
-test "rule placement follows the active app's window and focuses it on landing" {
+test "startup places an unmanaged hidden window on its rule's Space" {
+    const model = initializedModel(testTopology(101, null));
+    var observation = placementObservation(900, 102, .startup);
+    observation.window_placement_observed.rule_workspace_id = 3;
+    var copy = model;
+    try expectEffectTags(reduce(&copy, observation), &.{.place_native_window});
+
+    // The user can see it: adoption places it and follows.
+    var visible = observation;
+    visible.window_placement_observed.space_id = 101;
+    copy = model;
+    try expectEffectTags(reduce(&copy, visible), &.{});
+
+    var in_place = observation;
+    in_place.window_placement_observed.rule_workspace_id = 2;
+    copy = model;
+    try expectEffectTags(reduce(&copy, in_place), &.{});
+
+    var settled = observation;
+    settled.window_placement_observed.reason = .settled;
+    copy = model;
+    try expectEffectTags(reduce(&copy, settled), &.{});
+}
+
+test "settled placement adopts a managed window where the user put it" {
     const testing = std.testing;
     var model = initializedModel(testTopology(101, null));
     adoptTestWindows(&model, &.{102});
-    // Workspace 2 remembers another window until the followed one lands.
-    _ = reduce(&model, .{ .adopt_window = .{
-        .window_id = 900,
-        .process_id = 1900,
-        .space_key = .{ .id = 102 },
-        .layout = testLayoutInsertion(.bsp),
-    } });
-    _ = reduce(&model, .{ .record_workspace_focus = .{ .workspace_id = 2, .window_id = 900 } });
-    var request = trackNativeWindowMove(&model, 102, 1, 2);
-    request.track_native_window_move.follow_at_ms = 100;
 
-    // A background app's window is placed without moving the display.
-    model.active_process_id = 1;
-    try testing.expect(reduceCopy(model, request).model.pending_switch == null);
+    var copy = model;
+    _ = reduce(&copy, placementObservation(102, 103, .settled));
+    try testing.expect(copy.window(102).?.space_key.eql(.{ .id = 103 }));
+    try testing.expectEqual(@as(?WindowId, 102), copy.focusedWorkspaceWindow(3));
 
+    // Off screen, the reported Space may be one it is leaving.
+    var off_screen = placementObservation(102, 103, .settled);
+    off_screen.window_placement_observed.is_on_screen = false;
+    copy = model;
+    _ = reduce(&copy, off_screen);
+    try testing.expect(copy.window(102).?.space_key.eql(.{ .id = 102 }));
+
+    off_screen.window_placement_observed.reason = .topology_changed;
+    copy = model;
+    _ = reduce(&copy, off_screen);
+    try testing.expect(copy.window(102).?.space_key.eql(.{ .id = 103 }));
+
+    // Mid-switch placement is transitional.
+    copy = model;
+    _ = reduce(&copy, switchRequest(&copy, 1, 2, 100));
+    _ = reduce(&copy, placementObservation(102, 103, .settled));
+    try testing.expect(copy.window(102).?.space_key.eql(.{ .id = 102 }));
+}
+
+test "following a window the user moved adopts it where it is" {
+    const testing = std.testing;
+    var model = initializedModel(testTopology(101, null));
+    adoptTestWindows(&model, &.{102});
     model.active_process_id = 1102;
-    model = reduceCopy(model, request).model;
-    try testing.expectEqual(@as(?WindowId, 102), model.pending_switch.?.request.follow_window_id);
+    const observation: Event = .{ .follow_focus_observed = .{
+        .process_id = 1102,
+        .window_id = 102,
+        .leader_window_id = 102,
+        .source = .ax,
+        .target = model.space(.{ .id = 102 }).?,
+        .is_target_visible = false,
+        .at_ms = 100,
+        .space_id = 103,
+    } };
+
+    var copy = model;
+    _ = reduce(&copy, observation);
+    try testing.expect(copy.window(102).?.space_key.eql(.{ .id = 103 }));
+    try testing.expect(copy.pending_switch.?.request.target.key.eql(.{ .id = 103 }));
+
+    // bobrwm is moving it to workspace 3 itself: the old Space is expected.
+    copy = model;
+    _ = reduce(&copy, .{ .assign_window_space = .{ .window_id = 102, .space_key = .{ .id = 103 } } });
+    _ = reduce(&copy, trackNativeWindowMove(&copy, 102, 2, 3));
+    var stale = observation;
+    stale.follow_focus_observed.target = copy.space(.{ .id = 103 }).?;
+    stale.follow_focus_observed.space_id = 102;
+    _ = reduce(&copy, stale);
+    try testing.expect(copy.window(102).?.space_key.eql(.{ .id = 103 }));
+}
+
+test "display change sends a piled window back to its workspace's Space" {
+    const testing = std.testing;
+    var model = initializedModel(testTopology(101, null));
+    adoptTestWindows(&model, &.{102});
+
+    try expectEffectTags(reduce(&model, placementObservation(102, 101, .display_changed)), &.{.move_native_window});
+    try testing.expect(model.window(102).?.space_key.eql(.{ .id = 102 }));
+    try testing.expect(model.pendingNativeWindowMove(102).?.target.key.eql(.{ .id = 102 }));
+
+    // A Space no workspace owns has no move to roll back to.
+    var unowned = initializedModel(testTopology(101, null));
+    adoptTestWindows(&unowned, &.{102});
+    try expectEffectTags(reduce(&unowned, placementObservation(102, 999, .display_changed)), &.{.place_native_window});
+}
+
+test "off-screen cleanup judges only windows on a settled, shown Space" {
+    const testing = std.testing;
+    var model = initializedModel(testTopology(101, null));
+    adoptTestWindows(&model, &.{ 101, 102 });
+
+    var copy = model;
+    const listed = reduce(&copy, .{ .offscreen_window_list_observed = 1101 });
+    try testing.expectEqualSlices(WindowId, &.{101}, listed.effects[0].clean_offscreen_windows.windowIds());
+    copy = model;
+    try expectEffectTags(reduce(&copy, .{ .offscreen_window_list_observed = 1102 }), &.{});
+
+    // Apps list only windows on shown Spaces.
+    copy = model;
+    _ = reduce(&copy, .{ .window_offscreen_observed = 102 });
+    try testing.expect(copy.window(102) != null);
+
+    // The display may have just moved: wait for the topology.
+    copy = model;
+    _ = reduce(&copy, .{ .native_space_changed = 100 });
+    _ = reduce(&copy, .{ .window_offscreen_observed = 101 });
+    try testing.expect(copy.window(101) != null);
+
+    copy = model;
+    _ = reduce(&copy, .{ .window_offscreen_observed = 101 });
+    try testing.expect(copy.window(101) == null);
+}
+
+test "new window joins its rule's workspace, followed when its app is active" {
+    const testing = std.testing;
+    var model = initializedModel(testTopology(101, null));
+    // Workspace 2 remembers another window until the followed one lands.
+    adoptTestWindows(&model, &.{102});
+    const adoption: NewWindowAdoption = .{
+        .window_id = 500,
+        .process_id = 1500,
+        .frame = .{ .x = 0, .y = 0, .width = 800, .height = 600 },
+        .mode = .tiled,
+        .native_space = model.space(.{ .id = 101 }).?,
+        .rule_workspace_id = 2,
+        .at_ms = 100,
+    };
+
+    model.active_process_id = 1;
+    var background = reduceCopy(model, .{ .adopt_new_window = adoption }).model;
+    try testing.expect(background.window(500).?.space_key.eql(.{ .id = 102 }));
+    try testing.expect(background.pendingNativeWindowMove(500) != null);
+    try testing.expect(background.pending_switch == null);
+
+    var unruled = adoption;
+    unruled.rule_workspace_id = null;
+    background = reduceCopy(model, .{ .adopt_new_window = unruled }).model;
+    try testing.expect(background.window(500).?.space_key.eql(.{ .id = 101 }));
+    try testing.expect(background.pendingNativeWindowMove(500) == null);
+
+    model.active_process_id = 1500;
+    model = reduceCopy(model, .{ .adopt_new_window = adoption }).model;
+    try testing.expectEqual(@as(?WindowId, 500), model.pending_switch.?.request.follow_window_id);
     model = deliverTestSwitch(model, 110);
 
     // macOS moved the display past the target; the replan keeps the window.
@@ -1427,7 +1537,7 @@ test "rule placement follows the active app's window and focuses it on landing" 
         .at_ms = 200,
         .is_animating = false,
     } }).model;
-    try testing.expectEqual(@as(?WindowId, 102), model.pending_switch.?.request.follow_window_id);
+    try testing.expectEqual(@as(?WindowId, 500), model.pending_switch.?.request.follow_window_id);
 
     const landed = reduceCopy(model, .{ .native_topology_observed = .{
         .topology = &testTopology(102, null),
@@ -1439,9 +1549,9 @@ test "rule placement follows the active app's window and focuses it on landing" 
     for (landed.effects[0..landed.effect_count]) |effect| {
         if (effect == .focus_followed_window) focus = effect.focus_followed_window;
     }
-    try testing.expectEqual(@as(i32, 1102), focus.?.process_id);
-    try testing.expectEqual(@as(WindowId, 102), focus.?.window_id);
-    try testing.expectEqual(@as(?WindowId, 102), landed.model.focusedWorkspaceWindow(2));
+    try testing.expectEqual(@as(i32, 1500), focus.?.process_id);
+    try testing.expectEqual(@as(WindowId, 500), focus.?.window_id);
+    try testing.expectEqual(@as(?WindowId, 500), landed.model.focusedWorkspaceWindow(2));
 }
 
 test "native workspace placement is globally unique across displays" {
@@ -1739,7 +1849,6 @@ fn adoptTestWindows(model: *Model, space_ids: []const NativeSpaceId) void {
             .window_id = window_id,
             .process_id = @intCast(space_id + 1000),
             .space_key = .{ .id = space_id },
-            .layout = testLayoutInsertion(.bsp),
         } });
         _ = reduce(model, .{ .record_workspace_focus = .{
             .workspace_id = model.space(.{ .id = space_id }).?.workspace_id,
@@ -2086,20 +2195,18 @@ test "workspace and focused display are reducer owned" {
 
 test "off-screen cleanup waits out a workspace transition" {
     const testing = std.testing;
-    var catalog: SpaceCatalog = .{};
-    catalog.add(.{ .key = .{ .id = 1 }, .workspace_id = 1, .display_id = 11 });
-    catalog.add(.{ .key = .{ .id = 2 }, .workspace_id = 2, .display_id = 11 });
-    const model = reduceCopy(.{}, .{ .replace_space_catalog = &catalog }).model;
+    var model = initializedModel(testTopology(101, null));
+    adoptTestWindows(&model, &.{101});
 
-    var transition = reduceCopy(model, .{ .offscreen_window_list_observed = 42 });
-    try testing.expectEqual(@as(i32, 42), transition.effects[0].clean_offscreen_windows);
+    var transition = reduceCopy(model, .{ .offscreen_window_list_observed = 1101 });
+    try testing.expectEqual(@as(i32, 1101), transition.effects[0].clean_offscreen_windows.process_id);
 
     const switching = reduceCopy(model, .{ .start_workspace_transition = .{
         .kind = .switch_workspace,
-        .target = model.space(.{ .id = 2 }).?,
+        .target = model.space(.{ .id = 102 }).?,
         .at_ms = 100,
     } }).model;
-    transition = reduceCopy(switching, .{ .offscreen_window_list_observed = 42 });
+    transition = reduceCopy(switching, .{ .offscreen_window_list_observed = 1101 });
     try testing.expectEqual(@as(u8, 0), transition.effect_count);
 }
 
@@ -2893,7 +3000,6 @@ test "reconnected display with a fresh Space takes the highest workspace without
         .window_id = 42,
         .process_id = 10,
         .space_key = .{ .id = 105 },
-        .layout = testLayoutInsertion(.bsp),
     } }).model;
 
     // Workspace 5 kept its windows on the laptop while unplugged, so its Space
@@ -2927,7 +3033,6 @@ test "replaced native Spaces retain window and layout ownership" {
         .window_id = 42,
         .process_id = 10,
         .space_key = .{ .id = 103 },
-        .layout = testLayoutInsertion(.bsp),
     } }).model;
     var topology: NativeTopology = .{};
     var first = DisplayTopology.init(1, 101);
@@ -3272,14 +3377,12 @@ test "pointer drop swaps layout inside the reducer" {
         .process_id = 42,
         .space_key = .{ .id = 1 },
         .frame = .{ .x = 0, .y = 0, .width = 500, .height = 500 },
-        .layout = testLayoutInsertion(.bsp),
     } }).model;
     model = reduceCopy(model, .{ .adopt_window = .{
         .window_id = 200,
         .process_id = 43,
         .space_key = .{ .id = 1 },
         .frame = .{ .x = 500, .y = 0, .width = 500, .height = 500 },
-        .layout = testLayoutInsertion(.bsp),
     } }).model;
 
     model = reduceCopy(model, .{ .pointer_down = 100 }).model;
@@ -3312,14 +3415,12 @@ test "directional commands resolve focus and layout in the reducer" {
         .process_id = 42,
         .space_key = space_key,
         .frame = .{ .x = 0, .y = 0, .width = 500, .height = 500 },
-        .layout = testLayoutInsertion(.bsp),
     } }).model;
     model = reduceCopy(model, .{ .adopt_window = .{
         .window_id = 200,
         .process_id = 43,
         .space_key = space_key,
         .frame = .{ .x = 500, .y = 0, .width = 500, .height = 500 },
-        .layout = testLayoutInsertion(.bsp),
     } }).model;
 
     var transition = reduceCopy(model, .{ .focus_direction = .{
@@ -3354,7 +3455,6 @@ test "resize command leaves fullscreen layout unchanged and resumes after exit" 
             .process_id = 42,
             .space_key = space_key,
             .frame = .{ .x = 0, .y = 0, .width = 500, .height = 500 },
-            .layout = testLayoutInsertion(.bsp),
         } }).model;
     }
     model = reduceCopy(model, .{ .toggle_window_fullscreen = .{
@@ -3397,7 +3497,6 @@ test "window presentation commands reduce intent before platform effects" {
         .process_id = 42,
         .space_key = space_key,
         .frame = .{ .x = 10, .y = 20, .width = 400, .height = 300 },
-        .layout = testLayoutInsertion(.bsp),
     } }).model;
 
     var transition = reduceCopy(model, .{ .set_window_mode = .{
@@ -3457,7 +3556,6 @@ test "window move command commits ownership layout and intent atomically" {
         .window_id = 100,
         .process_id = 42,
         .space_key = source_key,
-        .layout = testLayoutInsertion(.bsp),
     } }).model;
     model = reduceCopy(model, .{ .record_workspace_focus = .{
         .workspace_id = 1,
@@ -3467,7 +3565,6 @@ test "window move command commits ownership layout and intent atomically" {
     const transition = reduceCopy(model, .{ .request_window_move = .{
         .window_id = 100,
         .target = catalog.find(target_key).?,
-        .layout = testLayoutInsertion(.bsp),
         .should_move_native = false,
     } });
     try testing.expect(transition.model.window(100).?.space_key.eql(target_key));

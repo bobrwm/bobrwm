@@ -84,10 +84,7 @@ pub fn reduceWindowModeCommand(
 
     var window = action.leader.snapshot();
     window.mode = command.mode;
-    window_reducer.reduceWindowUpdated(transition, .{
-        .window = window,
-        .layout = command.layout,
-    });
+    window_reducer.reduceWindowUpdated(transition, .{ .window = window });
     const updated = transition.model.window(action.leader.window_id) orelse return;
     if (updated.mode != command.mode) return;
 
@@ -190,7 +187,6 @@ pub fn reduceWindowMoveRequest(transition: *Transition, request: WindowMoveReque
     window_reducer.reduceWindowSpaceAssigned(transition, .{
         .window_id = action.leader.window_id,
         .space_key = target.key,
-        .layout = request.layout,
     });
     const moved = transition.model.window(action.leader.window_id) orelse return;
     if (!moved.space_key.eql(target.key)) return;
