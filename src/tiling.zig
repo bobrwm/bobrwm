@@ -3,6 +3,7 @@
 const Self = @This();
 
 const std = @import("std");
+const build_config = @import("build_config.zig");
 const space_mod = @import("space.zig");
 const window_mod = @import("window.zig");
 
@@ -300,7 +301,13 @@ pub fn totalWindowCount(self: *const Self) usize {
     return total;
 }
 
-pub fn assertValid(self: *const Self) void {
+/// Compiled out unless `build_config.slow_runtime_safety`.
+pub inline fn assertValid(self: *const Self) void {
+    if (comptime !build_config.slow_runtime_safety) return;
+    self.verify();
+}
+
+fn verify(self: *const Self) void {
     std.debug.assert(self.layout_count <= self.layouts.len);
     std.debug.assert(self.node_count <= self.nodes.len);
 

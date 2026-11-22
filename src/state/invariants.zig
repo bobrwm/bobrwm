@@ -1,6 +1,7 @@
 //! Cross-domain model invariants.
 
 const std = @import("std");
+const build_config = @import("../build_config.zig");
 const model_mod = @import("model.zig");
 const window_mod = @import("../window.zig");
 
@@ -16,7 +17,13 @@ fn windowCandidateIsValid(model: *const Model, candidate: WindowCandidate) bool 
         model.space(candidate.space_key) != null;
 }
 
-pub fn assertModel(model: *const Model) void {
+/// Compiled out unless `build_config.slow_runtime_safety`.
+pub inline fn assertModel(model: *const Model) void {
+    if (comptime !build_config.slow_runtime_safety) return;
+    verifyModel(model);
+}
+
+fn verifyModel(model: *const Model) void {
     std.debug.assert(model.next_epoch != 0);
     model.layout.assertValid();
     std.debug.assert(model.spaces.space_count <= model.spaces.spaces.len);
