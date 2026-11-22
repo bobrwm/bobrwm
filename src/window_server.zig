@@ -52,6 +52,27 @@ pub fn hasWindow(wid: u32) bool {
     return existing.len > 0;
 }
 
+/// Whether WindowServer places `wid` on the normal window layer (0), the
+/// only layer discovery tiles. Null when the window is unknown or the query
+/// fails, so callers keep their previous answer.
+pub fn isNormalLayer(wid: u32) ?bool {
+    std.debug.assert(wid != 0);
+
+    var values = [1]?*const anyopaque{@ptrFromInt(wid)};
+    const ids_ref = c.CFArrayCreate(null, &values, 1, null) orelse return null;
+    defer c.CFRelease(@ptrCast(ids_ref));
+
+    const descriptions = cg_extra.CGWindowListCreateDescriptionFromArray(ids_ref) orelse return null;
+    defer c.CFRelease(@ptrCast(descriptions));
+    if (c.CFArrayGetCount(descriptions) == 0) return null;
+
+    const info: c.CFDictionaryRef = @ptrCast(c.CFArrayGetValueAtIndex(descriptions, 0) orelse return null);
+    const layer_ref = c.CFDictionaryGetValue(info, cg_extra.kCGWindowLayer) orelse return null;
+    var layer: i32 = 0;
+    if (c.CFNumberGetValue(@ptrCast(layer_ref), c.kCFNumberSInt32Type, &layer) == 0) return null;
+    return layer == 0;
+}
+
 /// An empty description list is either every window gone or a WindowServer
 /// that is not answering. The on-screen list always holds at least the menu
 /// bar, so an empty one means the query failed.

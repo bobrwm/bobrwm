@@ -192,9 +192,14 @@ fn answerRequests(app: app_queue.App) void {
     var is_adopting = false;
     for (batch, 0..) |queued, index| {
         const is_gone = if (live) |ids| std.mem.findScalar(u32, ids, queued.wid) == null else false;
-        const answer: Answer = if (is_gone) .gone else if (elements[index]) |win| classify(win) else .pending;
-        answers[index] = answer;
+        var answer: Answer = if (is_gone) .gone else if (elements[index]) |win| classify(win) else .pending;
         const is_candidate = queued.purposes.contains(.pending_role) or queued.purposes.contains(.deferred);
+        // Discovery only tiles layer-0 windows, but AX creation events skip
+        // that filter. Always-on-top players (Firefox Picture-in-Picture sits
+        // at NSFloatingWindowLevel with a standard subrole) must not be
+        // adopted through it either.
+        if (answer == .ready and is_candidate and window_server.isNormalLayer(queued.wid) == false) answer = .reject;
+        answers[index] = answer;
         // Cleanup does not use resizability; only adoption needs this message.
         is_resizable[index] = !is_candidate or answer != .ready or ax.isAttributeSettable(elements[index].?, strings.size_attr);
         if (answer == .ready and is_candidate) is_adopting = true;
