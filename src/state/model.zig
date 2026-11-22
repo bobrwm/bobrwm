@@ -304,9 +304,7 @@ pub const HiddenSpaces = struct {
 
     /// Adds the Space unless a display shows it or it is already listed.
     pub fn addIfHidden(self: *HiddenSpaces, topology: *const NativeTopology, space_id: NativeSpaceId) void {
-        for (topology.displays[0..topology.display_count]) |display| {
-            if (display.observed_space_id == space_id) return;
-        }
+        if (topology.isSpaceShown(space_id)) return;
         for (self.slice()) |id| {
             if (id == space_id) return;
         }
@@ -392,6 +390,13 @@ pub const NativeWindowMoveRequest = struct {
     /// to, sent to its app rule's workspace. The display follows it when its
     /// app is active, as of this time.
     follow_at_ms: ?TimestampMs = null,
+};
+
+/// An unmanaged window on a hidden Space, and the Space its app rule names.
+pub const WindowPlacement = struct {
+    window_id: WindowId,
+    source: SpaceRef,
+    target: SpaceRef,
 };
 
 pub const NativeWindowMoveObservation = enum {
@@ -1215,6 +1220,7 @@ pub const Event = union(enum) {
         at_ms: TimestampMs,
     },
     track_native_window_move: NativeWindowMoveRequest,
+    rule_placement_observed: WindowPlacement,
     cancel_native_window_move: WindowId,
     native_window_move_observed: struct {
         window_id: WindowId,
@@ -1441,6 +1447,9 @@ pub const Effect = union(enum) {
     move_native_workspace_spaces: PendingNativeWorkspaceMove,
     native_workspace_move_completed: PendingNativeWorkspaceMove,
     hide_native_spaces: HiddenSpaces,
+    /// Untracked: the window is not managed, and adoption finds it wherever
+    /// it ends up.
+    place_native_window: WindowPlacement,
     focus_followed_window: struct {
         process_id: i32,
         window_id: WindowId,

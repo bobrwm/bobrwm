@@ -170,6 +170,13 @@ pub const NativeTopology = struct {
         return null;
     }
 
+    pub fn isSpaceShown(self: *const NativeTopology, space_id: NativeSpaceId) bool {
+        for (self.displays[0..self.display_count]) |display| {
+            if (display.observed_space_id == space_id) return true;
+        }
+        return false;
+    }
+
     pub fn observedWorkspace(self: *const NativeTopology, display_id: DisplayId) ?WorkspaceId {
         const topology = self.findDisplay(display_id) orelse return null;
         return topology.workspaceForSpace(topology.observed_space_id);

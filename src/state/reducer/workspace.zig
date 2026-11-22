@@ -33,6 +33,7 @@ const WorkspaceTransitionSettlementReason = model_mod.WorkspaceTransitionSettlem
 const PendingNativeWindowMove = model_mod.PendingNativeWindowMove;
 const PendingNativeWorkspaceMove = model_mod.PendingNativeWorkspaceMove;
 const HiddenSpaces = model_mod.HiddenSpaces;
+const WindowPlacement = model_mod.WindowPlacement;
 const WorkspaceMoveCommand = model_mod.WorkspaceMoveCommand;
 const SpaceOperand = model_mod.SpaceOperand;
 const NativeTopology = model_mod.NativeTopology;
@@ -506,6 +507,23 @@ pub fn reduceNativeWindowMoveTracked(
         .is_target_visible = if (display) |value| value.observed_space_id == target.key.id else false,
         .at_ms = at_ms,
     });
+}
+
+/// Move a window that is out of sight to its app rule's Space before its
+/// workspace is shown, so adoption finds it in place instead of moving it
+/// away from the user. Managed and visible windows have their own paths.
+pub fn reduceRulePlacementObserved(transition: *Transition, placement: WindowPlacement) void {
+    if (transition.model.window(placement.window_id) != null) return;
+    const source = transition.model.space(placement.source.key) orelse return;
+    const target = transition.model.space(placement.target.key) orelse return;
+    if (source.key.eql(target.key)) return;
+    if (transition.model.native_topology.isSpaceShown(source.key.id)) return;
+
+    transition.addEffect(.{ .place_native_window = .{
+        .window_id = placement.window_id,
+        .source = source,
+        .target = target,
+    } });
 }
 
 pub fn reduceNativeWindowMoveObserved(
