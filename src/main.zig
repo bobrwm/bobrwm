@@ -1403,7 +1403,12 @@ fn moveTabGroupToNativeSpace(wid: u32, target: state_mod.SpaceRef) bool {
     return sky.moveWindowToNativeSpace(wid, space_id);
 }
 
-fn requestNativeWindowMove(wid: u32, source: state_mod.SpaceRef, target: state_mod.SpaceRef) void {
+fn requestNativeWindowMove(
+    wid: u32,
+    source: state_mod.SpaceRef,
+    target: state_mod.SpaceRef,
+    follow_at_ms: ?state_mod.TimestampMs,
+) void {
     g_adoption_on_screen = null;
     source.assertValid();
     target.assertValid();
@@ -1412,6 +1417,7 @@ fn requestNativeWindowMove(wid: u32, source: state_mod.SpaceRef, target: state_m
         .window_id = leader_wid,
         .source = source,
         .target = target,
+        .follow_at_ms = follow_at_ms,
     } });
 }
 
@@ -4899,6 +4905,10 @@ fn executeStateEffect(effect: state_mod.Effect) void {
         }),
         .move_native_workspace_spaces => |pending| executeNativeWorkspaceMove(pending),
         .native_workspace_move_completed => |pending| completeNativeWorkspaceMove(pending),
+        .focus_followed_window => |focus| {
+            log.debug("focus followed window wid={d} pid={d}", .{ focus.window_id, focus.process_id });
+            focusWindow(focus.process_id, focus.window_id);
+        },
         .hide_native_spaces => |hidden| {
             if (!g_sky.?.hideNativeSpaces(hidden.slice())) log.warn("hide native Spaces failed count={d}", .{hidden.count});
         },
@@ -5633,7 +5643,7 @@ fn returnDisplacedWindows() void {
         // it does not land; an unbound leftover Space has no workspace to roll
         // back to, so that move is best effort.
         if (g_state.space(.{ .id = displaced.source_space_id })) |source| {
-            requestNativeWindowMove(displaced.wid, source, displaced.target);
+            requestNativeWindowMove(displaced.wid, source, displaced.target, null);
         } else if (!moveTabGroupToNativeSpace(displaced.wid, displaced.target)) {
             log.warn("display reconcile: window return failed wid={d} workspace={d}", .{
                 displaced.wid,
@@ -6167,7 +6177,8 @@ fn addNewWindowManagedWithAssignment(
         log.err("addNewWindow: failed to adopt pid={d} wid={d}: {}", .{ pid, wid, err });
         return false;
     };
-    if (!source_ws.key.eql(ws.key)) requestNativeWindowMove(wid, source_ws, ws);
+    // The user may be on this window: it was just launched or switched to.
+    if (!source_ws.key.eql(ws.key)) requestNativeWindowMove(wid, source_ws, ws, nativeStateNowMs());
 
     log.debug("addNewWindow: {s} pid={d} wid={d} on workspace {d} display {d} frame=({d:.0},{d:.0},{d:.0},{d:.0})", .{
         @tagName(win.mode),  pid,

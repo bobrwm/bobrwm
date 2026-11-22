@@ -12,6 +12,8 @@ const native_observation_delay_ms = model_mod.native_observation_delay_ms;
 const native_workspace_move_timeout_ms = model_mod.native_workspace_move_timeout_ms;
 const workspace_transition_settle_ms = model_mod.workspace_transition_settle_ms;
 const DisplayId = model_mod.DisplayId;
+const DisplayTopology = model_mod.DisplayTopology;
+const NativeSpaceId = model_mod.NativeSpaceId;
 const WorkspaceId = model_mod.WorkspaceId;
 const SpaceKey = model_mod.SpaceKey;
 const SpaceRef = model_mod.SpaceRef;
@@ -180,6 +182,12 @@ pub fn reduceTopologyObserved(
         return;
     }
 
+    // Something else moved the display, such as macOS following app focus,
+    // so the swipe can no longer land. Replan now instead of at the deadline.
+    if (display != null and isOffSwitchPath(display.?, pending)) {
+        if (recoverUnexpectedLanding(transition, pending, event.at_ms)) return;
+    }
+
     if (event.at_ms < pending.deadline_at_ms) {
         schedulePendingObservation(transition.model, pending, event.at_ms);
         return;
@@ -204,6 +212,7 @@ pub fn reduceGesturePrepared(transition: *Transition, event: @FieldType(Event, "
     }
 
     pending.phase = .delivering;
+    pending.plan = event.plan;
     pending.gesture = .{ .plan = event.plan, .steps_remaining = event.plan.steps };
     transition.model.pending_switch = pending;
     postGesturePhase(transition, pending);
@@ -264,6 +273,28 @@ fn postGesturePhase(transition: *Transition, pending: PendingSwitch) void {
         .direction = gesture.plan.direction,
         .velocity = gesture.plan.velocity,
     } });
+}
+
+/// The display settled outside the Spaces between the swipe's start and its
+/// target. Right swipes move toward later Spaces.
+fn isOffSwitchPath(display: *const DisplayTopology, pending: PendingSwitch) bool {
+    const plan = pending.plan orelse return false;
+    const target_index = spaceIndex(display, pending.request.target.key.id) orelse return false;
+    const actual_index = spaceIndex(display, display.observed_space_id) orelse return false;
+    const start_index = switch (plan.direction) {
+        .right => target_index -| plan.steps,
+        .left => target_index + plan.steps,
+    };
+    const low = @min(start_index, target_index);
+    const high = @max(start_index, target_index);
+    return actual_index < low or actual_index > high;
+}
+
+fn spaceIndex(display: *const DisplayTopology, space_id: NativeSpaceId) ?usize {
+    for (display.spaces[0..display.space_count], 0..) |space, index| {
+        if (space.id == space_id) return index;
+    }
+    return null;
 }
 
 fn recoverUnexpectedLanding(transition: *Transition, pending: PendingSwitch, at_ms: TimestampMs) bool {
@@ -462,6 +493,19 @@ pub fn reduceNativeWindowMoveTracked(
         return;
     }
     transition.addEffect(.{ .move_native_window = pending });
+
+    const at_ms = request.follow_at_ms orelse return;
+    const window = transition.model.window(pending.window_id) orelse return;
+    const display = transition.model.native_topology.findDisplay(target.display_id);
+    reduceFollowFocusObserved(transition, .{
+        .process_id = window.process_id,
+        .window_id = transition.model.windowTabActive(window.window_id),
+        .leader_window_id = window.window_id,
+        .source = .ax,
+        .target = target,
+        .is_target_visible = if (display) |value| value.observed_space_id == target.key.id else false,
+        .at_ms = at_ms,
+    });
 }
 
 pub fn reduceNativeWindowMoveObserved(
@@ -920,6 +964,9 @@ pub fn reduceFollowFocusObserved(
             .target = observation.target,
             .at_ms = observation.at_ms,
         });
+        if (transition.model.pending_switch) |*pending| {
+            if (pending.request.target.key.eql(observation.target.key)) pending.request.follow_window_id = observation.window_id;
+        }
         return;
     };
 
@@ -978,6 +1025,19 @@ pub fn finishSwitch(
                 .space = transition.model.space(pending.request.target.key) orelse pending.request.target,
                 .epoch = pending.epoch,
             } });
+            // macOS focuses whatever app was last active on the Space.
+            if (pending.request.follow_window_id) |window_id| followed: {
+                const leader = transition.model.window(transition.model.windowTabLeader(window_id)) orelse break :followed;
+                if (!leader.space_key.eql(pending.request.target.key)) break :followed;
+                window_reducer.reduceWorkspaceFocusRecorded(transition, .{
+                    .workspace_id = pending.request.target.workspace_id,
+                    .window_id = leader.window_id,
+                });
+                transition.addEffect(.{ .focus_followed_window = .{
+                    .process_id = leader.process_id,
+                    .window_id = transition.model.windowTabActive(leader.window_id),
+                } });
+            }
             if (pending.phase == .waiting_for_idle) {
                 transition.addEffect(.{ .workspace_switch_ready = .{ .target = pending.request.target } });
             }
@@ -1003,7 +1063,8 @@ pub fn startSwitch(
         transition.addEffect(.{ .native_switch_rejected = request.target });
         return;
     };
-    const current_request: SwitchRequest = .{ .target = target };
+    var current_request = request;
+    current_request.target = target;
     if (transition.model.native_topology.findDisplay(target.display_id) == null) {
         transition.addEffect(.{ .native_switch_rejected = target });
         return;

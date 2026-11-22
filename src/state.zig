@@ -1338,6 +1338,83 @@ test "intermediate Space becomes observed while request remains pending" {
     try testing.expect(transition.model.hasScheduledObservation());
 }
 
+test "switch replans at once when the display settles off the swipe path" {
+    const testing = std.testing;
+    var model = initializedModel(testTopology(101, null));
+    model = reduceCopy(model, switchRequest(&model, 1, 2, 100)).model;
+    model = deliverTestSwitch(model, 110);
+    const pending = model.pending_switch.?;
+
+    // Still on the start Space: the Dock may yet act on the swipe.
+    var transition = reduceCopy(model, .{ .native_topology_observed = .{
+        .topology = &testTopology(101, null),
+        .epoch = pending.epoch,
+        .at_ms = 150,
+        .is_animating = false,
+    } });
+    try testing.expectEqual(pending.epoch, transition.model.pending_switch.?.epoch);
+
+    // Past the target: something else moved the display.
+    transition = reduceCopy(model, .{ .native_topology_observed = .{
+        .topology = &testTopology(103, null),
+        .epoch = pending.epoch,
+        .at_ms = 200,
+        .is_animating = false,
+    } });
+    const replanned = transition.model.pending_switch.?;
+    try testing.expect(replanned.epoch != pending.epoch);
+    try testing.expect(replanned.has_retried);
+    try testing.expect(replanned.request.target.key.eql(.{ .id = 102 }));
+}
+
+test "rule placement follows the active app's window and focuses it on landing" {
+    const testing = std.testing;
+    var model = initializedModel(testTopology(101, null));
+    adoptTestWindows(&model, &.{102});
+    // Workspace 2 remembers another window until the followed one lands.
+    _ = reduce(&model, .{ .adopt_window = .{
+        .window_id = 900,
+        .process_id = 1900,
+        .space_key = .{ .id = 102 },
+        .layout = testLayoutInsertion(.bsp),
+    } });
+    _ = reduce(&model, .{ .record_workspace_focus = .{ .workspace_id = 2, .window_id = 900 } });
+    var request = trackNativeWindowMove(&model, 102, 1, 2);
+    request.track_native_window_move.follow_at_ms = 100;
+
+    // A background app's window is placed without moving the display.
+    model.active_process_id = 1;
+    try testing.expect(reduceCopy(model, request).model.pending_switch == null);
+
+    model.active_process_id = 1102;
+    model = reduceCopy(model, request).model;
+    try testing.expectEqual(@as(?WindowId, 102), model.pending_switch.?.request.follow_window_id);
+    model = deliverTestSwitch(model, 110);
+
+    // macOS moved the display past the target; the replan keeps the window.
+    model = reduceCopy(model, .{ .native_topology_observed = .{
+        .topology = &testTopology(103, null),
+        .epoch = model.pending_switch.?.epoch,
+        .at_ms = 200,
+        .is_animating = false,
+    } }).model;
+    try testing.expectEqual(@as(?WindowId, 102), model.pending_switch.?.request.follow_window_id);
+
+    const landed = reduceCopy(model, .{ .native_topology_observed = .{
+        .topology = &testTopology(102, null),
+        .epoch = model.pending_switch.?.epoch,
+        .at_ms = 300,
+        .is_animating = false,
+    } });
+    var focus: ?@FieldType(Effect, "focus_followed_window") = null;
+    for (landed.effects[0..landed.effect_count]) |effect| {
+        if (effect == .focus_followed_window) focus = effect.focus_followed_window;
+    }
+    try testing.expectEqual(@as(i32, 1102), focus.?.process_id);
+    try testing.expectEqual(@as(WindowId, 102), focus.?.window_id);
+    try testing.expectEqual(@as(?WindowId, 102), landed.model.focusedWorkspaceWindow(2));
+}
+
 test "native workspace placement is globally unique across displays" {
     const testing = std.testing;
     const model = initializedModel(testTopology(102, 202));
