@@ -153,6 +153,14 @@ fn axThreadKeepalivePerform(context: ?*anyopaque) callconv(.c) void {
 
 fn axThreadEntry(context: ?*anyopaque) callconv(.c) ?*anyopaque {
     _ = context;
+    osutil.setCurrentThreadName("bobrwm.ax-observer") catch |err| {
+        log.warn("failed to name AX observer thread: {}", .{err});
+    };
+    // Match AppKit's NSEventThread tier so AX window/focus notifications stay
+    // off efficiency cores under load without preempting the main UI thread.
+    osutil.setCurrentThreadQos(.user_initiated) catch |err| {
+        log.warn("failed to set AX observer thread QoS: {}", .{err});
+    };
     const run_loop = c.CFRunLoopGetCurrent();
     g_ax_thread_runloop = run_loop;
 
