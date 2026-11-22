@@ -2943,6 +2943,7 @@ fn startCore(config_path_arg: ?[]const u8) !void {
     g_core_stage = .ax_observer;
 
     // -- Discover existing windows and tile --
+    placeHiddenWindowsByRule();
     captureWorkspaceApplicationInventory();
     // The app frontmost at launch never reports an activation.
     if (frontmostApplicationPid()) |pid| dispatchStateEvent(.{ .app_activated = pid });
@@ -4909,6 +4910,17 @@ fn executeStateEffect(effect: state_mod.Effect) void {
             log.debug("focus followed window wid={d} pid={d}", .{ focus.window_id, focus.process_id });
             focusWindow(focus.process_id, focus.window_id);
         },
+        .place_native_window => |placement| {
+            log.debug("startup rule placement wid={d} space={d} -> workspace={d} space={d}", .{
+                placement.window_id,
+                placement.source.key.id,
+                placement.target.workspace_id,
+                placement.target.key.id,
+            });
+            if (!g_sky.?.moveWindowToNativeSpace(placement.window_id, placement.target.key.id)) {
+                log.warn("startup rule placement failed wid={d}", .{placement.window_id});
+            }
+        },
         .hide_native_spaces => |hidden| {
             if (!g_sky.?.hideNativeSpaces(hidden.slice())) log.warn("hide native Spaces failed count={d}", .{hidden.count});
         },
@@ -5768,6 +5780,32 @@ fn processPendingRoleWindows() void {
 
 fn processDeferredWindowCandidates() void {
     for (g_state.deferred_window_candidates.items()) |candidate| window_readiness.request(candidate.process_id, candidate.window_id, .deferred);
+}
+
+/// Report windows on hidden Spaces whose app rule names another workspace.
+/// AX cannot reach them until their Space is shown, so they are not adopted
+/// at startup; left alone, showing their Space reveals them where the rule
+/// says they do not belong, and adoption then moves them away.
+fn placeHiddenWindowsByRule() void {
+    if (!g_config.hasAppWorkspaceRules()) return;
+
+    var candidates: [256]shim.bw_window_info = undefined;
+    const discovery = enumerateWindows(&candidates, false);
+    if (discovery.truncated) log.debug("startup rule placement truncated limit={d}", .{candidates.len});
+
+    var topology = g_sky.?.nativeSpaceTopology() orelse return;
+    defer topology.deinit();
+
+    for (candidates[0..discovery.count]) |candidate| {
+        const space_id = nativeSpaceIdForWindowInTopology(&topology, candidate.wid) orelse continue;
+        const source = g_state.space(.{ .id = space_id }) orelse continue;
+        const target = configuredWorkspace(candidate.pid, source.display_id) orelse continue;
+        dispatchStateEvent(.{ .rule_placement_observed = .{
+            .window_id = candidate.wid,
+            .source = source,
+            .target = target,
+        } });
+    }
 }
 
 /// Capture one trustworthy app-to-workspace association per process before

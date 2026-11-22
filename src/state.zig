@@ -56,6 +56,7 @@ pub const WorkspaceTransitionSettlement = model_mod.WorkspaceTransitionSettlemen
 pub const PendingNativeWindowMove = model_mod.PendingNativeWindowMove;
 pub const PendingNativeWorkspaceMove = model_mod.PendingNativeWorkspaceMove;
 pub const SpaceMoveStep = model_mod.SpaceMoveStep;
+pub const WindowPlacement = model_mod.WindowPlacement;
 pub const SpaceOperand = model_mod.SpaceOperand;
 pub const DisplayChoice = model_mod.DisplayChoice;
 pub const DisplayOrder = model_mod.DisplayOrder;
@@ -191,6 +192,7 @@ pub fn reduce(model: *Model, event: Event) Transition {
         .complete_workspace_transition => |completion| workspace_reducer.reduceWorkspaceTransitionCompletion(&transition, completion),
         .workspace_transition_timer_fired => |timer| workspace_reducer.reduceWorkspaceTransitionTimer(&transition, timer),
         .track_native_window_move => |request| workspace_reducer.reduceNativeWindowMoveTracked(&transition, request),
+        .rule_placement_observed => |placement| workspace_reducer.reduceRulePlacementObserved(&transition, placement),
         .cancel_native_window_move => |window_id| {
             _ = transition.model.pending_native_window_moves.remove(window_id);
         },
@@ -1365,6 +1367,33 @@ test "switch replans at once when the display settles off the swipe path" {
     try testing.expect(replanned.epoch != pending.epoch);
     try testing.expect(replanned.has_retried);
     try testing.expect(replanned.request.target.key.eql(.{ .id = 102 }));
+}
+
+test "startup places an unmanaged hidden window on its rule's Space" {
+    var model = initializedModel(testTopology(101, null));
+    const placement: WindowPlacement = .{
+        .window_id = 900,
+        .source = model.space(.{ .id = 102 }).?,
+        .target = model.space(.{ .id = 103 }).?,
+    };
+    var copy = model;
+    try expectEffectTags(reduce(&copy, .{ .rule_placement_observed = placement }), &.{.place_native_window});
+
+    // The user can see it: adoption places it and follows.
+    var visible = placement;
+    visible.source = model.space(.{ .id = 101 }).?;
+    copy = model;
+    try expectEffectTags(reduce(&copy, .{ .rule_placement_observed = visible }), &.{});
+
+    var in_place = placement;
+    in_place.target = placement.source;
+    copy = model;
+    try expectEffectTags(reduce(&copy, .{ .rule_placement_observed = in_place }), &.{});
+
+    adoptTestWindows(&model, &.{102});
+    var managed = placement;
+    managed.window_id = 102;
+    try expectEffectTags(reduce(&model, .{ .rule_placement_observed = managed }), &.{});
 }
 
 test "rule placement follows the active app's window and focuses it on landing" {
