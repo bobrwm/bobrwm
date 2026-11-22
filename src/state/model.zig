@@ -113,6 +113,7 @@ pub const FollowFocusObservation = struct {
     target: SpaceRef,
     is_target_visible: bool,
     at_ms: TimestampMs,
+    space_id: ?NativeSpaceId = null,
 };
 
 pub const WindowFocusObservation = struct {
@@ -392,10 +393,38 @@ pub const NativeWindowMoveRequest = struct {
     follow_at_ms: ?TimestampMs = null,
 };
 
-/// An unmanaged window on a hidden Space, and the Space its app rule names.
-pub const WindowPlacement = struct {
+pub const WindowPlacementReason = enum {
+    /// Windows out of sight cannot be managed until their Space is shown,
+    /// but can already be put on their app rule's Space.
+    startup,
+    settled,
+    topology_changed,
+    /// macOS piled the windows of a display that came or went onto other
+    /// Spaces; they go back.
+    display_changed,
+};
+
+pub const WindowPlacementObservation = struct {
     window_id: WindowId,
-    source: SpaceRef,
+    space_id: ?NativeSpaceId,
+    rule_workspace_id: ?WorkspaceId = null,
+    is_on_screen: bool = false,
+    reason: WindowPlacementReason,
+};
+
+/// The reducer decides which workspace takes the window.
+pub const NewWindowAdoption = struct {
+    window_id: WindowId,
+    process_id: i32,
+    frame: window_mod.Window.Frame,
+    mode: window_mod.WindowMode,
+    native_space: SpaceRef,
+    rule_workspace_id: ?WorkspaceId,
+    at_ms: TimestampMs,
+};
+
+pub const NativeWindowPlacement = struct {
+    window_id: WindowId,
     target: SpaceRef,
 };
 
@@ -453,7 +482,6 @@ pub const CenterWindowEffect = struct {
 pub const WindowMoveRequest = struct {
     window_id: WindowId,
     target: SpaceRef,
-    layout: ?LayoutInsertion = null,
     should_move_native: bool,
     should_follow_focus: bool = false,
 };
@@ -751,6 +779,21 @@ pub const CleanupRequest = struct {
     process_ids: [max_cleanup_processes]i32 = @splat(0),
     process_count: u8 = 0,
     should_clean_offscreen: bool = false,
+    /// Filled when the request flushes.
+    offscreen_process_ids: [max_cleanup_processes]i32 = @splat(0),
+    offscreen_process_count: u8 = 0,
+};
+
+pub const max_offscreen_cleanup_windows = 32;
+
+pub const OffscreenCleanup = struct {
+    process_id: i32,
+    window_ids: [max_offscreen_cleanup_windows]WindowId = undefined,
+    window_count: u8 = 0,
+
+    pub fn windowIds(self: *const OffscreenCleanup) []const WindowId {
+        return self.window_ids[0..self.window_count];
+    }
 };
 
 pub const LayoutSpaceFrame = struct {
@@ -800,6 +843,33 @@ pub const LayoutInsertion = struct {
     options: tiling_mod.InsertOptions,
 };
 
+/// Where a display's layouts are rooted: its visible frame inset by the
+/// outer gaps, and the gap between tiles.
+pub const DisplayLayout = struct {
+    display_id: DisplayId,
+    content_frame: window_mod.Window.Frame,
+    inner_gap: f64,
+};
+
+pub const DisplayLayouts = struct {
+    displays: [workspace_mod.max_displays]DisplayLayout = undefined,
+    display_count: u8 = 0,
+
+    pub fn add(self: *DisplayLayouts, display: DisplayLayout) bool {
+        if (self.display_count == self.displays.len) return false;
+        self.displays[self.display_count] = display;
+        self.display_count += 1;
+        return true;
+    }
+
+    pub fn find(self: *const DisplayLayouts, display_id: DisplayId) ?DisplayLayout {
+        for (self.displays[0..self.display_count]) |display| {
+            if (display.display_id == display_id) return display;
+        }
+        return null;
+    }
+};
+
 pub const WindowAdoption = struct {
     window_id: WindowId,
     process_id: i32,
@@ -808,7 +878,6 @@ pub const WindowAdoption = struct {
     is_fullscreen: bool = false,
     mode: window_mod.WindowMode = .tiled,
     float_frame: ?window_mod.Window.Frame = null,
-    layout: ?LayoutInsertion = null,
     tab_group: ?*const WindowTabGroupObservation = null,
 
     pub fn managedWindow(self: WindowAdoption) ManagedWindow {
@@ -826,18 +895,15 @@ pub const WindowAdoption = struct {
 
 pub const WindowUpdate = struct {
     window: window_mod.Window,
-    layout: ?LayoutInsertion = null,
 };
 
 pub const WindowSpaceAssignment = struct {
     window_id: WindowId,
     space_key: SpaceKey,
-    layout: ?LayoutInsertion = null,
 };
 
 pub const WindowTabDetachment = struct {
     window_id: WindowId,
-    layout: ?LayoutInsertion = null,
 };
 
 pub const MenuTracking = struct {
@@ -870,6 +936,10 @@ pub const Model = struct {
     display_resettle_cause: DisplayReconcileCause = .display_change,
     bsp_split_mode: tiling_mod.SplitMode = .auto,
     bsp_insert_point: tiling_mod.InsertionPointPolicy = .focused,
+    layout_kind: tiling_mod.LayoutKind = .bsp,
+    layout_insert_child: tiling_mod.InsertChild = .second,
+    layout_split_ratio: f64 = 0.5,
+    display_layouts: DisplayLayouts = .{},
     pointer_drag: PointerDragState = .{},
     drag_preview: DragPreviewState = .{},
     menu_tracking: ?MenuTracking = null,
@@ -1014,6 +1084,20 @@ pub const Model = struct {
     }
 
     /// Snapshot the reducer-owned group containing a managed window.
+    /// Being off screen means gone only for a window with a layout slot on a
+    /// Space the latest settled topology shows: apps list only windows on
+    /// shown Spaces, background tabs are off screen by design, and a window
+    /// in flight is off screen on its way.
+    pub fn isOffscreenCleanupCandidate(self: *const Model, window_id: WindowId) bool {
+        const candidate = self.window(window_id) orelse return false;
+        if (candidate.tab_leader_window_id != candidate.window_id) return false;
+        if (self.windowTabGroup(window_id) != null) return false;
+        if (!self.native_topology.isSpaceShown(candidate.space_key.id)) return false;
+        if (self.observation_timer != null) return false;
+        if (self.pending_switch != null or self.pending_native_workspace_move != null) return false;
+        return self.pendingNativeWindowMove(window_id) == null;
+    }
+
     pub fn windowTabGroup(self: *const Model, window_id: WindowId) ?WindowTabGroupSnapshot {
         const managed_window = self.window(window_id) orelse return null;
         var snapshot: WindowTabGroupSnapshot = .{
@@ -1055,6 +1139,33 @@ pub const Model = struct {
     }
 
     /// Returns the most recently focused layout owner for a logical workspace.
+    pub fn layoutInsertion(self: *const Model, space_key: SpaceKey, window_id: WindowId) ?LayoutInsertion {
+        const target = self.space(space_key) orelse return null;
+        const anchor_window_id: ?WindowId = switch (self.bsp_insert_point) {
+            .focused => blk: {
+                const focused = self.focusedWorkspaceWindow(target.workspace_id) orelse break :blk null;
+                break :blk if (focused == window_id) null else focused;
+            },
+            .first => self.layout.firstWid(space_key),
+            .last => self.layout.lastWid(space_key),
+            .min_depth => null,
+        };
+        // A detached display has no root frame, and tiling ignores the gap
+        // without one.
+        const display = self.display_layouts.find(target.display_id);
+        return .{
+            .kind = self.layout_kind,
+            .options = .{
+                .split_mode = self.bsp_split_mode,
+                .child = self.layout_insert_child,
+                .anchor_wid = anchor_window_id,
+                .root_frame = if (display) |value| value.content_frame else null,
+                .inner_gap = if (display) |value| value.inner_gap else 0,
+                .split_ratio = self.layout_split_ratio,
+            },
+        };
+    }
+
     pub fn focusedWorkspaceWindow(self: *const Model, workspace_id: WorkspaceId) ?WindowId {
         if (workspace_id == 0 or workspace_id > self.workspace_focus.len) return null;
         return self.workspace_focus[workspace_id - 1].focused_window_id;
@@ -1220,7 +1331,9 @@ pub const Event = union(enum) {
         at_ms: TimestampMs,
     },
     track_native_window_move: NativeWindowMoveRequest,
-    rule_placement_observed: WindowPlacement,
+    window_placement_observed: WindowPlacementObservation,
+    adopt_new_window: NewWindowAdoption,
+    window_offscreen_observed: WindowId,
     cancel_native_window_move: WindowId,
     native_window_move_observed: struct {
         window_id: WindowId,
@@ -1231,7 +1344,6 @@ pub const Event = union(enum) {
         window_id: WindowId,
         epoch: Epoch,
         succeeded: bool,
-        layout: ?LayoutInsertion = null,
     },
     /// Moves the focused display's workspace; rejected while another
     /// workspace operation is in flight.
@@ -1300,7 +1412,11 @@ pub const Event = union(enum) {
     configure_layout_interaction: struct {
         split_mode: tiling_mod.SplitMode,
         insert_point: tiling_mod.InsertionPointPolicy,
+        kind: tiling_mod.LayoutKind,
+        insert_child: tiling_mod.InsertChild,
+        split_ratio: f64,
     },
+    observe_display_layouts: *const DisplayLayouts,
     toggle_split_mode,
     set_insert_point: tiling_mod.InsertionPointPolicy,
     focus_direction: struct {
@@ -1314,7 +1430,6 @@ pub const Event = union(enum) {
     set_window_mode: struct {
         window_id: WindowId,
         mode: window_mod.WindowMode,
-        layout: ?LayoutInsertion = null,
     },
     toggle_window_fullscreen: struct {
         window_id: WindowId,
@@ -1387,7 +1502,6 @@ pub const WindowCatalogRejectionReason = enum {
     window_exists,
     window_missing,
     space_missing,
-    layout_missing,
 };
 
 pub const Effect = union(enum) {
@@ -1447,9 +1561,10 @@ pub const Effect = union(enum) {
     move_native_workspace_spaces: PendingNativeWorkspaceMove,
     native_workspace_move_completed: PendingNativeWorkspaceMove,
     hide_native_spaces: HiddenSpaces,
-    /// Untracked: the window is not managed, and adoption finds it wherever
-    /// it ends up.
-    place_native_window: WindowPlacement,
+    /// Untracked: no workspace owns the window's Space, so a failed move
+    /// has nothing to roll back to. Adoption finds the window wherever it
+    /// ends up.
+    place_native_window: NativeWindowPlacement,
     focus_followed_window: struct {
         process_id: i32,
         window_id: WindowId,
@@ -1516,7 +1631,7 @@ pub const Effect = union(enum) {
     cancel_mouse_focus,
     retile_requested: RetileRequest,
     cleanup_requested: CleanupRequest,
-    clean_offscreen_windows: i32,
+    clean_offscreen_windows: OffscreenCleanup,
     cleanup_request_overflow: i32,
     geometry: geometry_mod.Effect,
     layout: tiling_mod.Effect,

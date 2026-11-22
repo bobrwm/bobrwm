@@ -61,14 +61,10 @@ pub fn reduceWindowAdopted(transition: *Transition, adoption: WindowAdoption) vo
         }
     }
 
-    if (adoption.layout) |layout| {
-        if (window.mode != .tiled) {
-            transition.addEffect(.{ .window_catalog_rejected = .{
-                .window_id = window.window_id,
-                .reason = .invalid_window,
-            } });
-            return;
-        }
+    // A window joining a tab group takes no slot of its own: its leader
+    // already holds one.
+    if (window.mode == .tiled and adoption.tab_group == null) {
+        const layout = transition.model.layoutInsertion(window.space_key, window.window_id).?;
         if (!layout_reducer.applyEvent(transition, .{ .insert = .{
             .space_key = window.space_key,
             .kind = layout.kind,
@@ -120,13 +116,7 @@ pub fn reduceWindowUpdated(transition: *Transition, update: WindowUpdate) void {
     const is_layout_owner = previous.tab_leader_window_id == previous.window_id;
     if (is_layout_owner and previous.mode != window.mode) {
         if (window.mode == .tiled) {
-            const layout = update.layout orelse {
-                transition.addEffect(.{ .window_catalog_rejected = .{
-                    .window_id = window.wid,
-                    .reason = .layout_missing,
-                } });
-                return;
-            };
+            const layout = transition.model.layoutInsertion(previous.space_key, window.wid).?;
             if (!layout_reducer.applyEvent(transition, .{ .insert = .{
                 .space_key = previous.space_key,
                 .kind = layout.kind,
@@ -204,13 +194,7 @@ pub fn reduceWindowSpaceAssigned(
     if (leader.space_key.eql(assignment.space_key)) return;
 
     if (transition.model.layout.contains(leader.space_key, leader.window_id)) {
-        const layout = assignment.layout orelse {
-            transition.addEffect(.{ .window_catalog_rejected = .{
-                .window_id = assignment.window_id,
-                .reason = .layout_missing,
-            } });
-            return;
-        };
+        const layout = transition.model.layoutInsertion(assignment.space_key, leader.window_id).?;
         if (!layout_reducer.applyEvent(transition, .{ .move_window = .{
             .source_key = leader.space_key,
             .target_key = assignment.space_key,
@@ -257,13 +241,7 @@ pub fn reduceWindowTabDetached(transition: *Transition, detachment: WindowTabDet
     if (window.mode == .tiled and
         transition.model.layout.contains(window.space_key, group.leader_window_id))
     {
-        const layout = detachment.layout orelse {
-            transition.addEffect(.{ .window_catalog_rejected = .{
-                .window_id = detachment.window_id,
-                .reason = .layout_missing,
-            } });
-            return;
-        };
+        const layout = transition.model.layoutInsertion(window.space_key, detachment.window_id).?;
 
         const original_layout = transition.model.layout;
         const is_leader = group.leader_window_id == detachment.window_id;
