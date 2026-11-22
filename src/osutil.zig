@@ -254,6 +254,35 @@ comptime {
 
 extern "c" fn proc_pidinfo(pid: c_int, flavor: c_int, arg: u64, buffer: ?*anyopaque, buffer_size: c_int) c_int;
 
+// Thread identity and macOS QoS
+
+/// macOS `qos_class_t` values from `<sys/qos.h>`.
+pub const ThreadQos = enum(c_uint) {
+    user_interactive = 0x21,
+    user_initiated = 0x19,
+    default = 0x15,
+    utility = 0x11,
+    background = 0x09,
+};
+
+extern "c" fn pthread_setname_np(name: [*:0]const u8) c_int;
+extern "c" fn pthread_set_qos_class_self_np(qos_class: ThreadQos, relative_priority: c_int) c_int;
+
+/// Name the calling thread for profilers, crash logs, and `sample`.
+pub fn setCurrentThreadName(name: [*:0]const u8) error{SetThreadNameFailed}!void {
+    if (pthread_setname_np(name) != 0) return error.SetThreadNameFailed;
+}
+
+/// Set the macOS QoS class of the calling thread. Must only be called on
+/// self-managed threads, never inside GCD worker callbacks.
+pub fn setCurrentThreadQos(class: ThreadQos) error{ ThreadIncompatible, Unexpected }!void {
+    return switch (std.posix.errno(pthread_set_qos_class_self_np(class, 0))) {
+        .SUCCESS => {},
+        .PERM => error.ThreadIncompatible,
+        else => error.Unexpected,
+    };
+}
+
 // App metadata
 
 /// Look up the bundle identifier for a PID via NSRunningApplication.
@@ -396,4 +425,40 @@ test "a zombie process has no start time" {
         if (attempts == 200) return error.TestUnexpectedResult;
         _ = libc.usleep(5 * std.time.us_per_ms);
     }
+}
+
+test "current thread name and QoS class apply to a spawned thread" {
+    const pthread = struct {
+        extern "c" fn pthread_self() ?*anyopaque;
+        extern "c" fn pthread_getname_np(thread: ?*anyopaque, buf: [*]u8, len: usize) c_int;
+        extern "c" fn pthread_get_qos_class_np(thread: ?*anyopaque, qos: *ThreadQos, rel: *c_int) c_int;
+    };
+    const Result = struct {
+        name_len: usize = 0,
+        name: [64]u8 = @splat(0),
+        qos: ThreadQos = .default,
+        ok: bool = false,
+    };
+    const Worker = struct {
+        fn run(result: *Result) void {
+            setCurrentThreadName("bobrwm.test") catch return;
+            setCurrentThreadQos(.user_initiated) catch return;
+            const self = pthread.pthread_self();
+            if (pthread.pthread_getname_np(self, &result.name, result.name.len) == 0) {
+                result.name_len = std.mem.sliceTo(&result.name, 0).len;
+            }
+            var rel: c_int = 0;
+            if (pthread.pthread_get_qos_class_np(self, &result.qos, &rel) == 0) {
+                result.ok = true;
+            }
+        }
+    };
+
+    var result: Result = .{};
+    const thread = try std.Thread.spawn(.{}, Worker.run, .{&result});
+    thread.join();
+
+    try std.testing.expect(result.ok);
+    try std.testing.expectEqualStrings("bobrwm.test", result.name[0..result.name_len]);
+    try std.testing.expectEqual(ThreadQos.user_initiated, result.qos);
 }

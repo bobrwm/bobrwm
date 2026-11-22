@@ -159,6 +159,11 @@ fn observe() ?Observation {
 }
 
 fn checkLoop() void {
+    // Keep default QoS: downgrading to .utility lets XNU timer-coalesce the
+    // 250ms sleep and report main-thread stalls late.
+    osutil.setCurrentThreadName("bobrwm.watchdog") catch |err| {
+        log.warn("failed to name watchdog thread: {}", .{err});
+    };
     while (!g_stop_requested.load(.seq_cst)) {
         sleepNs(check_interval_ns);
         const observation = observe() orelse continue;
