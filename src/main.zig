@@ -6898,7 +6898,8 @@ fn applyWindowFrame(
 ) bool {
     const physical = physicalFrame(wid, current);
     const tolerance = window_mod.Window.Frame.tolerance;
-    if (!two_pass and physical.sizeApproxEqual(target, tolerance)) {
+    const is_size_unknown = if (g_state.geometry.get(wid)) |entry| entry.is_size_unknown else false;
+    if (!two_pass and !is_size_unknown and physical.sizeApproxEqual(target, tolerance)) {
         return setWindowPositionTracked(pid, wid, target, source);
     }
     // Already at the target origin, so the layout frame fits where the
@@ -6906,7 +6907,7 @@ fn applyWindowFrame(
     // round trip into the app and, in Chromium apps, a full relayout (~4ms).
     const kind: ax_writer.Write = if (two_pass)
         .{ .position = true, .size = true, .guarded = true, .repeat = true }
-    else if (@abs(physical.x - target.x) <= tolerance and @abs(physical.y - target.y) <= tolerance)
+    else if (!is_size_unknown and @abs(physical.x - target.x) <= tolerance and @abs(physical.y - target.y) <= tolerance)
         .size_only
     else
         .frame;

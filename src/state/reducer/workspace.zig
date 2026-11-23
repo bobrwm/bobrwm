@@ -901,6 +901,14 @@ fn nativeWorkspaceMoveLanded(pending: PendingNativeWorkspaceMove, topology: *con
 fn finishNativeWorkspaceMove(transition: *Transition, pending: PendingNativeWorkspaceMove, at_ms: TimestampMs) void {
     transition.model.pending_native_workspace_move = null;
     syncNativeWorkspaceTopology(transition);
+
+    // These Spaces changed display, even if only to step away and back, and
+    // macOS fits their windows to each display they pass through.
+    for (transition.model.windows.items()) |window| {
+        const is_moved = window.space_key.eql(pending.source.key) or window.space_key.eql(pending.target.key) or
+            (pending.backfill != null and window.space_key.eql(pending.backfill.?.key));
+        if (is_moved) transition.model.geometry.markSizeUnknown(window.window_id);
+    }
     transition.model.workspace_topology.focused_display_id = pending.target.display_id;
     completeWorkspaceTransition(transition.model, pending.epoch, .native_space_changed, at_ms);
     transition.addEffect(.{ .native_workspace_move_completed = pending });

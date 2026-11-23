@@ -1968,6 +1968,10 @@ test "workspace move lands when the target display shows the moved Space" {
     try testing.expect(model.window(101).?.space_key.eql(.{ .id = 101 }));
     try testing.expect(model.window(201).?.space_key.eql(.{ .id = 201 }));
     try testing.expect(model.layout.contains(.{ .id = 101 }, 101));
+    // Both crossed displays; Space 102 stayed put.
+    try testing.expect(model.geometry.get(101).?.is_size_unknown);
+    try testing.expect(model.geometry.get(201).?.is_size_unknown);
+    try testing.expect(!model.geometry.get(102).?.is_size_unknown);
     try testing.expectEqual(@as(?WindowId, 101), model.focusedWorkspaceWindow(1));
     try testing.expectEqual(@as(?WindowId, 201), model.focusedWorkspaceWindow(4));
 }
