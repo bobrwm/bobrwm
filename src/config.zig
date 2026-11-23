@@ -272,9 +272,8 @@ pub const Action = enum(u8) {
     /// beside the one that moved. Neither display animates.
     ///
     /// A display always shows a workspace. When you move the only one it
-    /// has, it takes over the highest-numbered empty workspace instead; with
-    /// no empty workspace anywhere, it takes the workspace the other display
-    /// was showing, so the two displays trade.
+    /// has, it takes the workspace the other display was showing, so the two
+    /// displays trade.
     move_workspace_to_display = 29,
     /// Switch to the previous workspace. At the first workspace, the key
     /// passes through so native Spaces can handle it.

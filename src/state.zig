@@ -1988,37 +1988,9 @@ test "workspace move waits through intermediate topologies" {
     try testing.expectEqual(@as(?WorkspaceId, 1), model.activeWorkspace(1));
 }
 
-test "only workspace backfills its display with an empty workspace's Space" {
+test "only workspace trades displays, even when a workspace is empty" {
     const testing = std.testing;
     var model = initializedModel(testDisplays(&.{ &.{101}, &.{ 201, 202 } }));
-    adoptTestWindows(&model, &.{ 101, 201 });
-
-    _ = reduce(&model, workspaceMoveRequest(&model, .{ .slot = 1 }, 100));
-    const pending = model.pending_native_workspace_move.?;
-    try testing.expect(pending.backfill.?.key.eql(.{ .id = 202 }));
-    try expectSteps(pending, &.{
-        .{ .move_after = .{ .space = .{ .space = 202 }, .anchor = .{ .space = 101 } } },
-        .{ .move_before = .{ .space = .{ .space = 101 }, .anchor = .{ .space = 201 } } },
-        .{ .move_to_end = .{ .space = .{ .space = 201 }, .display_id = 1 } },
-        .{ .move_after = .{ .space = .{ .space = 201 }, .anchor = .{ .space = 101 } } },
-    });
-
-    startTestWorkspaceMove(&model, 105);
-    const landed = observedTopology(&.{
-        &.{.{ 202, 3 }},
-        &.{ .{ 101, 1 }, .{ 201, 2 } },
-    });
-    const transition = observeTestWorkspaceMove(&model, &landed, 110);
-    try expectEffectTags(transition, &.{ .native_workspace_move_completed, .hide_native_spaces });
-    try testing.expectEqualSlices(NativeSpaceId, &.{201}, transition.effects[1].hide_native_spaces.slice());
-    try testing.expectEqual(@as(?WorkspaceId, 3), model.activeWorkspace(1));
-    try testing.expectEqual(@as(?WorkspaceId, 1), model.activeWorkspace(2));
-    try testing.expectEqual(@as(DisplayId, 1), model.space(.{ .id = 202 }).?.display_id);
-}
-
-test "only workspace trades displays when no workspace is empty" {
-    const testing = std.testing;
-    var model = initializedModel(testDisplays(&.{ &.{101}, &.{201} }));
     adoptTestWindows(&model, &.{ 101, 201 });
 
     _ = reduce(&model, workspaceMoveRequest(&model, .{ .slot = 1 }, 100));
@@ -2033,7 +2005,7 @@ test "only workspace trades displays when no workspace is empty" {
     });
 
     startTestWorkspaceMove(&model, 105);
-    const landed = observedTopology(&.{ &.{.{ 201, 2 }}, &.{.{ 101, 1 }} });
+    const landed = observedTopology(&.{ &.{.{ 201, 2 }}, &.{ .{ 101, 1 }, .{ 202, 3 } } });
     try expectEffectTags(observeTestWorkspaceMove(&model, &landed, 110), &.{.native_workspace_move_completed});
     try testing.expectEqual(@as(?WorkspaceId, 2), model.activeWorkspace(1));
     try testing.expectEqual(@as(?WorkspaceId, 1), model.activeWorkspace(2));
