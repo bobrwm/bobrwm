@@ -811,18 +811,10 @@ fn planNativeWorkspaceMove(
         return pending;
     }
 
-    // W is the source display's only workspace, so the source needs a Space
-    // to fall back to. An empty workspace's Space joins it, just after W.
-    if (emptyHiddenWorkspace(model)) |donor| {
-        pending.backfill = donor;
-        pending.addStep(.{ .move_after = .{ .space = .{ .space = donor.key.id }, .anchor = moving } });
-        addHandoverSteps(&pending, moving, displaced);
-        return pending;
-    }
-
-    // Operator decision: with no empty workspace, the two displays trade. A
-    // temporary Space holds the source display while X crosses over, then
-    // steps away so the source falls back to X.
+    // W is the source display's only workspace, so the displays trade: the
+    // same result every time, whichever workspaces are empty. A temporary
+    // Space holds the source display while X crosses over, then steps away
+    // so the source falls back to X.
     pending.backfill = target;
     pending.addStep(.{ .create_temporary = source.display_id });
     pending.addStep(.{ .move_before = .{ .space = moving, .anchor = displaced } });
@@ -839,28 +831,6 @@ fn addHandoverSteps(pending: *PendingNativeWorkspaceMove, moving: SpaceOperand, 
     pending.addStep(.{ .move_before = .{ .space = moving, .anchor = displaced } });
     pending.addStep(.{ .move_to_end = .{ .space = displaced, .display_id = pending.source.display_id } });
     pending.addStep(.{ .move_after = .{ .space = displaced, .anchor = moving } });
-}
-
-/// The highest-numbered hidden workspace without managed windows; giving it
-/// away cannot strand anything the user arranged.
-fn emptyHiddenWorkspace(model: *const Model) ?SpaceRef {
-    var best: ?SpaceRef = null;
-    for (model.spaces.spaces[0..model.spaces.space_count]) |space| {
-        if (model.activeWorkspace(space.display_id) == space.workspace_id) continue;
-        if (spaceHasWindows(model, space.key)) continue;
-        if (best) |current| {
-            if (current.workspace_id > space.workspace_id) continue;
-        }
-        best = space;
-    }
-    return best;
-}
-
-fn spaceHasWindows(model: *const Model, key: SpaceKey) bool {
-    for (model.windows.items()) |window| {
-        if (window.space_key.eql(key)) return true;
-    }
-    return false;
 }
 
 pub fn reduceNativeWorkspaceMoveStarted(
