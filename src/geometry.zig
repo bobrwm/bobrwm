@@ -78,6 +78,9 @@ pub const Entry = struct {
     /// sample is the user's placement, which the drop already reconciles, so
     /// it must not be mistaken for the app resizing its own window.
     user_driven: bool = false,
+    /// macOS may have resized the window while it could not be sampled, so
+    /// `observed` cannot be trusted to skip a size write.
+    is_size_unknown: bool = false,
 };
 
 pub const ObservationOwner = enum {
@@ -357,6 +360,14 @@ pub fn seedObserved(self: *Self, wid: WindowId, observed: Frame) !void {
     std.debug.assert(wid > 0);
     const entry = try self.getOrPut(wid);
     entry.observed = observed;
+    entry.is_size_unknown = false;
+}
+
+/// The window's Space moved to a display of another shape, which macOS may
+/// have resized it to fit.
+pub fn markSizeUnknown(self: *Self, wid: WindowId) void {
+    const entry = self.getPtr(wid) orelse return;
+    entry.is_size_unknown = true;
 }
 
 /// Classify a WindowServer observation. Only the exact window identified as
@@ -374,6 +385,7 @@ pub fn observe(
 
     const entry = try self.getOrPut(wid);
     entry.observed = observed;
+    entry.is_size_unknown = false;
     entry.resample_at_ns = std.math.add(i128, now_ns, default_resample_delay_ns) catch
         std.math.maxInt(i128);
 
@@ -409,6 +421,7 @@ pub fn observe(
 pub fn settle(self: *Self, wid: WindowId, observed: Frame, now_ns: i128) SettlementOwner {
     const entry = self.getPtr(wid) orelse return .external;
     entry.observed = observed;
+    entry.is_size_unknown = false;
     entry.resample_at_ns = null;
 
     if (entry.intent) |intent| {
@@ -560,6 +573,17 @@ const testing = std.testing;
 
 const tiled: Frame = .{ .x = 4, .y = 37, .width = 750, .height = 941 };
 const fullscreen: Frame = .{ .x = 4, .y = 37, .width = 1504, .height = 941 };
+
+test "unknown size lasts until WindowServer is sampled again" {
+    var coordinator = Self.init();
+
+    try coordinator.seedObserved(10, tiled);
+    coordinator.markSizeUnknown(10);
+    try testing.expect(coordinator.get(10).?.is_size_unknown);
+
+    _ = try coordinator.observe(10, fullscreen, 1_000, null);
+    try testing.expect(!coordinator.get(10).?.is_size_unknown);
+}
 
 test "stale observation inside settlement interval remains manager owned" {
     var coordinator = Self.initWithSettleInterval(100);
