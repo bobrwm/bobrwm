@@ -234,6 +234,11 @@ fn classify(win: c.AXUIElementRef) Answer {
     // heuristic below, but tiling them resizes the parent app while the user
     // is choosing a file.
     if (ax.isAttributeTrue(win, strings.modal_attr)) return .reject;
+    // A minimized window is still listed in AXWindows and still exists in
+    // WindowServer, so neither the on-screen gate nor cleanup would drop it
+    // if its miniaturize notification was missed or raced a rediscovery.
+    // Deminiaturizing rediscovers it.
+    if (ax.isAttributeTrue(win, strings.minimized_attr)) return .reject;
 
     const role: c.CFStringRef = @ptrCast(ax.copyAttribute(win, strings.role_attr) orelse return .pending);
     defer c.CFRelease(@ptrCast(role));

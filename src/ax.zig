@@ -36,6 +36,7 @@ pub const AxStrings = struct {
     tabs_attr: c.CFStringRef,
     tab_group_role: c.CFStringRef,
     system_dialog_subrole: c.CFStringRef,
+    minimized_attr: c.CFStringRef,
 };
 
 var g_strings: ?AxStrings = null;
@@ -78,6 +79,7 @@ pub fn strings() ?*const AxStrings {
         "AXTabs",
         "AXTabGroup",
         "AXSystemDialog",
+        "AXMinimized",
     };
     var refs: [names.len]c.CFStringRef = undefined;
 
@@ -117,6 +119,7 @@ pub fn strings() ?*const AxStrings {
         .tabs_attr = refs[22],
         .tab_group_role = refs[23],
         .system_dialog_subrole = refs[24],
+        .minimized_attr = refs[25],
     };
     return &g_strings.?;
 }
