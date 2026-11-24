@@ -595,6 +595,7 @@ pub const Validation = struct {
         invalid_workspace_name,
         invalid_bsp_split_ratio,
         invalid_dim_level,
+        invalid_animation_bezier,
         unknown_key_name,
         invalid_keybind_workspace,
         invalid_keybind_display,
@@ -611,6 +612,7 @@ pub const Validation = struct {
                 .invalid_workspace_name => error.InvalidWorkspaceName,
                 .invalid_bsp_split_ratio => error.InvalidBspSplitRatio,
                 .invalid_dim_level => error.InvalidDimLevel,
+                .invalid_animation_bezier => error.InvalidAnimationBezier,
                 .unknown_key_name => error.UnknownKeyName,
                 .invalid_keybind_workspace => error.InvalidKeybindWorkspace,
                 .invalid_keybind_display => error.InvalidKeybindDisplay,
@@ -677,6 +679,9 @@ pub const Validation = struct {
             config.dimmed_inactive.level < 0 or config.dimmed_inactive.level > 1)
         {
             if (!sink.emit(.{ .kind = .invalid_dim_level })) return;
+        }
+        if (!config.animation.bezier.isValid()) {
+            if (!sink.emit(.{ .kind = .invalid_animation_bezier })) return;
         }
 
         if (!visitKeybindDiagnostics(config.keybinds, workspace_count, sink)) return;
@@ -766,6 +771,15 @@ pub const Validation = struct {
             .invalid_workspace_name => try writer.writeAll("workspace names must be valid UTF-8 and contain no NUL bytes"),
             .invalid_bsp_split_ratio => try writer.print("expected a finite value from 0.1 through 0.9, found {d}", .{config.bsp_split_ratio}),
             .invalid_dim_level => try writer.print("expected a finite value from 0 through 1, found {d}", .{config.dimmed_inactive.level}),
+            .invalid_animation_bezier => try writer.print(
+                "expected finite bezier control points with x1 and x2 from 0 through 1, found ({d}, {d}, {d}, {d})",
+                .{
+                    config.animation.bezier.x1,
+                    config.animation.bezier.y1,
+                    config.animation.bezier.x2,
+                    config.animation.bezier.y2,
+                },
+            ),
             .unknown_key_name => try writer.print("unknown key name \"{s}\"; expected a letter, digit, or named navigation key", .{
                 config.keybinds[diagnostic.index.?].key,
             }),
@@ -929,6 +943,7 @@ test "default config" {
     try t.expect(!cfg.animation.enabled);
     try t.expectEqual(@as(u64, 200), cfg.animation.duration_ms);
     try t.expectEqual(animation.Easing.ease_out, cfg.animation.easing);
+    try t.expectEqual(animation.CubicBezier{}, cfg.animation.bezier);
 }
 
 test "validate accepts defaults and a reduced workspace set" {
@@ -950,6 +965,14 @@ test "validate rejects geometry values that are not bounded" {
     cfg = .{};
     cfg.dimmed_inactive.level = std.math.nan(f32);
     try t.expectError(error.InvalidDimLevel, validate(&cfg));
+
+    cfg = .{};
+    cfg.animation.bezier.x1 = 1.5;
+    try t.expectError(error.InvalidAnimationBezier, validate(&cfg));
+
+    cfg = .{};
+    cfg.animation.bezier.y2 = std.math.nan(f64);
+    try t.expectError(error.InvalidAnimationBezier, validate(&cfg));
 }
 
 test "validate rejects invalid workspace references and duplicate rules" {

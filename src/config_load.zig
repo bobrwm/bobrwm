@@ -364,6 +364,13 @@ const ValidationContext = struct {
             .too_many_workspaces, .invalid_workspace_name => origins.workspace_names,
             .invalid_bsp_split_ratio => origins.bsp_split_ratio,
             .invalid_dim_level => origins.dimmed_inactive.level,
+            .invalid_animation_bezier => blk: {
+                const bezier = self.merged.config.animation.bezier;
+                if (!std.math.isFinite(bezier.x1) or bezier.x1 < 0 or bezier.x1 > 1) break :blk origins.animation.bezier.x1;
+                if (!std.math.isFinite(bezier.y1)) break :blk origins.animation.bezier.y1;
+                if (!std.math.isFinite(bezier.x2) or bezier.x2 < 0 or bezier.x2 > 1) break :blk origins.animation.bezier.x2;
+                break :blk origins.animation.bezier.y2;
+            },
             .unknown_key_name, .invalid_keybind_workspace, .invalid_keybind_display => self.merged.keybind_origins[issue.index.?],
             .empty_app_rule_id, .invalid_app_rule_workspace, .duplicate_app_rule => self.merged.rule_origins[issue.index.?],
             // `merge` folds the deprecated alias into app rules.
@@ -653,4 +660,38 @@ test "editing mixed dotted settings preserves unrelated precedence" {
     try std.testing.expectEqual(29, edited.config.gaps.outer.right);
     try std.testing.expectEqual(43, edited.config.gaps.outer.bottom);
     try std.testing.expectEqual(.monocle, edited.config.layout);
+}
+
+test "animation easing presets and custom bezier load and round-trip" {
+    var t: TestLoad = .{ .arena = .init(std.testing.allocator) };
+    defer t.arena.deinit();
+    const arena = t.arena.allocator();
+
+    const lua =
+        \\bobrwm.settings.set("animation.enabled", true)
+        \\bobrwm.settings.set("animation.easing", "snappy")
+    ;
+    const initial = try t.run(.{ .lua = lua });
+    try std.testing.expectEqual(.snappy, initial.config.animation.easing);
+
+    var next = initial.config;
+    next.animation.easing = .natural;
+    const saved = try editSettings(arena, null, &initial.config, &next);
+    const updated = try t.run(.{ .lua = lua, .json = saved });
+    try std.testing.expectEqual(.natural, updated.config.animation.easing);
+
+    next = updated.config;
+    next.animation.easing = .smooth;
+    const saved_smooth = try editSettings(arena, saved, &updated.config, &next);
+    const smooth = try t.run(.{ .lua = lua, .json = saved_smooth });
+    try std.testing.expectEqual(.smooth, smooth.config.animation.easing);
+
+    next = smooth.config;
+    next.animation.easing = .bezier;
+    next.animation.bezier = .{ .x1 = 0.16, .y1 = 1.0, .x2 = 0.30, .y2 = 1.0 };
+    const saved_bezier = try editSettings(arena, saved_smooth, &smooth.config, &next);
+    const custom = try t.run(.{ .lua = lua, .json = saved_bezier });
+    try std.testing.expectEqual(.bezier, custom.config.animation.easing);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.16), custom.config.animation.bezier.x1, 1e-9);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.30), custom.config.animation.bezier.x2, 1e-9);
 }

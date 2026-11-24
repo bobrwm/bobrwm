@@ -28,6 +28,10 @@ typedef struct {
   bool animation_enabled;
   uint64_t animation_duration_ms;
   uint8_t animation_easing;
+  double animation_bezier_x1;
+  double animation_bezier_y1;
+  double animation_bezier_x2;
+  double animation_bezier_y2;
   bool start_at_login;
   bool focus_follows_mouse;
   bool swipe_enabled;

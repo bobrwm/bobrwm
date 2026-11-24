@@ -122,21 +122,52 @@ enum NewWindowPositionSetting: UInt8, CaseIterable, Identifiable {
 }
 
 enum EasingSetting: UInt8, CaseIterable, Identifiable {
-    case linear
-    case easeIn
-    case easeOut
-    case easeInOut
-    case spring
+    case linear = 0
+    case easeIn = 1
+    case easeOut = 2
+    case easeInOut = 3
+    case spring = 4
+    case bezier = 5
+    case snappy = 6
+    case natural = 7
+    case smooth = 8
+
     var id: Self { self }
+
     var title: String {
         switch self {
+        case .snappy: "Snappy"
+        case .natural: "Natural"
+        case .smooth: "Smooth"
         case .linear: "Linear"
         case .easeIn: "Ease in"
         case .easeOut: "Ease out"
         case .easeInOut: "Ease in and out"
         case .spring: "Spring"
+        case .bezier: "Custom bezier"
         }
     }
+
+    var summary: String {
+        switch self {
+        case .snappy: "Fast launch with a crisp stop and no bounce."
+        case .natural: "macOS-style ease with a gentle start and balanced settle."
+        case .smooth: "Unhurried glide with a soft start and clean finish."
+        case .linear: "Constant speed from start to finish."
+        case .easeIn: "Starts slowly and accelerates into the target."
+        case .easeOut: "Starts quickly and decelerates smoothly."
+        case .easeInOut: "Accelerates through the middle and eases to a stop."
+        case .spring: "Playful spring with a slight overshoot."
+        case .bezier: "Custom cubic bezier. Y values outside 0\u{2013}1 overshoot."
+        }
+    }
+
+    /// Control points for presets that can seed the custom bezier editor.
+    static let bezierPresets: [(title: String, x1: Double, y1: Double, x2: Double, y2: Double)] = [
+        ("Snappy", 0.22, 1.0, 0.36, 1.0),
+        ("Natural", 0.25, 0.1, 0.25, 1.0),
+        ("Smooth", 0.30, 0.0, 0.40, 1.0),
+    ]
 }
 
 struct EditableSettings: Equatable {
@@ -155,6 +186,10 @@ struct EditableSettings: Equatable {
     var animationEnabled = false
     var animationDurationMilliseconds: UInt64 = 200
     var easing: EasingSetting = .easeOut
+    var animationBezierX1 = 0.22
+    var animationBezierY1 = 1.0
+    var animationBezierX2 = 0.36
+    var animationBezierY2 = 1.0
     var startAtLogin = false
     var focusFollowsMouse = false
     var swipeEnabled = false
@@ -180,6 +215,10 @@ struct EditableSettings: Equatable {
         animationEnabled = raw.animation_enabled
         animationDurationMilliseconds = raw.animation_duration_ms
         easing = EasingSetting(rawValue: raw.animation_easing) ?? .easeOut
+        animationBezierX1 = raw.animation_bezier_x1
+        animationBezierY1 = raw.animation_bezier_y1
+        animationBezierX2 = raw.animation_bezier_x2
+        animationBezierY2 = raw.animation_bezier_y2
         startAtLogin = raw.start_at_login
         focusFollowsMouse = raw.focus_follows_mouse
         swipeEnabled = raw.swipe_enabled
@@ -205,6 +244,10 @@ struct EditableSettings: Equatable {
             animation_enabled: animationEnabled,
             animation_duration_ms: animationDurationMilliseconds,
             animation_easing: easing.rawValue,
+            animation_bezier_x1: animationBezierX1,
+            animation_bezier_y1: animationBezierY1,
+            animation_bezier_x2: animationBezierX2,
+            animation_bezier_y2: animationBezierY2,
             start_at_login: startAtLogin,
             focus_follows_mouse: focusFollowsMouse,
             swipe_enabled: swipeEnabled,
@@ -846,12 +889,185 @@ private struct AppearancePane: View {
                         unit: "ms"
                     )
                     Picker("Easing", selection: $model.settings.easing) {
-                        ForEach(EasingSetting.allCases) { Text($0.title).tag($0) }
+                        Text(EasingSetting.snappy.title).tag(EasingSetting.snappy)
+                        Text(EasingSetting.natural.title).tag(EasingSetting.natural)
+                        Text(EasingSetting.smooth.title).tag(EasingSetting.smooth)
+                        Divider()
+                        Text(EasingSetting.easeOut.title).tag(EasingSetting.easeOut)
+                        Text(EasingSetting.easeInOut.title).tag(EasingSetting.easeInOut)
+                        Text(EasingSetting.easeIn.title).tag(EasingSetting.easeIn)
+                        Text(EasingSetting.linear.title).tag(EasingSetting.linear)
+                        Text(EasingSetting.spring.title).tag(EasingSetting.spring)
+                        Divider()
+                        Text(EasingSetting.bezier.title).tag(EasingSetting.bezier)
+                    }
+                    if settings.easing == .bezier {
+                        BezierCurveEditor(
+                            x1: $model.settings.animationBezierX1,
+                            y1: $model.settings.animationBezierY1,
+                            x2: $model.settings.animationBezierX2,
+                            y2: $model.settings.animationBezierY2
+                        )
                     }
                 }
                 .disabled(!settings.animationEnabled)
+            } footer: {
+                Text(settings.easing.summary)
+                    .foregroundStyle(.secondary)
+                    .multilineTextAlignment(.leading)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.horizontal, 10)
             }
         }
+    }
+}
+
+private struct BezierCurveEditor: View {
+    @Binding var x1: Double
+    @Binding var y1: Double
+    @Binding var x2: Double
+    @Binding var y2: Double
+
+    var body: some View {
+        LabeledContent {
+            HStack(alignment: .center, spacing: 14) {
+                BezierCurvePreview(x1: x1, y1: y1, x2: x2, y2: y2)
+                    .frame(width: 72, height: 72)
+                VStack(alignment: .trailing, spacing: 6) {
+                    HStack(spacing: 10) {
+                        DecimalStepper("X1", value: $x1, in: 0...1)
+                        DecimalStepper("Y1", value: $y1, in: -1...2)
+                    }
+                    HStack(spacing: 10) {
+                        DecimalStepper("X2", value: $x2, in: 0...1)
+                        DecimalStepper("Y2", value: $y2, in: -1...2)
+                    }
+                }
+            }
+        } label: {
+            VStack(alignment: .leading, spacing: 6) {
+                Text("Curve")
+                Menu("Preset") {
+                    ForEach(EasingSetting.bezierPresets, id: \.title) { preset in
+                        Button(preset.title) {
+                            x1 = preset.x1
+                            y1 = preset.y1
+                            x2 = preset.x2
+                            y2 = preset.y2
+                        }
+                    }
+                }
+                .controlSize(.small)
+                .fixedSize()
+            }
+        }
+    }
+}
+
+private struct BezierCurvePreview: View {
+    let x1: Double
+    let y1: Double
+    let x2: Double
+    let y2: Double
+
+    var body: some View {
+        Canvas { context, size in
+            let inset: CGFloat = 10
+            let box = CGRect(
+                x: inset,
+                y: inset,
+                width: size.width - inset * 2,
+                height: size.height - inset * 2
+            )
+            func map(_ x: Double, _ y: Double) -> CGPoint {
+                CGPoint(
+                    x: box.minX + CGFloat(x) * box.width,
+                    y: box.maxY - CGFloat(y) * box.height
+                )
+            }
+
+            let p0 = map(0, 0)
+            let p1 = map(x1, y1)
+            let p2 = map(x2, y2)
+            let p3 = map(1, 1)
+
+            var guide = Path()
+            guide.move(to: p0)
+            guide.addLine(to: p3)
+            context.stroke(
+                guide,
+                with: .color(.secondary.opacity(0.25)),
+                style: StrokeStyle(lineWidth: 1, dash: [3, 3])
+            )
+
+            var handles = Path()
+            handles.move(to: p0)
+            handles.addLine(to: p1)
+            handles.move(to: p3)
+            handles.addLine(to: p2)
+            context.stroke(handles, with: .color(.secondary.opacity(0.45)), lineWidth: 1)
+
+            var curve = Path()
+            curve.move(to: p0)
+            curve.addCurve(to: p3, control1: p1, control2: p2)
+            context.stroke(
+                curve,
+                with: .color(.accentColor),
+                style: StrokeStyle(lineWidth: 2, lineCap: .round)
+            )
+
+            for point in [p1, p2] {
+                let dot = CGRect(x: point.x - 2.5, y: point.y - 2.5, width: 5, height: 5)
+                context.fill(Path(ellipseIn: dot), with: .color(.accentColor))
+            }
+        }
+        .background(
+            RoundedRectangle(cornerRadius: 6, style: .continuous)
+                .fill(.quaternary.opacity(0.45))
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 6, style: .continuous)
+                .strokeBorder(.separator.opacity(0.6), lineWidth: 0.5)
+        )
+    }
+}
+
+private struct DecimalStepper: View {
+    let label: String
+    @Binding var value: Double
+    let range: ClosedRange<Double>
+
+    init(_ label: String, value: Binding<Double>, in range: ClosedRange<Double>) {
+        self.label = label
+        _value = value
+        self.range = range
+    }
+
+    var body: some View {
+        HStack(spacing: 4) {
+            Text(label)
+                .foregroundStyle(.secondary)
+                .font(.caption)
+                .frame(width: 18, alignment: .trailing)
+            TextField("", value: clamped, format: .number.precision(.fractionLength(2)))
+                .textFieldStyle(.roundedBorder)
+                .multilineTextAlignment(.trailing)
+                .monospacedDigit()
+                .frame(width: 48)
+                .labelsHidden()
+            Stepper("", value: clamped, in: range, step: 0.02)
+                .labelsHidden()
+        }
+    }
+
+    private var clamped: Binding<Double> {
+        Binding(
+            get: { value },
+            set: {
+                let rounded = ($0 * 100).rounded() / 100
+                value = min(max(rounded, range.lowerBound), range.upperBound)
+            }
+        )
     }
 }
 

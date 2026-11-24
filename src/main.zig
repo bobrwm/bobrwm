@@ -3369,6 +3369,12 @@ fn statusBarSetSettings(settings: *const statusbar.Settings) callconv(.c) bool {
         .enabled = settings.animation_enabled,
         .duration_ms = settings.animation_duration_ms,
         .easing = std.enums.fromInt(animation_mod.Easing, settings.animation_easing) orelse return invalidAppSettings(),
+        .bezier = .{
+            .x1 = settings.animation_bezier_x1,
+            .y1 = settings.animation_bezier_y1,
+            .x2 = settings.animation_bezier_x2,
+            .y2 = settings.animation_bezier_y2,
+        },
     };
     next.start_at_login = settings.start_at_login;
     next.focus_follows_mouse = settings.focus_follows_mouse;

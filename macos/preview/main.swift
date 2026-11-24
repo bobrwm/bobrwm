@@ -374,6 +374,16 @@ func renderAll(into directory: String) -> Bool {
             scheme: scheme,
             appearance: appearance
         ) && ok
+        let bezierModel = makeSettingsModel(accessibilityGranted: true)
+        bezierModel.settings.animationEnabled = true
+        bezierModel.settings.easing = .bezier
+        ok = renderPane(
+            .appearance,
+            model: bezierModel,
+            path: "\(directory)/settings-appearance-bezier-\(suffix).png",
+            scheme: scheme,
+            appearance: appearance
+        ) && ok
         ok = renderWindow(
             path: "\(directory)/settings-window-\(suffix).png",
             appearance: appearance
