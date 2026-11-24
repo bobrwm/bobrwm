@@ -1440,7 +1440,8 @@ var g_last_focused_window_id: u32 = 0;
 /// The caller of bw_set_keybinds owns the storage and must keep it alive for
 /// as long as the event tap can fire; main's KeybindTable guarantees this.
 var g_hotkey_bindings: []const shim.bw_keybind = &.{};
-var g_waker_source: c.CFRunLoopSourceRef = null;
+var g_waker_source: std.atomic.Value(c.CFRunLoopSourceRef) = .init(null);
+var g_waker_pending: std.atomic.Value(bool) = .init(false);
 var g_role_poll_source: c.dispatch_source_t = null;
 var g_scheduled_observation: ?state_mod.ObservationTimer = null;
 /// Tags each armed observation fire so a replaced timer's fire can be told apart.
@@ -2046,20 +2047,28 @@ fn wakerPerform(info: ?*anyopaque) callconv(.c) void {
 }
 
 fn initWakerSource() void {
-    if (g_waker_source != null) return;
+    if (g_waker_source.load(.acquire) != null) return;
 
     var context: c.CFRunLoopSourceContext = std.mem.zeroes(c.CFRunLoopSourceContext);
     context.perform = wakerPerform;
 
-    g_waker_source = c.CFRunLoopSourceCreate(null, 0, &context);
-    const source = g_waker_source orelse return;
-    c.CFRunLoopAddSource(c.CFRunLoopGetMain(), source, c.kCFRunLoopCommonModes);
+    const source = c.CFRunLoopSourceCreate(null, 0, &context) orelse return;
+    const run_loop = c.CFRunLoopGetMain();
+    c.CFRunLoopAddSource(run_loop, source, c.kCFRunLoopCommonModes);
+    // Publish after adding to the run loop so background threads never signal
+    // an unattached source.
+    g_waker_source.store(source, .release);
     // Drain events queued before the source existed.
+    g_waker_pending.store(true, .seq_cst);
     c.CFRunLoopSourceSignal(source);
+    if (run_loop != null) c.CFRunLoopWakeUp(run_loop);
 }
 
 fn signalWaker() void {
-    if (g_waker_source) |source| {
+    // Coalesce burst pushes into one CFRunLoop wake; drainEvents clears this
+    // with seq_cst before popping the event and IPC queues so no push is lost.
+    if (g_waker_pending.swap(true, .seq_cst)) return;
+    if (g_waker_source.load(.acquire)) |source| {
         c.CFRunLoopSourceSignal(source);
     }
     const run_loop = c.CFRunLoopGetMain();
@@ -2702,11 +2711,11 @@ fn deinitMainRunLoopSources() void {
         c.CFRelease(@ptrCast(tap));
         port.* = null;
     }
-    if (g_waker_source) |source| {
+    if (g_waker_source.swap(null, .acq_rel)) |source| {
         c.CFRunLoopRemoveSource(c.CFRunLoopGetMain(), source, c.kCFRunLoopCommonModes);
         c.CFRelease(@ptrCast(source));
-        g_waker_source = null;
     }
+    g_waker_pending.store(false, .seq_cst);
 }
 
 // Event bridge (called from ObjC shim)
@@ -2735,16 +2744,20 @@ export fn bw_emit_event_detail(kind: u8, pid: i32, wid: u32, detail: u8) void {
         .wid = wid,
     };
 
+    var dropped_count: ?usize = null;
     c.os_unfair_lock_lock(&g_ring_lock);
     event.enqueued_ns = @truncate(nanoTimestamp());
     if (!g_event_queue.push(event)) {
         g_event_dropped += 1;
         g_event_overflowed.store(true, .release);
-        log.err("event queue full, dropped event kind={s} pid={d} wid={d} total_dropped={d}", .{
-            @tagName(event.kind), event.pid, event.wid, g_event_dropped,
-        });
+        dropped_count = g_event_dropped;
     }
     c.os_unfair_lock_unlock(&g_ring_lock);
+    if (dropped_count) |total_dropped| {
+        log.err("event queue full, dropped event kind={s} pid={d} wid={d} total_dropped={d}", .{
+            @tagName(event.kind), event.pid, event.wid, total_dropped,
+        });
+    }
     signalWaker();
 }
 
@@ -2891,6 +2904,7 @@ fn startCore(config_path_arg: ?[]const u8) !void {
     dim.configure(g_config.dimmed_inactive);
     loginitem.reconcile(g_config.start_at_login);
 
+    app_queue.start();
     ax_writer.init(geometryWriteFailed, setFrontProcessViaSkylight);
     focus_query.init();
     window_readiness.init();
@@ -3032,10 +3046,13 @@ fn stopCore() void {
         setMouseEventTapEnabled(false);
     }
     display_link.stopAll();
-    deinitMainRunLoopSources();
+    // Stop and drain every background producer before releasing g_waker_source
+    // so no in-flight callback can signal a freed CFRunLoopSourceRef.
     if (coreReached(.ax_observer)) {
         ax_observer.deinit();
     }
+    app_queue.stop();
+    deinitMainRunLoopSources();
     if (coreReached(.workspace_observer)) {
         deinitWorkspaceObservers();
         objc_classes.deinit();
@@ -3079,6 +3096,7 @@ fn drainEvents() void {
     std.debug.assert(!g_event_drain_active);
     g_event_drain_active = true;
     defer g_event_drain_active = false;
+    g_waker_pending.store(false, .seq_cst);
     g_adoption_on_screen = null;
     defer g_adoption_on_screen = null;
 
