@@ -43,8 +43,11 @@ pub const Reading = struct {
 /// Above every encoded reading, so the next reading is always published.
 const reading_unknown: u8 = 0xff;
 
+var g_queue: c.dispatch_queue_t = null;
 var g_source: c.dispatch_source_t = null;
-/// Set before the timer starts and not changed while it runs.
+var g_cancel_done: c.dispatch_semaphore_t = null;
+var g_stopping: std.atomic.Value(bool) = .init(false);
+/// Set before the timer starts and cleared only after `stop` waits for cancel.
 var g_sky: ?*const skylight.SkyLight = null;
 /// Last reading published. Atomic because `forgetLastReading` runs on the
 /// main thread while the poll runs on a background queue.
@@ -54,15 +57,30 @@ var g_last_reading: std.atomic.Value(u8) = .init(reading_unknown);
 /// outlive the poll.
 pub fn start(sky: ?*const skylight.SkyLight) void {
     if (g_source != null) return;
-    g_sky = sky;
 
-    const queue = c.dispatch_get_global_queue(c.QOS_CLASS_UTILITY, 0);
+    const cancel_done = c.dispatch_semaphore_create(0) orelse return;
+    const attr = c.dispatch_queue_attr_make_with_qos_class(null, c.QOS_CLASS_UTILITY, 0);
+    const queue = c.dispatch_queue_create("com.bobrwm.spaces-settings", attr) orelse {
+        c.dispatch_release(.{ ._dsema = cancel_done });
+        return;
+    };
     const source = c.dispatch_source_create(
         cg_extra.DISPATCH_SOURCE_TYPE_TIMER(),
         0,
         0,
         queue,
-    ) orelse return;
+    ) orelse {
+        c.dispatch_release(.{ ._dq = queue });
+        c.dispatch_release(.{ ._dsema = cancel_done });
+        return;
+    };
+
+    g_sky = sky;
+    g_stopping.store(false, .release);
+    g_cancel_done = cancel_done;
+    g_queue = queue;
+    g_source = source;
+
     const interval_ns = poll_interval_ms * c.NSEC_PER_MSEC;
     c.dispatch_source_set_timer(
         source,
@@ -71,17 +89,30 @@ pub fn start(sky: ?*const skylight.SkyLight) void {
         500 * c.NSEC_PER_MSEC,
     );
     c.dispatch_source_set_event_handler_f(source, poll);
+    c.dispatch_source_set_cancel_handler_f(source, sourceCancelled);
     g_last_reading.store(reading_unknown, .release);
     c.dispatch_resume(.{ ._ds = source });
-    g_source = source;
 }
 
-/// Main thread.
+/// Main thread. Waits for the cancel handler so no in-flight poll can read
+/// `g_sky` or emit events after this returns.
 pub fn stop() void {
-    const source = g_source orelse return;
-    c.dispatch_source_cancel(source);
-    c.dispatch_release(.{ ._ds = source });
-    g_source = null;
+    g_stopping.store(true, .release);
+    if (g_source) |source| {
+        c.dispatch_source_cancel(source);
+        if (g_cancel_done) |sem| _ = c.dispatch_semaphore_wait(sem, c.DISPATCH_TIME_FOREVER);
+        c.dispatch_release(.{ ._ds = source });
+        g_source = null;
+    }
+    if (g_cancel_done) |sem| {
+        c.dispatch_release(.{ ._dsema = sem });
+        g_cancel_done = null;
+    }
+    if (g_queue) |queue| {
+        c.dispatch_release(.{ ._dq = queue });
+        g_queue = null;
+    }
+    g_sky = null;
 }
 
 /// Publish the next reading even if it has not changed, for when the last
@@ -90,13 +121,20 @@ pub fn forgetLastReading() void {
     g_last_reading.store(reading_unknown, .release);
 }
 
+fn sourceCancelled(context: ?*anyopaque) callconv(.c) void {
+    _ = context;
+    if (g_cancel_done) |sem| _ = c.dispatch_semaphore_signal(sem);
+}
+
 fn poll(context: ?*anyopaque) callconv(.c) void {
     _ = context;
+    if (g_stopping.load(.acquire)) return;
     const reading: Reading = .{
         // Unset means the macOS default, which is on.
         .rearranges_automatically = readBool("com.apple.dock", "mru-spaces", true) orelse return,
         .displays_share_spaces = displaysShareSpaces() orelse return,
     };
+    if (g_stopping.load(.acquire)) return;
     const encoded = reading.encode();
     if (g_last_reading.swap(encoded, .acq_rel) == encoded) return;
 
