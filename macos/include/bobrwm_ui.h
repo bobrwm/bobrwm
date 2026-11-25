@@ -27,6 +27,9 @@ typedef struct {
   uint16_t outer_gap_bottom;
   bool animation_enabled;
   uint64_t animation_duration_ms;
+  // Matches `animation.Easing` in src/animation.zig and `EasingSetting` in
+  // macos/src/Settings.swift: 0=linear, 1=ease_in, 2=ease_out, 3=ease_in_out,
+  // 4=spring, 5=bezier, 6=snappy, 7=natural, 8=smooth.
   uint8_t animation_easing;
   double animation_bezier_x1;
   double animation_bezier_y1;

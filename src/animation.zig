@@ -11,16 +11,20 @@ const std = @import("std");
 const ax_writer = @import("ax_writer.zig");
 const window_mod = @import("window.zig");
 
-pub const Easing = enum {
-    linear,
-    ease_in,
-    ease_out,
-    ease_in_out,
-    spring,
-    bezier,
-    snappy,
-    natural,
-    smooth,
+/// Easing curve selector. Explicit `u8` discriminants are part of the C ABI
+/// (`BWSettings.animation_easing` in `macos/include/bobrwm_ui.h` and
+/// `EasingSetting` in `macos/src/Settings.swift`); append new variants rather
+/// than renumbering existing ones.
+pub const Easing = enum(u8) {
+    linear = 0,
+    ease_in = 1,
+    ease_out = 2,
+    ease_in_out = 3,
+    spring = 4,
+    bezier = 5,
+    snappy = 6,
+    natural = 7,
+    smooth = 8,
 };
 
 /// Control points for a CSS-style cubic Bezier curve from `(0, 0)` to `(1, 1)`.
@@ -33,6 +37,8 @@ pub const CubicBezier = struct {
     pub const min_y: f64 = -1.0;
     pub const max_y: f64 = 2.0;
 
+    // Keep preset control points in sync with `EasingSetting.bezierPresets`
+    // in `macos/src/Settings.swift`.
     /// Fast launch with a crisp, bounce-free settle.
     pub const snappy: CubicBezier = .{ .x1 = 0.22, .y1 = 1.0, .x2 = 0.36, .y2 = 1.0 };
     /// macOS CoreAnimation `ease`: slight ease-in and balanced deceleration.

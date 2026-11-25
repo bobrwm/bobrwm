@@ -121,6 +121,8 @@ enum NewWindowPositionSetting: UInt8, CaseIterable, Identifiable {
     var title: String { self == .first ? "Left or top" : "Right or bottom" }
 }
 
+/// Raw values mirror `animation.Easing` in `src/animation.zig` and
+/// `BWSettings.animation_easing` in `macos/include/bobrwm_ui.h`.
 enum EasingSetting: UInt8, CaseIterable, Identifiable {
     case linear = 0
     case easeIn = 1
@@ -163,6 +165,7 @@ enum EasingSetting: UInt8, CaseIterable, Identifiable {
     }
 
     /// Control points for presets that can seed the custom bezier editor.
+    /// Keep in sync with `CubicBezier.{snappy,natural,smooth}` in `src/animation.zig`.
     static let bezierPresets: [(title: String, x1: Double, y1: Double, x2: Double, y2: Double)] = [
         ("Snappy", 0.22, 1.0, 0.36, 1.0),
         ("Natural", 0.25, 0.1, 0.25, 1.0),
