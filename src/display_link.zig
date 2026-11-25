@@ -121,23 +121,30 @@ pub fn invalidateAll() void {
 }
 
 /// Convert `CADisplayLink` frame times into nanoseconds on the link's clock.
-/// `anchor_ns` is one refresh interval before `target_ns` so newly started
-/// animations step cleanly by one frame on their first tick. Guards against a
-/// stale or inverted `timestamp` right after unpausing by falling back to the
-/// link's nominal `duration` (or 60 Hz).
-pub fn frameTimestampsNs(timestamp_s: f64, target_s: f64, duration_s: f64) FrameTimestamps {
+/// Returns `null` when `target_s` is non-finite, non-positive, or implausibly
+/// large so a display sleep/teardown glitch cannot crash `@intFromFloat` or
+/// anchor animations to a bogus clock. Otherwise `anchor_ns` is one refresh
+/// interval before `target_ns` (clamped at 0) so newly started animations step
+/// cleanly by one frame on their first tick. Guards against a stale or
+/// inverted `timestamp` right after unpausing by falling back to the link's
+/// nominal `duration` (or 60 Hz).
+pub fn frameTimestampsNs(timestamp_s: f64, target_s: f64, duration_s: f64) ?FrameTimestamps {
+    // >3,000 years of uptime; keeps `target_s * ns_per_s` safely inside i128.
+    const max_reasonable_target_s = 1e11;
+    if (!std.math.isFinite(target_s) or target_s <= 0.0 or target_s > max_reasonable_target_s) return null;
+
     const target_ns: i128 = @intFromFloat(target_s * std.time.ns_per_s);
     const raw_dt_s = target_s - timestamp_s;
     const max_reasonable_frame_s = 0.1;
-    const frame_dt_s = if (raw_dt_s > 0.0 and raw_dt_s <= max_reasonable_frame_s)
+    const frame_dt_s = if (std.math.isFinite(raw_dt_s) and raw_dt_s > 0.0 and raw_dt_s <= max_reasonable_frame_s)
         raw_dt_s
-    else if (duration_s > 0.0 and duration_s <= max_reasonable_frame_s)
+    else if (std.math.isFinite(duration_s) and duration_s > 0.0 and duration_s <= max_reasonable_frame_s)
         duration_s
     else
         1.0 / 60.0;
     const frame_dt_ns: i128 = @intFromFloat(frame_dt_s * std.time.ns_per_s);
     return .{
-        .anchor_ns = target_ns - frame_dt_ns,
+        .anchor_ns = @max(target_ns - frame_dt_ns, 0),
         .target_ns = target_ns,
     };
 }
@@ -186,26 +193,33 @@ fn fired(ref: objc.Object) void {
     const timestamp_s = ref.msgSend(f64, "timestamp", .{});
     const target_s = ref.msgSend(f64, "targetTimestamp", .{});
     const duration_s = ref.msgSend(f64, "duration", .{});
-    const times = frameTimestampsNs(timestamp_s, target_s, duration_s);
+    const times = frameTimestampsNs(timestamp_s, target_s, duration_s) orelse return;
     g_on_frame.?(link.display_id, times.anchor_ns, times.target_ns);
 }
 
-test "frameTimestampsNs anchors one refresh before target and guards stale timestamps" {
+test "frameTimestampsNs anchors one refresh before target and guards bad timestamps" {
     const testing = std.testing;
 
     // 120 Hz ProMotion healthy frame.
     const dt_120 = 1.0 / 120.0;
-    const t_120 = frameTimestampsNs(100.0, 100.0 + dt_120, dt_120);
+    const t_120 = frameTimestampsNs(100.0, 100.0 + dt_120, dt_120).?;
     const expected_120: i128 = @intFromFloat(dt_120 * std.time.ns_per_s);
     try testing.expectEqual(expected_120, t_120.target_ns - t_120.anchor_ns);
 
     // Stale timestamp from before pause (> 100ms old) falls back to nominal duration.
     const dt_60 = 1.0 / 60.0;
-    const stale = frameTimestampsNs(10.0, 25.0, dt_60);
+    const stale = frameTimestampsNs(10.0, 25.0, dt_60).?;
     const expected_60: i128 = @intFromFloat(dt_60 * std.time.ns_per_s);
     try testing.expectEqual(expected_60, stale.target_ns - stale.anchor_ns);
 
     // Inverted timestamp with invalid duration falls back to 60 Hz.
-    const bad = frameTimestampsNs(30.0, 25.0, 0.0);
+    const bad = frameTimestampsNs(30.0, 25.0, 0.0).?;
     try testing.expectEqual(expected_60, bad.target_ns - bad.anchor_ns);
+
+    // Non-finite, non-positive, or huge target timestamps are dropped.
+    try testing.expectEqual(@as(?FrameTimestamps, null), frameTimestampsNs(0.0, 0.0, dt_60));
+    try testing.expectEqual(@as(?FrameTimestamps, null), frameTimestampsNs(0.0, -1.0, dt_60));
+    try testing.expectEqual(@as(?FrameTimestamps, null), frameTimestampsNs(1.0, std.math.nan(f64), dt_60));
+    try testing.expectEqual(@as(?FrameTimestamps, null), frameTimestampsNs(1.0, std.math.inf(f64), dt_60));
+    try testing.expectEqual(@as(?FrameTimestamps, null), frameTimestampsNs(1.0, 1e20, dt_60));
 }
