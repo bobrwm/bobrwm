@@ -20,6 +20,11 @@ pub const max_spaces_per_display = topology_mod.max_spaces_per_display;
 pub const max_workspace_focus_history = 32;
 pub const max_pending_native_window_moves = 256;
 pub const native_switch_timeout_ms: u64 = 3200;
+/// Direct bridged Space switches apply in ~10ms; fall back to Dock swipe if
+/// WindowServer has not landed within this window.
+pub const native_direct_switch_timeout_ms: u64 = 500;
+pub const native_direct_switch_fast_observe_ms: u64 = 10;
+pub const native_direct_switch_fast_window_ms: u64 = 100;
 pub const native_observation_delay_ms: u64 = 50;
 pub const native_window_move_attempts_max: u8 = 3;
 /// The Space moves land within tens of ms; past this something refused them.
@@ -178,7 +183,9 @@ pub const PendingSwitch = struct {
     request: SwitchRequest,
     epoch: Epoch,
     deadline_at_ms: TimestampMs,
+    started_at_ms: TimestampMs = 0,
     has_retried: bool = false,
+    is_direct: bool = false,
     phase: enum { waiting_for_idle, preparing, delivering, observing } = .waiting_for_idle,
     gesture: ?native_gesture.Delivery = null,
     /// The swipe as planned, kept after delivery to tell which Spaces lie on
@@ -1305,6 +1312,7 @@ pub const Event = union(enum) {
         at_ms: TimestampMs,
         is_animating: ?bool = null,
     },
+    native_direct_switch_dispatched: struct { epoch: Epoch, at_ms: TimestampMs },
     native_gesture_prepared: struct { epoch: Epoch, plan: native_gesture.Plan, at_ms: TimestampMs },
     native_gesture_posted: struct { epoch: Epoch, phase: native_gesture.Phase, succeeded: bool, at_ms: TimestampMs },
     native_gesture_timer_fired: struct { epoch: Epoch, at_ms: TimestampMs },
@@ -1523,6 +1531,10 @@ pub const Effect = union(enum) {
     switch_native_space: struct {
         request: SwitchRequest,
         epoch: Epoch,
+        /// Ordinary Space currently shown on the target display when a direct
+        /// bridged switch is eligible; null on retries or native fullscreen
+        /// Spaces so the shell falls back to synthetic Dock gestures.
+        direct_source_space_id: ?NativeSpaceId = null,
     },
     observe_native_topology: Epoch,
     native_switch_completed: struct {

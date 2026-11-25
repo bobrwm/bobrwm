@@ -5447,6 +5447,24 @@ fn executeNativeSwitch(effect: @FieldType(state_mod.Effect, "switch_native_space
 
     const request = effect.request;
     const native_space_id = request.target.key.id;
+    if (effect.direct_source_space_id) |source_space_id| {
+        if (g_sky.?.switchNativeSpaceDirect(request.target.display_id, source_space_id, native_space_id)) {
+            dispatchStateEvent(.{ .native_direct_switch_dispatched = .{
+                .epoch = effect.epoch,
+                .at_ms = nativeStateNowMs(),
+            } });
+            log.debug("native workspace direct switch requested epoch={d} display={d} workspace={d} source={d} target={d}", .{
+                effect.epoch,
+                request.target.display_id,
+                request.target.workspace_id,
+                source_space_id,
+                native_space_id,
+            });
+            updateStatusBar();
+            return;
+        }
+    }
+
     const plan = g_sky.?.prepareNativeSpaceSwitch(request.target.display_id, native_space_id) orelse {
         dispatchStateEvent(.{ .native_switch_effect_failed = .{
             .epoch = effect.epoch,

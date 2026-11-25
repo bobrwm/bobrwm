@@ -91,6 +91,13 @@ pub const SkyLight = struct {
     bridgedSpaceMoveClass: ?objc.Class,
     bridgedSpaceMoveSelectorSupported: bool,
     bridgedSpaceHideClass: ?objc.Class,
+    bridgedSpaceHideSelectorSupported: bool,
+    bridgedSpaceShowClass: ?objc.Class,
+    bridgedSpaceShowSelectorSupported: bool,
+    bridgedSpaceWillSwitchClass: ?objc.Class,
+    bridgedSpaceWillSwitchSelectorSupported: bool,
+    bridgedSpaceSetCurrentClass: ?objc.Class,
+    bridgedSpaceSetCurrentSelectorSupported: bool,
     performBridgedMove: ?PerformBridgedMoveFn,
     bridgedMoveClass: ?objc.Class,
     bridgedMoveSelectorSupported: bool,
@@ -131,26 +138,21 @@ pub const SkyLight = struct {
         const move_windows_to_managed_space = lib.lookup(MoveWindowsToManagedSpaceFn, "SLSMoveWindowsToManagedSpace");
         const perform_bridged_move = resolveBridgedMove();
         const bridged_space_create_class = objc.getClass("SLSBridgedSpaceCreateOperation");
-        const bridged_space_create_selector_supported = if (bridged_space_create_class) |cls|
-            objc.c.class_getInstanceMethod(cls.value, objc.sel("performWithWMBridgeDelegate").value) != null
-        else
-            false;
+        const bridged_space_create_selector_supported = supportsPerformWithWMBridgeDelegate(bridged_space_create_class);
         const bridged_space_destroy_class = objc.getClass("SLSBridgedSpaceDestroyOperation");
-        const bridged_space_destroy_selector_supported = if (bridged_space_destroy_class) |cls|
-            objc.c.class_getInstanceMethod(cls.value, objc.sel("performWithWMBridgeDelegate").value) != null
-        else
-            false;
+        const bridged_space_destroy_selector_supported = supportsPerformWithWMBridgeDelegate(bridged_space_destroy_class);
         const bridged_space_move_class = objc.getClass("SLSBridgedMoveManagedSpaceToDisplayIndexOperation");
-        const bridged_space_move_selector_supported = if (bridged_space_move_class) |cls|
-            objc.c.class_getInstanceMethod(cls.value, objc.sel("performWithWMBridgeDelegate").value) != null
-        else
-            false;
+        const bridged_space_move_selector_supported = supportsPerformWithWMBridgeDelegate(bridged_space_move_class);
         const bridged_space_hide_class = objc.getClass("SLSBridgedHideSpacesOperation");
+        const bridged_space_hide_selector_supported = supportsPerformWithWMBridgeDelegate(bridged_space_hide_class);
+        const bridged_space_show_class = objc.getClass("SLSBridgedShowSpacesOperation");
+        const bridged_space_show_selector_supported = supportsPerformWithWMBridgeDelegate(bridged_space_show_class);
+        const bridged_space_will_switch_class = objc.getClass("SLSBridgedWillSwitchSpacesOperation");
+        const bridged_space_will_switch_selector_supported = supportsPerformWithWMBridgeDelegate(bridged_space_will_switch_class);
+        const bridged_space_set_current_class = objc.getClass("SLSBridgedManagedDisplaySetCurrentSpaceOperation");
+        const bridged_space_set_current_selector_supported = supportsPerformWithWMBridgeDelegate(bridged_space_set_current_class);
         const bridged_move_class = objc.getClass("SLSBridgedMoveWindowsToManagedSpaceOperation");
-        const bridged_move_selector_supported = if (bridged_move_class) |cls|
-            objc.c.class_getInstanceMethod(cls.value, objc.sel("performWithWMBridgeDelegate").value) != null
-        else
-            false;
+        const bridged_move_selector_supported = supportsPerformWithWMBridgeDelegate(bridged_move_class);
         const native_spaces_supported = copy_managed_display_spaces != null and
             copy_spaces_for_windows != null and
             ((bridged_move_class != null and
@@ -177,6 +179,13 @@ pub const SkyLight = struct {
             .bridgedSpaceMoveClass = bridged_space_move_class,
             .bridgedSpaceMoveSelectorSupported = bridged_space_move_selector_supported,
             .bridgedSpaceHideClass = bridged_space_hide_class,
+            .bridgedSpaceHideSelectorSupported = bridged_space_hide_selector_supported,
+            .bridgedSpaceShowClass = bridged_space_show_class,
+            .bridgedSpaceShowSelectorSupported = bridged_space_show_selector_supported,
+            .bridgedSpaceWillSwitchClass = bridged_space_will_switch_class,
+            .bridgedSpaceWillSwitchSelectorSupported = bridged_space_will_switch_selector_supported,
+            .bridgedSpaceSetCurrentClass = bridged_space_set_current_class,
+            .bridgedSpaceSetCurrentSelectorSupported = bridged_space_set_current_selector_supported,
             .performBridgedMove = perform_bridged_move,
             .bridgedMoveClass = bridged_move_class,
             .bridgedMoveSelectorSupported = bridged_move_selector_supported,
@@ -353,29 +362,67 @@ pub const SkyLight = struct {
     /// Order out the windows of Spaces that are not current. WindowServer can
     /// keep drawing a window after it, or its Space, moves to a hidden Space.
     pub fn hideNativeSpaces(self: *const SkyLight, space_ids: []const u64) bool {
-        if (space_ids.len == 0 or space_ids.len > hidden_space_batch_capacity) return false;
+        if (!self.bridgedSpaceHideSelectorSupported) return false;
         const bridged_class = self.bridgedSpaceHideClass orelse return false;
+        return performBridgedSpacesOp(bridged_class, space_ids);
+    }
 
-        var values: [hidden_space_batch_capacity]?*const anyopaque = undefined;
-        var value_count: usize = 0;
-        defer for (values[0..value_count]) |value| c.CFRelease(value);
+    /// Whether ordinary Spaces can switch directly through WindowManager's
+    /// bridged Space operations without synthetic Dock swipes.
+    pub fn supportsDirectNativeSpaceSwitch(self: *const SkyLight) bool {
+        return self.bridgedSpaceShowClass != null and self.bridgedSpaceShowSelectorSupported and
+            self.bridgedSpaceWillSwitchClass != null and self.bridgedSpaceWillSwitchSelectorSupported and
+            self.bridgedSpaceSetCurrentClass != null and self.bridgedSpaceSetCurrentSelectorSupported and
+            self.bridgedSpaceHideClass != null and self.bridgedSpaceHideSelectorSupported;
+    }
 
-        for (space_ids) |*space_id| {
-            const number = c.CFNumberCreate(null, c.kCFNumberSInt64Type, space_id) orelse return false;
-            values[value_count] = number;
-            value_count += 1;
+    /// Switch directly between two ordinary Spaces on a display in one
+    /// WindowServer transition, avoiding multi-hop Dock swipe animations.
+    /// `source_space_id` comes from the reducer's latest topology observation
+    /// so we avoid an extra `SLSCopyManagedDisplaySpaces` IPC here.
+    pub fn switchNativeSpaceDirect(
+        self: *const SkyLight,
+        display_id: u32,
+        source_space_id: u64,
+        target_space_id: u64,
+    ) bool {
+        if (source_space_id == 0 or target_space_id == 0 or source_space_id == target_space_id) return false;
+        if (!self.supportsDirectNativeSpaceSwitch()) return false;
+
+        const target_array = createSpaceIdArray(&.{target_space_id}) orelse return false;
+        defer c.CFRelease(target_array);
+
+        if (!performBridgedSpacesArrayOp(self.bridgedSpaceShowClass.?, target_array)) return false;
+        if (!performBridgedSpacesArrayOp(self.bridgedSpaceWillSwitchClass.?, target_array) or
+            !self.setCurrentNativeSpace(display_id, target_space_id))
+        {
+            // Hide the target Space we just ordered in so both Spaces are not left visible.
+            _ = performBridgedSpacesArrayOp(self.bridgedSpaceHideClass.?, target_array);
+            return false;
         }
+        _ = self.hideNativeSpaces(&.{source_space_id});
+        return true;
+    }
 
-        const spaces = c.CFArrayCreate(null, &values, @intCast(value_count), &c.kCFTypeArrayCallBacks) orelse return false;
-        defer c.CFRelease(spaces);
+    fn setCurrentNativeSpace(self: *const SkyLight, display_id: u32, space_id: u64) bool {
+        const bridged_class = self.bridgedSpaceSetCurrentClass orelse return false;
+        if (!self.bridgedSpaceSetCurrentSelectorSupported) return false;
+
+        const display_uuid = cg_extra.CGDisplayCreateUUIDFromDisplayID(display_id) orelse return false;
+        defer c.CFRelease(display_uuid);
+        const display_name = c.CFUUIDCreateString(null, display_uuid) orelse return false;
+        defer c.CFRelease(display_name);
 
         const allocated = bridged_class.msgSend(objc.Object, "alloc", .{});
         if (allocated.value == null) return false;
-        const operation = allocated.msgSend(objc.Object, "initWithSpaces:", .{spaces});
+        const operation = allocated.msgSend(objc.Object, "initWithDisplayIdentifier:spaceID:", .{
+            objc.Object.fromId(@constCast(display_name)),
+            space_id,
+        });
         if (operation.value == null) return false;
         defer operation.msgSend(void, "release", .{});
 
-        _ = operation.msgSend(objc.Object, "performWithWMBridgeDelegate", .{});
+        operation.msgSend(void, "performWithWMBridgeDelegate", .{});
         return true;
     }
 
@@ -719,6 +766,44 @@ fn applyImageSlide(value: usize, slide: isize) ?usize {
     const partial_magnitude: usize = @intCast(-(slide + 1));
     const magnitude = std.math.add(usize, partial_magnitude, 1) catch return null;
     return std.math.sub(usize, value, magnitude) catch null;
+}
+
+fn supportsPerformWithWMBridgeDelegate(class: ?objc.Class) bool {
+    const cls = class orelse return false;
+    return objc.c.class_getInstanceMethod(cls.value, objc.sel("performWithWMBridgeDelegate").value) != null;
+}
+
+fn createSpaceIdArray(space_ids: []const u64) ?CFArrayRef {
+    if (space_ids.len == 0 or space_ids.len > hidden_space_batch_capacity) return null;
+
+    var values: [hidden_space_batch_capacity]?*const anyopaque = undefined;
+    var value_count: usize = 0;
+    defer for (values[0..value_count]) |value| c.CFRelease(value);
+
+    for (space_ids) |*space_id| {
+        const number = c.CFNumberCreate(null, c.kCFNumberSInt64Type, space_id) orelse return null;
+        values[value_count] = number;
+        value_count += 1;
+    }
+
+    return c.CFArrayCreate(null, &values, @intCast(value_count), &c.kCFTypeArrayCallBacks);
+}
+
+fn performBridgedSpacesArrayOp(bridged_class: objc.Class, spaces: CFArrayRef) bool {
+    const allocated = bridged_class.msgSend(objc.Object, "alloc", .{});
+    if (allocated.value == null) return false;
+    const operation = allocated.msgSend(objc.Object, "initWithSpaces:", .{spaces});
+    if (operation.value == null) return false;
+    defer operation.msgSend(void, "release", .{});
+
+    operation.msgSend(void, "performWithWMBridgeDelegate", .{});
+    return true;
+}
+
+fn performBridgedSpacesOp(bridged_class: objc.Class, space_ids: []const u64) bool {
+    const spaces = createSpaceIdArray(space_ids) orelse return false;
+    defer c.CFRelease(spaces);
+    return performBridgedSpacesArrayOp(bridged_class, spaces);
 }
 
 fn cfString(value: [*:0]const u8) ?CFStringRef {

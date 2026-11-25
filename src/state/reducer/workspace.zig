@@ -8,6 +8,9 @@ const pointer_reducer = @import("pointer.zig");
 const window_reducer = @import("window.zig");
 
 const native_switch_timeout_ms = model_mod.native_switch_timeout_ms;
+const native_direct_switch_timeout_ms = model_mod.native_direct_switch_timeout_ms;
+const native_direct_switch_fast_observe_ms = model_mod.native_direct_switch_fast_observe_ms;
+const native_direct_switch_fast_window_ms = model_mod.native_direct_switch_fast_window_ms;
 const native_observation_delay_ms = model_mod.native_observation_delay_ms;
 const native_workspace_move_timeout_ms = model_mod.native_workspace_move_timeout_ms;
 const workspace_transition_settle_ms = model_mod.workspace_transition_settle_ms;
@@ -180,8 +183,20 @@ pub fn reduceTopologyObserved(
     }
 
     if (pending.phase == .waiting_for_idle) {
+        const direct_source_space_id: ?NativeSpaceId = if (!pending.has_retried) blk: {
+            const target_display = display orelse break :blk null;
+            const current_id = actual_space_id orelse break :blk null;
+            // Native fullscreen Spaces are not mapped to workspaces and need
+            // Dock's transition to exit cleanly.
+            if (target_display.workspaceForSpace(current_id) == null) break :blk null;
+            break :blk current_id;
+        } else null;
         transition.model.pending_switch.?.phase = .preparing;
-        transition.addEffect(.{ .switch_native_space = .{ .request = pending.request, .epoch = pending.epoch } });
+        transition.addEffect(.{ .switch_native_space = .{
+            .request = pending.request,
+            .epoch = pending.epoch,
+            .direct_source_space_id = direct_source_space_id,
+        } });
         return;
     }
 
@@ -202,6 +217,22 @@ pub fn reduceTopologyObserved(
         .reason = .unexpected_space,
         .actual = if (actual_space_id) |space_id| transition.model.space(.{ .id = space_id }) else null,
     });
+}
+
+pub fn reduceDirectSwitchDispatched(
+    transition: *Transition,
+    event: @FieldType(Event, "native_direct_switch_dispatched"),
+) void {
+    var pending = transition.model.pending_switch orelse return;
+    if (pending.epoch != event.epoch or pending.phase != .preparing) return;
+
+    pending.phase = .observing;
+    pending.is_direct = true;
+    pending.started_at_ms = event.at_ms;
+    const direct_deadline = event.at_ms +| native_direct_switch_timeout_ms;
+    if (pending.deadline_at_ms > direct_deadline) pending.deadline_at_ms = direct_deadline;
+    transition.model.pending_switch = pending;
+    schedulePendingObservation(transition.model, pending, event.at_ms);
 }
 
 pub fn reduceGesturePrepared(transition: *Transition, event: @FieldType(Event, "native_gesture_prepared")) void {
@@ -1148,11 +1179,14 @@ pub fn finishSwitch(
 
     const queued = transition.model.queued_switch orelse {
         if (failure == null) {
+            const landed = transition.model.space(pending.request.target.key) orelse pending.request.target;
             transition.addEffect(.{ .native_switch_completed = .{
-                .space = transition.model.space(pending.request.target.key) orelse pending.request.target,
+                .space = landed,
                 .epoch = pending.epoch,
             } });
-            // macOS focuses whatever app was last active on the Space.
+            // Dock swipes focus whatever app was last active on the Space;
+            // direct bridged switches only swap Space visibility, so BobrWM
+            // hands focus to the target workspace explicitly.
             if (pending.request.follow_window_id) |window_id| followed: {
                 const leader = transition.model.window(transition.model.windowTabLeader(window_id)) orelse break :followed;
                 if (!leader.space_key.eql(pending.request.target.key)) break :followed;
@@ -1164,9 +1198,8 @@ pub fn finishSwitch(
                     .process_id = leader.process_id,
                     .window_id = transition.model.windowTabActive(leader.window_id),
                 } });
-            }
-            if (pending.phase == .waiting_for_idle) {
-                transition.addEffect(.{ .workspace_switch_ready = .{ .target = pending.request.target } });
+            } else if (pending.is_direct or pending.phase == .waiting_for_idle) {
+                transition.addEffect(.{ .workspace_switch_ready = .{ .target = landed } });
             }
         }
         return;
@@ -1307,9 +1340,15 @@ pub fn refreshPendingNativeWindowMoves(model: *Model) void {
 }
 
 pub fn schedulePendingObservation(model: *Model, pending: PendingSwitch, at_ms: TimestampMs) void {
+    const is_fast_direct = pending.is_direct and
+        at_ms -| pending.started_at_ms < native_direct_switch_fast_window_ms;
+    const delay_ms = if (is_fast_direct)
+        native_direct_switch_fast_observe_ms
+    else
+        native_observation_delay_ms;
     model.observation_timer = .{
         .epoch = pending.epoch,
-        .due_at_ms = at_ms +| native_observation_delay_ms,
+        .due_at_ms = at_ms +| delay_ms,
     };
 }
 

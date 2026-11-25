@@ -189,6 +189,7 @@ pub fn reduce(model: *Model, event: Event) Transition {
         },
         .native_topology_unavailable => |unavailable| workspace_reducer.reduceTopologyUnavailable(&transition, unavailable),
         .native_switch_effect_failed => |failure| workspace_reducer.reduceSwitchEffectFailed(&transition, failure),
+        .native_direct_switch_dispatched => |dispatched| workspace_reducer.reduceDirectSwitchDispatched(&transition, dispatched),
         .native_gesture_prepared => |prepared| workspace_reducer.reduceGesturePrepared(&transition, prepared),
         .native_gesture_posted => |posted| workspace_reducer.reduceGesturePosted(&transition, posted),
         .native_gesture_timer_fired => |timer| workspace_reducer.reduceGestureTimer(&transition, timer),
@@ -3550,4 +3551,140 @@ test "window move command commits ownership layout and intent atomically" {
     try testing.expectEqual(@as(?WindowId, 100), transition.model.focusedWorkspaceWindow(2));
     try testing.expect(transition.model.retile_request.all_displays);
     try testing.expectEqual(std.meta.Tag(Effect).window_moved, std.meta.activeTag(transition.effects[0]));
+}
+
+test "direct native Space switch observes quickly, hands off focus, and retries on timeout" {
+    const testing = std.testing;
+    var model = initializedModel(testTopology(101, null));
+
+    try expectTestEffect(&model, switchRequest(&model, 1, 3, 100), .workspace_transition_started);
+    const epoch = model.pending_switch.?.epoch;
+    var transition = reduceCopy(model, .{ .native_topology_observed = .{
+        .topology = &testTopology(101, null),
+        .epoch = epoch,
+        .at_ms = 105,
+        .is_animating = false,
+    } });
+    try testing.expectEqual(std.meta.Tag(Effect).switch_native_space, std.meta.activeTag(transition.effects[0]));
+    try testing.expectEqual(@as(?NativeSpaceId, 101), transition.effects[0].switch_native_space.direct_source_space_id);
+    model = transition.model;
+
+    transition = reduceCopy(model, .{ .native_direct_switch_dispatched = .{
+        .epoch = epoch,
+        .at_ms = 106,
+    } });
+    model = transition.model;
+    try testing.expectEqual(@as(u8, 0), transition.effect_count);
+    try testing.expect(model.pending_switch.?.is_direct);
+    try testing.expectEqual(
+        @as(TimestampMs, 106 + model_mod.native_direct_switch_fast_observe_ms),
+        model.observation_timer.?.due_at_ms,
+    );
+    try testing.expectEqual(
+        @as(TimestampMs, 106 + model_mod.native_direct_switch_timeout_ms),
+        model.pending_switch.?.deadline_at_ms,
+    );
+
+    // Unlanded observation after the fast window falls back to the standard 50ms cadence.
+    transition = reduceCopy(model, .{ .native_topology_observed = .{
+        .topology = &testTopology(101, null),
+        .epoch = epoch,
+        .at_ms = 220,
+        .is_animating = false,
+    } });
+    try testing.expectEqual(
+        @as(TimestampMs, 220 + model_mod.native_observation_delay_ms),
+        transition.model.observation_timer.?.due_at_ms,
+    );
+
+    // Timeout retries once with has_retried set; the retry omits direct_source_space_id
+    // so the shell falls back to Dock swipes without inspecting reducer internals.
+    const timed_out = reduceCopy(model, .{ .native_topology_observed = .{
+        .topology = &testTopology(101, null),
+        .epoch = epoch,
+        .at_ms = model.pending_switch.?.deadline_at_ms,
+        .is_animating = false,
+    } });
+    try testing.expect(timed_out.model.pending_switch != null);
+    try testing.expect(timed_out.model.pending_switch.?.has_retried);
+    try testing.expect(!timed_out.model.pending_switch.?.is_direct);
+    const retry_epoch = timed_out.model.pending_switch.?.epoch;
+    const retry_prepare = reduceCopy(timed_out.model, .{ .native_topology_observed = .{
+        .topology = &testTopology(101, null),
+        .epoch = retry_epoch,
+        .at_ms = model.pending_switch.?.deadline_at_ms + 5,
+        .is_animating = false,
+    } });
+    try testing.expectEqual(std.meta.Tag(Effect).switch_native_space, std.meta.activeTag(retry_prepare.effects[0]));
+    try testing.expectEqual(@as(?NativeSpaceId, null), retry_prepare.effects[0].switch_native_space.direct_source_space_id);
+
+    // Switching away from a native fullscreen Space (not mapped to any workspace)
+    // also omits direct_source_space_id so Dock handles the fullscreen exit.
+    var fullscreen_model = initializedModel(testTopology(101, null));
+    try expectTestEffect(&fullscreen_model, switchRequest(&fullscreen_model, 1, 3, 100), .workspace_transition_started);
+    const fs_epoch = fullscreen_model.pending_switch.?.epoch;
+    const fs_prepare = reduceCopy(fullscreen_model, .{ .native_topology_observed = .{
+        .topology = &testTopology(999, null),
+        .epoch = fs_epoch,
+        .at_ms = 105,
+        .is_animating = false,
+    } });
+    try testing.expectEqual(std.meta.Tag(Effect).switch_native_space, std.meta.activeTag(fs_prepare.effects[0]));
+    try testing.expectEqual(@as(?NativeSpaceId, null), fs_prepare.effects[0].switch_native_space.direct_source_space_id);
+
+    // Landing on the target completes and emits workspace_switch_ready to hand off focus.
+    transition = reduceCopy(model, .{ .native_topology_observed = .{
+        .topology = &testTopology(103, null),
+        .epoch = epoch,
+        .at_ms = 116,
+        .is_animating = false,
+    } });
+    try testing.expect(transition.model.pending_switch == null);
+    try testing.expectEqual(@as(u8, 2), transition.effect_count);
+    try testing.expectEqual(std.meta.Tag(Effect).native_switch_completed, std.meta.activeTag(transition.effects[0]));
+    try testing.expectEqual(std.meta.Tag(Effect).workspace_switch_ready, std.meta.activeTag(transition.effects[1]));
+    try testing.expectEqual(@as(WorkspaceId, 3), transition.effects[1].workspace_switch_ready.target.workspace_id);
+}
+
+test "direct native Space switch preserves follow-focus target over workspace focus" {
+    const testing = std.testing;
+    var model = initializedModel(testTopology(101, null));
+    model = reduceCopy(model, .{ .adopt_window = .{
+        .window_id = 700,
+        .process_id = 77,
+        .space_key = .{ .id = 103 },
+    } }).model;
+    model.active_process_id = 77;
+
+    try expectTestEffect(&model, .{ .follow_focus_observed = .{
+        .process_id = 77,
+        .window_id = 700,
+        .leader_window_id = 700,
+        .source = .ax,
+        .target = model.spaceForWorkspace(1, 3).?,
+        .is_target_visible = false,
+        .at_ms = 100,
+    } }, .workspace_transition_started);
+    const epoch = model.pending_switch.?.epoch;
+    try expectTestEffect(&model, .{ .native_topology_observed = .{
+        .topology = &testTopology(101, null),
+        .epoch = epoch,
+        .at_ms = 105,
+        .is_animating = false,
+    } }, .switch_native_space);
+    model = reduceCopy(model, .{ .native_direct_switch_dispatched = .{
+        .epoch = epoch,
+        .at_ms = 106,
+    } }).model;
+
+    const landed = reduceCopy(model, .{ .native_topology_observed = .{
+        .topology = &testTopology(103, null),
+        .epoch = epoch,
+        .at_ms = 116,
+        .is_animating = false,
+    } });
+    try testing.expectEqual(@as(u8, 2), landed.effect_count);
+    try testing.expectEqual(std.meta.Tag(Effect).native_switch_completed, std.meta.activeTag(landed.effects[0]));
+    try testing.expectEqual(std.meta.Tag(Effect).focus_followed_window, std.meta.activeTag(landed.effects[1]));
+    try testing.expectEqual(@as(WindowId, 700), landed.effects[1].focus_followed_window.window_id);
 }
