@@ -78,6 +78,9 @@ const App = struct {
     generation: u32 = 0,
     elements: [element_slots]?CachedElement = @splat(null),
     enhanced_ui_false_at_ns: ?i128 = null,
+    /// True while this queue is holding `AXEnhancedUserInterface = false`
+    /// across animation ticks or a multi-burst drain.
+    enhanced_ui_suspended: bool = false,
 
     fn dropElements(self: *App) void {
         for (&self.elements) |*slot| {
@@ -86,11 +89,23 @@ const App = struct {
             slot.* = null;
         }
         self.enhanced_ui_false_at_ns = null;
+        self.enhanced_ui_suspended = false;
     }
+};
+
+const AnimationHold = struct {
+    pid: i32 = 0,
+    /// Active animated windows for `pid`.
+    active_count: u32 = 0,
+    /// Set by `runWrites` when it leaves `AXEnhancedUserInterface` suspended
+    /// so `endAnimation` knows to wake the queue if the animation is cancelled
+    /// without a final geometry write.
+    enhanced_ui_suspended: bool = false,
 };
 
 var g_lock: c.os_unfair_lock = .{};
 var g_apps: [app_queue.max_apps]App = @splat(.{});
+var g_animation_holds: [app_queue.max_apps]AnimationHold = @splat(.{});
 var g_pending: [max_pending]Pending = undefined;
 var g_pending_count: usize = 0;
 var g_on_failure: ?FailureFn = null;
@@ -199,6 +214,41 @@ pub fn forgetApp(pid: i32) void {
         if (g_pending[index].pid == pid) removePending(index) else index += 1;
     }
     if (hasFocusFor(pid)) g_focus = null;
+    if (findAnimationHoldLocked(pid)) |hold| hold.* = .{};
+}
+
+/// Mark that a window belonging to `pid` is actively animating so its queue
+/// keeps `AXEnhancedUserInterface` suspended across ticks instead of flipping
+/// it off and back on every frame. Must be paired with `endAnimation(pid)`.
+pub fn beginAnimation(pid: i32) void {
+    std.debug.assert(pid > 0);
+    c.os_unfair_lock_lock(&g_lock);
+    defer c.os_unfair_lock_unlock(&g_lock);
+
+    if (ensureAnimationHoldLocked(pid)) |hold| {
+        hold.active_count += 1;
+    }
+}
+
+/// Release one active animation for `pid`. When the app's last animation ends
+/// and `AXEnhancedUserInterface` was held suspended, schedules a write pass so
+/// it is restored even if the animation was cancelled without a final write.
+pub fn endAnimation(pid: i32) void {
+    std.debug.assert(pid > 0);
+    const should_wake = blk: {
+        c.os_unfair_lock_lock(&g_lock);
+        defer c.os_unfair_lock_unlock(&g_lock);
+
+        const hold = findAnimationHoldLocked(pid) orelse break :blk false;
+        if (hold.active_count > 0) hold.active_count -= 1;
+        if (hold.active_count > 0) break :blk false;
+        if (!hold.enhanced_ui_suspended) {
+            hold.* = .{};
+            break :blk false;
+        }
+        break :blk true;
+    };
+    if (should_wake) _ = app_queue.submit(pid, .write);
 }
 
 fn hasFocusFor(pid: i32) bool {
@@ -255,34 +305,88 @@ fn runWrites(app: app_queue.App) void {
     defer c.CFRelease(@ptrCast(ax_app));
     _ = c.AXUIElementSetMessagingTimeout(ax_app, messaging_timeout_seconds);
 
-    // Some apps silently reject geometry writes while AXEnhancedUserInterface
-    // is on. Hold it off for the whole burst, not around every write.
-    var restore_enhanced_ui = false;
-    defer if (restore_enhanced_ui) {
-        _ = c.AXUIElementSetAttributeValue(ax_app, strings.enhanced_ui_attr, c.kCFBooleanTrue);
-    };
-
+    // Some apps silently reject geometry writes or stall accessibility layout
+    // while AXEnhancedUserInterface is on. Hold it off across the full burst
+    // and across animation ticks, restoring it once both drain.
     const deadline_ns = osutil.nanoTimestamp() + 8 * std.time.ns_per_ms;
     for (0..8) |_| {
         c.os_unfair_lock_lock(&g_lock);
         const pending = takePending(app.pid);
         c.os_unfair_lock_unlock(&g_lock);
-        const write_request = pending orelse return;
+        const write_request = pending orelse break;
 
-        if (!restore_enhanced_ui) restore_enhanced_ui = suspendEnhancedUi(state, ax_app, strings);
+        if (!state.enhanced_ui_suspended) {
+            state.enhanced_ui_suspended = suspendEnhancedUi(state, ax_app, strings);
+        }
         if (!applyPending(state, app.pid, strings, write_request) and !write_request.write.quiet) {
             reportFailure(write_request);
         }
         if (osutil.nanoTimestamp() >= deadline_ns) break;
     }
 
+    const disposition = finishWriteBurst(app.pid, state.enhanced_ui_suspended);
+    if (disposition.restore_enhanced_ui) {
+        state.enhanced_ui_suspended = false;
+        _ = c.AXUIElementSetAttributeValue(ax_app, strings.enhanced_ui_attr, c.kCFBooleanTrue);
+    }
+    if (disposition.resubmit) _ = app_queue.submit(app.pid, .write);
+}
+
+const BurstDisposition = struct {
+    restore_enhanced_ui: bool = false,
+    resubmit: bool = false,
+};
+
+/// Decide whether `runWrites` should restore `AXEnhancedUserInterface` now or
+/// keep it suspended across ongoing animations / remaining queued writes.
+fn finishWriteBurst(pid: i32, enhanced_ui_suspended: bool) BurstDisposition {
     c.os_unfair_lock_lock(&g_lock);
     defer c.os_unfair_lock_unlock(&g_lock);
-    for (g_pending[0..g_pending_count]) |pending| {
-        if (pending.pid != app.pid) continue;
-        _ = app_queue.submit(app.pid, .write);
-        break;
+
+    const more_pending = hasPendingLocked(pid);
+    const hold = findAnimationHoldLocked(pid);
+    const animating = if (hold) |entry| entry.active_count > 0 else false;
+
+    if (enhanced_ui_suspended) {
+        if (animating or more_pending) {
+            if (ensureAnimationHoldLocked(pid)) |entry| {
+                entry.enhanced_ui_suspended = true;
+            }
+            return .{ .restore_enhanced_ui = false, .resubmit = more_pending };
+        }
+        if (hold) |entry| entry.* = .{};
+        return .{ .restore_enhanced_ui = true, .resubmit = false };
     }
+
+    if (hold) |entry| {
+        if (entry.active_count == 0) entry.* = .{};
+    }
+    return .{ .restore_enhanced_ui = false, .resubmit = more_pending };
+}
+
+fn hasPendingLocked(pid: i32) bool {
+    for (g_pending[0..g_pending_count]) |pending| {
+        if (pending.pid == pid) return true;
+    }
+    return false;
+}
+
+fn findAnimationHoldLocked(pid: i32) ?*AnimationHold {
+    for (&g_animation_holds) |*hold| {
+        if (hold.pid == pid) return hold;
+    }
+    return null;
+}
+
+fn ensureAnimationHoldLocked(pid: i32) ?*AnimationHold {
+    if (findAnimationHoldLocked(pid)) |existing| return existing;
+    for (&g_animation_holds) |*hold| {
+        if (hold.pid == 0) {
+            hold.* = .{ .pid = pid };
+            return hold;
+        }
+    }
+    return null;
 }
 
 fn runFocus(app: app_queue.App) void {
@@ -436,4 +540,67 @@ fn resolveWindow(pid: i32, wid: u32) ?c.AXUIElementRef {
         return candidate;
     }
     return null;
+}
+
+test "finishWriteBurst holds AXEnhancedUserInterface suspended across animations and restores after end" {
+    const testing = std.testing;
+    const pid: i32 = 9001;
+    defer forgetApp(pid);
+
+    // Non-animated burst restores immediately when no writes remain.
+    try testing.expectEqual(
+        BurstDisposition{ .restore_enhanced_ui = true, .resubmit = false },
+        finishWriteBurst(pid, true),
+    );
+
+    // While two windows of the same app are animating, enhanced UI stays suspended.
+    beginAnimation(pid);
+    beginAnimation(pid);
+    try testing.expectEqual(
+        BurstDisposition{ .restore_enhanced_ui = false, .resubmit = false },
+        finishWriteBurst(pid, true),
+    );
+    try testing.expect(findAnimationHoldLocked(pid).?.enhanced_ui_suspended);
+
+    // Ending only one window keeps it suspended for the other.
+    endAnimation(pid);
+    try testing.expectEqual(
+        BurstDisposition{ .restore_enhanced_ui = false, .resubmit = false },
+        finishWriteBurst(pid, true),
+    );
+
+    // Ending the last window triggers restore on the next burst (and clears the slot).
+    const Probe = struct {
+        var woken: std.atomic.Value(bool) = .init(false);
+        fn handler(_: app_queue.App) void {
+            woken.store(true, .release);
+        }
+    };
+    app_queue.start();
+    app_queue.setHandler(.write, Probe.handler);
+    defer {
+        app_queue.stop();
+        app_queue.start();
+    }
+
+    endAnimation(pid);
+    try testing.expectEqual(
+        BurstDisposition{ .restore_enhanced_ui = true, .resubmit = false },
+        finishWriteBurst(pid, true),
+    );
+    try testing.expectEqual(@as(?*AnimationHold, null), findAnimationHoldLocked(pid));
+}
+
+test "endAnimation without suspended enhanced UI clears slot without waking queue" {
+    const testing = std.testing;
+    const pid: i32 = 9002;
+    defer forgetApp(pid);
+
+    beginAnimation(pid);
+    try testing.expectEqual(
+        BurstDisposition{ .restore_enhanced_ui = false, .resubmit = false },
+        finishWriteBurst(pid, false),
+    );
+    endAnimation(pid);
+    try testing.expectEqual(@as(?*AnimationHold, null), findAnimationHoldLocked(pid));
 }

@@ -166,6 +166,11 @@ pub const Animator = struct {
         for (0..self.count) |i| {
             if (self.animations[i].wid == wid) {
                 const a = &self.animations[i];
+                if (a.pid != pid) {
+                    ax_writer.endAnimation(a.pid);
+                    ax_writer.beginAnimation(pid);
+                    a.pid = pid;
+                }
                 a.display_id = display_id;
                 a.start_frame = a.last_displayed_frame;
                 a.end_frame = target_frame;
@@ -178,6 +183,7 @@ pub const Animator = struct {
             return placeFinal(pid, wid, current_frame, target_frame);
         }
 
+        ax_writer.beginAnimation(pid);
         self.animations[self.count] = .{
             .wid = wid,
             .pid = pid,
@@ -214,6 +220,7 @@ pub const Animator = struct {
                 // drift. Pure moves never wrote a size, so they finish with
                 // a position-only write.
                 _ = placeFinal(a.pid, a.wid, a.start_frame, a.end_frame);
+                ax_writer.endAnimation(a.pid);
                 continue;
             }
 
@@ -239,6 +246,7 @@ pub const Animator = struct {
         for (0..self.count) |i| {
             const a = self.animations[i];
             _ = placeFinal(a.pid, a.wid, a.start_frame, a.end_frame);
+            ax_writer.endAnimation(a.pid);
         }
         self.count = 0;
     }
@@ -252,6 +260,7 @@ pub const Animator = struct {
             const a = self.animations[i];
             if (a.display_id == display_id) {
                 _ = placeFinal(a.pid, a.wid, a.start_frame, a.end_frame);
+                ax_writer.endAnimation(a.pid);
                 continue;
             }
             if (i != j) self.animations[j] = a;
@@ -265,10 +274,12 @@ pub const Animator = struct {
     pub fn cancel(self: *Animator, wid: u32) void {
         for (0..self.count) |i| {
             if (self.animations[i].wid == wid) {
+                const pid = self.animations[i].pid;
                 self.count -= 1;
                 if (i < self.count) {
                     self.animations[i] = self.animations[self.count];
                 }
+                ax_writer.endAnimation(pid);
                 return;
             }
         }

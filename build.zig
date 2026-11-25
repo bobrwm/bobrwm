@@ -801,6 +801,16 @@ pub fn build(b: *std.Build) !void {
     const animation_tests = b.addTest(.{ .name = "animation-tests", .root_module = animation_test_mod });
     const run_animation_tests = b.addRunArtifact(animation_tests);
 
+    const ax_writer_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/ax_writer.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    configureAppModule(ax_writer_test_mod, app_module_dependencies);
+    const ax_writer_tests = b.addTest(.{ .name = "ax-writer-tests", .root_module = ax_writer_test_mod });
+    const run_ax_writer_tests = b.addRunArtifact(ax_writer_tests);
+
     const display_link_test_mod = b.createModule(.{
         .root_source_file = b.path("src/display_link.zig"),
         .target = target,
@@ -881,6 +891,7 @@ pub fn build(b: *std.Build) !void {
     test_step.dependOn(&run_config_json_tests.step);
     test_step.dependOn(&run_config_load_tests.step);
     test_step.dependOn(&run_animation_tests.step);
+    test_step.dependOn(&run_ax_writer_tests.step);
     test_step.dependOn(&run_display_link_tests.step);
     test_step.dependOn(&run_config_watch_tests.step);
     // Running the generator itself catches doc lookups broken by renamed

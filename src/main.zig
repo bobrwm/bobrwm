@@ -3047,6 +3047,9 @@ fn stopCore() void {
         setMouseEventTapEnabled(false);
     }
     display_link.invalidateAll();
+    if (coreReached(.layout)) {
+        g_animator.finishAll();
+    }
     // Stop and drain every background producer before releasing g_waker_source
     // so no in-flight callback can signal a freed CFRunLoopSourceRef.
     if (coreReached(.ax_observer)) {
@@ -3065,7 +3068,6 @@ fn stopCore() void {
         signal_transport.deinit();
     }
     if (coreReached(.layout)) {
-        g_animator.finishAll();
         g_layout_entries.deinit(g_allocator);
     }
     if (coreReached(.config)) {
