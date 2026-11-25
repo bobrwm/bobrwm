@@ -351,6 +351,12 @@ fn easeInOutCubic(t: f64) f64 {
     return 1.0 - std.math.pow(f64, -2.0 * t + 2.0, 3) / 2.0;
 }
 
+/// Land the animation when the target timestamp is within 0.5 ms of the
+/// deadline. Absorbs sub-millisecond vsync jitter and 60 Hz truncation
+/// (`12 * 16_666_666 = 199_999_992 ns < 200 ms`) so exact-multiple durations
+/// do not burn an extra dead refresh waiting to place the final frame.
+const completion_epsilon_ns: i128 = 500 * std.time.ns_per_us;
+
 fn advanceProgress(start_time_ns: *?i128, anchor_ns: i128, target_ns: i128, duration_ns: i128) f64 {
     const start_ns = start_time_ns.* orelse blk: {
         start_time_ns.* = anchor_ns;
@@ -359,6 +365,7 @@ fn advanceProgress(start_time_ns: *?i128, anchor_ns: i128, target_ns: i128, dura
     if (duration_ns == 0) return 1.0;
     if (target_ns <= start_ns) return 0.0;
     const elapsed_ns = target_ns - start_ns;
+    if (elapsed_ns >= duration_ns - completion_epsilon_ns) return 1.0;
     const t_raw = @as(f64, @floatFromInt(elapsed_ns)) / @as(f64, @floatFromInt(duration_ns));
     return @min(t_raw, 1.0);
 }
@@ -387,6 +394,13 @@ test "advanceProgress anchors on first tick and finishes cleanly" {
     try testing.expectEqual(@as(f64, 0.0), advanceProgress(&start, 0, 999 * std.time.ns_per_ms, duration_ns));
     var zero_dur: ?i128 = null;
     try testing.expectEqual(@as(f64, 1.0), advanceProgress(&zero_dur, 1_000, 1_000, 0));
+
+    // Exact 60 Hz truncated steps (12 * 16_666_666 = 199_999_992 ns) land on tick 12,
+    // without burning a 13th ghost refresh for 8 missing nanoseconds.
+    var start_60: ?i128 = 1_000 * std.time.ns_per_ms;
+    const dt_60: i128 = 16_666_666;
+    try testing.expect(advanceProgress(&start_60, 0, start_60.? + 11 * dt_60, duration_ns) < 1.0);
+    try testing.expectEqual(@as(f64, 1.0), advanceProgress(&start_60, 0, start_60.? + 12 * dt_60, duration_ns));
 }
 
 test "cubic bezier matches endpoints, linear identity, and snappy default curve" {
