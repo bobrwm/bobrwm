@@ -446,9 +446,11 @@ fn hideTransitioningDim() void {
 }
 
 fn followAnimationsWithDim() void {
+    var batch = dim.Batch.begin();
+    defer batch.commit();
     for (g_animator.active()) |a| {
         const frame = a.last_displayed_frame;
-        dim.follow(a.wid, frame.x, frame.y, frame.width, frame.height);
+        batch.follow(a.wid, frame.x, frame.y, frame.width, frame.height);
     }
 }
 
@@ -2946,6 +2948,16 @@ fn startCore(config_path_arg: ?[]const u8) !void {
         log.err("required native Space APIs are unavailable", .{});
         return error.NativeSpacesUnavailable;
     }
+    if (g_sky.?.transactionOps()) |tx_ops| {
+        comptime std.debug.assert(@sizeOf(dim.CGPoint) == @sizeOf(skylight.CGPoint));
+        dim.setSlsOps(.{
+            .mainConnectionID = tx_ops.mainConnectionID,
+            .transactionCreate = tx_ops.transactionCreate,
+            .transactionCommit = tx_ops.transactionCommit,
+            .transactionMoveWindow = @ptrCast(tx_ops.transactionMoveWindow),
+            .transactionOrderWindow = tx_ops.transactionOrderWindow,
+        });
+    }
     if (g_config.focus_follows_mouse and !g_sky.?.supportsWindowHitTesting()) {
         log.warn("focus follows mouse: SLSFindWindowAndOwner fallback unavailable; event window IDs are required", .{});
     }
@@ -3085,6 +3097,7 @@ fn stopCore() void {
         objc_classes.deinit();
     }
     resetDimming();
+    dim.setSlsOps(null);
     g_bundle_ids.deinit(g_allocator);
     g_bundle_ids = .{};
     if (coreReached(.signal_transport)) {
