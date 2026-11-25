@@ -971,6 +971,7 @@ private struct BezierCurvePreview: View {
     let y2: Double
 
     var body: some View {
+        let shape = RoundedRectangle(cornerRadius: 6, style: .continuous)
         Canvas { context, size in
             let inset: CGFloat = 10
             let box = CGRect(
@@ -979,10 +980,15 @@ private struct BezierCurvePreview: View {
                 width: size.width - inset * 2,
                 height: size.height - inset * 2
             )
+            // Expand the vertical range when control points overshoot [0, 1]
+            // so the handles and curve peak stay inside the preview box.
+            let yMin = min(0.0, y1, y2)
+            let yMax = max(1.0, y1, y2)
+            let ySpan = max(yMax - yMin, 1.0)
             func map(_ x: Double, _ y: Double) -> CGPoint {
                 CGPoint(
                     x: box.minX + CGFloat(x) * box.width,
-                    y: box.maxY - CGFloat(y) * box.height
+                    y: box.maxY - CGFloat((y - yMin) / ySpan) * box.height
                 )
             }
 
@@ -990,6 +996,19 @@ private struct BezierCurvePreview: View {
             let p1 = map(x1, y1)
             let p2 = map(x2, y2)
             let p3 = map(1, 1)
+
+            if yMin < 0 || yMax > 1 {
+                var bounds = Path()
+                for refY in [0.0, 1.0] {
+                    bounds.move(to: map(0, refY))
+                    bounds.addLine(to: map(1, refY))
+                }
+                context.stroke(
+                    bounds,
+                    with: .color(.secondary.opacity(0.2)),
+                    style: StrokeStyle(lineWidth: 0.75, dash: [2, 2])
+                )
+            }
 
             var guide = Path()
             guide.move(to: p0)
@@ -1021,14 +1040,9 @@ private struct BezierCurvePreview: View {
                 context.fill(Path(ellipseIn: dot), with: .color(.accentColor))
             }
         }
-        .background(
-            RoundedRectangle(cornerRadius: 6, style: .continuous)
-                .fill(.quaternary.opacity(0.45))
-        )
-        .overlay(
-            RoundedRectangle(cornerRadius: 6, style: .continuous)
-                .strokeBorder(.separator.opacity(0.6), lineWidth: 0.5)
-        )
+        .background(shape.fill(.quaternary.opacity(0.45)))
+        .clipShape(shape)
+        .overlay(shape.strokeBorder(.separator.opacity(0.6), lineWidth: 0.5))
     }
 }
 

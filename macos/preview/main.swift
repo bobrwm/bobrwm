@@ -384,6 +384,20 @@ func renderAll(into directory: String) -> Bool {
             scheme: scheme,
             appearance: appearance
         ) && ok
+        let overshootModel = makeSettingsModel(accessibilityGranted: true)
+        overshootModel.settings.animationEnabled = true
+        overshootModel.settings.easing = .bezier
+        overshootModel.settings.animationBezierX1 = 0.34
+        overshootModel.settings.animationBezierY1 = 1.56
+        overshootModel.settings.animationBezierX2 = 0.64
+        overshootModel.settings.animationBezierY2 = 1.0
+        ok = renderPane(
+            .appearance,
+            model: overshootModel,
+            path: "\(directory)/settings-appearance-bezier-overshoot-\(suffix).png",
+            scheme: scheme,
+            appearance: appearance
+        ) && ok
         ok = renderWindow(
             path: "\(directory)/settings-window-\(suffix).png",
             appearance: appearance
