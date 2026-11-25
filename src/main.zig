@@ -2153,6 +2153,7 @@ fn applyReloadedConfig(next: ConfigRuntime) void {
     } });
     g_animator.finishAll();
     g_animator.init(g_config.animation);
+    if (!g_config.animation.enabled) display_link.invalidateAll();
     dim.configure(g_config.dimmed_inactive);
     loginitem.reconcile(g_config.start_at_login);
     configureSwipeEventTap(g_config.swipe.enabled);

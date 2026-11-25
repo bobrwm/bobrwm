@@ -1053,6 +1053,9 @@ private struct DecimalStepper: View {
     let label: String
     @Binding var value: Double
     let range: ClosedRange<Double>
+    // Bumped when an out-of-range text edit clamps back to the current value
+    // so SwiftUI refreshes the TextField instead of leaving stale text shown.
+    @State private var syncToken = 0
 
     init(_ label: String, value: Binding<Double>, in range: ClosedRange<Double>) {
         self.label = label
@@ -1067,6 +1070,7 @@ private struct DecimalStepper: View {
                 .font(.caption)
                 .frame(width: 18, alignment: .trailing)
             TextField("", value: clamped, format: .number.precision(.fractionLength(2)))
+                .id(syncToken)
                 .textFieldStyle(.roundedBorder)
                 .multilineTextAlignment(.trailing)
                 .monospacedDigit()
@@ -1082,7 +1086,11 @@ private struct DecimalStepper: View {
             get: { value },
             set: {
                 let rounded = ($0 * 100).rounded() / 100
-                value = min(max(rounded, range.lowerBound), range.upperBound)
+                let bounded = min(max(rounded, range.lowerBound), range.upperBound)
+                if bounded == value && bounded != $0 {
+                    syncToken &+= 1
+                }
+                value = bounded
             }
         )
     }
