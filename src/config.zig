@@ -772,7 +772,7 @@ pub const Validation = struct {
             .invalid_bsp_split_ratio => try writer.print("expected a finite value from 0.1 through 0.9, found {d}", .{config.bsp_split_ratio}),
             .invalid_dim_level => try writer.print("expected a finite value from 0 through 1, found {d}", .{config.dimmed_inactive.level}),
             .invalid_animation_bezier => try writer.print(
-                "expected finite bezier control points with x1 and x2 from 0 through 1, found ({d}, {d}, {d}, {d})",
+                "expected finite bezier control points with x1/x2 from 0 through 1 and y1/y2 from -1 through 2, found ({d}, {d}, {d}, {d})",
                 .{
                     config.animation.bezier.x1,
                     config.animation.bezier.y1,
@@ -968,6 +968,10 @@ test "validate rejects geometry values that are not bounded" {
 
     cfg = .{};
     cfg.animation.bezier.x1 = 1.5;
+    try t.expectError(error.InvalidAnimationBezier, validate(&cfg));
+
+    cfg = .{};
+    cfg.animation.bezier.y1 = 2.5;
     try t.expectError(error.InvalidAnimationBezier, validate(&cfg));
 
     cfg = .{};

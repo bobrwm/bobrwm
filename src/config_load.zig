@@ -366,8 +366,9 @@ const ValidationContext = struct {
             .invalid_dim_level => origins.dimmed_inactive.level,
             .invalid_animation_bezier => blk: {
                 const bezier = self.merged.config.animation.bezier;
+                const CubicBezier = @TypeOf(bezier);
                 if (!std.math.isFinite(bezier.x1) or bezier.x1 < 0 or bezier.x1 > 1) break :blk origins.animation.bezier.x1;
-                if (!std.math.isFinite(bezier.y1)) break :blk origins.animation.bezier.y1;
+                if (!std.math.isFinite(bezier.y1) or bezier.y1 < CubicBezier.min_y or bezier.y1 > CubicBezier.max_y) break :blk origins.animation.bezier.y1;
                 if (!std.math.isFinite(bezier.x2) or bezier.x2 < 0 or bezier.x2 > 1) break :blk origins.animation.bezier.x2;
                 break :blk origins.animation.bezier.y2;
             },
@@ -694,4 +695,13 @@ test "animation easing presets and custom bezier load and round-trip" {
     try std.testing.expectEqual(.bezier, custom.config.animation.easing);
     try std.testing.expectApproxEqAbs(@as(f64, 0.16), custom.config.animation.bezier.x1, 1e-9);
     try std.testing.expectApproxEqAbs(@as(f64, 0.30), custom.config.animation.bezier.x2, 1e-9);
+
+    // Out-of-range y1 must attribute to y1's line rather than falling through
+    // to default y2 (which ValidationContext.emit would ignore).
+    var bad: TestLoad = .{ .arena = .init(std.testing.allocator) };
+    defer bad.arena.deinit();
+    try std.testing.expectError(error.InvalidConfig, bad.run(.{
+        .lua = "bobrwm.settings.set('animation.bezier.y1', 5.0)",
+    }));
+    try bad.expectMessage("init.lua", 1, "y1/y2 from -1 through 2");
 }

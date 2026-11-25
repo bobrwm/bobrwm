@@ -24,8 +24,15 @@ pub const Easing = enum {
 };
 
 /// Control points for a CSS-style cubic Bezier curve from `(0, 0)` to `(1, 1)`.
-/// `x1` and `x2` must be between 0 and 1; `y1` and `y2` may overshoot.
+/// `x1` and `x2` must be between 0 and 1; `y1` and `y2` must be between -1 and 2
+/// (values outside 0 to 1 overshoot).
 pub const CubicBezier = struct {
+    /// Minimum and maximum allowed Y control point values. Keeps overshoot
+    /// bounded so intermediate frames stay finite and on-screen, matching
+    /// the Settings UI stepper range.
+    pub const min_y: f64 = -1.0;
+    pub const max_y: f64 = 2.0;
+
     /// Fast launch with a crisp, bounce-free settle.
     pub const snappy: CubicBezier = .{ .x1 = 0.22, .y1 = 1.0, .x2 = 0.36, .y2 = 1.0 };
     /// macOS CoreAnimation `ease`: slight ease-in and balanced deceleration.
@@ -35,18 +42,20 @@ pub const CubicBezier = struct {
 
     /// X coordinate of the first control point (0 to 1).
     x1: f64 = snappy.x1,
-    /// Y coordinate of the first control point. Values outside 0 to 1 overshoot.
+    /// Y coordinate of the first control point (-1 to 2). Values outside 0 to 1 overshoot.
     y1: f64 = snappy.y1,
     /// X coordinate of the second control point (0 to 1).
     x2: f64 = snappy.x2,
-    /// Y coordinate of the second control point. Values outside 0 to 1 overshoot.
+    /// Y coordinate of the second control point (-1 to 2). Values outside 0 to 1 overshoot.
     y2: f64 = snappy.y2,
 
     pub fn isValid(self: CubicBezier) bool {
         return std.math.isFinite(self.x1) and std.math.isFinite(self.y1) and
             std.math.isFinite(self.x2) and std.math.isFinite(self.y2) and
             self.x1 >= 0.0 and self.x1 <= 1.0 and
-            self.x2 >= 0.0 and self.x2 <= 1.0;
+            self.x2 >= 0.0 and self.x2 <= 1.0 and
+            self.y1 >= min_y and self.y1 <= max_y and
+            self.y2 >= min_y and self.y2 <= max_y;
     }
 
     /// Evaluate `y` at progress `x` in `[0, 1]`. Solves `B_x(u) = x` using
@@ -391,16 +400,22 @@ test "cubic bezier matches endpoints, linear identity, and snappy default curve"
     try testing.expect(steep.evaluate(0.9) > 1.0);
 }
 
-test "cubic bezier validation rejects out-of-range x and non-finite points" {
+test "cubic bezier validation rejects out-of-range x, y, and non-finite points" {
     const testing = std.testing;
     try testing.expect(!(CubicBezier{ .x1 = -0.01 }).isValid());
     try testing.expect(!(CubicBezier{ .x1 = 1.01 }).isValid());
     try testing.expect(!(CubicBezier{ .x2 = -0.1 }).isValid());
     try testing.expect(!(CubicBezier{ .x2 = 1.5 }).isValid());
+    try testing.expect(!(CubicBezier{ .y1 = -1.01 }).isValid());
+    try testing.expect(!(CubicBezier{ .y1 = 2.01 }).isValid());
+    try testing.expect(!(CubicBezier{ .y1 = 1e308 }).isValid());
+    try testing.expect(!(CubicBezier{ .y2 = -1.5 }).isValid());
+    try testing.expect(!(CubicBezier{ .y2 = 2.5 }).isValid());
     try testing.expect(!(CubicBezier{ .y1 = std.math.nan(f64) }).isValid());
     try testing.expect(!(CubicBezier{ .y2 = std.math.inf(f64) }).isValid());
-    // Overshoot on y is valid.
+    // Overshoot on y within [-1, 2] is valid.
     try testing.expect((CubicBezier{ .x1 = 0.34, .y1 = 1.56, .x2 = 0.64, .y2 = 1.0 }).isValid());
+    try testing.expect((CubicBezier{ .x1 = 0.0, .y1 = -1.0, .x2 = 1.0, .y2 = 2.0 }).isValid());
 }
 
 test "bezier presets are valid, monotonic, and ordered from snappy to smooth" {
