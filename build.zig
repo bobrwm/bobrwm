@@ -791,6 +791,26 @@ pub fn build(b: *std.Build) !void {
 
     const run_config_load_tests = b.addRunArtifact(config_load_tests);
 
+    const animation_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/animation.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    configureAppModule(animation_test_mod, app_module_dependencies);
+    const animation_tests = b.addTest(.{ .name = "animation-tests", .root_module = animation_test_mod });
+    const run_animation_tests = b.addRunArtifact(animation_tests);
+
+    const display_link_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/display_link.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    configureAppModule(display_link_test_mod, app_module_dependencies);
+    const display_link_tests = b.addTest(.{ .name = "display-link-tests", .root_module = display_link_test_mod });
+    const run_display_link_tests = b.addRunArtifact(display_link_tests);
+
     const config_watch_test_mod = b.createModule(.{
         .root_source_file = b.path("src/config_watch.zig"),
         .target = target,
@@ -860,6 +880,8 @@ pub fn build(b: *std.Build) !void {
     test_step.dependOn(&run_config_lua_tests.step);
     test_step.dependOn(&run_config_json_tests.step);
     test_step.dependOn(&run_config_load_tests.step);
+    test_step.dependOn(&run_animation_tests.step);
+    test_step.dependOn(&run_display_link_tests.step);
     test_step.dependOn(&run_config_watch_tests.step);
     // Running the generator itself catches doc lookups broken by renamed
     // containers or fields, which the unit tests cannot see.

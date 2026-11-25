@@ -1,31 +1,41 @@
-//! Display-synchronized frame clock for window animations. Each display with
-//! an in-flight animation gets a CADisplayLink from its NSScreen, scheduled
-//! on the main run loop in common modes so frames keep coming while a menu
-//! is tracking. Frames run on the main thread, where AX writes and animator
+//! Display-synchronized frame clock for window animations. Each display gets a
+//! CADisplayLink from its NSScreen, scheduled on the main run loop in common
+//! modes so frames keep coming while a menu is tracking. Links stay allocated
+//! and paused (`isPaused = true`) while idle so starting an animation only
+//! unpauses an existing link instead of recreating WindowServer display-link
+//! state every time; `invalidateAll` tears them down on display reconfigure
+//! and shutdown. Frames run on the main thread, where AX writes and animator
 //! state belong, and a busy main thread skips refreshes instead of draining
 //! a backlog of stale ones. Animations are sampled at the link's target
-//! timestamp, when the frame will reach the screen, instead of at whenever a
-//! fixed timer happened to fire, so steps are evenly spaced on 60 Hz,
-//! ProMotion, and mixed-rate setups alike.
+//! timestamp, when the frame will reach the screen, and newly started
+//! animations anchor to one refresh interval before that target so steps are
+//! evenly spaced on 60 Hz, ProMotion, and mixed-rate setups alike.
 //!
-//! Memory management is MRR: each running slot owns a +1 retain on its link.
+//! Memory management is MRR: each allocated slot owns a +1 retain on its link.
 
 const std = @import("std");
 const objc = @import("objc");
-const cg_extra = @import("cg_extra");
 const objc_classes = @import("objc_classes.zig");
 const workspace = @import("workspace.zig");
 
 const log = std.log.scoped(.display_link);
 
-/// Main-thread frame handler. `target_ns` is when the frame being produced
-/// will be shown, on the `nowNs` clock.
-pub const FrameFn = *const fn (display_id: u32, target_ns: i128) void;
+/// Main-thread frame handler. `anchor_ns` is one refresh interval before
+/// `target_ns` (used to anchor newly started animations cleanly to one step in),
+/// and `target_ns` is when the frame being produced will be shown. Both are on
+/// CoreAnimation's `CACurrentMediaTime` clock.
+pub const FrameFn = *const fn (display_id: u32, anchor_ns: i128, target_ns: i128) void;
+
+pub const FrameTimestamps = struct {
+    anchor_ns: i128,
+    target_ns: i128,
+};
 
 const Link = struct {
     display_id: u32 = 0,
-    /// +1 retain on the CADisplayLink; null while stopped.
+    /// +1 retain on the CADisplayLink; null while unallocated.
     ref: ?objc.Object = null,
+    paused: bool = true,
 };
 
 /// `NSString * const` exported by Foundation. Declared `extern var` for the
@@ -34,28 +44,25 @@ extern var NSRunLoopCommonModes: objc.c.id;
 
 var g_links: [workspace.max_displays]Link = @splat(.{});
 var g_on_frame: ?FrameFn = null;
-var g_timebase: cg_extra.mach_timebase_info_data_t = .{ .numer = 0, .denom = 0 };
 
 pub fn init(on_frame: FrameFn) void {
     g_on_frame = on_frame;
-    _ = cg_extra.mach_timebase_info(&g_timebase);
-    std.debug.assert(g_timebase.denom != 0);
     objc_classes.registerDisplayLinkTarget(fired);
 }
 
-/// Monotonic nanoseconds on the display link's clock (mach absolute time,
-/// which pauses during system sleep and is what CACurrentMediaTime reports).
-/// Animation start times must use this clock so they compare against frame
-/// target times.
-pub fn nowNs() i128 {
-    return @divTrunc(@as(i128, cg_extra.mach_absolute_time()) * g_timebase.numer, g_timebase.denom);
-}
-
-/// Start delivering frames for `display_id`. No-op if already running.
-/// Returns false when no link could be started, e.g. the display is gone.
+/// Start delivering frames for `display_id`, unpausing a cached link when one
+/// already exists or creating one on demand. Returns false when no link could
+/// be created, e.g. the display is gone.
 pub fn start(display_id: u32) bool {
-    if (running(display_id) != null) return true;
-    const link = idleSlot() orelse {
+    if (find(display_id)) |link| {
+        if (link.paused) {
+            link.paused = false;
+            link.ref.?.msgSend(void, "setPaused:", .{false});
+        }
+        return true;
+    }
+
+    const link = freeSlot() orelse {
         log.warn("no free display link slot display={d}", .{display_id});
         return false;
     };
@@ -84,37 +91,65 @@ pub fn start(display_id: u32) bool {
     ref.msgSend(void, "addToRunLoop:forMode:", .{ run_loop, objc.Object{ .value = NSRunLoopCommonModes } });
 
     _ = ref.msgSend(objc.Object, "retain", .{});
-    link.* = .{ .display_id = display_id, .ref = ref };
+    link.* = .{ .display_id = display_id, .ref = ref, .paused = false };
     return true;
 }
 
-/// Stop and release the link for `display_id`. No frame runs after this.
-pub fn stop(display_id: u32) void {
-    const link = running(display_id) orelse return;
-    const ref = link.ref.?;
-    link.ref = null;
-
-    // Invalidating removes the link from the run loop. Autorelease rather
-    // than release: stop runs from inside the link's own frame callback when
-    // the last animation lands, and the link must outlive that dispatch.
-    ref.msgSend(void, "invalidate", .{});
-    ref.msgSend(void, "autorelease", .{});
+/// Pause frame delivery for `display_id` while keeping the link allocated so
+/// future animations can resume without recreating it. No idle wakeups occur
+/// while paused.
+pub fn pause(display_id: u32) void {
+    const link = find(display_id) orelse return;
+    if (link.paused) return;
+    link.paused = true;
+    link.ref.?.msgSend(void, "setPaused:", .{true});
 }
 
-pub fn stopAll() void {
+/// Invalidate and release every cached link. Used on display reconfiguration
+/// (where an NSScreen may have gone away or changed refresh characteristics)
+/// and on shutdown.
+pub fn invalidateAll() void {
     for (&g_links) |*link| {
-        if (link.ref != null) stop(link.display_id);
+        const ref = link.ref orelse continue;
+        link.* = .{};
+
+        // Invalidating removes the link from the run loop. Autorelease rather
+        // than release in case teardown ever runs during a frame dispatch.
+        ref.msgSend(void, "invalidate", .{});
+        ref.msgSend(void, "autorelease", .{});
     }
 }
 
-fn running(display_id: u32) ?*Link {
+/// Convert `CADisplayLink` frame times into nanoseconds on the link's clock.
+/// `anchor_ns` is one refresh interval before `target_ns` so newly started
+/// animations step cleanly by one frame on their first tick. Guards against a
+/// stale or inverted `timestamp` right after unpausing by falling back to the
+/// link's nominal `duration` (or 60 Hz).
+pub fn frameTimestampsNs(timestamp_s: f64, target_s: f64, duration_s: f64) FrameTimestamps {
+    const target_ns: i128 = @intFromFloat(target_s * std.time.ns_per_s);
+    const raw_dt_s = target_s - timestamp_s;
+    const max_reasonable_frame_s = 0.1;
+    const frame_dt_s = if (raw_dt_s > 0.0 and raw_dt_s <= max_reasonable_frame_s)
+        raw_dt_s
+    else if (duration_s > 0.0 and duration_s <= max_reasonable_frame_s)
+        duration_s
+    else
+        1.0 / 60.0;
+    const frame_dt_ns: i128 = @intFromFloat(frame_dt_s * std.time.ns_per_s);
+    return .{
+        .anchor_ns = target_ns - frame_dt_ns,
+        .target_ns = target_ns,
+    };
+}
+
+fn find(display_id: u32) ?*Link {
     for (&g_links) |*link| {
         if (link.ref != null and link.display_id == display_id) return link;
     }
     return null;
 }
 
-fn idleSlot() ?*Link {
+fn freeSlot() ?*Link {
     for (&g_links) |*link| {
         if (link.ref == null) return link;
     }
@@ -145,9 +180,32 @@ fn fired(ref: objc.Object) void {
             if (owned.value == ref.value) break link;
         }
     } else return;
+    // Drop any callback already queued on the run loop before pause took effect.
+    if (link.paused) return;
 
-    // CFTimeInterval on the CACurrentMediaTime clock, i.e. mach absolute
-    // time in seconds, which is the same clock as nowNs.
+    const timestamp_s = ref.msgSend(f64, "timestamp", .{});
     const target_s = ref.msgSend(f64, "targetTimestamp", .{});
-    g_on_frame.?(link.display_id, @intFromFloat(target_s * std.time.ns_per_s));
+    const duration_s = ref.msgSend(f64, "duration", .{});
+    const times = frameTimestampsNs(timestamp_s, target_s, duration_s);
+    g_on_frame.?(link.display_id, times.anchor_ns, times.target_ns);
+}
+
+test "frameTimestampsNs anchors one refresh before target and guards stale timestamps" {
+    const testing = std.testing;
+
+    // 120 Hz ProMotion healthy frame.
+    const dt_120 = 1.0 / 120.0;
+    const t_120 = frameTimestampsNs(100.0, 100.0 + dt_120, dt_120);
+    const expected_120: i128 = @intFromFloat(dt_120 * std.time.ns_per_s);
+    try testing.expectEqual(expected_120, t_120.target_ns - t_120.anchor_ns);
+
+    // Stale timestamp from before pause (> 100ms old) falls back to nominal duration.
+    const dt_60 = 1.0 / 60.0;
+    const stale = frameTimestampsNs(10.0, 25.0, dt_60);
+    const expected_60: i128 = @intFromFloat(dt_60 * std.time.ns_per_s);
+    try testing.expectEqual(expected_60, stale.target_ns - stale.anchor_ns);
+
+    // Inverted timestamp with invalid duration falls back to 60 Hz.
+    const bad = frameTimestampsNs(30.0, 25.0, 0.0);
+    try testing.expectEqual(expected_60, bad.target_ns - bad.anchor_ns);
 }

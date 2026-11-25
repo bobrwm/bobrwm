@@ -37,8 +37,10 @@ pub const WindowAnimation = struct {
     start_frame: window_mod.Window.Frame,
     end_frame: window_mod.Window.Frame,
     last_displayed_frame: window_mod.Window.Frame,
-    /// On the display_link.nowNs clock, which frame target times share.
-    start_time_ns: i128,
+    /// Anchored on the first display-link tick (`anchor_ns`, one refresh before
+    /// `target_ns`) so animations do not lose opening frames to link unpause or
+    /// vsync phase. Null until the first tick runs.
+    start_time_ns: ?i128 = null,
 };
 
 const max_animations = 64;
@@ -69,7 +71,6 @@ pub const Animator = struct {
         wid: u32,
         current_frame: window_mod.Window.Frame,
         target_frame: window_mod.Window.Frame,
-        now_ns: i128,
     ) bool {
         for (0..self.count) |i| {
             if (self.animations[i].wid == wid) {
@@ -77,7 +78,7 @@ pub const Animator = struct {
                 a.display_id = display_id;
                 a.start_frame = a.last_displayed_frame;
                 a.end_frame = target_frame;
-                a.start_time_ns = now_ns;
+                a.start_time_ns = null;
                 return true;
             }
         }
@@ -93,16 +94,17 @@ pub const Animator = struct {
             .start_frame = current_frame,
             .end_frame = target_frame,
             .last_displayed_frame = current_frame,
-            .start_time_ns = now_ns,
+            .start_time_ns = null,
         };
         self.count += 1;
         return true;
     }
 
     /// Advance the animations on `display_id` to the frame shown at
-    /// `target_ns`. Moves each animated window to its interpolated position.
-    /// Removes completed animations.
-    pub fn tick(self: *Animator, display_id: u32, target_ns: i128) void {
+    /// `target_ns`, anchoring any newly started animation to `anchor_ns`.
+    /// Moves each animated window to its interpolated position and removes
+    /// completed animations.
+    pub fn tick(self: *Animator, display_id: u32, anchor_ns: i128, target_ns: i128) void {
         var j: usize = 0;
         for (0..self.count) |i| {
             const a = &self.animations[i];
@@ -112,12 +114,7 @@ pub const Animator = struct {
                 continue;
             }
 
-            const elapsed_ns = target_ns - a.start_time_ns;
-            const t_raw = if (self.duration_ns == 0)
-                @as(f64, 1)
-            else
-                @as(f64, @floatFromInt(elapsed_ns)) / @as(f64, @floatFromInt(self.duration_ns));
-            const t = @min(@max(t_raw, 0), 1);
+            const t = advanceProgress(&a.start_time_ns, anchor_ns, target_ns, self.duration_ns);
 
             if (t >= 1) {
                 // Final tick: place at the exact target — easings like
@@ -248,6 +245,38 @@ fn easeInOutCubic(t: f64) f64 {
     return 1.0 - std.math.pow(f64, -2.0 * t + 2.0, 3) / 2.0;
 }
 
+fn advanceProgress(start_time_ns: *?i128, anchor_ns: i128, target_ns: i128, duration_ns: i128) f64 {
+    const start_ns = start_time_ns.* orelse blk: {
+        start_time_ns.* = anchor_ns;
+        break :blk anchor_ns;
+    };
+    if (duration_ns == 0) return 1.0;
+    const elapsed_ns = target_ns - start_ns;
+    const t_raw = @as(f64, @floatFromInt(elapsed_ns)) / @as(f64, @floatFromInt(duration_ns));
+    return @min(@max(t_raw, 0.0), 1.0);
+}
+
 fn easeSpring(t: f64) f64 {
     return 1.0 - std.math.exp(-6.0 * t) * std.math.cos(10.0 * t);
+}
+
+test "advanceProgress anchors on first tick and finishes cleanly" {
+    const testing = std.testing;
+    const duration_ns: i128 = 200 * std.time.ns_per_ms;
+    const frame_ns: i128 = 10 * std.time.ns_per_ms;
+
+    var start: ?i128 = null;
+    // First tick anchors to `anchor_ns` so progress is exactly 1 frame in.
+    const t1 = advanceProgress(&start, 1_000 * std.time.ns_per_ms, 1_000 * std.time.ns_per_ms + frame_ns, duration_ns);
+    try testing.expectEqual(@as(?i128, 1_000 * std.time.ns_per_ms), start);
+    try testing.expectApproxEqAbs(@as(f64, 0.05), t1, 1e-9);
+
+    // Subsequent tick preserves the original anchor.
+    const t2 = advanceProgress(&start, 1_010 * std.time.ns_per_ms, 1_020 * std.time.ns_per_ms, duration_ns);
+    try testing.expectEqual(@as(?i128, 1_000 * std.time.ns_per_ms), start);
+    try testing.expectApproxEqAbs(@as(f64, 0.10), t2, 1e-9);
+
+    // Fallback landing when display link fails to start (`anchor = 0, target = maxInt`).
+    var unstarted: ?i128 = null;
+    try testing.expectEqual(@as(f64, 1.0), advanceProgress(&unstarted, 0, std.math.maxInt(i128), duration_ns));
 }

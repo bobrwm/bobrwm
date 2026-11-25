@@ -2078,14 +2078,14 @@ fn signalWaker() void {
 }
 
 /// Display link frame handler for `display_id`.
-fn animationFrame(display_id: u32, target_ns: i128) void {
+fn animationFrame(display_id: u32, anchor_ns: i128, target_ns: i128) void {
     const animating_before = g_animator.active().len;
-    g_animator.tick(display_id, target_ns);
+    g_animator.tick(display_id, anchor_ns, target_ns);
     if (dim.enabled) {
         // A finished animation needs a full snapshot to land on the final frame.
         if (g_animator.active().len < animating_before) pushDimSnapshot() else followAnimationsWithDim();
     }
-    if (!g_animator.isAnimatingOnDisplay(display_id)) display_link.stop(display_id);
+    if (!g_animator.isAnimatingOnDisplay(display_id)) display_link.pause(display_id);
 }
 
 fn ensureAnimationFrames(display_id: u32) void {
@@ -2094,7 +2094,7 @@ fn ensureAnimationFrames(display_id: u32) void {
     // Without frames the animations would never finish, and in-flight windows
     // ignore their own move events. A target past every deadline lands each
     // one on its final frame now.
-    animationFrame(display_id, std.math.maxInt(i128));
+    animationFrame(display_id, 0, std.math.maxInt(i128));
 }
 
 fn rolePollTimerTick(context: ?*anyopaque) callconv(.c) void {
@@ -3045,7 +3045,7 @@ fn stopCore() void {
     if (coreReached(.ax_observer)) {
         setMouseEventTapEnabled(false);
     }
-    display_link.stopAll();
+    display_link.invalidateAll();
     // Stop and drain every background producer before releasing g_waker_source
     // so no in-flight callback can signal a freed CFRunLoopSourceRef.
     if (coreReached(.ax_observer)) {
@@ -3822,7 +3822,7 @@ fn handleEvent(ev: *const event_mod.Event) void {
             // strand its animations mid-flight. Land them; the reconfigure
             // retile animates from the final frames.
             g_animator.finishAll();
-            display_link.stopAll();
+            display_link.invalidateAll();
             const at_ms = nativeStateNowMs();
             dispatchStateEvent(.{ .display_changed = .{
                 .at_ms = at_ms,
@@ -7172,7 +7172,7 @@ fn retileDisplay(display_id: u32) void {
             // exact display frame.
             var applied = true;
             if (g_config.animation.enabled and !win.is_fullscreen and !following_app_resize) {
-                applied = g_animator.animate(display_id, visible.pid, visible_wid, physicalFrame(visible_wid, visible.frame), target_frame, display_link.nowNs());
+                applied = g_animator.animate(display_id, visible.pid, visible_wid, physicalFrame(visible_wid, visible.frame), target_frame);
                 if (applied) recordAnimationIntent(visible_wid, target_frame);
                 ensureAnimationFrames(display_id);
             } else {
