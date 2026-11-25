@@ -2092,9 +2092,9 @@ fn ensureAnimationFrames(display_id: u32) void {
     if (!g_animator.isAnimatingOnDisplay(display_id)) return;
     if (display_link.start(display_id)) return;
     // Without frames the animations would never finish, and in-flight windows
-    // ignore their own move events. A target past every deadline lands each
-    // one on its final frame now.
-    animationFrame(display_id, 0, std.math.maxInt(i128));
+    // ignore their own move events. Place each one at its final frame now.
+    g_animator.finishOnDisplay(display_id);
+    if (dim.enabled) pushDimSnapshot();
 }
 
 fn rolePollTimerTick(context: ?*anyopaque) callconv(.c) void {

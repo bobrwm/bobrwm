@@ -237,6 +237,23 @@ pub const Animator = struct {
         self.count = 0;
     }
 
+    /// Immediately complete all active animations on `display_id`, leaving
+    /// animations on other displays untouched. Used when no display link can
+    /// be started for that display.
+    pub fn finishOnDisplay(self: *Animator, display_id: u32) void {
+        var j: usize = 0;
+        for (0..self.count) |i| {
+            const a = self.animations[i];
+            if (a.display_id == display_id) {
+                _ = placeFinal(a.pid, a.wid, a.start_frame, a.end_frame);
+                continue;
+            }
+            if (i != j) self.animations[j] = a;
+            j += 1;
+        }
+        self.count = j;
+    }
+
     /// Drop the animation for a window without moving it. Used when the
     /// window is destroyed or minimized and its frame no longer matters.
     pub fn cancel(self: *Animator, wid: u32) void {
@@ -340,9 +357,10 @@ fn advanceProgress(start_time_ns: *?i128, anchor_ns: i128, target_ns: i128, dura
         break :blk anchor_ns;
     };
     if (duration_ns == 0) return 1.0;
+    if (target_ns <= start_ns) return 0.0;
     const elapsed_ns = target_ns - start_ns;
     const t_raw = @as(f64, @floatFromInt(elapsed_ns)) / @as(f64, @floatFromInt(duration_ns));
-    return @min(@max(t_raw, 0.0), 1.0);
+    return @min(t_raw, 1.0);
 }
 
 fn easeSpring(t: f64) f64 {
@@ -365,9 +383,10 @@ test "advanceProgress anchors on first tick and finishes cleanly" {
     try testing.expectEqual(@as(?i128, 1_000 * std.time.ns_per_ms), start);
     try testing.expectApproxEqAbs(@as(f64, 0.10), t2, 1e-9);
 
-    // Fallback landing when display link fails to start (`anchor = 0, target = maxInt`).
-    var unstarted: ?i128 = null;
-    try testing.expectEqual(@as(f64, 1.0), advanceProgress(&unstarted, 0, std.math.maxInt(i128), duration_ns));
+    // Non-advancing timestamp clamps to 0 without underflow, and 0ms completes immediately.
+    try testing.expectEqual(@as(f64, 0.0), advanceProgress(&start, 0, 999 * std.time.ns_per_ms, duration_ns));
+    var zero_dur: ?i128 = null;
+    try testing.expectEqual(@as(f64, 1.0), advanceProgress(&zero_dur, 1_000, 1_000, 0));
 }
 
 test "cubic bezier matches endpoints, linear identity, and snappy default curve" {
