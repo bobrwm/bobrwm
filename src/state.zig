@@ -3688,3 +3688,44 @@ test "direct native Space switch preserves follow-focus target over workspace fo
     try testing.expectEqual(std.meta.Tag(Effect).focus_followed_window, std.meta.activeTag(landed.effects[1]));
     try testing.expectEqual(@as(WindowId, 700), landed.effects[1].focus_followed_window.window_id);
 }
+
+test "cross-display move to a visible workspace skips native Space move" {
+    const testing = std.testing;
+    var model = initializedModel(testTopology(101, 201));
+    model = reduceCopy(model, .{ .adopt_window = .{
+        .window_id = 500,
+        .process_id = 55,
+        .space_key = .{ .id = 101 },
+    } }).model;
+
+    // Display 2's Space 201 is already shown: frame placement moves the window
+    // onto Display 2 naturally, so no move_native_window effect should fire.
+    const to_visible_other = reduceCopy(model, .{ .request_window_move = .{
+        .window_id = 500,
+        .target = model.space(.{ .id = 201 }).?,
+        .should_move_native = true,
+    } });
+    try testing.expectEqual(@as(u8, 1), to_visible_other.effect_count);
+    try testing.expectEqual(std.meta.Tag(Effect).window_moved, std.meta.activeTag(to_visible_other.effects[0]));
+    try testing.expect(to_visible_other.model.pendingNativeWindowMove(500) == null);
+    try testing.expect(to_visible_other.model.geometry.get(500).?.is_size_unknown);
+
+    // Moving to a hidden Space on the other display (202) still uses native Space move.
+    const to_hidden_other = reduceCopy(model, .{ .request_window_move = .{
+        .window_id = 500,
+        .target = model.space(.{ .id = 202 }).?,
+        .should_move_native = true,
+    } });
+    try testing.expectEqual(@as(u8, 2), to_hidden_other.effect_count);
+    try testing.expectEqual(std.meta.Tag(Effect).move_native_window, std.meta.activeTag(to_hidden_other.effects[0]));
+    try testing.expectEqual(std.meta.Tag(Effect).window_moved, std.meta.activeTag(to_hidden_other.effects[1]));
+
+    // Same-display move to a hidden Space (102) still uses native Space move.
+    const to_hidden_same = reduceCopy(model, .{ .request_window_move = .{
+        .window_id = 500,
+        .target = model.space(.{ .id = 102 }).?,
+        .should_move_native = true,
+    } });
+    try testing.expectEqual(@as(u8, 2), to_hidden_same.effect_count);
+    try testing.expectEqual(std.meta.Tag(Effect).move_native_window, std.meta.activeTag(to_hidden_same.effects[0]));
+}

@@ -2097,6 +2097,28 @@ fn ensureAnimationFrames(display_id: u32) void {
     if (dim.enabled) pushDimSnapshot();
 }
 
+fn warmDisplayLinks() void {
+    if (!g_config.animation.enabled) return;
+    for (g_displays[0..g_display_count]) |display| {
+        display_link.warm(display.id);
+    }
+}
+
+/// Whether `frame`'s center lies on `display_id` rather than another attached
+/// display. Used to place cross-display moves directly instead of animating
+/// them across display boundaries where macOS clamps oversized frames.
+fn frameOnDisplay(frame: window_mod.Window.Frame, display_id: u32) bool {
+    const cx = frame.x + frame.width / 2.0;
+    const cy = frame.y + frame.height / 2.0;
+    for (g_displays[0..g_display_count]) |display| {
+        const b = display.full;
+        if (cx >= b.x and cx < b.x + b.w and cy >= b.y and cy < b.y + b.h) {
+            return display.id == display_id;
+        }
+    }
+    return true;
+}
+
 fn rolePollTimerTick(context: ?*anyopaque) callconv(.c) void {
     _ = context;
     bw_emit_event(shim.BW_EVENT_ROLE_POLL_TICK, 0, 0);
@@ -2153,7 +2175,7 @@ fn applyReloadedConfig(next: ConfigRuntime) void {
     } });
     g_animator.finishAll();
     g_animator.init(g_config.animation);
-    if (!g_config.animation.enabled) display_link.invalidateAll();
+    if (g_config.animation.enabled) warmDisplayLinks() else display_link.invalidateAll();
     dim.configure(g_config.dimmed_inactive);
     loginitem.reconcile(g_config.start_at_login);
     configureSwipeEventTap(g_config.swipe.enabled);
@@ -2931,6 +2953,7 @@ fn startCore(config_path_arg: ?[]const u8) !void {
     // -- Core state --
     g_core_stage = .layout;
     refreshDisplays();
+    warmDisplayLinks();
     if (!waitForNativeSpaceCapacity()) {
         log.err("could not reconcile Mission Control Space count", .{});
         return error.NativeSpaceCapacityUnavailable;
@@ -6922,6 +6945,7 @@ fn reconcileDisplayChange(cause: state_mod.DisplayReconcileCause) bool {
     } });
     assertDisplayCoverage();
     refreshRolePolling();
+    warmDisplayLinks();
     return true;
 }
 
@@ -7194,17 +7218,19 @@ fn retileDisplay(display_id: u32) void {
         if (!framesEqual(visible.frame, target_frame) or
             g_state.geometry.needsRepair(visible_wid, target_frame, nanoTimestamp()))
         {
-            // Fullscreen windows are never animated: macOS clamps their size
-            // mid-flight and they need the two-pass set below to land on the
-            // exact display frame.
+            const current_frame = physicalFrame(visible_wid, visible.frame);
+            const crosses_display = !frameOnDisplay(current_frame, display_id);
+            // Fullscreen windows and cross-display moves are never animated:
+            // macOS clamps oversized intermediate frames back onto the source
+            // display and stalls shared-PID apps on scale-factor redraws.
             var applied = true;
-            if (g_config.animation.enabled and !win.is_fullscreen and !following_app_resize) {
-                applied = g_animator.animate(display_id, visible.pid, visible_wid, physicalFrame(visible_wid, visible.frame), target_frame);
+            if (g_config.animation.enabled and !win.is_fullscreen and !following_app_resize and !crosses_display) {
+                applied = g_animator.animate(display_id, visible.pid, visible_wid, current_frame, target_frame);
                 if (applied) recordAnimationIntent(visible_wid, target_frame);
                 ensureAnimationFrames(display_id);
             } else {
-                // The window may have entered fullscreen mid-animation; stop
-                // the in-flight animation so it doesn't fight the placement.
+                // The window may have entered fullscreen or crossed displays
+                // mid-animation; stop the in-flight animation so it doesn't fight.
                 g_animator.cancel(visible_wid);
                 applied = applyWindowFrame(visible.pid, visible_wid, visible.frame, target_frame, win.is_fullscreen, .layout);
             }

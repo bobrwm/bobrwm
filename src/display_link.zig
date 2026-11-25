@@ -62,13 +62,25 @@ pub fn start(display_id: u32) bool {
         return true;
     }
 
+    return createLink(display_id, false) != null;
+}
+
+/// Pre-allocate a paused link for `display_id` so the first animation on that
+/// display unpauses in ~10us instead of paying cold CADisplayLink setup (~30ms)
+/// on the first retile.
+pub fn warm(display_id: u32) void {
+    if (find(display_id) != null) return;
+    _ = createLink(display_id, true);
+}
+
+fn createLink(display_id: u32, start_paused: bool) ?*Link {
     const link = freeSlot() orelse {
         log.warn("no free display link slot display={d}", .{display_id});
-        return false;
+        return null;
     };
     const screen = screenForDisplay(display_id) orelse {
         log.warn("display link screen missing display={d}", .{display_id});
-        return false;
+        return null;
     };
 
     // The link retains its target, so the target needs no other owner.
@@ -83,16 +95,17 @@ pub fn start(display_id: u32) bool {
     });
     if (ref.value == null) {
         log.warn("display link create failed display={d}", .{display_id});
-        return false;
+        return null;
     }
+    if (start_paused) ref.msgSend(void, "setPaused:", .{true});
 
     const NSRunLoop = objc.getClass("NSRunLoop").?;
     const run_loop = NSRunLoop.msgSend(objc.Object, "mainRunLoop", .{});
     ref.msgSend(void, "addToRunLoop:forMode:", .{ run_loop, objc.Object{ .value = NSRunLoopCommonModes } });
 
     _ = ref.msgSend(objc.Object, "retain", .{});
-    link.* = .{ .display_id = display_id, .ref = ref, .paused = false };
-    return true;
+    link.* = .{ .display_id = display_id, .ref = ref, .paused = start_paused };
+    return link;
 }
 
 /// Pause frame delivery for `display_id` while keeping the link allocated so

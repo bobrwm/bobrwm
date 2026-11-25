@@ -45,5 +45,12 @@ pub const Window = struct {
             return @abs(self.width - other.width) <= tol and
                 @abs(self.height - other.height) <= tol;
         }
+
+        /// Compare only origin within a tolerance. When true, an in-place
+        /// resize needs no AXPosition write, halving per-tick AX IPC.
+        pub fn posApproxEqual(self: Frame, other: Frame, tol: f64) bool {
+            return @abs(self.x - other.x) <= tol and
+                @abs(self.y - other.y) <= tol;
+        }
     };
 };

@@ -200,7 +200,22 @@ pub fn reduceWindowMoveRequest(transition: *Transition, request: WindowMoveReque
     }
     transition.model.retile_request.all_displays = true;
     transition.model.retile_request.display_count = 0;
-    if (request.should_move_native) {
+    const is_cross_display = action.space.display_id != target.display_id;
+    const active_window_id = transition.model.windowTabActive(moved.window_id);
+    if (is_cross_display) {
+        // Crossing onto another display can change backing scale or clamp size
+        // (see 9dbd80b); invalidate size so placement uses a guarded frame write.
+        transition.model.geometry.markSizeUnknown(moved.window_id);
+        if (active_window_id != moved.window_id) {
+            transition.model.geometry.markSizeUnknown(active_window_id);
+        }
+    }
+    // Moving across displays onto a Space that is already visible on the
+    // target display only needs the retile frame write; forcing a SkyLight
+    // Space move on top fights the frame placement and triggers retries.
+    const needs_native_space_move = request.should_move_native and
+        !(is_cross_display and transition.model.native_topology.isSpaceShown(target.key.id));
+    if (needs_native_space_move) {
         workspace_reducer.reduceNativeWindowMoveTracked(transition, .{
             .window_id = moved.window_id,
             .source = action.space,
@@ -208,7 +223,6 @@ pub fn reduceWindowMoveRequest(transition: *Transition, request: WindowMoveReque
         });
     }
 
-    const active_window_id = transition.model.windowTabActive(moved.window_id);
     const active = transition.model.window(active_window_id) orelse return;
     transition.addEffect(.{ .window_moved = .{
         .window_id = active.window_id,

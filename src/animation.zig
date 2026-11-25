@@ -227,10 +227,11 @@ pub const Animator = struct {
             const tol = window_mod.Window.Frame.tolerance;
             const frame = interpolateFrame(a.start_frame, a.end_frame, easeValue(self.easing, self.bezier, t));
             if (!a.last_displayed_frame.approxEqual(frame, tol)) {
-                // Pure moves skip the size write, halving the per-tick IPC.
-                const resizing = @abs(a.end_frame.width - a.start_frame.width) > tol or
-                    @abs(a.end_frame.height - a.start_frame.height) > tol;
-                const step: ax_writer.Write = .{ .position = true, .size = resizing, .quiet = true };
+                const step: ax_writer.Write = switch (changedAxes(a.start_frame, a.end_frame)) {
+                    .position_only => .{ .position = true, .size = false, .quiet = true },
+                    .size_only => .{ .position = false, .size = true, .quiet = true },
+                    .both => .{ .position = true, .size = true, .quiet = true },
+                };
                 if (ax_writer.write(a.pid, a.wid, frame, step)) a.last_displayed_frame = frame;
             }
 
@@ -314,17 +315,29 @@ pub const Animator = struct {
     }
 };
 
-/// Place a window at its animation target. A pure move (size unchanged
-/// between the animation's endpoints) finishes with a position-only write:
-/// intermediate ticks never wrote a size, so there is no size drift to heal,
-/// and an AXSize write would flash and reflow size-sensitive apps. Resizing
-/// animations keep the full clamping-safe frame write. Returns whether the
-/// write was queued.
+const ChangedAxes = enum {
+    position_only,
+    size_only,
+    both,
+};
+
+/// Classify which axes change between animation endpoints so pure moves skip
+/// AXSize (avoiding resize flash) and pure in-place resizes skip AXPosition
+/// (halving per-tick AX IPC). Equal endpoints default to `position_only`.
+fn changedAxes(from: window_mod.Window.Frame, to: window_mod.Window.Frame) ChangedAxes {
+    const tol = window_mod.Window.Frame.tolerance;
+    if (from.sizeApproxEqual(to, tol)) return .position_only;
+    if (from.posApproxEqual(to, tol)) return .size_only;
+    return .both;
+}
+
+/// Place a window at its animation target. Returns whether the write was queued.
 fn placeFinal(pid: i32, wid: u32, from: window_mod.Window.Frame, to: window_mod.Window.Frame) bool {
-    const kind: ax_writer.Write = if (from.sizeApproxEqual(to, window_mod.Window.Frame.tolerance))
-        .position_only
-    else
-        .frame;
+    const kind: ax_writer.Write = switch (changedAxes(from, to)) {
+        .position_only => .position_only,
+        .size_only => .size_only,
+        .both => .frame,
+    };
     return ax_writer.write(pid, wid, to, kind);
 }
 
@@ -490,4 +503,24 @@ test "bezier presets are valid, monotonic, and ordered from snappy to smooth" {
     const smooth_early = easeValue(.smooth, .{}, 0.25);
     try testing.expect(snappy_early > natural_early);
     try testing.expect(natural_early > smooth_early);
+}
+
+test "changedAxes omits unchanged axes on pure moves and pure resizes" {
+    const testing = std.testing;
+    const base: window_mod.Window.Frame = .{ .x = 0, .y = 0, .width = 860, .height = 1440 };
+
+    // Pure move skips size.
+    const moved: window_mod.Window.Frame = .{ .x = 860, .y = 0, .width = 860, .height = 1440 };
+    try testing.expectEqual(ChangedAxes.position_only, changedAxes(base, moved));
+
+    // Pure in-place resize skips position.
+    const resized: window_mod.Window.Frame = .{ .x = 0, .y = 0, .width = 1720, .height = 1440 };
+    try testing.expectEqual(ChangedAxes.size_only, changedAxes(base, resized));
+
+    // Combined move + resize writes both axes.
+    const both: window_mod.Window.Frame = .{ .x = 860, .y = 0, .width = 1720, .height = 1440 };
+    try testing.expectEqual(ChangedAxes.both, changedAxes(base, both));
+
+    // Equal frames default to position_only so neither axis is ever omitted completely.
+    try testing.expectEqual(ChangedAxes.position_only, changedAxes(base, base));
 }
