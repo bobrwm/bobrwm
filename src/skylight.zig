@@ -71,6 +71,22 @@ pub const ProcessSerialNumber = extern struct {
 pub const SetFrontProcessFn = *const fn (*ProcessSerialNumber, u32, u32) callconv(.c) c_int;
 pub const PostEventRecordFn = *const fn (*ProcessSerialNumber, [*]u8) callconv(.c) c_int;
 
+pub const TransactionRef = *anyopaque;
+// Verified against macOS 27.2.1 ARM64 SkyLight: transaction setters and
+// SLSTransactionCommit return void (leaving unrelated bytes in w0).
+pub const TransactionCreateFn = *const fn (c_int) callconv(.c) ?TransactionRef;
+pub const TransactionCommitFn = *const fn (TransactionRef, c_int) callconv(.c) void;
+pub const TransactionMoveWindowFn = *const fn (TransactionRef, u32, CGPoint) callconv(.c) void;
+pub const TransactionOrderWindowFn = *const fn (TransactionRef, u32, c_int, u32) callconv(.c) void;
+
+pub const TransactionOps = struct {
+    mainConnectionID: *const fn () callconv(.c) c_int,
+    transactionCreate: TransactionCreateFn,
+    transactionCommit: TransactionCommitFn,
+    transactionMoveWindow: TransactionMoveWindowFn,
+    transactionOrderWindow: TransactionOrderWindowFn,
+};
+
 pub const SkyLight = struct {
     mainConnectionID: *const fn () callconv(.c) c_int,
     getWindowBounds: *const fn (c_int, u32, *CGRect) callconv(.c) c_int,
@@ -84,6 +100,10 @@ pub const SkyLight = struct {
     getSpaceManagementMode: ?GetSpaceManagementModeFn,
     copySpacesForWindows: ?CopySpacesForWindowsFn,
     moveWindowsToManagedSpace: ?MoveWindowsToManagedSpaceFn,
+    transactionCreate: ?TransactionCreateFn,
+    transactionCommit: ?TransactionCommitFn,
+    transactionMoveWindow: ?TransactionMoveWindowFn,
+    transactionOrderWindow: ?TransactionOrderWindowFn,
     bridgedSpaceCreateClass: ?objc.Class,
     bridgedSpaceCreateSelectorSupported: bool,
     bridgedSpaceDestroyClass: ?objc.Class,
@@ -172,6 +192,10 @@ pub const SkyLight = struct {
             .getSpaceManagementMode = lib.lookup(GetSpaceManagementModeFn, "SLSGetSpaceManagementMode"),
             .copySpacesForWindows = copy_spaces_for_windows,
             .moveWindowsToManagedSpace = move_windows_to_managed_space,
+            .transactionCreate = lib.lookup(TransactionCreateFn, "SLSTransactionCreate"),
+            .transactionCommit = lib.lookup(TransactionCommitFn, "SLSTransactionCommit"),
+            .transactionMoveWindow = lib.lookup(TransactionMoveWindowFn, "SLSTransactionMoveWindowWithGroup"),
+            .transactionOrderWindow = lib.lookup(TransactionOrderWindowFn, "SLSTransactionOrderWindow"),
             .bridgedSpaceCreateClass = bridged_space_create_class,
             .bridgedSpaceCreateSelectorSupported = bridged_space_create_selector_supported,
             .bridgedSpaceDestroyClass = bridged_space_destroy_class,
@@ -211,6 +235,18 @@ pub const SkyLight = struct {
 
     pub fn supportsWindowHitTesting(self: *const SkyLight) bool {
         return self.findWindowAndOwner != null;
+    }
+
+    /// Return the resolved `SLSTransaction*` function table for batching
+    /// owned-window moves and ordering, or null if any symbol is unavailable.
+    pub fn transactionOps(self: *const SkyLight) ?TransactionOps {
+        return .{
+            .mainConnectionID = self.mainConnectionID,
+            .transactionCreate = self.transactionCreate orelse return null,
+            .transactionCommit = self.transactionCommit orelse return null,
+            .transactionMoveWindow = self.transactionMoveWindow orelse return null,
+            .transactionOrderWindow = self.transactionOrderWindow orelse return null,
+        };
     }
 
     /// Return the frontmost WindowServer window at a global screen point.

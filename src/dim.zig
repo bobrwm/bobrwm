@@ -58,16 +58,122 @@ const ns_window_collection_behavior_full_screen_auxiliary: usize = 1 << 8;
 const NSPoint = extern struct { x: f64, y: f64 };
 const NSSize = extern struct { width: f64, height: f64 };
 const NSRect = extern struct { origin: NSPoint, size: NSSize };
+pub const CGPoint = extern struct { x: f64, y: f64 };
+const CGRect = struct { x: f64 = 0, y: f64 = 0, w: f64 = 0, h: f64 = 0 };
+
+pub const SlsTransactionRef = *anyopaque;
+const sls_order_out: c_int = 0;
+const sls_order_above: c_int = 1;
+
+// Verified against macOS 27.2.1 ARM64 SkyLight: transaction setters and
+// SLSTransactionCommit return void (leaving unrelated bytes in w0).
+pub const MainConnectionIdFn = *const fn () callconv(.c) c_int;
+pub const TransactionCreateFn = *const fn (c_int) callconv(.c) ?SlsTransactionRef;
+pub const TransactionCommitFn = *const fn (SlsTransactionRef, c_int) callconv(.c) void;
+pub const TransactionMoveWindowFn = *const fn (SlsTransactionRef, u32, CGPoint) callconv(.c) void;
+pub const TransactionOrderWindowFn = *const fn (SlsTransactionRef, u32, c_int, u32) callconv(.c) void;
+pub const ReleaseFn = *const fn (*const anyopaque) callconv(.c) void;
+
+extern "c" fn CFRelease(cf: *const anyopaque) void;
+
+/// Optional SkyLight `SLSTransaction*` function table injected from
+/// `skylight.zig` at startup so SkyLight symbol lookup stays in one place.
+pub const SlsOps = struct {
+    mainConnectionID: MainConnectionIdFn,
+    transactionCreate: TransactionCreateFn,
+    transactionCommit: TransactionCommitFn,
+    transactionMoveWindow: TransactionMoveWindowFn,
+    transactionOrderWindow: TransactionOrderWindowFn,
+    release: ReleaseFn = CFRelease,
+};
+
+var sls_ops: ?SlsOps = null;
+
+/// Install (or clear) the SkyLight transaction ops used to batch overlay
+/// updates. When unset, overlays fall back cleanly to AppKit.
+pub fn setSlsOps(ops: ?SlsOps) void {
+    sls_ops = ops;
+}
+
+/// Batches owned-overlay moves and z-order updates into one async WindowServer
+/// `SLSTransaction`, avoiding per-panel AppKit/Mach overhead on animation ticks
+/// and snapshot diffs. Lazily creates the transaction on the first encoded op
+/// so idle batches do no work.
+pub const Batch = struct {
+    api: ?SlsOps,
+    tx: ?SlsTransactionRef = null,
+
+    pub fn begin() Batch {
+        return .{ .api = sls_ops };
+    }
+
+    /// Move an existing overlay inside this batch without re-diffing the
+    /// snapshot. Used per animation tick, where a full snapshot would cost a
+    /// WindowServer window-list copy every frame.
+    pub fn follow(self: *Batch, wid: u32, x: f64, y: f64, w: f64, h: f64) void {
+        if (!enabled) return;
+
+        const target: CGRect = .{ .x = x, .y = y, .w = w, .h = h };
+        for (slots[0..slot_count]) |*s| {
+            if (!s.shown or s.wid != wid) continue;
+            if (cgRectEql(s.cg_frame, target)) return;
+            moveOrResizeSlot(s, target, self);
+            return;
+        }
+    }
+
+    pub fn commit(self: *Batch) void {
+        const tx = self.tx orelse return;
+        const api = self.api.?;
+        self.tx = null;
+        // sync=0 commits asynchronously in WindowServer submission order,
+        // avoiding a synchronous main-thread round-trip.
+        api.transactionCommit(tx, 0);
+        api.release(tx);
+    }
+
+    fn ensureTx(self: *Batch) ?SlsTransactionRef {
+        if (self.tx) |tx| return tx;
+        const api = self.api orelse return null;
+        const tx = api.transactionCreate(api.mainConnectionID()) orelse return null;
+        self.tx = tx;
+        return tx;
+    }
+
+    fn moveWindow(self: *Batch, panel_wid: u32, x: f64, y: f64) bool {
+        const tx = self.ensureTx() orelse return false;
+        self.api.?.transactionMoveWindow(tx, panel_wid, .{ .x = x, .y = y });
+        return true;
+    }
+
+    fn orderWindow(self: *Batch, panel_wid: u32, order: c_int, relative_wid: u32) bool {
+        const tx = self.ensureTx() orelse return false;
+        self.api.?.transactionOrderWindow(tx, panel_wid, order, relative_wid);
+        return true;
+    }
+};
 
 const Slot = struct {
     panel: objc.Object,
+    panel_wid: u32 = 0, // panel's CGWindowID once ordered in by AppKit
     wid: u32 = 0, // target window; 0 when the slot is hidden/free
     pid: i32 = 0,
     display_id: u32 = 0,
     shown: bool = false,
+    /// True once AppKit has ordered this panel in at least once so its backing
+    /// store and rounded-corner layer exist in WindowServer.
+    backing_ready: bool = false,
     // Ordered during the current apply(), so restacking can skip it.
     is_ordered: bool = false,
-    frame: NSRect = .{ .origin = .{ .x = 0, .y = 0 }, .size = .{ .width = 0, .height = 0 } },
+    /// Authoritative CG frame (top-left origin) in WindowServer.
+    cg_frame: CGRect = .{},
+    /// Backing store size currently owned by AppKit's last `setFrame:`.
+    backing_w: f64 = 0,
+    backing_h: f64 = 0,
+    /// Set when `SLSTransactionMoveWindowWithGroup` moved the panel without
+    /// updating AppKit's cached frame origin. A subsequent resize re-asserts
+    /// the CG origin via SLS so AppKit cannot skip an unchanged cached origin.
+    origin_sls_dirty: bool = false,
 };
 
 var slots: [max_overlays]Slot = undefined;
@@ -101,10 +207,13 @@ pub fn apply(focused: []const u32, frontmost_pid: i32, entries: []const Entry) v
         return;
     }
 
+    var batch = Batch.begin();
+    defer batch.commit();
+
     // Pass 1: hide overlays whose target is no longer a dim candidate.
     for (slots[0..slot_count]) |*s| {
         if (!s.shown) continue;
-        if (!isDimTarget(entries, focused, s.wid)) hideSlot(s);
+        if (!isDimTarget(entries, focused, s.wid)) hideSlot(s, &batch);
     }
 
     // Pass 2: ensure an overlay exists (and is current) for each candidate.
@@ -112,7 +221,7 @@ pub fn apply(focused: []const u32, frontmost_pid: i32, entries: []const Entry) v
     for (entries) |e| {
         if (e.wid == 0 or contains(focused, e.wid)) continue;
         if (e.w <= 0 or e.h <= 0) continue;
-        ensureOverlay(e);
+        ensureOverlay(e, &batch);
     }
 
     // Only the activated app's windows were raised, so only its overlays can
@@ -120,33 +229,27 @@ pub fn apply(focused: []const u32, frontmost_pid: i32, entries: []const Entry) v
     if (frontmost_pid == applied_frontmost_pid) return;
     applied_frontmost_pid = frontmost_pid;
     for (slots[0..slot_count]) |*s| {
-        if (s.shown and !s.is_ordered and s.pid == frontmost_pid) orderAbove(s);
+        if (s.shown and !s.is_ordered and s.pid == frontmost_pid) orderAbove(s, &batch);
     }
 }
 
 /// Hide the overlays on one display without a snapshot, so a Space switch can
 /// clear them before the slide starts.
 pub fn hideDisplay(display_id: u32) void {
+    var batch = Batch.begin();
+    defer batch.commit();
     for (slots[0..slot_count]) |*s| {
-        if (s.shown and s.display_id == display_id) hideSlot(s);
+        if (s.shown and s.display_id == display_id) hideSlot(s, &batch);
     }
 }
 
 /// Move an existing overlay to a new CG frame without re-diffing the
-/// snapshot. Used per animation tick, where a full snapshot would cost a
-/// WindowServer window-list copy every 16ms.
+/// snapshot. Prefer `Batch.begin()` + `batch.follow(...)` when updating
+/// multiple overlays in one tick so all moves share a single transaction.
 pub fn follow(wid: u32, x: f64, y: f64, w: f64, h: f64) void {
-    if (!enabled) return;
-
-    const frame = nsRectFromCg(x, y, w, h);
-    for (slots[0..slot_count]) |*s| {
-        if (!s.shown or s.wid != wid) continue;
-        if (rectEql(s.frame, frame)) return;
-        // The content is a static layer; forcing a redraw per tick buys nothing.
-        s.panel.msgSend(void, "setFrame:display:", .{ frame, false });
-        s.frame = frame;
-        return;
-    }
+    var batch = Batch.begin();
+    defer batch.commit();
+    batch.follow(wid, x, y, w, h);
 }
 
 /// Flip the enabled state at runtime and return the new value. When turning
@@ -160,8 +263,10 @@ pub fn toggle() bool {
 
 /// Hide every overlay. Called on focus loss, feature disable, and shutdown.
 pub fn resetAll() void {
+    var batch = Batch.begin();
+    defer batch.commit();
     for (slots[0..slot_count]) |*s| {
-        if (s.shown) hideSlot(s);
+        if (s.shown) hideSlot(s, &batch);
     }
     applied_frontmost_pid = 0;
 }
@@ -178,8 +283,8 @@ fn isDimTarget(entries: []const Entry, focused: []const u32, wid: u32) bool {
     return false;
 }
 
-fn ensureOverlay(e: Entry) void {
-    const frame = nsRectFromCg(e.x, e.y, e.w, e.h);
+fn ensureOverlay(e: Entry, batch: *Batch) void {
+    const target: CGRect = .{ .x = e.x, .y = e.y, .w = e.w, .h = e.h };
 
     // Reuse an overlay already targeting this window: only re-place it if its
     // frame moved. Ordering and framing are skipped when nothing changed to
@@ -187,10 +292,9 @@ fn ensureOverlay(e: Entry) void {
     for (slots[0..slot_count]) |*s| {
         if (s.shown and s.wid == e.wid) {
             s.display_id = e.display_id;
-            if (!rectEql(s.frame, frame)) {
-                s.panel.msgSend(void, "setFrame:display:", .{ frame, false });
-                s.frame = frame;
-                orderAbove(s);
+            if (!cgRectEql(s.cg_frame, target)) {
+                moveOrResizeSlot(s, target, batch);
+                orderAbove(s, batch);
             }
             return;
         }
@@ -202,20 +306,75 @@ fn ensureOverlay(e: Entry) void {
     s.wid = e.wid;
     s.pid = e.pid;
     s.display_id = e.display_id;
-    s.frame = frame;
     s.shown = true;
-    s.panel.msgSend(void, "setFrame:display:", .{ frame, true });
-    orderAbove(s);
+
+    if (s.backing_ready) {
+        moveOrResizeSlot(s, target, batch);
+        orderAbove(s, batch);
+        return;
+    }
+
+    // First-ever show for a newly created panel: go through AppKit once so
+    // the backing store and rounded-corner layer are materialized.
+    const ns_frame = nsRectFromCg(target.x, target.y, target.w, target.h);
+    s.panel.msgSend(void, "setFrame:display:", .{ ns_frame, true });
+    s.panel.msgSend(void, "orderWindow:relativeTo:", .{ ns_window_order_above, @as(i64, s.wid) });
+    const wn = s.panel.msgSend(i64, "windowNumber", .{});
+    if (wn > 0) s.panel_wid = @intCast(wn);
+    s.backing_ready = true;
+    s.cg_frame = target;
+    s.backing_w = target.w;
+    s.backing_h = target.h;
+    s.origin_sls_dirty = false;
+    s.is_ordered = true;
 }
 
-fn orderAbove(s: *Slot) void {
+/// Update a backing-ready panel's geometry: pure moves encode directly into
+/// `batch` via `SLSTransactionMoveWindowWithGroup` (~4us for 4 overlays),
+/// while size changes resize the backing store via AppKit to preserve crisp
+/// rounded corners.
+fn moveOrResizeSlot(s: *Slot, target: CGRect, batch: *Batch) void {
+    const same_backing_size = s.backing_w == target.w and s.backing_h == target.h;
+    if (same_backing_size and s.backing_ready and s.panel_wid != 0) {
+        if (batch.moveWindow(s.panel_wid, target.x, target.y)) {
+            s.cg_frame = target;
+            s.origin_sls_dirty = true;
+            return;
+        }
+    }
+
+    // The content is a static layer; forcing a redraw per tick buys nothing.
+    const ns_frame = nsRectFromCg(target.x, target.y, target.w, target.h);
+    s.panel.msgSend(void, "setFrame:display:", .{ ns_frame, false });
+    if (s.origin_sls_dirty and s.panel_wid != 0) {
+        // Re-assert the CG origin in the batch in case AppKit's stale cached
+        // NS origin matched `ns_frame.origin` and skipped sending the move.
+        _ = batch.moveWindow(s.panel_wid, target.x, target.y);
+    }
+    s.cg_frame = target;
+    s.backing_w = target.w;
+    s.backing_h = target.h;
+    s.origin_sls_dirty = false;
+}
+
+fn orderAbove(s: *Slot, batch: *Batch) void {
+    if (s.backing_ready and s.panel_wid != 0 and batch.orderWindow(s.panel_wid, sls_order_above, s.wid)) {
+        s.is_ordered = true;
+        return;
+    }
     s.panel.msgSend(void, "orderWindow:relativeTo:", .{ ns_window_order_above, @as(i64, s.wid) });
     s.is_ordered = true;
 }
 
-fn hideSlot(s: *Slot) void {
+fn hideSlot(s: *Slot, batch: *Batch) void {
+    if (s.backing_ready and s.panel_wid != 0 and batch.orderWindow(s.panel_wid, sls_order_out, 0)) {
+        s.shown = false;
+        s.wid = 0;
+        return;
+    }
     const nil_object: objc.Object = .{ .value = null };
     s.panel.msgSend(void, "orderOut:", .{nil_object});
+    s.backing_ready = false;
     s.shown = false;
     s.wid = 0;
 }
@@ -287,9 +446,8 @@ fn createPanel() ?objc.Object {
     return panel;
 }
 
-fn rectEql(a: NSRect, b: NSRect) bool {
-    return a.origin.x == b.origin.x and a.origin.y == b.origin.y and
-        a.size.width == b.size.width and a.size.height == b.size.height;
+fn cgRectEql(a: CGRect, b: CGRect) bool {
+    return a.x == b.x and a.y == b.y and a.w == b.w and a.h == b.h;
 }
 
 /// Convert a CG rect (top-left origin) to an NS rect (bottom-left origin),
@@ -400,10 +558,135 @@ test "contains" {
     try t.expect(!contains(&[_]u32{}, 5)); // empty set matches nothing
 }
 
-test "rectEql" {
-    const a: NSRect = .{ .origin = .{ .x = 1, .y = 2 }, .size = .{ .width = 3, .height = 4 } };
-    const b: NSRect = .{ .origin = .{ .x = 1, .y = 2 }, .size = .{ .width = 3, .height = 4 } };
-    const c: NSRect = .{ .origin = .{ .x = 1, .y = 2 }, .size = .{ .width = 3, .height = 5 } };
-    try t.expect(rectEql(a, b));
-    try t.expect(!rectEql(a, c));
+test "cgRectEql" {
+    const a: CGRect = .{ .x = 1, .y = 2, .w = 3, .h = 4 };
+    const b: CGRect = .{ .x = 1, .y = 2, .w = 3, .h = 4 };
+    const c: CGRect = .{ .x = 1, .y = 2, .w = 3, .h = 5 };
+    try t.expect(cgRectEql(a, b));
+    try t.expect(!cgRectEql(a, c));
+}
+
+test "Batch lazily creates, commits once async, and releases" {
+    const Mock = struct {
+        var sentinel: u8 = 0;
+        var create_calls: usize = 0;
+        var move_calls: usize = 0;
+        var order_calls: usize = 0;
+        var commit_calls: usize = 0;
+        var last_sync: c_int = -1;
+        var release_calls: usize = 0;
+        var last_move_wid: u32 = 0;
+        var last_move_pt: CGPoint = .{ .x = 0, .y = 0 };
+        var last_order: c_int = -1;
+        var last_rel_wid: u32 = 0;
+
+        fn reset() void {
+            create_calls = 0;
+            move_calls = 0;
+            order_calls = 0;
+            commit_calls = 0;
+            last_sync = -1;
+            release_calls = 0;
+            last_move_wid = 0;
+            last_move_pt = .{ .x = 0, .y = 0 };
+            last_order = -1;
+            last_rel_wid = 0;
+        }
+
+        fn conn() callconv(.c) c_int {
+            return 42;
+        }
+        fn create(_: c_int) callconv(.c) ?SlsTransactionRef {
+            create_calls += 1;
+            return @ptrCast(&sentinel);
+        }
+        fn commit(_: SlsTransactionRef, sync: c_int) callconv(.c) void {
+            commit_calls += 1;
+            last_sync = sync;
+        }
+        fn move(_: SlsTransactionRef, wid: u32, pt: CGPoint) callconv(.c) void {
+            move_calls += 1;
+            last_move_wid = wid;
+            last_move_pt = pt;
+        }
+        fn order(_: SlsTransactionRef, _: u32, ord: c_int, rel: u32) callconv(.c) void {
+            order_calls += 1;
+            last_order = ord;
+            last_rel_wid = rel;
+        }
+        fn release(_: *const anyopaque) callconv(.c) void {
+            release_calls += 1;
+        }
+    };
+
+    const mock_api: SlsOps = .{
+        .mainConnectionID = Mock.conn,
+        .transactionCreate = Mock.create,
+        .transactionCommit = Mock.commit,
+        .transactionMoveWindow = Mock.move,
+        .transactionOrderWindow = Mock.order,
+        .release = Mock.release,
+    };
+
+    // Idle batch must not create, commit, or release a transaction.
+    Mock.reset();
+    var empty: Batch = .{ .api = mock_api };
+    empty.commit();
+    try t.expectEqual(@as(usize, 0), Mock.create_calls);
+    try t.expectEqual(@as(usize, 0), Mock.commit_calls);
+    try t.expectEqual(@as(usize, 0), Mock.release_calls);
+
+    // Multiple moves and orders collapse into one async (sync=0) transaction.
+    Mock.reset();
+    var batch: Batch = .{ .api = mock_api };
+    try t.expect(batch.moveWindow(101, 10, 20));
+    try t.expect(batch.moveWindow(102, 30, 40));
+    try t.expect(batch.orderWindow(101, sls_order_above, 999));
+    batch.commit();
+    try t.expectEqual(@as(usize, 1), Mock.create_calls);
+    try t.expectEqual(@as(usize, 2), Mock.move_calls);
+    try t.expectEqual(@as(usize, 1), Mock.order_calls);
+    try t.expectEqual(@as(usize, 1), Mock.commit_calls);
+    try t.expectEqual(@as(c_int, 0), Mock.last_sync);
+    try t.expectEqual(@as(usize, 1), Mock.release_calls);
+    try t.expectEqual(@as(u32, 102), Mock.last_move_wid);
+    try t.expectEqual(@as(f64, 30), Mock.last_move_pt.x);
+    try t.expectEqual(@as(f64, 40), Mock.last_move_pt.y);
+    try t.expectEqual(sls_order_above, Mock.last_order);
+    try t.expectEqual(@as(u32, 999), Mock.last_rel_wid);
+
+    // Pure-move follow() on a backing-ready slot encodes directly via SLS and marks origin_sls_dirty.
+    const saved_enabled = enabled;
+    const saved_slot_count = slot_count;
+    const saved_slot0 = slots[0];
+    defer {
+        enabled = saved_enabled;
+        slot_count = saved_slot_count;
+        slots[0] = saved_slot0;
+    }
+
+    Mock.reset();
+    enabled = true;
+    slot_count = 1;
+    slots[0] = .{
+        .panel = .{ .value = null },
+        .panel_wid = 500,
+        .wid = 77,
+        .pid = 12,
+        .display_id = 1,
+        .shown = true,
+        .backing_ready = true,
+        .cg_frame = .{ .x = 0, .y = 0, .w = 400, .h = 300 },
+        .backing_w = 400,
+        .backing_h = 300,
+    };
+    var follow_batch: Batch = .{ .api = mock_api };
+    follow_batch.follow(77, 120, 80, 400, 300);
+    follow_batch.follow(77, 120, 80, 400, 300); // unchanged frame is skipped
+    follow_batch.commit();
+    try t.expectEqual(@as(usize, 1), Mock.move_calls);
+    try t.expectEqual(@as(u32, 500), Mock.last_move_wid);
+    try t.expectEqual(@as(f64, 120), slots[0].cg_frame.x);
+    try t.expectEqual(@as(f64, 80), slots[0].cg_frame.y);
+    try t.expect(slots[0].origin_sls_dirty);
 }
